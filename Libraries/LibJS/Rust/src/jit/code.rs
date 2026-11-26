@@ -9,9 +9,10 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::ops::ControlFlow;
-use std::collections::HashMap;
 
 use ak::Zone;
+use foldhash::fast::RandomState;
+use hashbrown::HashMap;
 use libjs_jit::artifact::{Artifact, FrameView, Layout, Patch, SiteView};
 use libjs_jit::bytecode::{EnvironmentCoordinate, decode_instruction};
 use libjs_jit::code::ExitKind;
@@ -141,7 +142,7 @@ pub fn speculated_cache_size(cache: &PropertyLookupCache) -> u8 {
     let entries = cache
         .entries()
         .iter()
-        .filter(|entry| entry.get().entry_type != PropertyLookupCacheEntryType::Empty)
+        .filter(|entry| entry.entry_type.get() != PropertyLookupCacheEntryType::Empty)
         .count();
     u8::try_from(entries).expect("caches that are not megamorphic have few entries")
 }
@@ -193,7 +194,7 @@ pub struct JitCode {
     /// in them, and how many more tier-up checks each may make at back edges from where it reaches no on-stack
     /// replacement entry before the code is discarded, by frame id (see Vm::frame_id_of()). Unlike frame addresses,
     /// ids are never reused by later frames.
-    interpreted_frames: RefCell<HashMap<u64, u32>>,
+    interpreted_frames: RefCell<HashMap<u64, u32, RandomState>>,
     /// How many frames `interpreted_frames` holds before forget_inactive_interpreted_frames() looks for returned ones.
     interpreted_frame_count_to_forget_at: Cell<usize>,
     memory: ExecutableMemory,
@@ -264,7 +265,7 @@ impl JitCode {
         let (embedded_cells, function_cells) = split_function_cells(embedded_cells, defer_gc);
         Self {
             exit_count: Cell::new(0),
-            interpreted_frames: RefCell::new(HashMap::new()),
+            interpreted_frames: RefCell::new(HashMap::default()),
             interpreted_frame_count_to_forget_at: Cell::new(MIN_INTERPRETED_FRAME_COUNT_TO_FORGET_AT),
             memory,
             entry,
@@ -478,7 +479,7 @@ impl JitCode {
         if frames.len() < self.interpreted_frame_count_to_forget_at.get() {
             return;
         }
-        let mut live_frames = HashMap::new();
+        let mut live_frames = HashMap::with_hasher(foldhash::fast::RandomState::default());
         vm.for_each_live_execution_context(|frame| {
             if let Some(checks) = frames.remove(&frame.frame_id.get()) {
                 live_frames.insert(frame.frame_id.get(), checks);
@@ -839,9 +840,17 @@ impl Executable {
     /// the interpreter added the shapes the code did not know to the cache, so recompiles speculate on them all. Each
     /// such exit needs a larger cache, so this ends once the cache is megamorphic.
     pub fn jit_exit_sites_for_recompile(&self) -> Vec<(u32, ExitKind)> {
+        let sites = self.jit_state().exit_sites.borrow();
+        if sites.is_empty() {
+            return Vec::new();
+        }
         let sizes = self.jit_state().shape_exit_cache_sizes.borrow();
-        self.jit_exit_sites()
-            .into_iter()
+        if sizes.is_empty() {
+            return sites.clone();
+        }
+        sites
+            .iter()
+            .copied()
             .filter(|&(pc, kind)| {
                 if kind != ExitKind::BadShape {
                     return true;

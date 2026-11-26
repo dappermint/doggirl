@@ -60,6 +60,9 @@ struct Chunks {
     next_chunk_offset: usize,
     /// A committed chunk whose pages are faulted in already, which is the next one that blocks come from.
     prepared_chunk: Option<usize>,
+    /// True while the decommit worker is faulting pages into a newly committed chunk before publishing it.
+    #[cfg(target_os = "macos")]
+    preparing_chunk: bool,
     /// The blocks of the current chunk that were never used.
     next_unused_block: usize,
     unused_blocks_end: usize,
@@ -109,7 +112,7 @@ impl Region {
         //     is already running prepares chunks: starting it here could start a second thread before the process is
         //     sandboxed, which some sandboxes do not allow.
         if took_chunk
-            && cfg!(any(target_os = "linux", target_os = "android"))
+            && cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"))
             && let Some(worker) = DecommitWorker::the_if_started()
         {
             worker.request_prepared_chunk();
@@ -123,18 +126,37 @@ impl Region {
         let chunk = {
             let mut chunks = lock(&self.chunks);
             // NB: Running out of the region is left to take_unused_block(), on the thread that needs another chunk.
-            if chunks.prepared_chunk.is_some() || chunks.next_chunk_offset > self.last_chunk_offset {
+            #[cfg(target_os = "macos")]
+            let no_spare_chunk = chunks.preparing_chunk || chunks.next_chunk_offset >= self.last_chunk_offset;
+            #[cfg(not(target_os = "macos"))]
+            let no_spare_chunk = chunks.next_chunk_offset > self.last_chunk_offset;
+            if chunks.prepared_chunk.is_some() || no_spare_chunk {
                 return;
             }
             let chunk = self.commit_next_chunk(&mut chunks);
-            // NB: The chunk is there to take before its pages are in, so that a thread that needs another chunk
-            //     meanwhile takes this one rather than commit the next, which might not exist.
-            chunks.prepared_chunk = Some(chunk);
+            #[cfg(target_os = "macos")]
+            {
+                // NB: On macOS, `os::populate` writes one byte per page to fault pages in, so publish the chunk only
+                //     after faulting completes to avoid racing with a mutator initializing blocks in it.
+                chunks.preparing_chunk = true;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // NB: The chunk is there to take before its pages are in, so that a thread that needs another chunk
+                //     meanwhile takes this one rather than commit the next, which might not exist.
+                chunks.prepared_chunk = Some(chunk);
+            }
             chunk
         };
-        // SAFETY: The chunk was just committed. Faulting its pages in leaves their contents alone, so a thread may use
-        //         its blocks already.
+        // SAFETY: The chunk was just committed. On Linux/Android, `MADV_POPULATE_WRITE` leaves contents alone; on
+        //         macOS, `preparing_chunk` keeps the chunk exclusive to this worker until published below.
         unsafe { os::populate(block_pointer(chunk), CHUNK_SIZE) };
+        #[cfg(target_os = "macos")]
+        {
+            let mut chunks = lock(&self.chunks);
+            chunks.prepared_chunk = Some(chunk);
+            chunks.preparing_chunk = false;
+        }
     }
 
     fn committed_end(&self) -> usize {
@@ -270,7 +292,7 @@ impl DecommitWorker {
                 state: Mutex::new(WorkerState {
                     pending: Vec::new(),
                     kicked: false,
-                    chunk_requested: false,
+                    chunk_requested: cfg!(target_os = "macos"),
                     last_return_of_cold_blocks: Instant::now(),
                 }),
                 condition: Condvar::new(),
@@ -458,6 +480,8 @@ pub extern "C" fn rust_gc_heap_region_init(base: *mut u8, first_chunk_offset: us
             chunks: Mutex::new(Chunks {
                 next_chunk_offset: first_chunk_offset,
                 prepared_chunk: None,
+                #[cfg(target_os = "macos")]
+                preparing_chunk: false,
                 next_unused_block: 0,
                 unused_blocks_end: 0,
             }),

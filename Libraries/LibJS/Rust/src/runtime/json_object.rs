@@ -139,10 +139,6 @@ impl<'vm> StringifyObjectStack<'vm> {
         }
     }
 
-    fn len(&self) -> usize {
-        self.objects.borrow().len() - self.base
-    }
-
     fn contains(&self, object: Gc<Object>) -> bool {
         if self.lookup.is_empty() {
             return self.objects.borrow()[self.base..].contains(&object);
@@ -151,25 +147,27 @@ impl<'vm> StringifyObjectStack<'vm> {
     }
 
     fn push(&mut self, object: Gc<Object>) {
-        if self.len() == STRINGIFY_OBJECT_STACK_LINEAR_LOOKUP_LIMIT {
-            for seen_object in &self.objects.borrow()[self.base..] {
+        let mut objects = self.objects.borrow_mut();
+        if objects.len() - self.base == STRINGIFY_OBJECT_STACK_LINEAR_LOOKUP_LIMIT {
+            for seen_object in &objects[self.base..] {
                 self.lookup.insert(address_of(*seen_object));
             }
         }
         if !self.lookup.is_empty() {
             self.lookup.insert(address_of(object));
         }
-        self.objects.borrow_mut().push(object);
+        objects.push(object);
     }
 
     fn pop(&mut self) {
-        assert!(self.len() > 0, "an object is being serialized");
-        let object = self.objects.borrow_mut().pop().expect("an object is being serialized");
+        let mut objects = self.objects.borrow_mut();
+        assert!(objects.len() > self.base, "an object is being serialized");
+        let object = objects.pop().expect("an object is being serialized");
         if self.lookup.is_empty() {
             return;
         }
         self.lookup.remove(&address_of(object));
-        if self.len() <= STRINGIFY_OBJECT_STACK_LINEAR_LOOKUP_LIMIT {
+        if objects.len() - self.base <= STRINGIFY_OBJECT_STACK_LINEAR_LOOKUP_LIMIT {
             self.lookup.clear();
         }
     }
@@ -1270,15 +1268,34 @@ impl JSONObject {
 
         // OPTIMIZATION: The special property cache of the shape of an object without other properties may know that it
         //               has no toJSON to call, and then what is known of the shape tells what to serialize of it when
-        //               nothing runs before it is serialized.
+        //               nothing runs before it is serialized. Exact plain `Object` and `Array` instances cannot be
+        //               boxed primitives, functions, or proxies, so they skip the wrapper checks directly.
         let mut shape_info = None;
-        if value.is_object()
-            && state.replacer_function.is_none()
-            && can_use_direct_property_access(&value.as_object())
-            && special_property_cache::known(&value.as_object(), SpecialPropertyKey::ToJson)
-                .is_some_and(|to_json| to_json.is_undefined())
-        {
-            shape_info = Some(vm.json_stringify_cache().info(vm, value.as_object().shape()));
+        if value.is_object() && state.replacer_function.is_none() {
+            let value_object = value.as_object();
+            let class = value_object.class();
+            if core::ptr::eq(class, Object::CLASS)
+                && can_use_direct_property_access(&value_object)
+                && special_property_cache::known(&value_object, SpecialPropertyKey::ToJson)
+                    .is_some_and(|to_json| to_json.is_undefined())
+            {
+                let info = vm.json_stringify_cache().info(vm, value_object.shape());
+                Self::serialize_json_object(vm, state, value_object, Some(info))?;
+                return Ok(true);
+            }
+            if core::ptr::eq(class, Array::CLASS)
+                && special_property_cache::known(&value_object, SpecialPropertyKey::ToJson)
+                    .is_some_and(|to_json| to_json.is_undefined())
+            {
+                Self::serialize_json_array(vm, state, value_object)?;
+                return Ok(true);
+            }
+            if can_use_direct_property_access(&value_object)
+                && special_property_cache::known(&value_object, SpecialPropertyKey::ToJson)
+                    .is_some_and(|to_json| to_json.is_undefined())
+            {
+                shape_info = Some(vm.json_stringify_cache().info(vm, value_object.shape()));
+            }
         }
 
         // 2. If Type(value) is Object or BigInt, then
@@ -1313,33 +1330,35 @@ impl JSONObject {
         // 4. If Type(value) is Object, then
         if value.is_object() {
             let value_object = value.as_object();
-
-            // a. If value has an [[IsRawJSON]] internal slot, then
-            if value_object.is::<RawJSONObject>() {
-                // i. Return ! Get(value, "rawJSON").
-                let raw_json = value_object.get(vm, &vm.names.rawJSON).must();
-                state.builder.append(raw_json.as_string().utf16_string_view());
-                return Ok(true);
-            }
-            // b. If value has a [[NumberData]] internal slot, then
-            if value_object.is::<NumberObject>() {
-                // i. Set value to ? ToNumber(value).
-                value = value.to_number(vm)?;
-            }
-            // c. Else if value has a [[StringData]] internal slot, then
-            else if value_object.is::<StringObject>() {
-                // i. Set value to ? ToString(value).
-                value = Value::from_string(PrimitiveString::create(vm, value.to_utf16_string(vm)?));
-            }
-            // d. Else if value has a [[BooleanData]] internal slot, then
-            else if let Some(boolean) = value_object.downcast::<BooleanObject>() {
-                // i. Set value to value.[[BooleanData]].
-                value = Value::from_bool(boolean.boolean());
-            }
-            // e. Else if value has a [[BigIntData]] internal slot, then
-            else if let Some(bigint) = value_object.downcast::<BigIntObject>() {
-                // i. Set value to value.[[BigIntData]].
-                value = Value::from_bigint(bigint.bigint());
+            let class = value_object.class();
+            if !core::ptr::eq(class, Object::CLASS) && !core::ptr::eq(class, Array::CLASS) {
+                // a. If value has an [[IsRawJSON]] internal slot, then
+                if value_object.is::<RawJSONObject>() {
+                    // i. Return ! Get(value, "rawJSON").
+                    let raw_json = value_object.get(vm, &vm.names.rawJSON).must();
+                    state.builder.append(raw_json.as_string().utf16_string_view());
+                    return Ok(true);
+                }
+                // b. If value has a [[NumberData]] internal slot, then
+                if value_object.is::<NumberObject>() {
+                    // i. Set value to ? ToNumber(value).
+                    value = value.to_number(vm)?;
+                }
+                // c. Else if value has a [[StringData]] internal slot, then
+                else if value_object.is::<StringObject>() {
+                    // i. Set value to ? ToString(value).
+                    value = Value::from_string(PrimitiveString::create(vm, value.to_utf16_string(vm)?));
+                }
+                // d. Else if value has a [[BooleanData]] internal slot, then
+                else if let Some(boolean) = value_object.downcast::<BooleanObject>() {
+                    // i. Set value to value.[[BooleanData]].
+                    value = Value::from_bool(boolean.boolean());
+                }
+                // e. Else if value has a [[BigIntData]] internal slot, then
+                else if let Some(bigint) = value_object.downcast::<BigIntObject>() {
+                    // i. Set value to value.[[BigIntData]].
+                    value = Value::from_bigint(bigint.bigint());
+                }
             }
         }
 
@@ -1612,10 +1631,10 @@ impl JSONObject {
         };
 
         state.builder.append_ascii("[");
+        let has_gap = !Utf16View::of_string(&state.gap).is_empty();
 
         for i in 0..length {
             // Write separator
-            let has_gap = !Utf16View::of_string(&state.gap).is_empty();
             if i > 0 {
                 state.builder.append_ascii(",");
                 if has_gap {
