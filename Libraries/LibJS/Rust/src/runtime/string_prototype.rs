@@ -42,8 +42,8 @@ use crate::runtime::value_conversions::MAX_ARRAY_LIKE_INDEX;
 use crate::unicode::intl as unicode_intl;
 use crate::unicode::{self, NormalizationForm, normalize};
 use crate::utf16::{
-    TrimMode, Utf16StringBuilder, Utf16View, decode_utf16_surrogate_pair, is_unicode_surrogate, is_utf16_low_surrogate,
-    to_well_formed,
+    TrimMode, Utf16StringBuilder, Utf16View, concatenate, decode_utf16_surrogate_pair, is_unicode_surrogate,
+    is_utf16_low_surrogate, to_well_formed,
 };
 
 /// The CodePoint record CodePointAt returns.
@@ -1071,9 +1071,9 @@ impl StringPrototype {
             string_view.substring_view(following_start, string_view.length_in_code_units() - following_start);
 
         // 12. If functionalReplace is true, then
-        let replacement = if replace_value.is_function() {
+        if replace_value.is_function() {
             // a. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(position), string »)).
-            let result = call(
+            let replacement = call(
                 vm,
                 replace_value,
                 Value::UNDEFINED,
@@ -1082,35 +1082,46 @@ impl StringPrototype {
                     Value::from_f64(position as f64),
                     Value::from_string(string),
                 ],
-            )?;
-            result.to_utf16_string(vm)?
-        }
-        // 13. Else,
-        else {
-            // a. Assert: replaceValue is a String.
-            let replace_string =
-                replace_string.expect("a replacement that is not a function was converted to a string");
-
-            // b. Let captures be a new empty List.
-            // c. Let replacement be ! GetSubstitution(searchString, string, position, captures, undefined, replaceValue).
-            get_substitution(
-                vm,
-                search_string_view,
-                string_view,
-                position,
-                &[],
-                Value::UNDEFINED,
-                Utf16View::of_string(&replace_string),
             )?
+            .to_utf16_string(vm)?;
+
+            // 14. Return the string-concatenation of preceding, replacement, and following.
+            return Ok(string_value(
+                vm,
+                concatenate(&[preceding, Utf16View::of_string(&replacement), following]),
+            ));
+        }
+
+        // 13. Else,
+        // a. Assert: replaceValue is a String.
+        let replace_string = replace_string.expect("a replacement that is not a function was converted to a string");
+        let replace_view = Utf16View::of_string(&replace_string);
+        let has_dollar = match replace_view {
+            Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => memchr::memchr(b'$', bytes).is_some(),
+            Utf16View::Utf16(units) => units.contains(&u16::from(b'$')),
         };
+        if !has_dollar {
+            // OPTIMIZATION: Without '$' in the replacement string, GetSubstitution returns it unchanged.
+            return Ok(string_value(vm, concatenate(&[preceding, replace_view, following])));
+        }
+
+        // b. Let captures be a new empty List.
+        // c. Let replacement be ! GetSubstitution(searchString, string, position, captures, undefined, replaceValue).
+        let replacement = get_substitution(
+            vm,
+            search_string_view,
+            string_view,
+            position,
+            &[],
+            Value::UNDEFINED,
+            replace_view,
+        )?;
 
         // 14. Return the string-concatenation of preceding, replacement, and following.
-        let mut builder = Utf16StringBuilder::new();
-        builder.append(preceding);
-        builder.append(Utf16View::of_string(&replacement));
-        builder.append(following);
-
-        Ok(string_value(vm, builder.to_utf16_string()))
+        Ok(string_value(
+            vm,
+            concatenate(&[preceding, Utf16View::of_string(&replacement), following]),
+        ))
     }
 
     // 22.1.3.20 String.prototype.replaceAll ( searchValue, replaceValue ), https://tc39.es/ecma262/#sec-string.prototype.replaceall
@@ -1205,21 +1216,49 @@ impl StringPrototype {
             position = string_index_of(string_view, search_string_view, match_position + advance_by);
         }
 
+        if match_positions.is_empty() {
+            return Ok(Value::from_string(string));
+        }
+
         // 12. Let endOfLastMatch be 0.
         let mut end_of_last_match = 0;
 
         // 13. Let result be the empty String.
-        let mut result = Utf16StringBuilder::new();
+        let string_length = string_view.length_in_code_units();
+        let simple_replace_view = if !replace_value.is_function() {
+            let replace_string = replace_string
+                .as_ref()
+                .expect("a replacement that is not a function was converted to a string");
+            let view = Utf16View::of_string(replace_string);
+            let has_dollar = match view {
+                Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => memchr::memchr(b'$', bytes).is_some(),
+                Utf16View::Utf16(units) => units.contains(&u16::from(b'$')),
+            };
+            (!has_dollar).then_some(view)
+        } else {
+            None
+        };
+        let estimated_capacity = if let Some(view) = simple_replace_view {
+            let removed = match_positions.len().saturating_mul(search_length);
+            let added = match_positions.len().saturating_mul(view.length_in_code_units());
+            string_length.saturating_sub(removed).saturating_add(added)
+        } else {
+            string_length
+        };
+        let mut result = Utf16StringBuilder::with_capacity(estimated_capacity);
 
         // 14. For each element p of matchPositions, do
         for position in match_positions {
             // a. Let preserved be the substring of string from endOfLastMatch to p.
             let preserved = string_view.substring_view(end_of_last_match, position - end_of_last_match);
+            result.append(preserved);
 
             // b. If functionalReplace is true, then
-            let replacement = if replace_value.is_function() {
+            if let Some(view) = simple_replace_view {
+                result.append(view);
+            } else if replace_value.is_function() {
                 // i. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(p), string »)).
-                call(
+                let replacement = call(
                     vm,
                     replace_value,
                     Value::UNDEFINED,
@@ -1229,7 +1268,8 @@ impl StringPrototype {
                         Value::from_string(string),
                     ],
                 )?
-                .to_utf16_string(vm)?
+                .to_utf16_string(vm)?;
+                result.append(Utf16View::of_string(&replacement));
             }
             // c. Else,
             else {
@@ -1239,7 +1279,7 @@ impl StringPrototype {
                     .expect("a replacement that is not a function was converted to a string");
                 // ii. Let captures be a new empty List.
                 // iii. Let replacement be ! GetSubstitution(searchString, string, p, captures, undefined, replaceValue).
-                get_substitution(
+                let replacement = get_substitution(
                     vm,
                     search_string_view,
                     string_view,
@@ -1247,18 +1287,13 @@ impl StringPrototype {
                     &[],
                     Value::UNDEFINED,
                     Utf16View::of_string(replace_string),
-                )?
-            };
-
-            // d. Set result to the string-concatenation of result, preserved, and replacement.
-            result.append(preserved);
-            result.append(Utf16View::of_string(&replacement));
+                )?;
+                result.append(Utf16View::of_string(&replacement));
+            }
 
             // e. Set endOfLastMatch to p + searchLength.
             end_of_last_match = position + search_length;
         }
-
-        let string_length = string_view.length_in_code_units();
 
         // 15. If endOfLastMatch < the length of string, then
         if end_of_last_match < string_length {

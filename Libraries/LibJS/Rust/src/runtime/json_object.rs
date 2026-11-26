@@ -9,7 +9,7 @@ use core::ops::ControlFlow;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use ak::{Utf16FlyString, Utf16String};
+use ak::{Utf16FlyString, Utf16String, Utf16StringUnits};
 use libjs_runtime_macros::Trace;
 
 use crate::bytecode::executable::StaticPropertyLookupCacheSite;
@@ -186,6 +186,8 @@ struct StringifyCachedProperty {
     property: NonSymbolPropertyKey,
     offset: u32,
     serialized_key: Utf16String,
+    /// Pre-formatted `,"key":` as raw ASCII bytes when the serialized key is ASCII; index 0 is skipped for the first property.
+    comma_serialized_key_ascii: Option<Box<[u8]>>,
 }
 
 /// What JSON.stringify knows of the objects of a shape that have no other properties than those of the shape.
@@ -209,11 +211,22 @@ impl StringifyShapeInfo {
             let mut key_builder = Utf16StringBuilder::new();
             key_builder.append_quoted_escaped_for_json(Utf16View::of_fly_string(property_key.as_string()));
             key_builder.append_ascii(":");
+            let serialized_key = key_builder.to_utf16_string();
+            let comma_serialized_key_ascii = match serialized_key.as_units() {
+                Utf16StringUnits::Ascii(bytes) => {
+                    let mut with_comma = Vec::with_capacity(bytes.len() + 1);
+                    with_comma.push(b',');
+                    with_comma.extend_from_slice(bytes);
+                    Some(with_comma.into_boxed_slice())
+                }
+                _ => None,
+            };
 
             properties.push(StringifyCachedProperty {
                 property,
                 offset: metadata.offset,
-                serialized_key: key_builder.to_utf16_string(),
+                serialized_key,
+                comma_serialized_key_ascii,
             });
             ControlFlow::Continue(())
         });
@@ -235,6 +248,8 @@ pub struct JsonStringifyCache {
     objects: RefCell<Vec<Gc<Object>>>,
     /// The length of the last JSON text, which the next one likely has too.
     last_text_length: Cell<usize>,
+    /// Whether the last JSON text needed UTF-16 storage, so repeated Unicode serializations skip mid-build widening.
+    last_was_utf16: Cell<bool>,
 }
 
 impl JsonStringifyCache {
@@ -247,6 +262,7 @@ impl JsonStringifyCache {
             entries: RefCell::new(Box::new([const { None }; JsonStringifyCache::ENTRY_COUNT])),
             objects: RefCell::new(Vec::new()),
             last_text_length: Cell::new(0),
+            last_was_utf16: Cell::new(false),
         }
     }
 }
@@ -1081,18 +1097,23 @@ impl JSONObject {
     ) -> ThrowCompletionOr<Option<Utf16String>> {
         let realm = vm.current_realm().expect("JSON is stringified in a realm");
 
+        let stringify_cache = vm.json_stringify_cache();
+        let initial_capacity = stringify_cache
+            .last_text_length
+            .get()
+            .min(JsonStringifyCache::MAXIMUM_INITIAL_TEXT_CAPACITY);
+        let builder = if stringify_cache.last_was_utf16.get() {
+            Utf16StringBuilder::with_utf16_capacity(initial_capacity)
+        } else {
+            Utf16StringBuilder::with_capacity(initial_capacity)
+        };
         let mut state = StringifyState {
             replacer_function: None,
             object_stack: StringifyObjectStack::new(vm),
             indent_depth: 0,
             gap: Utf16String::default(),
             property_list: None,
-            builder: Utf16StringBuilder::with_capacity(
-                vm.json_stringify_cache()
-                    .last_text_length
-                    .get()
-                    .min(JsonStringifyCache::MAXIMUM_INITIAL_TEXT_CAPACITY),
-            ),
+            builder,
         };
 
         if replacer.is_object() {
@@ -1174,8 +1195,13 @@ impl JSONObject {
             return Ok(None);
         }
 
-        vm.json_stringify_cache().last_text_length.set(state.builder.len());
-        Ok(Some(state.builder.to_utf16_string()))
+        let result = state.builder.to_utf16_string();
+        let cache = vm.json_stringify_cache();
+        cache.last_text_length.set(state.builder.len());
+        cache
+            .last_was_utf16
+            .set(matches!(result.as_units(), Utf16StringUnits::Utf16(_)));
+        Ok(Some(result))
     }
 
     // 25.5.2 JSON.stringify ( value [ , replacer [ , space ] ] ), https://tc39.es/ecma262/#sec-json.stringify
@@ -1492,10 +1518,14 @@ impl JSONObject {
                             continue;
                         }
                         let write_key = |builder: &mut Utf16StringBuilder, first: bool| {
-                            if !first {
-                                builder.append_ascii(",");
+                            if let Some(ref ascii) = property.comma_serialized_key_ascii {
+                                builder.append_ascii_bytes(&ascii[usize::from(first)..]);
+                            } else {
+                                if !first {
+                                    builder.append_ascii(",");
+                                }
+                                builder.append(Utf16View::of_string(&property.serialized_key));
                             }
-                            builder.append(Utf16View::of_string(&property.serialized_key));
                         };
                         if value.is_string() {
                             write_key(&mut state.builder, first);
