@@ -2268,8 +2268,19 @@ impl<'pass> SvgFormattingContext<'pass> {
         if text.is_empty() {
             return;
         }
-        const ZERO_WIDTH_JOINER: u32 = 0x200d;
         let frozen_font_list = style.frozen_font_list();
+        // Fast path: when every code unit is ASCII and resolved in text presentation by the primary font,
+        // emit the entire text as a single font run without per-codepoint emoji or fallback checks.
+        if let Some((font, ascii_mask)) =
+            frozen_font_list.first_font_and_ascii_code_points_it_resolves_in_text_presentation()
+            && text
+                .iter()
+                .all(|&unit| unit < 128 && (ascii_mask & (1u128 << unit)) != 0)
+        {
+            run(font, text);
+            return;
+        }
+        const ZERO_WIDTH_JOINER: u32 = 0x200d;
         // https://drafts.csswg.org/css-fonts-4/#font-variant-emoji-prop
         // FIXME: Take 'font-variant-emoji' into account.
         let presentation_at = |offset: usize| {

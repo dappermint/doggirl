@@ -57,10 +57,12 @@ u8 Node::dom_paint_facts_of(DOM::Node const* node)
         facts |= static_cast<u8>(RustFFI::DomPaintFact::EditableOrEditingHost);
     if (node->inside_blocking_wheel_event_handler())
         facts |= static_cast<u8>(RustFFI::DomPaintFact::InsideBlockingWheelEventHandler);
-    if (auto const* navigable_container = as_if<HTML::NavigableContainer>(*node); navigable_container && navigable_container->content_navigable())
-        facts |= static_cast<u8>(RustFFI::DomPaintFact::NestedNavigableContainer);
-    if (auto const* html_element = as_if<HTML::HTMLElement>(*node); html_element && html_element->is_devolvable_widget())
-        facts |= static_cast<u8>(RustFFI::DomPaintFact::DevolvableWidget);
+    if (auto const* html_element = as_if<HTML::HTMLElement>(*node)) {
+        if (html_element->is_navigable_container() && static_cast<HTML::NavigableContainer const&>(*html_element).content_navigable())
+            facts |= static_cast<u8>(RustFFI::DomPaintFact::NestedNavigableContainer);
+        if (html_element->is_devolvable_widget())
+            facts |= static_cast<u8>(RustFFI::DomPaintFact::DevolvableWidget);
+    }
     return facts;
 }
 

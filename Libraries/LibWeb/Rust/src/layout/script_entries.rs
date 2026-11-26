@@ -10,18 +10,21 @@
 //! where it wrote them since.
 
 use super::FfiCssPixelRect;
-use super::node_data::NodeSlotId;
+use super::node_data::{NodeFlag, NodeKind, NodeSlotId};
+use super::node_facts::{self, NodeShape};
 use super::query::inline_cursor::{self, CaretPosition, InlineCursor};
 use super::used_values::{FfiCssPixelPoint, FfiCssPixelSize};
-use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style::tree::StyleNodeID;
+use crate::fast_hash::FastMap;
 use crate::layout::text_queries::FfiDomTextRange;
 use crate::painting::ffi::FfiBoxModelMetrics;
 use crate::painting::host::FfiCaretPaintKind;
 use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow, PaintSource};
-use crate::painting::viewport_mapping::{FfiViewportMapping, ViewportSpace};
-use crate::render_state::{DocumentHost, ScriptForcedRead};
+use crate::painting::style_queries;
+use crate::painting::viewport_mapping::{FfiViewportMapping, ViewportMapping, ViewportSpace};
+use crate::render_state::{BegunRead, DocumentHost, ScriptForcedRead};
 use std::ffi::c_void;
 
 /// Mints the forced read of a script call that reaches the host through one of this module's entries.
@@ -151,6 +154,333 @@ pub extern "C" fn layout_script_can_compute_client_rects_without_visual_context_
             viewport_scroll_offset_is_zero,
         )
     })
+}
+
+/// Matches `Gfx::Rect::intersects`: open-interval overlap without an empty-rect guard.
+#[inline]
+fn rect_intersects_gfx(a: CssPixelRect, b: CssPixelRect) -> bool {
+    a.left() < b.right() && b.left() < a.right() && a.top() < b.bottom() && b.top() < a.bottom()
+}
+
+fn ancestor_opacity_is_positive(
+    rows: &impl PaintRead,
+    start: NodeSlotId,
+    cache: &mut FastMap<NodeSlotId, bool>,
+) -> bool {
+    if start.is_invalid() {
+        return true;
+    }
+    if let Some(&cached) = cache.get(&start) {
+        return cached;
+    }
+    let mut positive = true;
+    let mut cursor = start;
+    while let Some(row) = rows.node(cursor) {
+        if let Some(&cached) = cache.get(&cursor) {
+            positive = cached;
+            break;
+        }
+        if let Some(style) = row.style()
+            && style.effects().opacity <= 0.0
+        {
+            positive = false;
+            break;
+        }
+        cursor = row.parent();
+    }
+    cache.insert(start, positive);
+    positive
+}
+
+fn ancestor_can_compute_without_visual_context(
+    rows: &impl PaintRead,
+    start: NodeSlotId,
+    viewport_scroll_offset_is_zero: bool,
+    cache: &mut FastMap<NodeSlotId, bool>,
+) -> bool {
+    if start.is_invalid() {
+        return true;
+    }
+    if let Some(&cached) = cache.get(&start) {
+        return cached;
+    }
+    let mut ok = true;
+    let mut cursor = start;
+    while let Some(row) = rows.node(cursor) {
+        if let Some(&cached) = cache.get(&cursor) {
+            ok = cached;
+            break;
+        }
+        let (kind, flags, parent) = (row.kind(), row.flags(), row.parent());
+        if node_facts::kind_is_svg_box(kind) || kind == NodeKind::SVGForeignObjectBox || kind == NodeKind::SVGSVGBox {
+            ok = false;
+            break;
+        }
+        if flags & NodeFlag::HasStyle as u32 != 0 {
+            if let Some(style) = row.style()
+                && (style_queries::has_css_transform(rows, cursor, style)
+                    || style.transform().has_perspective
+                    || style_queries::is_sticky_position(style))
+            {
+                ok = false;
+                break;
+            }
+            let compensates_for_scroll =
+                NodeFlag::CompensatesForHorizontalScroll as u32 | NodeFlag::CompensatesForVerticalScroll as u32;
+            if flags & compensates_for_scroll != 0 {
+                ok = false;
+                break;
+            }
+            let scroll_offset_is_zero = if kind == NodeKind::Viewport {
+                viewport_scroll_offset_is_zero
+            } else {
+                flags & NodeFlag::HasScrollOffset as u32 == 0
+            };
+            if !scroll_offset_is_zero && rows.paintable_row_is_populated(cursor) {
+                ok = false;
+                break;
+            }
+        }
+        cursor = parent;
+    }
+    cache.insert(start, ok);
+    ok
+}
+
+fn containing_block_element_style_node(
+    rows: &impl PaintRead,
+    cb: NodeSlotId,
+    cache: &mut FastMap<NodeSlotId, u32>,
+) -> u32 {
+    if let Some(&cached) = cache.get(&cb) {
+        return cached;
+    }
+    let mut found = 0u32;
+    let mut cursor = cb;
+    while let Some(row) = rows.node(cursor) {
+        if row.is_dom_backed()
+            && row.kind() != NodeKind::Viewport
+            && let Some(id) = row.style_node()
+            && id.text_index().is_none()
+        {
+            found = id.raw();
+            break;
+        }
+        if row.generated_for() != 0
+            && let Some(id) = row.style_node()
+        {
+            found = id.raw();
+            break;
+        }
+        cursor = row.parent();
+    }
+    cache.insert(cb, found);
+    found
+}
+
+fn text_box_united_client_rect(
+    rows: &impl PaintRead,
+    slot: NodeSlotId,
+    viewport_mapping: &ViewportMapping<'_>,
+) -> CssPixelRect {
+    let mut united_rect = CssPixelRect::default();
+    let fragments = rows.text_fragments(slot);
+    let node_slots = fragments.as_slice();
+    crate::painting::text_fragment::for_each_fragment_of_nodes(rows, node_slots, |block, _, fragment| {
+        if fragment.dom_end_offset_in_node == 0 {
+            return true;
+        }
+        let rect = crate::painting::text_fragment::range_rect(
+            rows,
+            fragment,
+            crate::painting::paintable_data::SELECTION_STATE_FULL,
+            0,
+            usize::MAX,
+        );
+        let mapped = if rows.slot_is_live(block) {
+            viewport_mapping.line_content_rect_to_viewport(
+                rows,
+                block,
+                fragment.layout_node,
+                rect,
+                ViewportSpace::LayoutViewport,
+            )
+        } else {
+            rect
+        };
+        if !mapped.is_empty() {
+            if united_rect.is_empty() {
+                united_rect = mapped;
+            } else {
+                united_rect.unite(mapped);
+            }
+        }
+        true
+    });
+    united_rect
+}
+
+/// Resolves all newly noted and previously pending text rows for paint timing in a single batched pass
+/// directly over the layout rows, avoiding per-node shell lookups and redundant visual context builds.
+///
+/// `check_candidate` returns:
+/// - 0: drop (dead, disconnected, wrong document, empty text, or non-element containing block)
+/// - 1: candidate with non-empty text (keep pending if not paintable)
+/// - 2: candidate with whitespace-only text (drop if not paintable)
+/// - 3: containing-block element already recorded in set of elements with rendered text (drop and cache)
+///
+/// # Safety
+///
+/// `host` must be a live document host on its document's thread, `existing_pending` must be valid for
+/// `existing_pending_count` elements when non-zero, and the callbacks must be sound to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_resolve_text_rows_for_first_paint<'a>(
+    host: &'a DocumentHost,
+    read: &BegunRead,
+    take_new_rows: bool,
+    existing_pending: *const NodeSlotId,
+    existing_pending_count: usize,
+    has_viewport: bool,
+    scrolling_area: FfiCssPixelRect,
+    viewport_scroll_offset: FfiCssPixelPoint,
+    viewport_mapping: &mut FfiViewportMapping<'a>,
+    device_pixels_per_css_pixel: f32,
+    context: *mut c_void,
+    check_candidate: unsafe extern "C" fn(*mut c_void, u32, u32) -> u8,
+    on_painted: unsafe extern "C" fn(*mut c_void, u32, FfiCssPixelRect),
+    on_keep_pending: unsafe extern "C" fn(*mut c_void, NodeSlotId),
+) {
+    let mut slots: Vec<NodeSlotId> = if existing_pending_count != 0 {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { ak::slice_from_raw_parts(existing_pending, existing_pending_count) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    if take_new_rows {
+        let new_rows = host.ask(read, |state| state.arena_mut().take_text_rows_for_first_paint());
+        slots.extend_from_slice(&new_rows);
+        if existing_pending_count != 0 && slots.len() != existing_pending_count {
+            slots.sort_unstable_by_key(|slot| slot.index);
+            slots.dedup();
+        }
+    }
+    if slots.is_empty() {
+        return;
+    }
+
+    let scrolling_area = CssPixelRect::from(scrolling_area);
+    let scroll_offset = CssPixelPoint::from(viewport_scroll_offset);
+    let viewport_scroll_offset_is_zero = scroll_offset.x.raw_value() == 0 && scroll_offset.y.raw_value() == 0;
+    let existing_resolved = viewport_mapping.is_initialized().then(|| viewport_mapping.resolve());
+    let identity_mapping = ViewportMapping::default();
+
+    let mut needs_vc: Vec<(NodeSlotId, u32, bool)> = Vec::new();
+    host.read_rows(read, false, |rows| {
+        let mut opacity_positive: FastMap<NodeSlotId, bool> = FastMap::default();
+        let mut no_vc_needed: FastMap<NodeSlotId, bool> = FastMap::default();
+        let mut cb_element: FastMap<NodeSlotId, u32> = FastMap::default();
+        let mut skip_elements: FastMap<u32, ()> = FastMap::default();
+
+        for slot in slots {
+            let Some(text_row) = rows.node(slot) else {
+                continue;
+            };
+            if text_row.kind() != NodeKind::TextNode || !text_row.is_dom_backed() {
+                continue;
+            }
+            let Some(text_style_node) = text_row.style_node() else {
+                continue;
+            };
+            let Some(cb) = rows.node_containing_block_if_live(slot) else {
+                continue;
+            };
+            let element_style_node = containing_block_element_style_node(rows, cb, &mut cb_element);
+            if element_style_node == 0 || skip_elements.contains_key(&element_style_node) {
+                continue;
+            }
+            // SAFETY: Guaranteed by the caller.
+            let verdict = unsafe { check_candidate(context, text_style_node.raw(), element_style_node) };
+            let keep_if_not_paintable = match verdict {
+                1 => true,
+                2 => false,
+                3 => {
+                    skip_elements.insert(element_style_node, ());
+                    continue;
+                }
+                _ => continue,
+            };
+            if !has_viewport {
+                if keep_if_not_paintable {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_keep_pending(context, slot) };
+                }
+                continue;
+            }
+            let parent = text_row.parent();
+            let is_visible = rows
+                .node(parent)
+                .and_then(|parent_row| parent_row.style())
+                .is_some_and(|style| style.visibility() == crate::css::css_enums::visibility::VISIBLE);
+            if !is_visible || !ancestor_opacity_is_positive(rows, parent, &mut opacity_positive) {
+                if keep_if_not_paintable {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_keep_pending(context, slot) };
+                }
+                continue;
+            }
+
+            if let Some(resolved) = &existing_resolved {
+                let client_rect = text_box_united_client_rect(rows, slot, &resolved.mapping());
+                if rect_intersects_gfx(client_rect.translated_by(scroll_offset), scrolling_area) {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_painted(context, element_style_node, client_rect.into()) };
+                } else if keep_if_not_paintable {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_keep_pending(context, slot) };
+                }
+            } else if ancestor_can_compute_without_visual_context(
+                rows,
+                parent,
+                viewport_scroll_offset_is_zero,
+                &mut no_vc_needed,
+            ) {
+                let client_rect = text_box_united_client_rect(rows, slot, &identity_mapping);
+                if rect_intersects_gfx(client_rect.translated_by(scroll_offset), scrolling_area) {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_painted(context, element_style_node, client_rect.into()) };
+                } else if keep_if_not_paintable {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe { on_keep_pending(context, slot) };
+                }
+            } else {
+                needs_vc.push((slot, element_style_node, keep_if_not_paintable));
+            }
+        }
+    });
+
+    if needs_vc.is_empty() {
+        return;
+    }
+
+    // SAFETY: Guaranteed by the caller.
+    if let Some(tree) = unsafe { crate::painting::ffi::main_visual_context_tree(host, read) } {
+        *viewport_mapping =
+            crate::painting::viewport_mapping::viewport_mapping_through(host, tree, None, device_pixels_per_css_pixel);
+    }
+    let resolved = viewport_mapping.resolve();
+    let mapping = resolved.mapping();
+    host.read_rows(read, false, |rows| {
+        for (slot, element_style_node, keep_if_not_paintable) in needs_vc {
+            let client_rect = text_box_united_client_rect(rows, slot, &mapping);
+            if rect_intersects_gfx(client_rect.translated_by(scroll_offset), scrolling_area) {
+                // SAFETY: Guaranteed by the caller.
+                unsafe { on_painted(context, element_style_node, client_rect.into()) };
+            } else if keep_if_not_paintable {
+                // SAFETY: Guaranteed by the caller.
+                unsafe { on_keep_pending(context, slot) };
+            }
+        }
+    });
 }
 
 /// # Safety

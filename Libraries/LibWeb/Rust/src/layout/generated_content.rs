@@ -39,12 +39,43 @@ pub(crate) struct GeneratedContent {
     /// marker shows. A later style change compares what the pseudo-element's record names now
     /// against this to decide whether the box has to be rebuilt.
     content_counter_styles_in_use: crate::cow_map::CowMap<CounterOwner, Vec<Option<Arc<CounterStyle>>>>,
+    /// A bit per element slot, clear where none of the element's pseudo-elements hold entries here.
+    may_hold_content: Arc<Vec<u64>>,
 }
 
 impl GeneratedContent {
+    #[inline]
+    fn element_may_hold_content(&self, element: StyleNodeID) -> bool {
+        let slot = element.element_slot();
+        self.may_hold_content
+            .get(slot / 64)
+            .is_some_and(|word| word & (1 << (slot % 64)) != 0)
+    }
+
+    fn mark_element_may_hold_content(&mut self, element: StyleNodeID) {
+        let slot = element.element_slot();
+        let word_index = slot / 64;
+        let bit = 1u64 << (slot % 64);
+        if self
+            .may_hold_content
+            .get(word_index)
+            .is_some_and(|word| word & bit != 0)
+        {
+            return;
+        }
+        let bits = Arc::make_mut(&mut self.may_hold_content);
+        if bits.len() <= word_index {
+            bits.resize(word_index + 1, 0);
+        }
+        bits[word_index] |= bit;
+    }
+
     /// The text the content of `owner` last resolved to, the way accessibility reads it: the alt text
     /// when there is one, otherwise every string in order.
     pub(crate) fn accessible_text(&self, owner: CounterOwner) -> &[u16] {
+        if !self.element_may_hold_content(owner.element) {
+            return &[];
+        }
         self.accessible_texts.get(&owner).map_or(&[], Vec::as_slice)
     }
 
@@ -52,6 +83,9 @@ impl GeneratedContent {
     /// changes: a `counter()` or `counters()` of its content, or the counter style its marker shows, that represents
     /// some values differently.
     pub(crate) fn shows_counter_value(&self, owner: CounterOwner) -> bool {
+        if !self.element_may_hold_content(owner.element) {
+            return false;
+        }
         self.content_counter_styles_in_use.get(&owner).is_some_and(|styles| {
             styles
                 .iter()
@@ -66,6 +100,7 @@ impl GeneratedContent {
             counter_styles,
             accessible_text,
         } = record;
+        self.mark_element_may_hold_content(owner.element);
         match accessible_text {
             AccessibleText::Unchanged => {}
             AccessibleText::Remove => {
@@ -81,11 +116,18 @@ impl GeneratedContent {
 
     /// Drops everything kept for an element's pseudo-elements, once its identity is retired.
     pub(crate) fn forget(&mut self, element: StyleNodeID) {
+        if !self.element_may_hold_content(element) {
+            return;
+        }
         // NB: One lookup per owner, not a walk over every pseudo-element of the document: a removed
         //     subtree retires its identities one at a time.
         for owner in CounterOwner::every_owner_of(element) {
             self.accessible_texts.remove(&owner);
             self.content_counter_styles_in_use.remove(&owner);
+        }
+        let slot = element.element_slot();
+        if let Some(word) = Arc::make_mut(&mut self.may_hold_content).get_mut(slot / 64) {
+            *word &= !(1 << (slot % 64));
         }
     }
 }
