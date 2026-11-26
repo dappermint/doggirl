@@ -1216,17 +1216,17 @@ in
       type = types.nullOr types.package;
       default = null;
       description = ''
-        Optional Nix derivation providing a built `Ladybird.app` bundle or
-        `bin/Ladybird` binary to wrap.
+        Optional Nix derivation providing a built `Doggirl.app` bundle or
+        `bin/Doggirl` binary to wrap.
       '';
     };
 
     localAppPath = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = "/Volumes/dev/ladybird/Build/distribution/bin/Ladybird.app";
+      example = "/Applications/Doggirl.app";
       description = ''
-        Optional host path to a locally built `Ladybird.app` bundle or binary.
+        Optional host path to a locally built `Doggirl.app` bundle or binary.
         Useful during active development so incremental CMake builds take effect
         immediately without rebuilding a Nix store package.
       '';
@@ -1317,7 +1317,7 @@ in
       default = { };
       description = ''
         Named browser profiles written under
-        `<configBaseDir>/Ladybird/Profiles/<name>/`. Profile names must match
+        `<configBaseDir>/Doggirl/Profiles/<name>/`. Profile names must match
         `[a-z0-9_-]+` (for example `developer` for local builds or `default` for
         release builds).
       '';

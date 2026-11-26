@@ -246,7 +246,7 @@
   };
 
   bundleIdentifiers = {
-    release = "org.ladybird.Ladybird";
-    development = "org.ladybird.Ladybird.Development";
+    release = "dev.dappermint.doggirl";
+    development = "dev.dappermint.doggirl.Development";
   };
 }
