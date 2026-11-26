@@ -38,6 +38,14 @@ describe("correct behavior", () => {
         });
     });
 
+    test("serialize function with a toJSON property", () => {
+        function fn() {}
+        fn.toJSON = () => ({ ok: true });
+        expect(JSON.stringify(fn)).toBe('{"ok":true}');
+        expect(JSON.stringify({ a: fn, b: () => {} })).toBe('{"a":{"ok":true}}');
+        expect(JSON.stringify([fn, () => {}])).toBe('[{"ok":true},null]');
+    });
+
     test("serialize BigInt with a toJSON property", () => {
         Object.defineProperty(BigInt.prototype, "toJSON", {
             configurable: true, // Allows deleting this property at the end of this test case.

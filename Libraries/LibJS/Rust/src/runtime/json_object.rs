@@ -1485,24 +1485,61 @@ impl JSONObject {
             let initial_shape = object.shape();
             let info = shape_info.unwrap_or_else(|| vm.json_stringify_cache().info(vm, initial_shape));
             for property in &info.properties {
-                if object.shape() == initial_shape && !object.get_direct(property.offset).is_accessor() {
+                if object.shape() == initial_shape {
                     let value = object.get_direct(property.offset);
+                    if !value.is_accessor() {
+                        if value.is_undefined() || value.is_symbol() {
+                            continue;
+                        }
+                        let write_key = |builder: &mut Utf16StringBuilder, first: bool| {
+                            if !first {
+                                builder.append_ascii(",");
+                            }
+                            builder.append(Utf16View::of_string(&property.serialized_key));
+                        };
+                        if value.is_string() {
+                            write_key(&mut state.builder, first);
+                            state
+                                .builder
+                                .append_quoted_escaped_for_json(value.as_string().utf16_string_view());
+                            first = false;
+                            continue;
+                        }
+                        if value.is_boolean() {
+                            write_key(&mut state.builder, first);
+                            state
+                                .builder
+                                .append_ascii(if value.as_bool() { "true" } else { "false" });
+                            first = false;
+                            continue;
+                        }
+                        if value.is_null() {
+                            write_key(&mut state.builder, first);
+                            state.builder.append_ascii("null");
+                            first = false;
+                            continue;
+                        }
+                        if value.is_finite_number() {
+                            write_key(&mut state.builder, first);
+                            append_json_number(&mut state.builder, value);
+                            first = false;
+                            continue;
+                        }
 
-                    let mark = state.builder.len();
-                    if !first {
-                        state.builder.append_ascii(",");
-                    }
-                    state.builder.append(Utf16View::of_string(&property.serialized_key));
+                        let mark = state.builder.len();
+                        write_key(&mut state.builder, first);
 
-                    let wrote_value = Self::serialize_json_value(vm, state, &property.property, Some(object), value)?;
-                    if wrote_value {
-                        first = false;
-                    } else {
-                        state.builder.truncate(mark);
+                        let wrote_value =
+                            Self::serialize_json_value(vm, state, &property.property, Some(object), value)?;
+                        if wrote_value {
+                            first = false;
+                        } else {
+                            state.builder.truncate(mark);
+                        }
+                        continue;
                     }
-                } else {
-                    Self::serialize_json_object_property(vm, state, object, &property.property, &mut first)?;
                 }
+                Self::serialize_json_object_property(vm, state, object, &property.property, &mut first)?;
             }
         } else {
             Self::serialize_json_own_properties(vm, state, object, &mut first)?;
