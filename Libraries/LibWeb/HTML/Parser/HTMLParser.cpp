@@ -217,7 +217,7 @@ static bool ascii_bytes_contain_whitespace(ReadonlyBytes bytes)
 //               list markup) share a single immutable string buffer and, for single-token class values, a pre-interned
 //               Utf16FlyString so detached element parsing skips both whitespace scanning and fly-string table lookups.
 template<typename CodeUnit>
-static Utf16String cached_ascii_attribute_value(ReadonlySpan<CodeUnit> code_units, bool prefer_fly_string, Utf16FlyString const*& out_single_class_token)
+static Utf16String cached_ascii_attribute_value(Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& cache, ReadonlySpan<CodeUnit> code_units, bool prefer_fly_string, Utf16FlyString const*& out_single_class_token)
 {
     out_single_class_token = nullptr;
     auto const length = code_units.size();
@@ -226,7 +226,7 @@ static Utf16String cached_ascii_attribute_value(ReadonlySpan<CodeUnit> code_unit
         return utf16_string_from_ascii_code_units(code_units);
 
     u32 const hash = hash_ascii_code_units(code_units);
-    auto& entry = ascii_attribute_value_cache()[(hash ^ (hash >> 16)) & ascii_value_cache_mask];
+    auto& entry = cache[(hash ^ (hash >> 16)) & ascii_value_cache_mask];
     if (entry.hash == hash && entry.value.length_in_code_units() == length) {
         auto cached_bytes = entry.value.utf16_view().latin1_span();
         if (ascii_span_equals_latin1(code_units, cached_bytes)) {
@@ -264,14 +264,14 @@ static Utf16String cached_ascii_attribute_value(ReadonlySpan<CodeUnit> code_unit
 }
 
 template<typename CodeUnit>
-static Utf16String cached_ascii_text_value(ReadonlySpan<CodeUnit> code_units)
+static Utf16String cached_ascii_text_value(Array<CachedAsciiTextEntry, ascii_value_cache_size>& cache, ReadonlySpan<CodeUnit> code_units)
 {
     auto const length = code_units.size();
     if (length < 8 || length > ascii_value_cache_max_length)
         return utf16_string_from_ascii_code_units(code_units);
 
     u32 const hash = hash_ascii_code_units(code_units);
-    auto& entry = ascii_text_value_cache()[(hash ^ (hash >> 16)) & ascii_value_cache_mask];
+    auto& entry = cache[(hash ^ (hash >> 16)) & ascii_value_cache_mask];
     if (entry.hash == hash && entry.value.length_in_code_units() == length
         && ascii_span_equals_latin1(code_units, entry.value.utf16_view().latin1_span())) {
         return entry.value;
@@ -300,11 +300,22 @@ static Utf16String utf16_string_from_span(ReadonlySpan<char16_t> utf16, IsKnownT
 
 static constexpr size_t newline_then_spaces_table_size = 64;
 
-static Utf16String const& newline_then_spaces_string(size_t length)
+static Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_then_spaces_table()
+{
+    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> s_strings;
+    return *s_strings;
+}
+
+static Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_then_tabs_table()
+{
+    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> s_strings;
+    return *s_strings;
+}
+
+static Utf16String const& newline_then_spaces_string(Array<Optional<Utf16String>, newline_then_spaces_table_size>& table, size_t length)
 {
     VERIFY(length > 1 && length < newline_then_spaces_table_size);
-    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> newline_then_spaces_strings;
-    auto& string = (*newline_then_spaces_strings)[length];
+    auto& string = table[length];
     if (!string.has_value()) {
         Array<char, newline_then_spaces_table_size> characters;
         characters[0] = '\n';
@@ -314,11 +325,10 @@ static Utf16String const& newline_then_spaces_string(size_t length)
     return *string;
 }
 
-static Utf16String const& newline_then_tabs_string(size_t length)
+static Utf16String const& newline_then_tabs_string(Array<Optional<Utf16String>, newline_then_spaces_table_size>& table, size_t length)
 {
     VERIFY(length > 1 && length < newline_then_spaces_table_size);
-    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> newline_then_tabs_strings;
-    auto& string = (*newline_then_tabs_strings)[length];
+    auto& string = table[length];
     if (!string.has_value()) {
         Array<char, newline_then_spaces_table_size> characters;
         characters[0] = '\n';
@@ -328,6 +338,13 @@ static Utf16String const& newline_then_tabs_string(size_t length)
     return *string;
 }
 
+struct DetachedFragmentCaches {
+    Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& attribute_values;
+    Array<CachedAsciiTextEntry, ascii_value_cache_size>& text_values;
+    Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_spaces;
+    Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_tabs;
+};
+
 // OPTIMIZATION: Markup indents tags with a newline followed by spaces or tabs, so many Text nodes hold such a run.
 //               Like Blink, share one string for each length of these runs instead of allocating one for every Text node.
 template<typename CharT, typename... IsKnownToBeASCIIOrNothing>
@@ -336,15 +353,30 @@ static Utf16String text_node_data_from_span(ReadonlySpan<CharT> text, IsKnownToB
     if (text.size() > 1 && text.size() < newline_then_spaces_table_size && text[0] == '\n') {
         auto second = text[1];
         if (second == ' ' && all_of(text.slice(2), [](CharT ch) { return ch == ' '; }))
-            return newline_then_spaces_string(text.size());
+            return newline_then_spaces_string(newline_then_spaces_table(), text.size());
         if (second == '\t' && all_of(text.slice(2), [](CharT ch) { return ch == '\t'; }))
-            return newline_then_tabs_string(text.size());
+            return newline_then_tabs_string(newline_then_tabs_table(), text.size());
     }
     if constexpr (sizeof...(IsKnownToBeASCIIOrNothing) == 1) {
         if ((is_known_to_be_ascii, ...) == IsKnownToBeASCII::Yes && text.size() >= 8 && text.size() <= ascii_value_cache_max_length)
-            return cached_ascii_text_value(text);
+            return cached_ascii_text_value(ascii_text_value_cache(), text);
     }
     return utf16_string_from_span(text, is_known_to_be_ascii...);
+}
+
+template<typename CharT>
+static Utf16String detached_text_node_data_from_span(DetachedFragmentCaches& caches, ReadonlySpan<CharT> text, IsKnownToBeASCII is_known_to_be_ascii)
+{
+    if (text.size() > 1 && text.size() < newline_then_spaces_table_size && text[0] == '\n') {
+        auto second = text[1];
+        if (second == ' ' && all_of(text.slice(2), [](CharT ch) { return ch == ' '; }))
+            return newline_then_spaces_string(caches.newline_spaces, text.size());
+        if (second == '\t' && all_of(text.slice(2), [](CharT ch) { return ch == '\t'; }))
+            return newline_then_tabs_string(caches.newline_tabs, text.size());
+    }
+    if (is_known_to_be_ascii == IsKnownToBeASCII::Yes && text.size() >= 8 && text.size() <= ascii_value_cache_max_length)
+        return cached_ascii_text_value(caches.text_values, text);
+    return utf16_string_from_span(text, is_known_to_be_ascii);
 }
 
 static Optional<Utf16FlyString> attribute_namespace_from_html_parser_ffi(RustFfiHtmlAttributeNamespace);
@@ -1746,6 +1778,13 @@ public:
             && !document.page().accessibility_interested()
             && !document.page().listen_for_dom_mutations()
             && document.document_translator_if_exists() == nullptr;
+        DetachedFragmentCaches caches {
+            .attribute_values = ascii_attribute_value_cache(),
+            .text_values = ascii_text_value_cache(),
+            .newline_spaces = newline_then_spaces_table(),
+            .newline_tabs = newline_then_tabs_table(),
+        };
+        auto const& hot_attr_names = hot_attribute_qualified_names();
         GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
         auto append = [&](GC::Ref<DOM::Node> node) {
             if (parents.is_empty())
@@ -1761,48 +1800,55 @@ public:
             case RustFfiHtmlFragmentOperationKind::OpenElement:
             case RustFfiHtmlFragmentOperationKind::AppendVoidElement: {
                 auto element = DOM::create_builtin_html_element_for_fragment(document, to_underlying(operation.tag_kind), uses_document_global_registry, registry);
-                if (operation.length > 0)
+                if (operation.length > 2)
                     element->ensure_attribute_capacity(operation.length);
                 bool const is_input = operation.tag_kind == RustFfiHtmlFragmentTag::Input;
                 bool input_needs_reset = false;
                 Optional<size_t> detached_input_value_attr_index;
                 for (auto const& attribute : attributes.slice(operation.start, operation.length)) {
-                    bool const is_class = attribute.known_name == AttributeNames::class_.raw_identity();
+                    auto const hot_kind = attribute.hot_kind;
+                    bool const is_class = hot_kind == RustFfiHtmlFragmentAttributeKind::Class;
                     Utf16FlyString const* preinterned_single_class = nullptr;
                     auto value = with_code_units(attribute.value_start, attribute.value_length, [&](auto code_units) {
                         if (attribute.value_is_ascii)
-                            return cached_ascii_attribute_value(code_units, is_class, preinterned_single_class);
+                            return cached_ascii_attribute_value(caches.attribute_values, code_units, is_class, preinterned_single_class);
                         return utf16_string_from_span(code_units, IsKnownToBeASCII::No);
                     });
-                    if (is_input && skip_observer_checks) {
-                        if (attribute.known_name == AttributeNames::type.raw_identity()) {
-                            auto value_view = value.utf16_view();
-                            if (value_view.equals_ignoring_ascii_case("checkbox"sv)) {
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
-                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
+                    if (skip_observer_checks) {
+                        if (hot_kind == RustFfiHtmlFragmentAttributeKind::DataId || hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData) {
+                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                            continue;
+                        }
+                        if (is_input) {
+                            if (hot_kind == RustFfiHtmlFragmentAttributeKind::Type) {
+                                auto value_view = value.utf16_view();
+                                if (value_view.equals_ignoring_ascii_case("checkbox"sv)) {
+                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                    as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
+                                    continue;
+                                }
+                                if (value_view.equals_ignoring_ascii_case("text"sv)) {
+                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                    as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
+                                    continue;
+                                }
+                            } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Checked) {
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
+                                continue;
+                            } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Value) {
+                                detached_input_value_attr_index = element->attribute_list_size();
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
                                 continue;
                             }
-                            if (value_view.equals_ignoring_ascii_case("text"sv)) {
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
-                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
-                                continue;
-                            }
-                        } else if (attribute.known_name == AttributeNames::checked.raw_identity()) {
-                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
-                            as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
-                            continue;
-                        } else if (attribute.known_name == AttributeNames::value.raw_identity()) {
-                            detached_input_value_attr_index = element->attribute_list_size();
-                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
-                            continue;
                         }
                     }
                     if (is_input
-                        && (attribute.known_name == AttributeNames::value.raw_identity()
-                            || attribute.known_name == AttributeNames::checked.raw_identity())) {
+                        && (hot_kind == RustFfiHtmlFragmentAttributeKind::Value
+                            || hot_kind == RustFfiHtmlFragmentAttributeKind::Checked)) {
                         input_needs_reset = true;
                     }
-                    element->append_attribute_from_detached_parser(attribute_qualified_name(attribute), move(value), skip_observer_checks, preinterned_single_class);
+                    element->append_attribute_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value), skip_observer_checks, preinterned_single_class);
                 }
                 // NB: Among the built-in HTML tags accepted by the fragment scanner, only <input> is resettable,
                 //     and fragment.rs restricts <input> to type="text" or type="checkbox" (or default text). For a
@@ -1835,7 +1881,7 @@ public:
             case RustFfiHtmlFragmentOperationKind::AppendText: {
                 auto is_ascii = operation.is_ascii ? IsKnownToBeASCII::Yes : IsKnownToBeASCII::No;
                 auto data = with_code_units(operation.start, operation.length, [&](auto code_units) {
-                    return text_node_data_from_span(code_units, is_ascii);
+                    return detached_text_node_data_from_span(caches, code_units, is_ascii);
                 });
                 append(DOM::Text::create(document, move(data)));
                 break;
@@ -1859,41 +1905,45 @@ private:
         return callback(m_input.utf16_span().slice(start, length));
     }
 
-    DOM::QualifiedName attribute_qualified_name(RustFfiHtmlFragmentAttribute const& attribute) const
+    static constexpr size_t hot_attribute_table_size = to_underlying(RustFfiHtmlFragmentAttributeKind::DataId) + 1;
+    using HotAttributeTable = Array<Optional<DOM::QualifiedName>, hot_attribute_table_size>;
+
+    static HotAttributeTable const& hot_attribute_qualified_names()
     {
+        static NeverDestroyed<HotAttributeTable> s_table = [] {
+            HotAttributeTable table;
+            auto set = [&](RustFfiHtmlFragmentAttributeKind kind, Utf16FlyString const& name) {
+                table[to_underlying(kind)] = DOM::QualifiedName { name, {}, {} };
+            };
+            set(RustFfiHtmlFragmentAttributeKind::Class, AttributeNames::class_);
+            set(RustFfiHtmlFragmentAttributeKind::Id, AttributeNames::id);
+            set(RustFfiHtmlFragmentAttributeKind::Type, AttributeNames::type);
+            set(RustFfiHtmlFragmentAttributeKind::Value, AttributeNames::value);
+            set(RustFfiHtmlFragmentAttributeKind::Checked, AttributeNames::checked);
+            set(RustFfiHtmlFragmentAttributeKind::Href, AttributeNames::href);
+            set(RustFfiHtmlFragmentAttributeKind::Style, AttributeNames::style);
+            set(RustFfiHtmlFragmentAttributeKind::Name, AttributeNames::name);
+            set(RustFfiHtmlFragmentAttributeKind::For, AttributeNames::for_);
+            set(RustFfiHtmlFragmentAttributeKind::Title, AttributeNames::title);
+            set(RustFfiHtmlFragmentAttributeKind::Disabled, AttributeNames::disabled);
+            set(RustFfiHtmlFragmentAttributeKind::Placeholder, AttributeNames::placeholder);
+            set(RustFfiHtmlFragmentAttributeKind::Target, AttributeNames::target);
+            set(RustFfiHtmlFragmentAttributeKind::Rel, AttributeNames::rel);
+            set(RustFfiHtmlFragmentAttributeKind::Hidden, AttributeNames::hidden);
+            set(RustFfiHtmlFragmentAttributeKind::Tabindex, AttributeNames::tabindex);
+            set(RustFfiHtmlFragmentAttributeKind::Autocomplete, AttributeNames::autocomplete);
+            set(RustFfiHtmlFragmentAttributeKind::DataId, "data-id"_utf16_fly_string);
+            return table;
+        }();
+        return *s_table;
+    }
+
+    DOM::QualifiedName attribute_qualified_name(HotAttributeTable const& hot_names, RustFfiHtmlFragmentAttribute const& attribute) const
+    {
+        auto kind_index = to_underlying(attribute.hot_kind);
+        if (kind_index > 0 && kind_index < hot_attribute_table_size)
+            return *hot_names[kind_index];
         if (auto raw = attribute.known_name) {
-            if (raw == AttributeNames::class_.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_class { DOM::QualifiedName { AttributeNames::class_, {}, {} } };
-                return *s_class;
-            }
-            if (raw == AttributeNames::type.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_type { DOM::QualifiedName { AttributeNames::type, {}, {} } };
-                return *s_type;
-            }
-            if (raw == AttributeNames::value.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_value { DOM::QualifiedName { AttributeNames::value, {}, {} } };
-                return *s_value;
-            }
-            if (raw == AttributeNames::id.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_id { DOM::QualifiedName { AttributeNames::id, {}, {} } };
-                return *s_id;
-            }
-            if (raw == AttributeNames::checked.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_checked { DOM::QualifiedName { AttributeNames::checked, {}, {} } };
-                return *s_checked;
-            }
-            if (raw == AttributeNames::href.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_href { DOM::QualifiedName { AttributeNames::href, {}, {} } };
-                return *s_href;
-            }
-            if (raw == AttributeNames::style.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_style { DOM::QualifiedName { AttributeNames::style, {}, {} } };
-                return *s_style;
-            }
-            if (raw == AttributeNames::name.raw_identity()) {
-                static NeverDestroyed<DOM::QualifiedName> s_name { DOM::QualifiedName { AttributeNames::name, {}, {} } };
-                return *s_name;
-            }
             static NeverDestroyed<HashMap<FlatPtr, DOM::QualifiedName>> s_known_attribute_qualified_names;
             auto& cache = *s_known_attribute_qualified_names;
             if (auto it = cache.find(raw); it != cache.end())

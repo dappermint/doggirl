@@ -404,15 +404,24 @@ void publish_writing_suggestion(DOM::Document& document, DOM::Text const* text, 
 
 void publish_table_spans(DOM::Element const& element)
 {
-    if (element.style_node_id().value() == 0)
+    if (element.style_node_id().value() == 0 || !element.is_html_element())
         return;
+    auto const& local_name = element.local_name();
     u16 column_span = 1;
     u16 row_span = 1;
-    if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
-        column_span = static_cast<u16>(cell->col_span());
-        row_span = static_cast<u16>(cell->row_span());
-    } else if (auto const* column = as_if<HTML::HTMLTableColElement>(element)) {
-        column_span = static_cast<u16>(column->span());
+    if (local_name.is_one_of(HTML::TagNames::td, HTML::TagNames::th)) {
+        if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
+            column_span = static_cast<u16>(cell->col_span());
+            row_span = static_cast<u16>(cell->row_span());
+        } else {
+            return;
+        }
+    } else if (local_name.is_one_of(HTML::TagNames::col, HTML::TagNames::colgroup)) {
+        if (auto const* column = as_if<HTML::HTMLTableColElement>(element)) {
+            column_span = static_cast<u16>(column->span());
+        } else {
+            return;
+        }
     } else {
         return;
     }
