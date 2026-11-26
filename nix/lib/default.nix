@@ -37,6 +37,8 @@ in
     mkProfileManifestEntry
     ;
 
+  mkDoggirlReleaseBin = pkgs: args: pkgs.callPackage ../packages/release-bin.nix args;
+
   mkDoggirlWrapper =
     pkgs: args: pkgs.callPackage ../packages/wrap-app.nix ({ repoRoot = self; } // args);
 
