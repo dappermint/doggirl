@@ -23,7 +23,12 @@ pub(crate) fn can_compute_client_rects_without_visual_context_update(
     let mut node = layout_node;
     while let Some(row) = arena.node(node) {
         let (kind, flags, parent) = (row.kind(), row.flags(), row.parent());
-        if node_facts::kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox || kind == NodeKind::SVGForeignObjectBox {
+        // An SVGSVGBox's own border box sits in normal layout coordinates (only its descendants receive the SVG
+        // viewport/viewBox transform), so it only requires a visual-context update when encountered as an ancestor.
+        if node_facts::kind_is_svg_box(kind)
+            || kind == NodeKind::SVGForeignObjectBox
+            || (kind == NodeKind::SVGSVGBox && node != layout_node)
+        {
             return false;
         }
 

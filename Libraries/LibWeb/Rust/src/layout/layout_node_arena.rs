@@ -2506,26 +2506,50 @@ impl LayoutNodeArena {
             pseudo_element_scroll_offsets,
             writing_suggestion,
         } = &mut self.style_node_tables;
-        counters_sets.forget(style_node);
-        generated_content.forget(style_node);
-        let removed_svg_attribute_facts = svg_attribute_facts.remove(&style_node);
-        svg_points.remove(&style_node);
-        svg_text_positions.remove(&style_node);
-        math_attribute_facts.remove(&style_node);
-        implicit_anchor_elements.retain(|element, anchor| *element != style_node && *anchor != style_node);
-        let removed_implicit_anchor = implicit_anchor_candidates.remove(&style_node);
-        identities_in_focused_text_control.remove(&style_node);
-        element_scroll_offsets.remove(&style_node);
-        pseudo_element_scroll_offsets.remove(&style_node);
+        if !identities_in_focused_text_control.is_empty() {
+            identities_in_focused_text_control.remove(&style_node);
+        }
         if writing_suggestion
             .as_ref()
             .is_some_and(|suggestion| suggestion.text == style_node)
         {
             *writing_suggestion = None;
         }
-        // A retired shadow host takes its tree scope with it. The registry withdraws no names from a
-        // scope it can no longer name.
-        anchor_name_elements.retain(|name, _| name.scope_host != Some(style_node));
+        let mut removed_svg_attribute_facts = None;
+        let mut removed_implicit_anchor = false;
+        if style_node.text_index().is_none() {
+            counters_sets.forget(style_node);
+            generated_content.forget(style_node);
+            if !svg_attribute_facts.is_empty() {
+                removed_svg_attribute_facts = svg_attribute_facts.remove(&style_node);
+            }
+            if !svg_points.is_empty() {
+                svg_points.remove(&style_node);
+            }
+            if !svg_text_positions.is_empty() {
+                svg_text_positions.remove(&style_node);
+            }
+            if !math_attribute_facts.is_empty() {
+                math_attribute_facts.remove(&style_node);
+            }
+            if !implicit_anchor_elements.is_empty() {
+                implicit_anchor_elements.retain(|element, anchor| *element != style_node && *anchor != style_node);
+            }
+            if !implicit_anchor_candidates.is_empty() {
+                removed_implicit_anchor = implicit_anchor_candidates.remove(&style_node);
+            }
+            if !element_scroll_offsets.is_empty() {
+                element_scroll_offsets.remove(&style_node);
+            }
+            if !pseudo_element_scroll_offsets.is_empty() {
+                pseudo_element_scroll_offsets.remove(&style_node);
+            }
+            // A retired shadow host takes its tree scope with it. The registry withdraws no names from a
+            // scope it can no longer name.
+            if !anchor_name_elements.is_empty() {
+                anchor_name_elements.retain(|name, _| name.scope_host != Some(style_node));
+            }
+        }
         if removed_implicit_anchor {
             self.record_partial_relayout_escape();
         }
@@ -6132,10 +6156,22 @@ impl LayoutNodeArena {
     }
 
     /// The row of the node `id` names, or `None` once the node is gone.
+    #[inline]
     pub(crate) fn live_row(&self, id: NodeSlotId) -> Option<LiveRow<'_>> {
-        self.slot_is_live(id).then(|| LiveRow {
-            data: self.data(id),
-            style_node: self.style_nodes[id.slot_index() as usize],
+        let generation = id.generation();
+        if generation == 0 || id.is_invalid() {
+            return None;
+        }
+        let index = id.slot_index() as usize;
+        let chunk = self.chunks.get(index / SLOTS_PER_CHUNK)?;
+        let data = chunk.slot(index % SLOTS_PER_CHUNK);
+        if data.slot_generation.get() != generation {
+            return None;
+        }
+        debug_assert!(self.slot_is_live(id));
+        Some(LiveRow {
+            data,
+            style_node: self.style_nodes[index],
         })
     }
 
@@ -6519,6 +6555,7 @@ impl LayoutNodeArena {
             .map(|metadata| NodeSlotId::new(index, metadata.generation))
     }
 
+    #[inline]
     pub(crate) fn slot_is_live(&self, id: NodeSlotId) -> bool {
         if id.is_invalid() {
             return false;

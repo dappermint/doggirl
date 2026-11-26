@@ -188,7 +188,10 @@ fn unicode_mapping(source: &[u16], transform: u8, locale: Option<&[u16]>) -> Tra
 }
 
 pub(super) fn may_require_bidi_processing(text: &[u16]) -> bool {
-    if text.iter().all(|unit| *unit <= 0x7f) {
+    if text
+        .iter()
+        .all(|&unit| unit < 0x0590 || (0x2000..=0x200d).contains(&unit) || (0x2010..=0x2029).contains(&unit))
+    {
         return false;
     }
     // SAFETY: The Unicode lookup only reads this borrowed text during the call.

@@ -5,10 +5,10 @@
  */
 
 #include <AK/NeverDestroyed.h>
-#include <AK/QuickSort.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/BackgroundSizeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
@@ -29,6 +29,7 @@
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/PaintTiming/PerformancePaintTiming.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -247,7 +248,7 @@ static bool paints_non_default_content(Layout::Node const& node)
     return border_is_painted(node_with_style->border_left()) || border_is_painted(node_with_style->border_top()) || border_is_painted(node_with_style->border_right()) || border_is_painted(node_with_style->border_bottom());
 }
 
-CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
+static CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
 {
     if (!node.is_text_node())
         return Painting::bounding_client_rect(node, viewport_mapping);
@@ -270,27 +271,43 @@ CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI::FfiVi
 class PaintableChecker {
 public:
     explicit PaintableChecker(DOM::Document& document)
-        : m_read(document)
+        : m_document(document)
+        , m_read(document)
     {
-        auto navigable = document.navigable();
-        if (!navigable)
-            return;
-        m_viewport = document.layout_node(m_read);
-        if (!m_viewport || !Painting::has_committed_box(*m_viewport)) {
-            m_viewport = nullptr;
-            return;
-        }
-
-        // NB: The scrolling area is in the coordinate space of the document, while client rects are relative to the
-        //     viewport, so client rects are offset by the viewport's scroll offset before they are compared with it.
-        m_scrolling_area = Painting::scrollable_overflow_rect(*m_viewport);
-        m_scroll_offset = navigable->viewport_scroll_offset();
-
-        m_viewport_mapping = Painting::viewport_mapping(document);
     }
 
     Layout::BegunRead const& read() const { return m_read; }
-    Layout::Viewport const* viewport() const { return m_scrolling_area.has_value() ? m_viewport : nullptr; }
+
+    Layout::Viewport const* viewport() const
+    {
+        ensure_viewport_and_scrolling_area();
+        return m_scrolling_area.has_value() ? m_viewport : nullptr;
+    }
+
+    CSSPixelRect scrolling_area() const
+    {
+        ensure_viewport_and_scrolling_area();
+        return m_scrolling_area.value_or({});
+    }
+
+    CSSPixelPoint scroll_offset() const
+    {
+        ensure_viewport_and_scrolling_area();
+        return m_scroll_offset;
+    }
+
+    Layout::RustFFI::FfiViewportMapping existing_viewport_mapping() const
+    {
+        return m_initialized_viewport_mapping ? m_viewport_mapping : Layout::RustFFI::FfiViewportMapping {};
+    }
+
+    void note_viewport_mapping(Layout::RustFFI::FfiViewportMapping mapping) const
+    {
+        if (mapping.host) {
+            m_viewport_mapping = mapping;
+            m_initialized_viewport_mapping = true;
+        }
+    }
 
     enum class CheckAncestorOpacity {
         No,
@@ -298,10 +315,10 @@ public:
     };
 
     // https://w3c.github.io/paint-timing/#paintable
-    bool is_paintable(Layout::Node const& node, CheckAncestorOpacity check_ancestor_opacity) const
+    Optional<CSSPixelRect> paintable_client_rect(Layout::Node const& node, CheckAncestorOpacity check_ancestor_opacity) const
     {
         if (!viewport())
-            return false;
+            return {};
 
         // An element el is paintable when all of the following apply:
         // - el is being rendered.
@@ -312,33 +329,103 @@ public:
         if (!node_with_style)
             node_with_style = as_if<Layout::NodeWithStyle>(node.parent_ptr());
         if (!node_with_style || node_with_style->visibility() != CSS::Visibility::Visible)
-            return false;
+            return {};
 
         // - el and all of its ancestors' used opacity is greater than zero.
         if (check_ancestor_opacity == CheckAncestorOpacity::Yes) {
-            for (auto const* ancestor = &node; ancestor; ancestor = ancestor->parent_ptr()) {
-                if (auto const* ancestor_with_style = as_if<Layout::NodeWithStyle>(*ancestor); ancestor_with_style && ancestor_with_style->opacity() <= 0)
-                    return false;
-            }
+            if (!ancestors_have_positive_opacity(node))
+                return {};
         }
 
         // - el's paintable bounding rect intersects with the scrolling area of the document.
         // https://w3c.github.io/paint-timing/#paintable-bounding-rect
         // 1. Let boundingRect be the result of running the getBoundingClientRect() on target.
-        auto bounding_rect = client_rect_of_box(node, m_viewport_mapping).translated(m_scroll_offset);
+        Layout::RustFFI::FfiViewportMapping viewport_mapping {};
+        if (m_initialized_viewport_mapping) {
+            viewport_mapping = m_viewport_mapping;
+        } else if (!m_document.can_compute_client_rects_without_accumulated_visual_contexts_update(node)) {
+            ensure_viewport_mapping();
+            viewport_mapping = m_viewport_mapping;
+        }
+        auto client_rect = client_rect_of_box(node, viewport_mapping);
+        auto bounding_rect = client_rect.translated(m_scroll_offset);
 
         // 2. Clip boundingRect with the document's scrolling area.
         // 3. Return boundingRect.
         // NB: The clipped rect is not empty only if the rect intersects with the scrolling area.
-        return bounding_rect.intersects(*m_scrolling_area);
+        if (!bounding_rect.intersects(*m_scrolling_area))
+            return {};
+        return client_rect;
+    }
+
+    bool is_paintable(Layout::Node const& node, CheckAncestorOpacity check_ancestor_opacity) const
+    {
+        return paintable_client_rect(node, check_ancestor_opacity).has_value();
     }
 
 private:
+    void ensure_viewport_and_scrolling_area() const
+    {
+        if (m_initialized_viewport)
+            return;
+        m_initialized_viewport = true;
+
+        auto navigable = m_document.navigable();
+        if (!navigable)
+            return;
+        m_viewport = m_document.layout_node(m_read);
+        if (!m_viewport || !Painting::has_committed_box(*m_viewport)) {
+            m_viewport = nullptr;
+            return;
+        }
+
+        // NB: The scrolling area is in the coordinate space of the document, while client rects are relative to the
+        //     viewport, so client rects are offset by the viewport's scroll offset before they are compared with it.
+        m_scrolling_area = Painting::scrollable_overflow_rect(*m_viewport);
+        m_scroll_offset = navigable->viewport_scroll_offset();
+    }
+
+    void ensure_viewport_mapping() const
+    {
+        if (m_initialized_viewport_mapping)
+            return;
+        m_initialized_viewport_mapping = true;
+        m_viewport_mapping = Painting::viewport_mapping(m_document);
+    }
+
+    bool ancestors_have_positive_opacity(Layout::Node const& node) const
+    {
+        if (auto const* self_with_style = as_if<Layout::NodeWithStyle>(node); self_with_style && self_with_style->opacity() <= 0)
+            return false;
+        auto const* parent = node.parent_ptr();
+        if (!parent)
+            return true;
+        bool positive = true;
+        for (auto const* ancestor = parent; ancestor; ancestor = ancestor->parent_ptr()) {
+            if (auto cached = m_ancestor_opacity_positive.get(ancestor); cached.has_value()) {
+                positive = *cached;
+                if (ancestor == parent)
+                    return positive;
+                break;
+            }
+            if (auto const* ancestor_with_style = as_if<Layout::NodeWithStyle>(*ancestor); ancestor_with_style && ancestor_with_style->opacity() <= 0) {
+                positive = false;
+                break;
+            }
+        }
+        m_ancestor_opacity_positive.set(parent, positive);
+        return positive;
+    }
+
+    DOM::Document& m_document;
     Layout::ForcedReadScope m_read;
-    Layout::Viewport const* m_viewport { nullptr };
-    Optional<CSSPixelRect> m_scrolling_area;
-    CSSPixelPoint m_scroll_offset;
-    Layout::RustFFI::FfiViewportMapping m_viewport_mapping {};
+    mutable bool m_initialized_viewport { false };
+    mutable bool m_initialized_viewport_mapping { false };
+    mutable Layout::Viewport const* m_viewport { nullptr };
+    mutable Optional<CSSPixelRect> m_scrolling_area;
+    mutable CSSPixelPoint m_scroll_offset;
+    mutable Layout::RustFFI::FfiViewportMapping m_viewport_mapping {};
+    mutable HashMap<Layout::Node const*, bool> m_ancestor_opacity_positive;
 };
 
 struct PaintedContent {
@@ -424,20 +511,6 @@ void process_an_image_that_finished_loading(DOM::Element& element, ImageRequestI
     });
 }
 
-// NB: The element whose box is the containing block of the given text box.
-static GC::Ptr<DOM::Element> element_which_determines_the_containing_block_of(Layout::Node const& text_box)
-{
-    for (auto const* box = static_cast<Layout::Node const*>(text_box.containing_block()); box; box = box->parent_ptr()) {
-        if (auto const* element = as_if<DOM::Element>(box->dom_node()))
-            return const_cast<DOM::Element*>(element);
-        if (box->is_generated_for_pseudo_element()) {
-            if (auto generator = box->pseudo_element_generator())
-                return const_cast<DOM::Element*>(generator.ptr());
-        }
-    }
-    return nullptr;
-}
-
 // https://w3c.github.io/paint-timing/#mark-paint-timing
 void mark_paint_timing(DOM::Document& document)
 {
@@ -513,60 +586,70 @@ void mark_paint_timing(DOM::Document& document)
     });
 
     // NB: The text layout nodes the layout node arena noted since the last frame join the ones that were not paintable
-    //     yet. The arena hands each one out once, so a slot is in the list twice only if it was pending already.
+    //     yet. All candidates are resolved in a single batched Rust pass directly over layout rows without creating
+    //     C++ layout node shells.
     auto& text_boxes = state.text_boxes_pending_first_paint;
-    if (may_have_noted_text_boxes) {
-        auto pending_count = text_boxes.size();
-        Layout::RustFFI::layout_take_text_rows_for_first_paint(host, &checker.read(), &text_boxes, [](void* context, Compositing::RustFFI::NodeSlotId slot) {
-            static_cast<Vector<Compositing::RustFFI::NodeSlotId>*>(context)->append(slot);
-        });
-        if (pending_count != 0 && text_boxes.size() != pending_count) {
-            quick_sort(text_boxes, [](auto a, auto b) { return a.index < b.index; });
-            size_t unique_count = 0;
-            for (size_t i = 0; i < text_boxes.size(); ++i) {
-                if (unique_count == 0 || text_boxes[unique_count - 1].index != text_boxes[i].index)
-                    text_boxes[unique_count++] = text_boxes[i];
-            }
-            text_boxes.shrink(unique_count);
-        }
+    if (may_have_noted_text_boxes || !text_boxes.is_empty()) {
+        auto previous_pending = move(text_boxes);
+        bool has_viewport = checker.viewport() != nullptr;
+        auto scrolling_area = has_viewport ? checker.scrolling_area() : CSSPixelRect {};
+        auto scroll_offset = has_viewport ? checker.scroll_offset() : CSSPixelPoint {};
+        auto viewport_mapping = checker.existing_viewport_mapping();
+        auto device_pixels_per_css_pixel = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
+
+        struct ResolveContext {
+            DOM::Document& document;
+            CSS::StyleComputer const& style_computer;
+            PaintedTextNodes& painted_text_nodes;
+            Vector<Compositing::RustFFI::NodeSlotId>& remaining_pending;
+        };
+        ResolveContext resolve_context {
+            .document = document,
+            .style_computer = document.style_computer(),
+            .painted_text_nodes = painted_text_nodes,
+            .remaining_pending = text_boxes,
+        };
+
+        Layout::RustFFI::layout_resolve_text_rows_for_first_paint(
+            host,
+            &checker.read(),
+            may_have_noted_text_boxes,
+            previous_pending.data(),
+            previous_pending.size(),
+            has_viewport,
+            scrolling_area,
+            scroll_offset,
+            &viewport_mapping,
+            device_pixels_per_css_pixel,
+            &resolve_context,
+            [](void* context, u32 text_style_node, u32 element_style_node) -> u8 {
+                auto& ctx = *static_cast<ResolveContext*>(context);
+                auto* text = as_if<DOM::Text>(ctx.style_computer.node_for_style_node(CSS::StyleNodeID { text_style_node }).ptr());
+                if (!text || !text->is_connected() || &text->document() != &ctx.document)
+                    return 0;
+                if (text->data().is_empty())
+                    return 0;
+                auto* element = as_if<DOM::Element>(ctx.style_computer.node_for_style_node(CSS::StyleNodeID { element_style_node }).ptr());
+                if (!element)
+                    return 0;
+                if (element->is_in_set_of_elements_with_rendered_text())
+                    return 3;
+                return is_non_empty(text->data().utf16_view()) ? 1 : 2;
+            },
+            [](void* context, u32 element_style_node, CSSPixelRect client_rect) {
+                auto& ctx = *static_cast<ResolveContext*>(context);
+                auto* element = as_if<DOM::Element>(ctx.style_computer.node_for_style_node(CSS::StyleNodeID { element_style_node }).ptr());
+                if (!element)
+                    return;
+                auto& rect = ctx.painted_text_nodes.ensure(*element);
+                if (!client_rect.is_empty())
+                    rect = rect.is_empty() ? client_rect : rect.united(client_rect);
+            },
+            [](void* context, Compositing::RustFFI::NodeSlotId slot) {
+                static_cast<ResolveContext*>(context)->remaining_pending.append(slot);
+            });
+        checker.note_viewport_mapping(viewport_mapping);
     }
-
-    // NB: This is when the user agent paints a Text node for the first time.
-    text_boxes.remove_all_matching([&](Compositing::RustFFI::NodeSlotId slot) {
-        // NB: A text node whose layout node is gone has its new layout node noted once it gets one.
-        auto const* text_box = document.layout_node_arena().node_if_live(checker.read(), slot);
-        if (!text_box)
-            return true;
-        auto* text = as_if<DOM::Text>(const_cast<DOM::Node*>(text_box->dom_node()));
-        if (!text || !text->is_connected() || &text->document() != &document)
-            return true;
-
-        // OPTIMIZATION: Once an element is in the set of elements with rendered text, the text nodes it owns are never
-        //               read, so a text node whose element is in it already is not looked at again. Its layout node
-        //               is noted again if its text changes, or if it is rebuilt, as it is when the node moves.
-        auto element = element_which_determines_the_containing_block_of(*text_box);
-        if (!element || element->is_in_set_of_elements_with_rendered_text())
-            return true;
-
-        if (!checker.is_paintable(*text_box, PaintableChecker::CheckAncestorOpacity::Yes)) {
-            // OPTIMIZATION: Text that is all white space and paints nothing, often in a box without fragments, is not
-            //               looked at again until its data changes to something else.
-            return !is_non_empty(text->data().utf16_view());
-        }
-
-        // https://w3c.github.io/paint-timing/#sec-modifications-dom
-        // When the user agent paints a Text node text for the first time, it should execute the following steps:
-        // FIXME: - If text will not be painted due to the font face being in its font block period, then return.
-
-        // - Let element be the Element which determines the containing block of text.
-        // NB: The element was found above.
-
-        // - Append text to element's set of owned text nodes.
-        // NB: The set of owned text nodes is only read for the elements that are appended to paintedTextNodes below,
-        //     in this frame, so only their text nodes are kept.
-        painted_text_nodes.ensure(*element).append(*text);
-        return true;
-    });
 
     // 6. For each Element element in doc's descendants:
     // OPTIMIZATION: Only the elements that got their first owned text nodes in this frame can be appended below.

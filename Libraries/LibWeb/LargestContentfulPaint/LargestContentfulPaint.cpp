@@ -8,7 +8,6 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/Text.h>
 #include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -211,8 +210,7 @@ static Optional<PaintTiming::LargestContentfulPaintCandidate> compute_a_new_larg
 
     // 5. For each textNode of paintedTextNodes,
     Layout::ForcedReadScope read { document };
-    auto viewport_mapping = Painting::viewport_mapping(document);
-    for (auto const& [text_node, owned_text_nodes] : painted_text_nodes) {
+    for (auto const& [text_node, text_rect] : painted_text_nodes) {
         // 1. If textNode is not exposed for paint timing, given document, continue.
         if (!PaintTiming::is_exposed_for_paint_timing(*text_node, document))
             continue;
@@ -231,16 +229,6 @@ static Optional<PaintTiming::LargestContentfulPaintCandidate> compute_a_new_larg
 
         // 3. Let intersectionRect be the union of the border boxes of all Text nodes in textNode's set of owned text
         //    nodes, intersected with the visual viewport.
-        CSSPixelRect text_rect;
-        for (auto const& text : owned_text_nodes) {
-            auto const* text_layout_node = text->layout_node(read);
-            if (!text_layout_node)
-                continue;
-            auto rect = PaintTiming::client_rect_of_box(*text_layout_node, viewport_mapping);
-            if (rect.is_empty())
-                continue;
-            text_rect = text_rect.is_empty() ? rect : text_rect.united(rect);
-        }
         auto intersection_rect = text_rect.intersected(viewport_rect);
 
         // 4. Let result be the effective visual size of textNode given intersectionRect and null.

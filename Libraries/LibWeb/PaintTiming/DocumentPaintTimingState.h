@@ -68,8 +68,8 @@ struct LargestContentfulPaintCandidate {
 };
 
 // NB: The elements that get a text node in their set of owned text nodes for the first time as a frame is painted,
-//     with those text nodes.
-using PaintedTextNodes = GC::OrderedRootHashMap<GC::Ref<DOM::Element>, GC::RootVector<GC::Ref<DOM::Text>>>;
+//     with the united client rect of those text nodes computed while checking paintability.
+using PaintedTextNodes = GC::OrderedRootHashMap<GC::Ref<DOM::Element>, CSSPixelRect>;
 
 struct DocumentPaintTimingState {
     // https://w3c.github.io/paint-timing/#set-of-previously-reported-paints
