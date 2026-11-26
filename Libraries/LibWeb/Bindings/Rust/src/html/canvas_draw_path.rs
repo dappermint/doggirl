@@ -89,8 +89,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fill
     pub(crate) fn fill(&self, _: &mut CallContext, fill_rule: CanvasFillRule) -> WebIdlResult<()> {
-        let path = self.path().clone();
-        self.fill_internal(&path, fill_rule.into());
+        self.fill_current_path(fill_rule.into());
         Ok(())
     }
 
@@ -107,8 +106,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-stroke
     pub(crate) fn stroke(&self, _: &mut CallContext) -> WebIdlResult<()> {
-        let path = self.path().clone();
-        self.stroke_internal(&path);
+        self.stroke_current_path();
         Ok(())
     }
 
@@ -120,8 +118,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-clip
     pub(crate) fn clip(&self, _: &mut CallContext, fill_rule: CanvasFillRule) -> WebIdlResult<()> {
-        let path = self.path().clone();
-        self.clip_internal(&path, fill_rule.into());
+        self.clip_current_path(fill_rule.into());
         Ok(())
     }
 

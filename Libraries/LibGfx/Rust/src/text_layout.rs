@@ -545,6 +545,16 @@ impl GlyphBuffer {
         }
     }
 
+    /// Moves all glyphs along the inline axis.
+    pub fn shift_x(&mut self, offset: f32) {
+        if offset == 0.0 {
+            return;
+        }
+        for placement in self.placements_mut() {
+            placement.x += offset;
+        }
+    }
+
     pub fn push_placed(&mut self, placed: PlacedGlyph) {
         self.placements_mut().push(GlyphPlacement::new(
             placed.x,
@@ -838,19 +848,35 @@ struct ShapeForParams {
 
 struct ShapesForText {
     last_used_tick: u64,
-    shapes: Vec<ShapeForParams>,
+    first: ShapeForParams,
+    extra: Option<Box<[ShapeForParams]>>,
 }
 
 impl ShapesForText {
     /// About what the entry for `text` holds: the text, the entry, and its shapes.
     fn size_in_bytes(&self, text: &[u16]) -> usize {
-        size_of_val(text)
-            + size_of::<(Box<[u16]>, ShapesForText)>()
-            + self
-                .shapes
+        let extra_bytes = self.extra.as_ref().map_or(0, |extra| {
+            extra
                 .iter()
                 .map(|shape| size_of::<ShapeForParams>() + shape.shape.size_in_bytes())
-                .sum::<usize>()
+                .sum()
+        });
+        size_of_val(text)
+            + size_of::<(Box<[u16]>, ShapesForText)>()
+            + size_of::<ShapeForParams>()
+            + self.first.shape.size_in_bytes()
+            + extra_bytes
+    }
+
+    fn find(&self, params: &ShapeParams) -> Option<&Arc<CachedShape>> {
+        if self.first.params.matches(params) {
+            return Some(&self.first.shape);
+        }
+        self.extra
+            .as_ref()?
+            .iter()
+            .find(|entry| entry.params.matches(params))
+            .map(|entry| &entry.shape)
     }
 }
 
@@ -859,6 +885,7 @@ type FastMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 struct FontShapeCache {
     last_used_tick: u64,
     single_ascii_common_shapes: [Option<Arc<CachedShape>>; SINGLE_ASCII_SHAPE_CACHE_SIZE],
+    single_ascii_ltr_shapes: [Option<Arc<CachedShape>>; SINGLE_ASCII_SHAPE_CACHE_SIZE],
     shapes_by_text: FastMap<Box<[u16]>, ShapesForText>,
     /// What the entries of `shapes_by_text` hold, see `ShapesForText::size_in_bytes()`.
     bytes: usize,
@@ -869,6 +896,7 @@ impl Default for FontShapeCache {
         Self {
             last_used_tick: 0,
             single_ascii_common_shapes: [const { None }; SINGLE_ASCII_SHAPE_CACHE_SIZE],
+            single_ascii_ltr_shapes: [const { None }; SINGLE_ASCII_SHAPE_CACHE_SIZE],
             shapes_by_text: FastMap::default(),
             bytes: 0,
         }
@@ -888,14 +916,19 @@ impl FontShapeCache {
     ) -> &Arc<CachedShape> {
         if let &[code_unit] = text
             && (code_unit as usize) < SINGLE_ASCII_SHAPE_CACHE_SIZE
-            && params.text_type == TextType::Common
             && params.letter_spacing == 0.0
             && params.word_spacing == 0.0
             && params.joining_context == JoiningContext::default()
             && !params.vertical_forms
         {
-            return self.single_ascii_common_shapes[code_unit as usize]
-                .get_or_insert_with(|| Arc::new(shape_uncached()));
+            if params.text_type == TextType::Common {
+                return self.single_ascii_common_shapes[code_unit as usize]
+                    .get_or_insert_with(|| Arc::new(shape_uncached()));
+            }
+            if params.text_type == TextType::Ltr {
+                return self.single_ascii_ltr_shapes[code_unit as usize]
+                    .get_or_insert_with(|| Arc::new(shape_uncached()));
+            }
         }
 
         if self.shapes_by_text.len() > MAX_SHAPE_CACHE_TEXTS_PER_FONT
@@ -903,36 +936,40 @@ impl FontShapeCache {
         {
             *total_bytes -= self.evict_texts_used_at_or_before(threshold);
         }
-        let entry = match self.shapes_by_text.entry_ref(text) {
-            EntryRef::Occupied(entry) => entry.into_mut(),
-            EntryRef::Vacant(entry) => entry.insert_with_key(
-                Box::from(text),
-                ShapesForText {
+        match self.shapes_by_text.entry_ref(text) {
+            EntryRef::Occupied(occupied) => {
+                let entry = occupied.into_mut();
+                entry.last_used_tick = tick;
+                if entry.find(&params).is_none() {
+                    let bytes_before = entry.size_in_bytes(text);
+                    let mut extra = entry.extra.take().map(Vec::from).unwrap_or_default();
+                    extra.push(ShapeForParams {
+                        params,
+                        shape: Arc::new(shape_uncached()),
+                    });
+                    entry.extra = Some(extra.into_boxed_slice());
+                    let added_bytes = entry.size_in_bytes(text) - bytes_before;
+                    self.bytes += added_bytes;
+                    *total_bytes += added_bytes;
+                }
+                entry.find(&params).expect("shape was just found or inserted")
+            }
+            EntryRef::Vacant(vacant) => {
+                let shapes_for_text = ShapesForText {
                     last_used_tick: tick,
-                    shapes: Vec::new(),
-                },
-            ),
-        };
-        entry.last_used_tick = tick;
-        let index = match entry.shapes.iter().position(|entry| entry.params.matches(&params)) {
-            Some(index) => index,
-            None => {
-                let bytes_before = if entry.shapes.is_empty() {
-                    0
-                } else {
-                    entry.size_in_bytes(text)
+                    first: ShapeForParams {
+                        params,
+                        shape: Arc::new(shape_uncached()),
+                    },
+                    extra: None,
                 };
-                entry.shapes.push(ShapeForParams {
-                    params,
-                    shape: Arc::new(shape_uncached()),
-                });
-                let added_bytes = entry.size_in_bytes(text) - bytes_before;
+                let added_bytes = shapes_for_text.size_in_bytes(text);
                 self.bytes += added_bytes;
                 *total_bytes += added_bytes;
-                entry.shapes.len() - 1
+                let entry = vacant.insert_with_key(Box::from(text), shapes_for_text);
+                &entry.first.shape
             }
-        };
-        &entry.shapes[index].shape
+        }
     }
 
     /// Returns the bytes the evicted texts held.
@@ -1042,6 +1079,7 @@ pub fn clear_shaping_cache() {
             *cache = ShapingCache::default();
         }
     });
+    crate::path::clear_glyph_outline_cache();
 }
 
 fn shape_text_uncached(font: &FontHandle, text: &[u16], params: ShapeParams) -> CachedShape {

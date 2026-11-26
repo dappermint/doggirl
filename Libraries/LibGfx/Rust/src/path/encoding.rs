@@ -23,28 +23,54 @@ fn padded_to_four(size: usize) -> usize {
 }
 
 pub fn encode(geometry: &PathGeometry) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    encode_into(geometry, &mut bytes);
+    bytes
+}
+
+pub fn encode_into(geometry: &PathGeometry, bytes: &mut Vec<u8>) {
+    bytes.clear();
     let empty = PathGeometry::new();
     let geometry = if geometry.has_geometry() { geometry } else { &empty };
     let verbs = geometry.verbs();
     let points = geometry.points();
     let conic_weights = geometry.conic_weights();
 
-    let mut bytes =
-        Vec::with_capacity(HEADER_SIZE + padded_to_four(verbs.len()) + points.len() * 8 + conic_weights.len() * 4);
+    let total_len = HEADER_SIZE + padded_to_four(verbs.len()) + points.len() * 8 + conic_weights.len() * 4;
+    bytes.reserve(total_len);
     bytes.extend_from_slice(&[VERSION, geometry.fill_rule() as u8, 0, 0]);
     for count in [verbs.len(), points.len(), conic_weights.len()] {
         bytes.extend_from_slice(&(count as u32).to_le_bytes());
     }
-    bytes.extend(verbs.iter().map(|verb| *verb as u8));
-    bytes.resize(HEADER_SIZE + padded_to_four(verbs.len()), 0);
-    for point in points {
-        bytes.extend_from_slice(&point.x.to_le_bytes());
-        bytes.extend_from_slice(&point.y.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        const _: () = assert!(size_of::<PathVerb>() == 1);
+        const _: () = assert!(size_of::<FloatPoint>() == 8);
+        const _: () = assert!(core::mem::offset_of!(FloatPoint, x) == 0 && core::mem::offset_of!(FloatPoint, y) == 4);
+        // SAFETY: `PathVerb` is `#[repr(u8)]`, `FloatPoint` is `#[repr(C)]` `{ x: f32, y: f32 }`,
+        // and on little-endian targets their in-memory layout matches the wire format exactly.
+        unsafe {
+            bytes.extend_from_slice(ak::slice_from_raw_parts(verbs.as_ptr().cast::<u8>(), verbs.len()));
+            bytes.resize(HEADER_SIZE + padded_to_four(verbs.len()), 0);
+            bytes.extend_from_slice(ak::slice_from_raw_parts(points.as_ptr().cast::<u8>(), points.len() * 8));
+            bytes.extend_from_slice(ak::slice_from_raw_parts(
+                conic_weights.as_ptr().cast::<u8>(),
+                conic_weights.len() * 4,
+            ));
+        }
     }
-    for weight in conic_weights {
-        bytes.extend_from_slice(&weight.to_le_bytes());
+    #[cfg(not(target_endian = "little"))]
+    {
+        bytes.extend(verbs.iter().map(|verb| *verb as u8));
+        bytes.resize(HEADER_SIZE + padded_to_four(verbs.len()), 0);
+        for point in points {
+            bytes.extend_from_slice(&point.x.to_le_bytes());
+            bytes.extend_from_slice(&point.y.to_le_bytes());
+        }
+        for weight in conic_weights {
+            bytes.extend_from_slice(&weight.to_le_bytes());
+        }
     }
-    bytes
 }
 
 /// The path that the bytes describe, or None if they do not describe one: if the sizes do not match

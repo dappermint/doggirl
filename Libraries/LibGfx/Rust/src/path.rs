@@ -4,13 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use crate::geometry::{FloatPoint, FloatSize};
 use crate::matrix::AffineTransform;
 use crate::paint_enums::WindingRule;
-use geometry::PathGeometry;
+use geometry::{PathGeometry, PathVerb};
 pub use measure::PathVertex;
 
 mod arcs;
@@ -40,23 +41,181 @@ pub struct GlyphRun {
     pub glyphs: crate::text_layout::GlyphBuffer,
 }
 
-struct GlyphOutlineSink<'a> {
-    geometry: &'a mut PathGeometry,
-    transforms: &'a [AffineTransform],
+const GLYPH_OUTLINE_CACHE_SIZE: usize = 1024;
+
+#[derive(Clone, Default)]
+struct CachedGlyphOutline {
+    font_id: u64,
+    glyph_id: u16,
+    verbs: Vec<PathVerb>,
+    points: Vec<FloatPoint>,
+    conic_weights: Vec<f32>,
 }
 
-unsafe extern "C" fn append_glyph_outline(
+thread_local! {
+    static GLYPH_OUTLINE_CACHE: RefCell<Box<[CachedGlyphOutline]>> = RefCell::new(
+        vec![CachedGlyphOutline::default(); GLYPH_OUTLINE_CACHE_SIZE].into_boxed_slice()
+    );
+}
+
+/// Clears the calling thread's cached glyph outlines, e.g. on memory pressure or cache flush.
+pub fn clear_glyph_outline_cache() {
+    GLYPH_OUTLINE_CACHE.with(|cache_cell| {
+        if let Ok(mut cache) = cache_cell.try_borrow_mut() {
+            for entry in cache.iter_mut() {
+                *entry = CachedGlyphOutline::default();
+            }
+        }
+    });
+}
+
+#[inline(always)]
+fn glyph_outline_cache_slot(font_id: u64, glyph_id: u16) -> usize {
+    let hash = font_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(glyph_id).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    ((hash ^ (hash >> 32)) as usize) & (GLYPH_OUTLINE_CACHE_SIZE - 1)
+}
+
+struct MissingGlyphOutlineSink<'a> {
+    font_id: u64,
+    glyphs: &'a [crate::text_layout::DrawGlyph],
+    fetched: &'a mut Vec<CachedGlyphOutline>,
+}
+
+unsafe extern "C" fn collect_missing_glyph_outline(
     context: *mut c_void,
     glyph_index: usize,
     outline: *const ffi::PathGeometryData,
 ) {
-    // SAFETY: `context` is the sink that append_glyph_outlines() passes, and the outline is a live path for this
-    // synchronous call.
+    // SAFETY: `context` is the sink passed by `append_glyph_outlines_cached()` and `outline` is valid for this call.
     unsafe {
-        let sink = &mut *context.cast::<GlyphOutlineSink<'_>>();
-        let transform = sink.transforms[glyph_index];
-        (*outline).append_mapped_to(sink.geometry, |point| transform.map_point(point));
+        let sink = &mut *context.cast::<MissingGlyphOutlineSink<'_>>();
+        let data = &*outline;
+        let verbs = ak::slice_from_raw_parts(data.verbs.cast::<PathVerb>(), data.verb_count);
+        let points = ak::slice_from_raw_parts(data.points, data.point_count);
+        let conic_weights = ak::slice_from_raw_parts(data.conic_weights, data.conic_weight_count);
+        sink.fetched.push(CachedGlyphOutline {
+            font_id: sink.font_id,
+            glyph_id: sink.glyphs[glyph_index].glyph_id,
+            verbs: verbs.to_vec(),
+            points: points.to_vec(),
+            conic_weights: conic_weights.to_vec(),
+        });
     }
+}
+
+/// Core cache lookup and append helper, factored out so collision behavior can be unit tested without FFI.
+fn append_glyph_outlines_with_cache(
+    cache: &mut [CachedGlyphOutline],
+    geometry: &mut PathGeometry,
+    font_id: u64,
+    glyphs: &[crate::text_layout::DrawGlyph],
+    fetch_missing: impl FnOnce(&[crate::text_layout::DrawGlyph], &mut Vec<CachedGlyphOutline>),
+    mut append_one: impl FnMut(&mut PathGeometry, usize, &[PathVerb], &[FloatPoint], &[f32]),
+) {
+    if glyphs.is_empty() {
+        return;
+    }
+
+    // Fast path: check whether every glyph in this run is already cached so we avoid any allocations or FFI.
+    let mut all_hit = true;
+    for glyph in glyphs {
+        let slot = glyph_outline_cache_slot(font_id, glyph.glyph_id);
+        let entry = &cache[slot];
+        if entry.font_id != font_id || entry.glyph_id != glyph.glyph_id {
+            all_hit = false;
+            break;
+        }
+    }
+    if all_hit {
+        for (index, glyph) in glyphs.iter().enumerate() {
+            let entry = &cache[glyph_outline_cache_slot(font_id, glyph.glyph_id)];
+            append_one(geometry, index, &entry.verbs, &entry.points, &entry.conic_weights);
+        }
+        return;
+    }
+
+    // Collect unique missing glyphs in order and fetch them in one batch.
+    let mut missing_glyphs: Vec<crate::text_layout::DrawGlyph> = Vec::new();
+    for glyph in glyphs {
+        let slot = glyph_outline_cache_slot(font_id, glyph.glyph_id);
+        let entry = &cache[slot];
+        if (entry.font_id != font_id || entry.glyph_id != glyph.glyph_id)
+            && !missing_glyphs
+                .iter()
+                .any(|existing| existing.glyph_id == glyph.glyph_id)
+        {
+            missing_glyphs.push(*glyph);
+        }
+    }
+    let mut fetched = Vec::with_capacity(missing_glyphs.len());
+    if !missing_glyphs.is_empty() {
+        fetch_missing(&missing_glyphs, &mut fetched);
+    }
+
+    // Append every glyph BEFORE writing `fetched` into `cache`, so a newly fetched glyph that hashes to the same
+    // direct-mapped slot as an already-cached glyph in this run cannot evict it before it is read.
+    for (index, glyph) in glyphs.iter().enumerate() {
+        let slot = glyph_outline_cache_slot(font_id, glyph.glyph_id);
+        let entry = &cache[slot];
+        if entry.font_id == font_id && entry.glyph_id == glyph.glyph_id {
+            append_one(geometry, index, &entry.verbs, &entry.points, &entry.conic_weights);
+        } else if let Some(item) = fetched.iter().find(|item| item.glyph_id == glyph.glyph_id) {
+            append_one(geometry, index, &item.verbs, &item.points, &item.conic_weights);
+        } else {
+            debug_assert!(
+                false,
+                "glyph {} missing from both cache and fetched outlines",
+                glyph.glyph_id
+            );
+            append_one(geometry, index, &[], &[], &[]);
+        }
+    }
+
+    // Move fetched entries into the direct-mapped cache without cloning.
+    for item in fetched {
+        let slot = glyph_outline_cache_slot(font_id, item.glyph_id);
+        cache[slot] = item;
+    }
+}
+
+/// Fetches uncached outlines for `glyphs` in a single FFI call and invokes `append_one` for every glyph in order.
+fn append_glyph_outlines_cached(
+    geometry: &mut PathGeometry,
+    font: &crate::font::FontHandle,
+    glyphs: &[crate::text_layout::DrawGlyph],
+    append_one: impl FnMut(&mut PathGeometry, usize, &[PathVerb], &[FloatPoint], &[f32]),
+) {
+    if glyphs.is_empty() {
+        return;
+    }
+    let font_id = font.id().0;
+    GLYPH_OUTLINE_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        append_glyph_outlines_with_cache(
+            &mut cache,
+            geometry,
+            font_id,
+            glyphs,
+            |missing_glyphs, fetched| {
+                let mut sink = MissingGlyphOutlineSink {
+                    font_id,
+                    glyphs: missing_glyphs,
+                    fetched,
+                };
+                // SAFETY: `font` keeps the Gfx::Font live and `missing_glyphs`/`sink` stay valid for the synchronous call.
+                unsafe {
+                    ladybird_gfx_font_glyph_outlines(
+                        font.as_raw(),
+                        missing_glyphs.as_ptr(),
+                        missing_glyphs.len(),
+                        collect_missing_glyph_outline,
+                        (&raw mut sink).cast(),
+                    );
+                }
+            },
+            append_one,
+        );
+    });
 }
 
 /// Adds the outline of each glyph, in pixels with its origin on the baseline, mapped by the transform at the same
@@ -68,20 +227,15 @@ fn append_glyph_outlines(
     transforms: &[AffineTransform],
 ) {
     debug_assert_eq!(glyphs.len(), transforms.len());
-    if glyphs.is_empty() {
-        return;
-    }
-    let mut sink = GlyphOutlineSink { geometry, transforms };
-    // SAFETY: The handle keeps the font live, and the glyphs and the sink stay valid for the synchronous call.
-    unsafe {
-        ladybird_gfx_font_glyph_outlines(
-            font.as_raw(),
-            glyphs.as_ptr(),
-            glyphs.len(),
-            append_glyph_outline,
-            (&raw mut sink).cast(),
-        );
-    }
+    append_glyph_outlines_cached(
+        geometry,
+        font,
+        glyphs,
+        |geometry, index, verbs, points, conic_weights| {
+            let transform = transforms[index];
+            geometry.append_mapped_contours(verbs, points, conic_weights, |point| transform.map_point(point));
+        },
+    );
 }
 
 /// How a path is stroked, as `Path::stroke_to_fill()` takes it.
@@ -250,8 +404,16 @@ impl Path {
         svg_text::to_svg_string(&self.geometry)
     }
 
+    pub fn clear(&mut self) {
+        self.geometry_mut().clear();
+    }
+
     pub fn serialize_to_bytes(&self) -> Vec<u8> {
         encoding::encode(&self.geometry)
+    }
+
+    pub fn serialize_into(&self, bytes: &mut Vec<u8>) {
+        encoding::encode_into(&self.geometry, bytes);
     }
 
     /// The path that the bytes describe. Bytes that describe no path give an empty path.
@@ -263,18 +425,25 @@ impl Path {
     pub fn from_glyph_runs(runs: &[GlyphRun]) -> Path {
         let mut geometry = PathGeometry::new();
         for run in runs {
-            if run.font.is_invisible() {
+            if run.font.is_invisible() || run.glyphs.is_empty() {
                 continue;
             }
             let ascent = run.font.facts().ascent;
-            let transforms: Vec<_> = run
-                .glyphs
-                .placed()
-                .map(|glyph| AffineTransform {
-                    values: [1.0, 0.0, 0.0, 1.0, glyph.x, glyph.y + ascent],
-                })
-                .collect();
-            append_glyph_outlines(&mut geometry, &run.font, &run.glyphs, &transforms);
+            let mut placed = run.glyphs.placed();
+            append_glyph_outlines_cached(
+                &mut geometry,
+                &run.font,
+                &run.glyphs,
+                |geometry, _index, verbs, points, conic_weights| {
+                    let placed_glyph = placed.next().expect("placed glyphs match glyph count");
+                    let dx = placed_glyph.x;
+                    let dy = placed_glyph.y + ascent;
+                    geometry.append_mapped_contours(verbs, points, conic_weights, |point| FloatPoint {
+                        x: point.x + dx,
+                        y: point.y + dy,
+                    });
+                },
+            );
         }
         geometry.update_state_from_contours();
         Self::from_geometry(geometry)
@@ -539,5 +708,54 @@ mod tests {
         assert_vertices(&zero_length_line, &[vertex(10.0, 20.0, 0.0, 0.0, 0.0)]);
 
         assert_vertices(&Path::new(), &[]);
+    }
+
+    #[test]
+    fn glyph_outline_cache_collision_does_not_drop_cached_glyph() {
+        let font_id = 42u64;
+        let glyph_a = 1u16;
+        let slot_a = glyph_outline_cache_slot(font_id, glyph_a);
+        let glyph_b = (2u16..=u16::MAX)
+            .find(|&candidate| glyph_outline_cache_slot(font_id, candidate) == slot_a)
+            .expect("direct-mapped 1024-entry cache has a colliding glyph id");
+
+        let make_outline = |glyph_id: u16, x: f32| CachedGlyphOutline {
+            font_id,
+            glyph_id,
+            verbs: vec![PathVerb::Move],
+            points: vec![point(x, 0.0)],
+            conic_weights: Vec::new(),
+        };
+
+        let mut cache = vec![CachedGlyphOutline::default(); GLYPH_OUTLINE_CACHE_SIZE];
+        cache[slot_a] = make_outline(glyph_a, 10.0);
+
+        let glyphs = [
+            crate::text_layout::DrawGlyph::new(10.0, u32::from(glyph_a), 1, true),
+            crate::text_layout::DrawGlyph::new(10.0, u32::from(glyph_b), 1, true),
+        ];
+
+        let mut geometry = PathGeometry::new();
+        let mut appended_xs = Vec::new();
+        let mut fetched_ids = Vec::new();
+        append_glyph_outlines_with_cache(
+            &mut cache,
+            &mut geometry,
+            font_id,
+            &glyphs,
+            |missing, fetched| {
+                for g in missing {
+                    fetched_ids.push(g.glyph_id);
+                    fetched.push(make_outline(g.glyph_id, 20.0));
+                }
+            },
+            |_geometry, index, _verbs, points, _weights| {
+                appended_xs.push((index, points[0].x));
+            },
+        );
+
+        assert_eq!(fetched_ids, vec![glyph_b]);
+        assert_eq!(appended_xs, vec![(0, 10.0), (1, 20.0)]);
+        assert_eq!(cache[slot_a].glyph_id, glyph_b);
     }
 }
