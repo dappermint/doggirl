@@ -54,10 +54,22 @@ pub fn initial_tier_up_budget(jit: &JitState) -> i32 {
 }
 
 /// The interpreter tier and the tier-up budget a new executable starts with. While the JIT is on, new executables warm
-/// up before the interpreter collects feedback for them, unless there is no warmup.
-pub fn initial_tier(jit: &JitState) -> (InterpreterTier, i32) {
+/// up before the interpreter collects feedback for them, unless there is no warmup or this shared bytecode has already
+/// proven hot enough to JIT-compile in an earlier realm.
+pub fn initial_tier(jit: &JitState, executable: &Executable) -> (InterpreterTier, i32) {
     if jit.options.collects_feedback() && jit.options.warmup == 0 {
         (InterpreterTier::Profiling, initial_tier_up_budget(jit))
+    } else if jit.options.collects_feedback()
+        && jit.options.enabled
+        && !jit.options.random_thresholds
+        && !jit.options.sync
+        && !jit.options.dump_feedback
+        && executable.code().was_jit_compiled()
+    {
+        let full = threshold_budget(&jit.options);
+        let min_hot = 16i32.saturating_mul(tier_up_costs::FUNCTION_ENTRY);
+        let hot_budget = (full / 4).max(min_hot).min(full);
+        (InterpreterTier::Profiling, hot_budget)
     } else if jit.options.collects_feedback() {
         (InterpreterTier::WarmingUp, warmup_budget(jit))
     } else {
@@ -216,10 +228,29 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     let executable = vm.current_executable();
     let options = &vm.jit.options;
 
-    // NB: An executable whose compile job is queued checks at every call whether the job finished, so it does nothing
-    //     else here.
+    // NB: An executable whose compile job is queued checks whether its own job finished (or enough compiles
+    //     accumulated to justify a batched install). For non-loop entries, a 2-call grace window lets concurrent
+    //     compiles coalesce into one contiguous allocation and one `sys_icache_invalidate`; loops install at once
+    //     so OSR is never delayed.
     if executable.jit_compile_state() == CompileState::Queued {
-        install_finished_compiles(vm);
+        let jit_state = executable.jit_state();
+        let job_id = jit_state.queued_job_id.get();
+        let ready_job_id = if is_loop || vm.jit.options.stress_install {
+            Some(job_id)
+        } else if let Some(queue) = vm.jit.started_compile_queue()
+            && queue.is_job_ready(job_id)
+        {
+            let polls = jit_state.queued_ready_polls.get().saturating_add(1);
+            jit_state.queued_ready_polls.set(polls);
+            if polls >= 2 || queue.finished_count() >= 4 {
+                Some(job_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        install_finished_compiles_with_min_batch(vm, INSTALL_BATCH_MIN, ready_job_id);
         match executable.jit_compile_state() {
             CompileState::Queued => executable.head.tier_up_budget.set(QUEUED_BUDGET),
             CompileState::Installed => executable.head.tier_up_budget.set(compile_wait_budget(options)),
@@ -231,7 +262,7 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     // NB: Frames with installed code may check successive back edges to find an OSR entry. Folding all their value
     //     feedback at each check is unnecessary: a new compile's snapshot folds it before using it.
     if executable.jit_compile_state() == CompileState::Installed && !options.dump_feedback {
-        install_finished_compiles(vm);
+        install_finished_compiles_with_min_batch(vm, INSTALL_BATCH_MIN, None);
         executable.head.tier_up_budget.set(compile_wait_budget(options));
         return;
     }
@@ -256,13 +287,15 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
         return;
     }
 
-    if let Some(feedback) = executable.feedback() {
-        feedback.update_value_feedback();
-    }
-    if options.dump_feedback && !executable.has_dumped_feedback() {
-        executable.set_has_dumped_feedback();
-        if let Some(description) = super::feedback_dump::describe_feedback(&executable) {
-            eprintln!("{description}");
+    if options.dump_feedback || !options.enabled {
+        if let Some(feedback) = executable.feedback() {
+            feedback.update_value_feedback();
+        }
+        if options.dump_feedback && !executable.has_dumped_feedback() {
+            executable.set_has_dumped_feedback();
+            if let Some(description) = super::feedback_dump::describe_feedback(&executable) {
+                eprintln!("{description}");
+            }
         }
     }
 
@@ -271,7 +304,7 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
         return;
     }
 
-    install_finished_compiles(vm);
+    install_finished_compiles_with_min_batch(vm, INSTALL_BATCH_MIN, None);
     match executable.jit_compile_state() {
         CompileState::None => {}
         CompileState::Queued => unreachable!("queued executables return early"),
@@ -379,8 +412,7 @@ fn install(
     code.set_sample_slots(sample_slots, defer_gc);
     code.set_id(id);
     code.set_frame_offsets(compiled.site_index_frame_offset, compiled.register_dump_frame_offset);
-    let dependencies = artifact.dependencies().collect::<Vec<_>>();
-    vm.jit.dependents.register(vm, executable, id, &dependencies);
+    vm.jit.dependents.register(vm, executable, id, artifact.dependencies());
     // NB: A callee's tier-up check may install the code while its caller still runs in the interpreter, possibly
     //     past the loop the code has an on-stack replacement entry at.
     vm.for_each_live_execution_context(|frame| {
@@ -462,6 +494,7 @@ fn compile(
     sync: bool,
 ) {
     assert_eq!(executable.jit_compile_state(), CompileState::None);
+    executable.code().mark_jit_compiled();
     executable.set_jit_compile_state(CompileState::Queued);
 
     // NB: Asking the realm watches its intrinsics anew with new sets where the old ones fired, which allocates, so it
@@ -478,6 +511,7 @@ fn compile(
     let defer_gc = DeferGc::new(vm);
     let CapturedSnapshot {
         snapshot,
+        bytecode_owners,
         cells,
         snapshot_executables,
         sample_slots,
@@ -486,17 +520,16 @@ fn compile(
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
         let result = super::compile_queue::compile(&snapshot);
         super::compile_queue::give_back_snapshot(snapshot);
+        drop(bytecode_owners);
         let memory = should_install(vm, &result).then(|| {
             let code = &result.as_ref().expect("the compile succeeded").code;
-            let name = super::describe_executable(&executable);
-            ExecutableMemory::allocate(
-                vm.jit.code_allocator(),
-                &[&code[..]],
-                &[name.as_str()],
-                vm.jit.options.perf_map,
-            )
-            .pop()
-            .expect("one code was allocated")
+            let perf_map = vm.jit.options.perf_map;
+            let name = perf_map.then(|| super::describe_executable(&executable));
+            let name_str = name.as_deref().unwrap_or("");
+            let name_views: &[&str] = if perf_map { &[name_str] } else { &[] };
+            ExecutableMemory::allocate(vm.jit.code_allocator(), &[&code[..]], name_views, perf_map)
+                .pop()
+                .expect("one code was allocated")
         });
         finish_compile(
             vm,
@@ -520,8 +553,11 @@ fn compile(
         },
         &defer_gc,
     );
+    let jit_state = executable.jit_state();
+    jit_state.queued_job_id.set(job_id);
+    jit_state.queued_ready_polls.set(0);
     drop(defer_gc);
-    vm.jit.compile_queue().submit(job_id, snapshot);
+    vm.jit.compile_queue().submit(job_id, snapshot, bytecode_owners);
 }
 
 /// Compiles the executable of `function` right away, from the feedback it has, unless it has code, is being compiled or
@@ -545,16 +581,33 @@ pub fn compile_now(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
     executable.jit_compile_state() == CompileState::Installed
 }
 
+/// Minimum number of finished compile jobs before opportunistic non-queued tier-up checks drain and install them,
+/// amortizing page-protection toggles and instruction cache invalidations across multiple compiles.
+const INSTALL_BATCH_MIN: usize = 8;
+
 /// Installs the code of the compile jobs that finished since the last call.
 pub fn install_finished_compiles(vm: &Vm) {
+    install_finished_compiles_with_min_batch(vm, 1, None);
+}
+
+fn install_finished_compiles_with_min_batch(vm: &Vm, min_batch: usize, ready_job_id: Option<u64>) {
     let Some(queue) = vm.jit.started_compile_queue() else {
         return;
     };
-    install_compile_results(
-        vm,
-        vm.jit.compile_results_to_install(queue.take_finished()),
-        &DeferGc::new(vm),
-    );
+    let finished = if vm.jit.options.stress_install {
+        queue.take_finished()
+    } else {
+        let results = queue.take_finished_if_ready(min_batch, ready_job_id);
+        if results.is_empty() {
+            return;
+        }
+        results
+    };
+    let to_install = vm.jit.compile_results_to_install(finished);
+    if to_install.is_empty() {
+        return;
+    }
+    install_compile_results(vm, to_install, &DeferGc::new(vm));
 }
 
 /// Waits for the compile job of `executable` to finish and installs its code, and that of every other job that
@@ -583,12 +636,35 @@ pub fn wait_for_compile_jobs(vm: &Vm) {
 
 /// Installs the code of finished compile jobs.
 fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc: &DeferGc<'_>) {
-    let finished: Vec<(CompileJob, CompileResult)> = results
+    let mut finished: Vec<(CompileJob, CompileResult)> = results
         .into_iter()
         // NB: Jobs abandoned meanwhile have no entry anymore.
         .filter_map(|(id, result)| Some((vm.jit.take_job(id, defer_gc)?.into_inner(), result)))
         .collect();
     if finished.is_empty() {
+        return;
+    }
+    if finished.len() == 1 {
+        let (job, result) = finished.pop().expect("finished has one job");
+        let memory = should_install(vm, &result).then(|| {
+            let code = &result.as_ref().expect("the compile succeeded").code;
+            let perf_map = vm.jit.options.perf_map;
+            let name = perf_map.then(|| super::describe_executable(&job.executable));
+            let name_str = name.as_deref().unwrap_or("");
+            let name_views: &[&str] = if perf_map { &[name_str] } else { &[] };
+            ExecutableMemory::allocate(vm.jit.code_allocator(), &[&code[..]], name_views, perf_map)
+                .pop()
+                .expect("one code was allocated")
+        });
+        finish_compile(
+            vm,
+            job.executable,
+            result,
+            memory,
+            job.snapshot_executables,
+            job.sample_slots,
+            defer_gc,
+        );
         return;
     }
 
@@ -605,12 +681,16 @@ fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc
     let codes: Vec<&[u8]> = installed()
         .map(|(_, result)| &result.as_ref().expect("the compile succeeded").code[..])
         .collect();
-    let names: Vec<String> = installed()
-        .map(|(job, _)| super::describe_executable(&job.executable))
-        .collect();
+    let perf_map = vm.jit.options.perf_map;
+    let names: Vec<String> = if perf_map {
+        installed()
+            .map(|(job, _)| super::describe_executable(&job.executable))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let name_views: Vec<&str> = names.iter().map(String::as_str).collect();
-    let mut memories =
-        ExecutableMemory::allocate(vm.jit.code_allocator(), &codes, &name_views, vm.jit.options.perf_map).into_iter();
+    let mut memories = ExecutableMemory::allocate(vm.jit.code_allocator(), &codes, &name_views, perf_map).into_iter();
 
     for ((job, result), install) in finished.into_iter().zip(verdicts) {
         let memory = install.then(|| memories.next().expect("there is memory for each installed code"));

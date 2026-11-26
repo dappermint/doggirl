@@ -90,6 +90,141 @@ fn clear_bytes(words: &mut [u64], offset: usize, size: usize) {
     }
 }
 
+/// Copies the words of `cell` directly into a stack array and adds them to `snapshot`, bypassing `OpenLists`.
+fn fixed_cell_words<T, const WORDS: usize>(snapshot: &mut SnapshotWriter, cell: Gc<T>) -> List<u64> {
+    const {
+        assert!(WORDS * size_of::<u64>() >= size_of::<T>());
+    }
+    let mut words = [0u64; WORDS];
+    // SAFETY: `cell` is live and has `size_of::<T>()` bytes, which fit inside `words`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            cell.as_ptr().cast::<u8>(),
+            words.as_mut_ptr().cast::<u8>(),
+            size_of::<T>(),
+        );
+    }
+    // NB: A copy is a new cell, which has not been hashed, whatever the identity hash state of the sample is.
+    if IDENTITY_HASH_STATE_OFFSET < size_of::<T>() {
+        // SAFETY: `words` is `WORDS * 8 >= size_of::<T>() > IDENTITY_HASH_STATE_OFFSET` initialized bytes.
+        unsafe { *words.as_mut_ptr().cast::<u8>().add(IDENTITY_HASH_STATE_OFFSET) = 0 };
+    }
+    snapshot.add(&words)
+}
+
+/// VM-constant allocation info (heap counter addresses and size-class free lists) cached once per VM.
+pub(crate) struct CachedAllocationInfo {
+    pub object: ObjectAllocationInfo,
+    pub object_size_classes: Box<[ObjectSizeClass]>,
+    pub array: ArrayAllocationInfo,
+    pub storage_size_classes: Box<[StorageSizeClass]>,
+    pub rope: RopeAllocationInfo,
+    pub function: FunctionAllocationInfo,
+}
+
+pub(crate) fn build_cached_allocation_info(vm: &Vm) -> CachedAllocationInfo {
+    let heap = vm.heap();
+    let inline = heap.inline_allocation_info();
+    let heap_address = heap.raw() as u64;
+    let heap_offset = |field: NonNull<usize>| {
+        u32::try_from(field.as_ptr() as u64 - heap_address).expect("the counters are fields of the heap")
+    };
+
+    let object = ObjectAllocationInfo {
+        empty_object_inline_capacity: u32::from(EMPTY_PLAIN_OBJECT_INLINE_CAPACITY),
+        heap: heap_address,
+        heap_allocated_bytes_offset: heap_offset(inline.allocated_bytes_since_last_gc),
+        heap_threshold_offset: heap_offset(inline.gc_bytes_threshold),
+        heap_total_allocated_bytes_offset: heap_offset(inline.total_allocated_bytes),
+        local_free_list_offset: 0,
+        freelist_next_offset: offset(inline.free_cell_next_offset),
+        freelist_link_mask: u32::try_from(inline.free_cell_link_mask).expect("links are offsets within a block"),
+        local_cursor_offset: offset(inline.local_cursor_offset),
+        local_end_offset: offset(inline.local_end_offset),
+        local_cell_size_offset: offset(inline.local_cell_size_offset),
+        template: List::empty(),
+        shape_offset: offset(core::mem::offset_of!(Object, shape)),
+        named_properties_offset: offset(core::mem::offset_of!(Object, named_properties)),
+        inline_storage_offset: offset(core::mem::offset_of!(Object, inline_named_storage)),
+        plain_inline_storage_offset: offset(core::mem::offset_of!(Object, indexed_elements)),
+        inline_capacity_offset: offset(core::mem::offset_of!(Object, inline_named_capacity)),
+        slow_path: jit_function_address!(libjs_jit_allocate_object),
+        ..ObjectAllocationInfo::default()
+    };
+
+    // NB: Free lists are only popped inline where the heap gives their addresses (not in AddressSanitizer builds).
+    let object_size_classes = if heap.local_free_list_of(Object::CLASS).is_some() {
+        plain_object_size_classes(heap)
+            .iter()
+            .zip(&PLAIN_OBJECT_INLINE_CAPACITIES)
+            .map(|(size_class, inline_capacity)| ObjectSizeClass {
+                allocator: address(size_class.local_free_list()),
+                cell_size: size_class.cell_size(),
+                inline_capacity: u32::from(*inline_capacity),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    } else {
+        Box::new([])
+    };
+
+    // NB: Storage is only allocated inline where the heap gives the addresses of all the free lists it comes from.
+    let mut has_all_free_lists = true;
+    let mut storage_classes = Vec::with_capacity(SIZE_CLASS_CAPACITIES.len());
+    for (size_class, capacity) in value_storage::size_classes(heap).iter().zip(SIZE_CLASS_CAPACITIES) {
+        let allocator = address(size_class.local_free_list());
+        has_all_free_lists &= allocator != 0;
+        storage_classes.push(StorageSizeClass {
+            allocator,
+            cell_size: size_class.cell_size(),
+            capacity,
+        });
+    }
+    let storage_size_classes = if has_all_free_lists {
+        storage_classes.into_boxed_slice()
+    } else {
+        Box::new([])
+    };
+
+    let array = ArrayAllocationInfo {
+        allocator: address(heap.local_free_list_of(Array::CLASS)),
+        cell_size: size(size_of::<Array>()),
+        template: List::empty(),
+        shape: CellId(0),
+        storage_size_classes: List::empty(),
+        storage_template: List::empty(),
+        storage_values_offset: offset(VALUES_OFFSET),
+        storage_capacity_offset: offset(value_storage::CAPACITY_OFFSET),
+        slow_path: jit_function_address!(libjs_jit_allocate_array),
+    };
+
+    let rope = RopeAllocationInfo {
+        allocator: address(heap.local_free_list_of(RopeString::CLASS)),
+        cell_size: size(size_of::<RopeString>()),
+        template: List::empty(),
+        lhs_offset: offset(ROPE_STRING_LHS_OFFSET),
+        rhs_offset: offset(ROPE_STRING_RHS_OFFSET),
+        length_offset: offset(core::mem::offset_of!(PrimitiveString, length_in_utf16_code_units)),
+        min_length: ROPE_STRING_MIN_LENGTH,
+        slow_path: jit_function_address!(libjs_jit_create_rope_string),
+    };
+
+    let function = FunctionAllocationInfo {
+        allocator: address(heap.local_free_list_of(EcmascriptFunctionObject::CLASS)),
+        cell_size: size(size_of::<EcmascriptFunctionObject>()),
+        slow_path: jit_function_address!(libjs_jit_clone_function),
+    };
+
+    CachedAllocationInfo {
+        object,
+        object_size_classes,
+        array,
+        storage_size_classes,
+        rope,
+        function,
+    }
+}
+
 /// What JIT code needs to allocate cells itself, for code of `realm`. The templates come from cells allocated here,
 /// so this may collect garbage.
 pub struct AllocationInfos<'d> {
@@ -107,106 +242,45 @@ pub fn allocation_infos<'d>(
     defer_gc: &'d DeferGc<'_>,
     snapshot: &mut SnapshotWriter,
 ) -> AllocationInfos<'d> {
-    let heap = vm.heap();
-    let inline = heap.inline_allocation_info();
-    let heap_address = heap.raw() as u64;
-    let heap_offset = |field: NonNull<usize>| {
-        u32::try_from(field.as_ptr() as u64 - heap_address).expect("the counters are fields of the heap")
-    };
+    let cached = vm.jit.cached_allocation_info(vm);
 
-    let object_template = Object::create(vm, realm, Some(realm.object_prototype()));
-    object_template.shape().note_in_allocation_template();
-    let mut object = ObjectAllocationInfo {
-        empty_object_inline_capacity: u32::from(EMPTY_PLAIN_OBJECT_INLINE_CAPACITY),
-        heap: heap_address,
-        heap_allocated_bytes_offset: heap_offset(inline.allocated_bytes_since_last_gc),
-        heap_threshold_offset: heap_offset(inline.gc_bytes_threshold),
-        heap_total_allocated_bytes_offset: heap_offset(inline.total_allocated_bytes),
-        local_free_list_offset: 0,
-        freelist_next_offset: offset(inline.free_cell_next_offset),
-        freelist_link_mask: u32::try_from(inline.free_cell_link_mask).expect("links are offsets within a block"),
-        local_cursor_offset: offset(inline.local_cursor_offset),
-        local_end_offset: offset(inline.local_end_offset),
-        local_cell_size_offset: offset(inline.local_cell_size_offset),
-        template: cell_words(snapshot, object_template, size_of::<Object>()),
-        shape_offset: offset(core::mem::offset_of!(Object, shape)),
-        named_properties_offset: offset(core::mem::offset_of!(Object, named_properties)),
-        inline_storage_offset: offset(core::mem::offset_of!(Object, inline_named_storage)),
-        plain_inline_storage_offset: offset(core::mem::offset_of!(Object, indexed_elements)),
-        inline_capacity_offset: offset(core::mem::offset_of!(Object, inline_named_capacity)),
-        slow_path: jit_function_address!(libjs_jit_allocate_object),
-        ..ObjectAllocationInfo::default()
-    };
-    // NB: Free lists are only popped inline where the heap gives their addresses (not in AddressSanitizer builds).
-    if heap.local_free_list_of(Object::CLASS).is_some() {
-        let size_classes = snapshot.begin();
-        for (size_class, inline_capacity) in plain_object_size_classes(heap)
-            .iter()
-            .zip(&PLAIN_OBJECT_INLINE_CAPACITIES)
-        {
-            snapshot.push(ObjectSizeClass {
-                allocator: address(size_class.local_free_list()),
-                cell_size: size_class.cell_size(),
-                inline_capacity: u32::from(*inline_capacity),
-            });
+    let object_template = match realm.storage.jit_object_template.get() {
+        Some(template) => template,
+        None => {
+            let template = Object::create(vm, realm, Some(realm.object_prototype()));
+            template.shape().note_in_allocation_template();
+            realm.storage.jit_object_template.set(Some(template));
+            template
         }
-        object.size_classes = snapshot.end(size_classes);
-    }
+    };
+    let mut object = cached.object;
+    object.template = fixed_cell_words::<Object, { size_of::<Object>().div_ceil(8) }>(snapshot, object_template);
+    object.size_classes = snapshot.add(&cached.object_size_classes);
 
-    let array_template = Array::create(vm, realm, 0, None).must();
+    let array_template = match realm.storage.jit_array_template.get() {
+        Some(template) => template,
+        None => {
+            let template = Array::create(vm, realm, 0, None).must();
+            template.shape().note_in_allocation_template();
+            realm.storage.jit_array_template.set(Some(template));
+            template
+        }
+    };
     let array_shape = array_template.shape();
-    array_shape.note_in_allocation_template();
-    // NB: Storage is only allocated inline where the heap gives the addresses of all the free lists it comes from.
-    let storage_size_classes = snapshot.begin();
-    let mut has_all_free_lists = true;
-    for (size_class, capacity) in value_storage::size_classes(heap).iter().zip(SIZE_CLASS_CAPACITIES) {
-        let allocator = address(size_class.local_free_list());
-        has_all_free_lists &= allocator != 0;
-        snapshot.push(StorageSizeClass {
-            allocator,
-            cell_size: size_class.cell_size(),
-            capacity,
-        });
-    }
-    if !has_all_free_lists {
-        snapshot.drop_rows(&storage_size_classes);
-    }
-    let storage_size_classes = snapshot.end(storage_size_classes);
-    let array = ArrayAllocationInfo {
-        allocator: address(heap.local_free_list_of(Array::CLASS)),
-        cell_size: size(size_of::<Array>()),
-        template: cell_words(snapshot, array_template, size_of::<Array>()),
-        shape: CellId(array_shape.as_ptr() as u64),
-        storage_size_classes,
-        storage_template: snapshot.add(&value_storage::cell_header_template()[..]),
-        storage_values_offset: offset(VALUES_OFFSET),
-        storage_capacity_offset: offset(value_storage::CAPACITY_OFFSET),
-        slow_path: jit_function_address!(libjs_jit_allocate_array),
-    };
+    let mut array = cached.array;
+    array.template = fixed_cell_words::<Array, { size_of::<Array>().div_ceil(8) }>(snapshot, array_template);
+    array.shape = CellId(array_shape.as_ptr() as u64);
+    array.storage_size_classes = snapshot.add(&cached.storage_size_classes);
+    array.storage_template = snapshot.add(&value_storage::cell_header_template()[..]);
 
-    let rope_template = rope_template(vm, snapshot);
-    let rope = RopeAllocationInfo {
-        allocator: address(heap.local_free_list_of(RopeString::CLASS)),
-        cell_size: size(size_of::<RopeString>()),
-        template: rope_template,
-        lhs_offset: offset(ROPE_STRING_LHS_OFFSET),
-        rhs_offset: offset(ROPE_STRING_RHS_OFFSET),
-        length_offset: offset(core::mem::offset_of!(PrimitiveString, length_in_utf16_code_units)),
-        min_length: ROPE_STRING_MIN_LENGTH,
-        slow_path: jit_function_address!(libjs_jit_create_rope_string),
-    };
-
-    let function = FunctionAllocationInfo {
-        allocator: address(heap.local_free_list_of(EcmascriptFunctionObject::CLASS)),
-        cell_size: size(size_of::<EcmascriptFunctionObject>()),
-        slow_path: jit_function_address!(libjs_jit_clone_function),
-    };
+    let mut rope = cached.rope;
+    rope.template = rope_template(vm, snapshot);
 
     AllocationInfos {
         object,
         array,
         rope,
-        function,
+        function: cached.function,
         cells: defer_gc.cover(vec![header_of(array_shape)]),
     }
 }
@@ -216,17 +290,26 @@ fn header_of<T: Extends<CellHeader>>(cell: Gc<T>) -> Gc<CellHeader> {
 }
 
 /// The bytes of a new rope string, with null halves.
+/// All non-null bytes of a cleared rope template (vtable/class header, cell state, rope flags) are process-constant,
+/// so we initialize them once instead of allocating two strings on every JIT compile.
 fn rope_template(vm: &Vm, snapshot: &mut SnapshotWriter) -> List<u64> {
-    let half = PrimitiveString::create_from_utf8(vm, "ropes are made of two halves");
-    let rope = PrimitiveString::create_from_concatenation(vm, half, half).must();
-    assert!(class_of(rope).is_subclass_of(RopeString::CLASS));
-    let words = cell_words(snapshot, rope, size_of::<RopeString>());
-    // NB: A snapshot that had no room for the words does not have all of them (see `Snapshot::is_complete()`).
-    if snapshot.is_complete() {
-        clear_bytes(&mut snapshot[words], ROPE_STRING_LHS_OFFSET, 4);
-        clear_bytes(&mut snapshot[words], ROPE_STRING_RHS_OFFSET, 4);
-    }
-    words
+    const ROPE_TEMPLATE_WORD_COUNT: usize = size_of::<RopeString>().div_ceil(8);
+    static ROPE_TEMPLATE_WORDS: std::sync::OnceLock<[u64; ROPE_TEMPLATE_WORD_COUNT]> = std::sync::OnceLock::new();
+    let words = ROPE_TEMPLATE_WORDS.get_or_init(|| {
+        let half = PrimitiveString::create_from_utf8(vm, "ropes are made of two halves");
+        let rope = PrimitiveString::create_from_concatenation(vm, half, half).must();
+        assert!(class_of(rope).is_subclass_of(RopeString::CLASS));
+        let mut words = [0u64; ROPE_TEMPLATE_WORD_COUNT];
+        let mut index = 0;
+        for_each_cell_word(rope, size_of::<RopeString>(), |word| {
+            words[index] = word;
+            index += 1;
+        });
+        clear_bytes(&mut words, ROPE_STRING_LHS_OFFSET, 4);
+        clear_bytes(&mut words, ROPE_STRING_RHS_OFFSET, 4);
+        words
+    });
+    snapshot.add(words)
 }
 
 /// The size class of the environments of calls with room for `binding_count` binding values in their cells, as

@@ -131,9 +131,16 @@ pub fn build_graph_with_feedback<'z>(
 /// of its slots recorded something. Instructions without feedback count as
 /// having run. Instructions that never ran are compiled as unconditional exits.
 pub fn has_run(snapshot: &Snapshot, executable: &ExecutableSnapshot, pc: u32) -> bool {
-    let Some(slots) = crate::bytecode::feedback_slots_at(&snapshot[executable.bytecode], pc) else {
+    let Some(slots) = crate::bytecode::feedback_slots_at(snapshot.bytecode(executable.bytecode), pc) else {
         return true;
     };
+    if executable.unprofiled {
+        return slots.arith.is_none()
+            && slots.value.is_none()
+            && slots.cache_value.is_none()
+            && slots.call.is_none()
+            && slots.keyed.is_none();
+    }
     let feedback = &executable.feedback;
     let slot = |slot: Option<u16>| slot.map(usize::from);
     let recorded = [
@@ -457,7 +464,7 @@ fn decoded_function<'c, 'w>(
 ) -> Result<&'c DecodedFunction<'w>, CompileFailure> {
     cache
         .get_or_init(|| {
-            let bytecode = &snapshot[executable.bytecode];
+            let bytecode = snapshot.bytecode(executable.bytecode);
             let instructions = decode_all(bytecode, work).map_err(|error| CompileFailure::InvalidBytecode {
                 pc: error.pc,
                 reason: "undecodable instruction",

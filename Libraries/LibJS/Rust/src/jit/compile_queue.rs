@@ -10,16 +10,17 @@
 
 use core::ops::Deref;
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use crate::bytecode::executable_data::ExecutableData;
 use crate::jit_compile_pool::{CompilePool, CompilePoolClient};
 use libjs_jit::CompileFailure;
 use libjs_jit::code::CompiledCode;
 use libjs_jit::scratch::Scratch;
-use libjs_jit::snapshot::{OpenLists, Snapshot};
+use libjs_jit::snapshot::Snapshot;
 
 pub type CompileResult = Result<Compiled, CompileFailure>;
 
@@ -38,17 +39,11 @@ const SPARE_SNAPSHOTS: usize = 16;
 const SPARE_CODE_BYTES: usize = 64 * 1024;
 const SPARE_TABLE_WORDS: usize = 8 * 1024;
 
-/// How many threads that capture snapshots at one time find the memory of an earlier capture for the lists they
-/// write row by row.
-const SPARE_OPEN_LISTS: usize = 2;
-
-/// The snapshots and the results that nothing uses now, and the memory that captures write with. The thread of a VM
-/// writes the input of a compile into a snapshot, and the compile thread that read it brings it back. A compile
-/// thread writes the code and the tables of a compile into a result, and the thread of the VM that asked for the
-/// compile brings it back.
+/// The snapshots and the results that nothing uses now. The thread of a VM writes the input of a compile into a
+/// snapshot, and the compile thread that read it brings it back. A compile thread writes the code and the tables of
+/// a compile into a result, and the thread of the VM that asked for the compile brings it back.
 struct Spare {
     snapshots: [Option<Box<Snapshot>>; SPARE_SNAPSHOTS],
-    open_lists: [Option<OpenLists>; SPARE_OPEN_LISTS],
     results: [Option<CompiledCode>; SPARE_RESULTS],
     /// How many compile threads had a task since they last were idle. The last of them to go idle gives the memory
     /// of the snapshots and of the results back to the system.
@@ -57,7 +52,6 @@ struct Spare {
 
 static SPARE: Mutex<Spare> = Mutex::new(Spare {
     snapshots: [const { None }; SPARE_SNAPSHOTS],
-    open_lists: [const { None }; SPARE_OPEN_LISTS],
     results: [const { None }; SPARE_RESULTS],
     active_thread_count: 0,
 });
@@ -115,12 +109,10 @@ fn note_thread_is_idle() {
         return;
     }
     let snapshots = core::mem::replace(&mut spare.snapshots, [const { None }; SPARE_SNAPSHOTS]);
-    let open_lists = core::mem::replace(&mut spare.open_lists, [const { None }; SPARE_OPEN_LISTS]);
     let results = core::mem::replace(&mut spare.results, [const { None }; SPARE_RESULTS]);
     drop(spare);
     // NB: The memory is given back here, with the lock released.
     drop(snapshots);
-    drop(open_lists);
     drop(results);
 }
 
@@ -128,24 +120,6 @@ fn note_thread_is_idle() {
 pub fn spare_snapshot() -> Box<Snapshot> {
     let snapshot = spare().snapshots.iter_mut().find_map(Option::take);
     snapshot.unwrap_or_default()
-}
-
-/// The memory for the lists that a capture writes row by row. It is the memory of an earlier capture if that is
-/// spare.
-pub fn spare_open_lists() -> OpenLists {
-    let lists = spare().open_lists.iter_mut().find_map(Option::take);
-    lists.unwrap_or_default()
-}
-
-/// Takes back the memory for the lists that a capture wrote row by row, for a later capture.
-pub fn give_back_open_lists(lists: OpenLists) {
-    let mut spare = spare();
-    // NB: With no place left, the memory goes back to the system here.
-    let Some(place) = spare.open_lists.iter_mut().find(|place| place.is_none()) else {
-        return;
-    };
-    *place = Some(lists);
-    release_spare_memory_later(spare);
 }
 
 /// Takes back a snapshot that nothing reads anymore, for a later capture.
@@ -240,9 +214,13 @@ pub struct CompileQueue {
     client: CompilePoolClient,
     result_sender: Sender<(u64, CompileResult)>,
     results: Receiver<(u64, CompileResult)>,
-    /// Set by a compile thread after it sends a result, and cleared before the results are taken. The thread that owns
-    /// the queue checks for finished jobs very often, and the flag is cheaper to check than the channel.
-    results_pending: Arc<AtomicBool>,
+    /// Incremented by a compile thread after it sends a result, and cleared before the results are taken. The thread
+    /// that owns the queue checks for finished jobs very often, and the counter is cheaper to check than the channel
+    /// and lets callers batch small installs to amortize page-protection toggles and icache invalidations.
+    finished_count: Arc<AtomicUsize>,
+    /// Bitmask of `(job_id & 63)` for jobs sent since the last drain, so a queued executable can install as soon as
+    /// its own job finishes without draining single unrelated jobs one at a time.
+    finished_job_bits: Arc<AtomicU64>,
 }
 
 impl CompileQueue {
@@ -252,39 +230,78 @@ impl CompileQueue {
             client: compile_pool(thread_count).add_client(),
             result_sender,
             results,
-            results_pending: Arc::new(AtomicBool::new(false)),
+            finished_count: Arc::new(AtomicUsize::new(0)),
+            finished_job_bits: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn submit(&self, id: u64, snapshot: Box<Snapshot>) {
+    pub fn submit(&self, id: u64, snapshot: Box<Snapshot>, bytecode_owners: Vec<Arc<ExecutableData>>) {
+        // NB: Field order ensures `snapshot` is dropped before `_bytecode_owners` even if a queued task is
+        //     cancelled when the client drops before it runs.
+        struct OwnedSnapshot {
+            snapshot: Box<Snapshot>,
+            _bytecode_owners: Vec<Arc<ExecutableData>>,
+        }
+        let owned = OwnedSnapshot {
+            snapshot,
+            _bytecode_owners: bytecode_owners,
+        };
         let result_sender = self.result_sender.clone();
-        let results_pending = Arc::clone(&self.results_pending);
+        let finished_count = Arc::clone(&self.finished_count);
+        let finished_job_bits = Arc::clone(&self.finished_job_bits);
         self.client.submit(Box::new(move || {
             note_thread_is_active();
+            let OwnedSnapshot {
+                snapshot,
+                _bytecode_owners,
+            } = owned;
             let result = compile(&snapshot);
             give_back_snapshot(snapshot);
+            drop(_bytecode_owners);
             // NB: A VM that went away has no use for the result, and the thread goes on with other VMs' jobs.
             if result_sender.send((id, result)).is_ok() {
-                results_pending.store(true, Ordering::Release);
+                finished_count.fetch_add(1, Ordering::Release);
+                finished_job_bits.fetch_or(1u64 << (id & 63), Ordering::Release);
             }
         }));
+    }
+
+    pub fn finished_count(&self) -> usize {
+        self.finished_count.load(Ordering::Relaxed)
+    }
+
+    pub fn is_job_ready(&self, job_id: u64) -> bool {
+        self.finished_job_bits.load(Ordering::Relaxed) & (1u64 << (job_id & 63)) != 0
     }
 
     /// The results of the jobs that finished since the last call, waiting for one to finish if none has. The queue must
     /// have a job.
     pub fn wait_for_finished(&self) -> Vec<(u64, CompileResult)> {
         let mut finished = vec![self.results.recv().expect("the queue keeps a sender")];
+        self.finished_job_bits.store(0, Ordering::Relaxed);
+        self.finished_count.store(0, Ordering::Relaxed);
         finished.extend(self.results.try_iter());
         finished
     }
 
-    /// The results of the jobs that finished since the last call.
-    pub fn take_finished(&self) -> Vec<(u64, CompileResult)> {
-        // NB: A result sent after the flag is cleared sets it again, so it is taken here or by the next call. The load
-        //     keeps the swap, which is a full barrier, out of the calls that find nothing.
-        if !self.results_pending.load(Ordering::Relaxed) || !self.results_pending.swap(false, Ordering::Acquire) {
+    /// The results of the jobs that finished since the last call when either at least `min_batch` results are ready
+    /// or `ready_job_id` has likely finished (matching its 64-bit bloom slot).
+    pub fn take_finished_if_ready(&self, min_batch: usize, ready_job_id: Option<u64>) -> Vec<(u64, CompileResult)> {
+        let batch_ready = self.finished_count.load(Ordering::Relaxed) >= min_batch;
+        let job_ready =
+            ready_job_id.is_some_and(|id| self.finished_job_bits.load(Ordering::Relaxed) & (1u64 << (id & 63)) != 0);
+        if !batch_ready && !job_ready {
             return Vec::new();
         }
+        // NB: Clear bits before count (the reverse of worker publication order), and drain unconditionally once
+        //     triggered so no concurrent completion can lose both its bit and its count.
+        self.finished_job_bits.swap(0, Ordering::Acquire);
+        self.finished_count.swap(0, Ordering::Acquire);
         self.results.try_iter().collect()
+    }
+
+    /// The results of the jobs that finished since the last call.
+    pub fn take_finished(&self) -> Vec<(u64, CompileResult)> {
+        self.take_finished_if_ready(1, None)
     }
 }

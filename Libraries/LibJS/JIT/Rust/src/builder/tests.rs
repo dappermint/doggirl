@@ -25,7 +25,7 @@ pub(crate) fn test_constants() -> Vec<u64> {
 pub(crate) fn add_program(snapshot: &mut Snapshot, program: &Program, layout: FrameLayout) {
     let code: &'static [u8] = Box::leak(program.bytes.clone().into_boxed_slice());
     let executable = ExecutableSnapshot {
-        bytecode: snapshot.add(code),
+        bytecode: crate::snapshot::BytecodeSlice::Inline(snapshot.add(code)),
         bytecode_address: code.as_ptr() as u64,
         layout,
         constants: snapshot.add(&test_constants()),

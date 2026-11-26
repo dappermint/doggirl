@@ -102,8 +102,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold: 400,
-            warmup: 8,
+            threshold: 160,
+            warmup: 4,
             sync: false,
             compile_threads: 0,
             callee_boost: 16,
@@ -567,7 +567,7 @@ mod tests {
             assert!(help.contains(&definition.syntax()), "{}", definition.name);
         }
         assert!(help.ends_with(
-            "In effect: LIBJS_JIT=on,threshold=50,warmup=8,compile-threads=0,callee-boost=16,inline-budget=250,inline-max-size=30,inline-depth=5,\
+            "In effect: LIBJS_JIT=on,threshold=50,warmup=4,compile-threads=0,callee-boost=16,inline-budget=250,inline-max-size=30,inline-depth=5,\
              seed=1,stress-exits=0,stress-invalidate=0\n"
         ));
     }

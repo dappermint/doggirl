@@ -17,7 +17,7 @@ use super::code::{
     CompileState, EXIT_COUNT_BEFORE_DISCARD, EXIT_COUNT_BEFORE_DISCARD_FROM_LOOP, EntryStatus, JitEntry, JitResult,
 };
 use super::translate::{self, RegisterDump};
-use super::{executable_of, frame_of, frames_above};
+use super::{executable_of, frame_of, outermost_frame_above};
 use crate::bytecode::executable::Executable;
 use crate::bytecode::feedback::tier_up_costs;
 use crate::bytecode::{instruction_at, op};
@@ -249,10 +249,7 @@ pub unsafe extern "C" fn libjs_jit_exit(
 /// The frame a call at a call site in an inlined callee of the code running `root` made, from the running frame: the
 /// one linked to `root`.
 fn call_site_callee_frame(vm: &Vm, root: NonNull<ExecutionContext>) -> NonNull<ExecutionContext> {
-    *frames_above(vm, root)
-        .expect("the frame is on the running frame's chain")
-        .last()
-        .expect("the callee frame is linked to the frame")
+    outermost_frame_above(vm, root).expect("the callee frame is linked to the frame on the running frame's chain")
 }
 
 /// Called by compiled code on the generic paths of a call at an inlined call site, which run in the frames of its

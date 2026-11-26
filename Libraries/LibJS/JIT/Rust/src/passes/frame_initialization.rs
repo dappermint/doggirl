@@ -131,7 +131,13 @@ fn need(node: &Node, layout: &FrameLayout) -> Need {
         //     compiled function's frame, and only observe its slots through
         //     those frames, whose full translation initializes it.
         Op::CallSlowPath { .. } => Need::Published,
-        Op::CallDirect { executable, .. } | Op::CallNative { executable, .. } if *executable != 0 => Need::Published,
+        Op::CallDirect { executable, .. }
+        | Op::CallNative { executable, .. }
+        | Op::CallNativeAccessor { executable, .. }
+            if *executable != 0 =>
+        {
+            Need::Published
+        }
         // NB: The helpers only look at their arguments.
         Op::ToBoolean | Op::CallFloat64Function { .. } => Need::Nothing,
         // NB: The generator resumes in the frame, where the interpreter

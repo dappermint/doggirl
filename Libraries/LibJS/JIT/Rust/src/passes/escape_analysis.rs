@@ -73,20 +73,74 @@ type Shapes<'w> = ZoneMap<'w, NodeId, (CellId, u32)>;
 /// The analysis of one graph.
 struct Analysis<'w> {
     /// The allocations that may be replaced.
-    candidates: ZoneSet<'w, NodeId>,
+    candidates: ZoneBitSet<'w>,
     /// The candidates that are closures.
-    closures: ZoneSet<'w, NodeId>,
+    closures: ZoneBitSet<'w>,
     /// For every value that is a candidate or stands for one (a candidate
     /// with empty values made undefined, or its cell address): the candidate.
-    roots: ZoneMap<'w, NodeId, NodeId>,
+    roots: ZoneVec<'w, Option<NodeId>>,
     escaped: ZoneBitSet<'w>,
     /// Whether an object that does not escape is stored into another one.
     has_nested_objects: bool,
 }
 
 impl Analysis<'_> {
+    #[inline]
     fn root(&self, value: NodeId) -> Option<NodeId> {
-        self.roots.get(&value).copied()
+        self.roots.get(value.index()).copied().flatten()
+    }
+}
+
+/// Candidate roots referenced by each frame state (including its parent chain), cached lazily so repeated
+/// visits to the same frame state across nodes do not re-walk its chain.
+struct FrameStateCandidateRoots<'w> {
+    runs: ZoneVec<'w, (u32, u32)>,
+    roots: ZoneVec<'w, NodeId>,
+}
+
+const UNCOMPUTED_FRAME_RUN: (u32, u32) = (u32::MAX, 0);
+
+impl<'w> FrameStateCandidateRoots<'w> {
+    fn new_in(frame_state_count: usize, work: &'w Zone) -> Self {
+        Self {
+            runs: ZoneVec::from_elem_in(UNCOMPUTED_FRAME_RUN, frame_state_count, work),
+            roots: ZoneVec::new_in(work),
+        }
+    }
+
+    fn roots_of(&mut self, graph: &Graph, frame_state: FrameStateId, roots: &[Option<NodeId>]) -> &[NodeId] {
+        let index = frame_state.index();
+        if self.runs[index] == UNCOMPUTED_FRAME_RUN {
+            self.compute(graph, frame_state, roots);
+        }
+        let (start, end) = self.runs[index];
+        &self.roots[start as usize..end as usize]
+    }
+
+    fn compute(&mut self, graph: &Graph, frame_state: FrameStateId, roots: &[Option<NodeId>]) {
+        let state = graph.frame_state(frame_state);
+        let parent_range = state.parent.map(|parent| {
+            let parent_index = parent.index();
+            if self.runs[parent_index] == UNCOMPUTED_FRAME_RUN {
+                self.compute(graph, parent, roots);
+            }
+            self.runs[parent_index]
+        });
+        let start = self.roots.len();
+        if let Some((parent_start, parent_end)) = parent_range {
+            for index in parent_start as usize..parent_end as usize {
+                let root = self.roots[index];
+                self.roots.push(root);
+            }
+        }
+        for &(_, value) in &state.values {
+            if let Some(root) = roots[value.index()]
+                && !self.roots[start..].contains(&root)
+            {
+                self.roots.push(root);
+            }
+        }
+        self.runs[frame_state.index()] = (start as u32, self.roots.len() as u32);
     }
 }
 
@@ -95,21 +149,22 @@ fn placed_nodes<'w>(graph: &Graph, work: &'w Zone) -> ZoneVec<'w, NodeId> {
 }
 
 fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[NodeId]) -> Analysis<'w> {
-    let mut candidates = ZoneSet::new_in(work);
-    let mut closures = ZoneSet::new_in(work);
-    let mut roots = ZoneMap::new_in(work);
-    for node in placed {
-        match graph.node(*node).op {
+    let node_count = graph.nodes.len();
+    let mut candidates = ZoneBitSet::new_in(node_count, work);
+    let mut closures = ZoneBitSet::new_in(node_count, work);
+    let mut roots = ZoneVec::from_elem_in(None, node_count, work);
+    for &node in placed {
+        match graph.node(node).op {
             Op::AllocateObject { .. } => {}
             Op::AllocateFunction { .. } => {
-                closures.insert(*node);
+                closures.insert(node.index());
             }
             _ => continue,
         }
-        candidates.insert(*node);
-        roots.insert(*node, *node);
+        candidates.insert(node.index());
+        roots[node.index()] = Some(node);
     }
-    let mut escaped = ZoneBitSet::new_in(graph.nodes.len(), work);
+    let mut escaped = ZoneBitSet::new_in(node_count, work);
     for object in escaping {
         escaped.insert(object.index());
     }
@@ -128,15 +183,18 @@ fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[Nod
     let mut changed = true;
     while changed {
         changed = false;
-        for node in placed {
-            let data = graph.node(*node);
-            let stands_for_input = matches!(data.op, Op::EmptyToUndefined | Op::CellAddress)
-                || data.op.refined_input() == Some(0) && data.repr.is_some();
-            if !stands_for_input || roots.contains_key(node) {
+        for &node in placed {
+            if roots[node.index()].is_some() {
                 continue;
             }
-            if let Some(root) = roots.get(&data.inputs[0]).copied() {
-                roots.insert(*node, root);
+            let data = graph.node(node);
+            let stands_for_input = matches!(data.op, Op::EmptyToUndefined | Op::CellAddress)
+                || data.op.refined_input() == Some(0) && data.repr.is_some();
+            if !stands_for_input {
+                continue;
+            }
+            if let Some(root) = roots[data.inputs[0].index()] {
+                roots[node.index()] = Some(root);
                 changed = true;
             }
         }
@@ -167,61 +225,66 @@ fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[Nod
             !guarded.contains(node) || read_before.contains(&(frame_state.executable, frame_state.pc))
         };
         for value in graph.legacy_argument_values_read_by(*node, allocated_in) {
-            if let Some(root) = roots.get(&value) {
+            if let Some(root) = roots[value.index()] {
                 escaped.insert(root.index());
             }
         }
     }
 
-    let shapes_before = shapes_before_uses(graph, work, &candidates, &roots, &mut escaped);
+    let mut frame_roots = FrameStateCandidateRoots::new_in(graph.frame_states.len(), work);
+    let shapes_before = shapes_before_uses(graph, work, &candidates, &roots, &mut frame_roots, &mut escaped);
 
     // NB: Only closures escape from frame states.
-    for node in placed.iter().filter(|_| !closures.is_empty()) {
-        let data = graph.node(*node);
-        let Some(frame_state) = data.frame_state else {
-            continue;
-        };
-        let is_published = graph.frame_state(frame_state).parent.is_some() && lowering_info(data).publishes_frames;
-        let is_call_without_frames = matches!(
-            data.op,
-            Op::CallDirect { inlined_frame_bytes, .. } | Op::CallNative { inlined_frame_bytes, .. }
-                if inlined_frame_bytes != 0
-        );
-        if !is_published && !is_call_without_frames {
-            continue;
-        }
-        for value in frame_state_values(graph, frame_state) {
-            let Some(root) = roots.get(&value).copied().filter(|root| closures.contains(root)) else {
+    if !closures.is_empty() {
+        for &node in placed {
+            let data = graph.node(node);
+            let Some(frame_state) = data.frame_state else {
                 continue;
             };
-            let legacy_caller = matches!(
-                graph.node(root).op,
-                Op::AllocateFunction {
-                    legacy_caller: true,
-                    ..
-                }
+            let is_published = graph.frame_state(frame_state).parent.is_some() && lowering_info(data).publishes_frames;
+            let is_call_without_frames = matches!(
+                data.op,
+                Op::CallDirect { inlined_frame_bytes, .. }
+                    | Op::CallNative { inlined_frame_bytes, .. }
+                    | Op::CallNativeAccessor { inlined_frame_bytes, .. }
+                    if inlined_frame_bytes != 0
             );
-            if is_published || legacy_caller {
-                escaped.insert(root.index());
+            if !is_published && !is_call_without_frames {
+                continue;
+            }
+            for &root in frame_roots.roots_of(graph, frame_state, &roots) {
+                if !closures.contains(root.index()) {
+                    continue;
+                }
+                let legacy_caller = matches!(
+                    graph.node(root).op,
+                    Op::AllocateFunction {
+                        legacy_caller: true,
+                        ..
+                    }
+                );
+                if is_published || legacy_caller {
+                    escaped.insert(root.index());
+                }
             }
         }
     }
 
     // Values stored into candidates: (value's candidate, the candidate it is stored into).
     let mut stored_into = ZoneVec::new_in(work);
-    for node in placed {
-        let data = graph.node(*node);
+    for &node in placed {
+        let data = graph.node(node);
         for (index, input) in data.inputs.iter().enumerate() {
-            let Some(root) = roots.get(input).copied() else {
+            let Some(root) = roots[input.index()] else {
                 continue;
             };
             // NB: Every use of a candidate is where it has a known shape.
-            let Some((shape, count)) = shapes_before.get(&(*node, root)).copied() else {
+            let Some((shape, count)) = shapes_before.get(&(node, root)).copied() else {
                 escaped.insert(root.index());
                 continue;
             };
             // NB: Closures have no properties that this pass knows.
-            if closures.contains(&root) {
+            if closures.contains(root.index()) {
                 if !matches!(data.op, Op::EmptyToUndefined | Op::CellAddress | Op::CheckObject) {
                     escaped.insert(root.index());
                 }
@@ -236,7 +299,7 @@ fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[Nod
                 Op::InitializeNamed { offset } | Op::StoreNamed { offset, .. } if index != 1 => *offset < count,
                 Op::AddNamed { offset, .. } if index != 1 => *offset == count,
                 Op::InitializeNamed { offset } | Op::StoreNamed { offset, .. } | Op::AddNamed { offset, .. } => {
-                    stored_into.push((root, roots.get(&data.inputs[0]).copied(), *offset));
+                    stored_into.push((root, roots[data.inputs[0].index()], *offset));
                     true
                 }
                 _ => false,
@@ -248,10 +311,8 @@ fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[Nod
         // A frame state that refers to a candidate describes it as a virtual object with the shape it has there,
         // so it escapes where that shape isn't known: at a loop header that only a back edge reaches, e.g.
         if let Some(frame_state) = data.frame_state {
-            for value in frame_state_values(graph, frame_state) {
-                if let Some(root) = roots.get(&value).copied()
-                    && !shapes_before.contains_key(&(*node, root))
-                {
+            for &root in frame_roots.roots_of(graph, frame_state, &roots) {
+                if !shapes_before.contains_key(&(node, root)) {
                     escaped.insert(root.index());
                 }
             }
@@ -259,8 +320,8 @@ fn analyze<'w>(graph: &Graph, work: &'w Zone, placed: &[NodeId], escaping: &[Nod
     }
     // Loads of properties of candidates, as (candidate, offset).
     let loaded = ZoneVec::from_iter_in(
-        placed.iter().filter_map(|node| match graph.node(*node).op {
-            Op::LoadNamed { offset, .. } => roots.get(&graph.node(*node).inputs[0]).map(|root| (*root, offset)),
+        placed.iter().filter_map(|&node| match graph.node(node).op {
+            Op::LoadNamed { offset, .. } => roots[graph.node(node).inputs[0].index()].map(|root| (root, offset)),
             _ => None,
         }),
         work,
@@ -335,8 +396,9 @@ fn merge_shapes<'a, 'w: 'a>(
 fn shapes_before_uses<'w>(
     graph: &Graph,
     work: &'w Zone,
-    candidates: &ZoneSet<NodeId>,
-    roots: &ZoneMap<NodeId, NodeId>,
+    candidates: &ZoneBitSet,
+    roots: &[Option<NodeId>],
+    frame_roots: &mut FrameStateCandidateRoots<'w>,
     escaped: &mut ZoneBitSet,
 ) -> ZoneMap<'w, (NodeId, NodeId), (CellId, u32)> {
     let mut before = ZoneMap::new_in(work);
@@ -353,32 +415,37 @@ fn shapes_before_uses<'w>(
         entries[index] = shapes.clone();
         for node in block.nodes() {
             let data = graph.node(node);
-            let referred = data
-                .frame_state
-                .into_iter()
-                .flat_map(|frame_state| frame_state_values(graph, frame_state));
-            for value in data.inputs.iter().copied().chain(referred) {
-                if let Some(root) = roots.get(&value)
-                    && let Some(shape) = shapes.get(root)
-                {
-                    before.insert((node, *root), *shape);
+            if !shapes.is_empty() {
+                for &input in &data.inputs {
+                    if let Some(root) = roots[input.index()]
+                        && let Some(shape) = shapes.get(&root)
+                    {
+                        before.insert((node, root), *shape);
+                    }
+                }
+                if let Some(frame_state) = data.frame_state {
+                    for &root in frame_roots.roots_of(graph, frame_state, roots) {
+                        if let Some(shape) = shapes.get(&root) {
+                            before.insert((node, root), *shape);
+                        }
+                    }
                 }
             }
             match data.op {
                 Op::AllocateObject {
                     shape, property_count, ..
-                } if candidates.contains(&node) => {
+                } if candidates.contains(node.index()) => {
                     shapes.insert(node, (shape, property_count));
                 }
                 // NB: A closure has one shape, and no properties that this pass knows.
-                Op::AllocateFunction { sample_slot, .. } if candidates.contains(&node) => {
+                Op::AllocateFunction { sample_slot, .. } if candidates.contains(node.index()) => {
                     shapes.insert(node, (sample_slot, 0));
                 }
                 Op::AddNamed {
                     shape, property_count, ..
                 } => {
-                    if let Some(root) = roots.get(&data.inputs[0]) {
-                        shapes.insert(*root, (shape, property_count));
+                    if let Some(root) = roots[data.inputs[0].index()] {
+                        shapes.insert(root, (shape, property_count));
                     }
                 }
                 _ => {}
@@ -405,60 +472,73 @@ fn shapes_before_uses<'w>(
     before
 }
 
-/// The values the frame states in the chain `frame_state` starts refer to.
-fn frame_state_values<'g>(graph: &'g Graph, frame_state: FrameStateId) -> impl Iterator<Item = NodeId> + 'g {
-    graph
-        .frame_state_chain(frame_state)
-        .flat_map(|id| graph.frame_state(id).values.iter().map(|(_, value)| *value))
-}
-
 /// The value of each property of each replaced object at one point.
 type Properties<'w> = ZoneMap<'w, (NodeId, u32), NodeId>;
 
-pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
-    let [step, _] = steps;
-    let placed = placed_nodes(graph, work);
-    let mut escaping = ZoneVec::new_in(work);
-    loop {
-        // NB: Each trial makes an analysis and a copy of the graph, which go when it ends.
-        let done = step.scope(|step| {
-            let analysis = analyze(graph, step, &placed, &escaping);
-            // NB: Only objects stored into others can be values of phis of
-            //     properties.
-            if !analysis.has_nested_objects {
-                replace_objects(graph, &analysis, step)
-                    .expect("objects not stored into others merge in no phi of properties");
-                return true;
-            }
-            // NB: A trial leaves the graph half edited where it fails, so it edits a copy, and the graph gets the
-            //     same edits where it works.
-            let mut copy = graph.clone_in(step);
-            match replace_objects(&mut copy, &analysis, step) {
-                Ok(()) => {
-                    replace_objects(graph, &analysis, step).expect("the edits of a copy of the graph worked");
-                    true
+/// Returns whether the graph was modified.
+pub fn run_checked(graph: &mut Graph, work: &Zone, step: &mut Zone) -> bool {
+    let has_allocations = graph.blocks.iter().any(|block| {
+        block.body.iter().any(|node| {
+            matches!(
+                graph.node(*node).op,
+                Op::AllocateObject { .. } | Op::AllocateFunction { .. }
+            )
+        })
+    });
+    let mut changed = false;
+    if has_allocations {
+        let placed = placed_nodes(graph, work);
+        let mut escaping = ZoneVec::new_in(work);
+        loop {
+            // NB: Each trial makes an analysis and a copy of the graph, which go when it ends.
+            let done = step.scope(|step| {
+                let analysis = analyze(graph, step, &placed, &escaping);
+                // NB: Only objects stored into others can be values of phis of
+                //     properties.
+                if !analysis.has_nested_objects {
+                    changed |= replace_objects(graph, &analysis, step)
+                        .expect("objects not stored into others merge in no phi of properties");
+                    return true;
                 }
-                Err(objects) => {
-                    escaping.extend_from_slice(objects);
-                    false
+                // NB: A trial leaves the graph half edited where it fails, so it edits a copy, and the graph gets the
+                //     same edits where it works.
+                let mut copy = graph.clone_in(step);
+                match replace_objects(&mut copy, &analysis, step) {
+                    Ok(replaced) => {
+                        if replaced {
+                            replace_objects(graph, &analysis, step).expect("the edits of a copy of the graph worked");
+                            changed = true;
+                        }
+                        true
+                    }
+                    Err(objects) => {
+                        escaping.extend_from_slice(objects);
+                        false
+                    }
                 }
+            });
+            if done {
+                break;
             }
-        });
-        if done {
-            break;
         }
     }
-    resolve_legacy_arguments_guards(graph, work);
+    changed |= resolve_legacy_arguments_guards(graph, work);
+    changed
 }
 
 /// Makes the `AssumeLegacyArgumentsUnread` nodes after nodes whose code may
 /// read objects the code never allocated through legacy `arguments` (see
 /// `Graph::defers_legacy_argument_objects()`) `AssumeValid` nodes, and
 /// removes the others.
-fn resolve_legacy_arguments_guards(graph: &mut Graph, work: &Zone) {
+fn resolve_legacy_arguments_guards(graph: &mut Graph, work: &Zone) -> bool {
+    if graph.legacy_arguments_guards.is_empty() {
+        return false;
+    }
     let mut placed = ZoneBitSet::new_in(graph.nodes.len(), work);
-    for node in placed_nodes(graph, work) {
-        placed.insert(node.index());
+    for block in &graph.blocks {
+        for node in block.nodes() {
+            placed.insert(node.index());
+        }
     }
     let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
     for (guard, nodes) in graph.legacy_arguments_guards.take() {
@@ -472,6 +552,7 @@ fn resolve_legacy_arguments_guards(graph: &mut Graph, work: &Zone) {
         }
     }
     edit::remove_nodes(graph, &removed);
+    true
 }
 
 /// Lists that `virtualize_frame_state()` uses for each frame state, which it
@@ -489,13 +570,13 @@ struct Scratch<'w> {
 /// Replaces the objects of `analysis` that do not escape. Fails with the
 /// replaced objects that would be the values of phis of properties where
 /// paths merge, which must escape instead, leaving `graph` half edited.
-fn replace_objects<'w>(graph: &mut Graph, analysis: &Analysis, work: &'w Zone) -> Result<(), &'w [NodeId]> {
+fn replace_objects<'w>(graph: &mut Graph, analysis: &Analysis, work: &'w Zone) -> Result<bool, &'w [NodeId]> {
     if analysis
         .candidates
         .iter()
-        .all(|candidate| analysis.escaped.contains(candidate.index()))
+        .all(|candidate| analysis.escaped.contains(candidate))
     {
-        return Ok(());
+        return Ok(false);
     }
     let is_replaced = |value: NodeId| {
         analysis
@@ -705,7 +786,7 @@ fn replace_objects<'w>(graph: &mut Graph, analysis: &Analysis, work: &'w Zone) -
     replacements.apply(graph);
     edit::remove_nodes(graph, &removed);
     edit::remove_trivial_phis(graph, work);
-    Ok(())
+    Ok(true)
 }
 
 /// A copy of the frame state chain `frame_state` with the objects that were
@@ -750,7 +831,7 @@ fn virtualize_frame_state(
             return *object;
         }
         let (shape, _) = *shapes.get(&root).expect("replaced objects have shapes");
-        let kind = if analysis.closures.contains(&root) {
+        let kind = if analysis.closures.contains(root.index()) {
             VirtualObjectKind::Closure { sample_slot: shape }
         } else {
             VirtualObjectKind::Object { shape }
@@ -786,7 +867,7 @@ fn virtualize_frame_state(
         filled.push(object);
         inputs.clear();
         // NB: The environments of a closure are what its allocation had.
-        if analysis.closures.contains(&root) {
+        if analysis.closures.contains(root.index()) {
             inputs.extend(graph.node(root).inputs.iter().map(|input| replacements.resolve(*input)));
             graph.nodes[object.index()].inputs.assign(inputs);
             continue;

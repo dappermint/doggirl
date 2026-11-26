@@ -886,6 +886,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             }
             | Op::CallNative {
                 inlined_frame_bytes, ..
+            }
+            | Op::CallNativeAccessor {
+                inlined_frame_bytes, ..
             } if inlined_frame_bytes != 0 => inlined_frame_bytes,
             _ => return None,
         };
@@ -1255,12 +1258,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     pub(super) fn emit_call_native_accessor(
         &mut self,
         node: NodeId,
+        executable: u32,
         pc: u32,
         part: AccessorPart,
         target: NativeCallTarget,
     ) -> Result<(), CompileFailure> {
         let invalid = |reason| CompileFailure::InvalidBytecode { pc, reason };
-        let decoded = self.decoded(0, pc)?;
+        let decoded = self.decoded(executable, pc)?;
         let next_pc = decoded.next_pc();
         let (dst, argument) = match (part, decoded.instruction) {
             (AccessorPart::Getter, Instruction::GetById { dst, .. } | Instruction::GetLength { dst, .. }) => {
@@ -1273,6 +1277,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         };
         let this_operand = CallOperand::Register(self.input(node, 0));
         let temps = [self.temp(node, 0), self.temp(node, 1), self.temp(node, 2)];
+        let site = self.inlined_call_site(node);
         let check = self.masm.new_label();
         let done = self.masm.new_label();
 
@@ -1280,9 +1285,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             self.emit_direct_getter_load(self.input(node, 0), fields, temps, done);
         }
 
-        // Stack traces show the caller at its access.
+        // Stack traces show the caller at its access (or the outer inlined call).
         let program_counter = self.frame_field(self.runtime.offsets.execution_context_program_counter);
-        self.masm.store_imm32(&program_counter, pc);
+        self.masm
+            .store_imm32(&program_counter, site.as_ref().map_or(pc, |site| site.outer_pc));
 
         // NB: The result stays in the return register. Needs no native stack
         //     check: the prologue made the same check, with the stack pointer
@@ -1293,7 +1299,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             argument.as_slice(),
             next_pc,
             None,
-            None,
+            site.as_ref(),
             temps,
             None,
             [check, done],
@@ -1303,7 +1309,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         //     if the frame does, where the getter's destination has its value.
         self.masm.bind(check);
         self.emit_continuation_check(next_pc, &[]);
-        if let Some(dst) = dst {
+        if let Some(site) = &site {
+            self.masm.load64(
+                self.pinned.frame,
+                &Address::new(self.pinned.vm, self.runtime.offsets.vm_running_execution_context as i32),
+            );
+            if let Some(dst) = dst {
+                let destination = self.slot_address(dst.raw())?;
+                self.masm.load64(M::RETURN_GPRS[0], &destination);
+            } else {
+                self.masm.move_imm64(M::RETURN_GPRS[0], value::UNDEFINED);
+            }
+            for _ in 0..site.depth {
+                self.emit_pop_inline_frame();
+            }
+        } else if let Some(dst) = dst {
             let address = self.slot_address(dst.raw())?;
             self.masm.load64(M::RETURN_GPRS[0], &address);
         } else {

@@ -48,6 +48,9 @@ pub fn run(graph: &mut Graph, work: &Zone) {
             }
         }
     }
+    if pending.is_empty() {
+        return;
+    }
     let mut loop_phis = ZoneBitSet::new_in(graph.nodes.len(), work);
     for block in graph.blocks.iter().filter(|block| block.is_loop_header) {
         for phi in &block.phis {

@@ -32,13 +32,15 @@ pub struct Dominators<'w> {
     children: Lists<'w, BlockId>,
     /// The reachable blocks in reverse postorder.
     order: ZoneVec<'w, BlockId>,
-    /// The place of each reachable block in `order`, plus one.
+    /// The place of each reachable block in `order`, plus one (0 if unreachable).
     ranks: ZoneVec<'w, u32>,
-    /// Whether each block has an immediate dominator or the virtual root above every entry as its dominator so far.
-    processed: ZoneVec<'w, bool>,
+    /// Immediate dominator indexed by RPO rank (0 = virtual root, 1..=order.len() = RPO rank, u32::MAX = unprocessed).
+    idom_rpo: ZoneVec<'w, u32>,
     /// The blocks that a walk still has to enter or leave, and whether it is to leave them.
     pending: ZoneVec<'w, (BlockId, bool)>,
 }
+
+const UNPROCESSED_RPO: u32 = u32::MAX;
 
 impl<'w> Dominators<'w> {
     /// The most blocks a graph has whose dominators a compile computes. A compile whose graph has more fails (see
@@ -54,7 +56,7 @@ impl<'w> Dominators<'w> {
             children: Lists::new_in(work),
             order: ZoneVec::new_in(work),
             ranks: ZoneVec::new_in(work),
-            processed: ZoneVec::new_in(work),
+            idom_rpo: ZoneVec::new_in(work),
             pending: ZoneVec::new_in(work),
         }
     }
@@ -76,10 +78,7 @@ impl<'w> Dominators<'w> {
         self.order.clear();
         self.order.reserve(count);
         self.pending.clear();
-        // NB: A block waits to be left one time, and to be entered one time for each edge into it and for each entry
-        //     it is.
-        let edges = graph.blocks.iter().map(|block| block.predecessors.len()).sum::<usize>();
-        self.pending.reserve(count + edges + graph.entries().count());
+        self.pending.reserve(count * 2 + graph.osr_entries.len() + 1);
         for entry in graph.entries() {
             self.pending.push((entry, false));
         }
@@ -93,49 +92,102 @@ impl<'w> Dominators<'w> {
             }
             self.reachable[block.index()] = true;
             self.pending.push((block, true));
+            let reachable = &self.reachable;
+            let pending = &mut self.pending;
             graph.control(block).op.for_each_successor(|successor| {
-                self.pending.push((successor, false));
+                if !reachable[successor.index()] {
+                    pending.push((successor, false));
+                }
             });
         }
         self.order.reverse();
-        // NB: Rank zero is the virtual root. Walking to an immediate
-        //     dominator decreases the rank, avoiding ancestor-depth scans.
+        let rpo_len = self.order.len();
+        // NB: Rank zero is the virtual root. Storing idom indexed by RPO rank lets intersection walk
+        //     without indirection through `ranks`.
         self.ranks.clear();
         self.ranks.resize(count, 0);
         for (index, block) in self.order.iter().enumerate() {
             self.ranks[block.index()] = index as u32 + 1;
         }
 
-        // NB: `None` with `processed` set means "dominated by the virtual root".
-        self.idom.clear();
-        self.idom.resize(count, None);
-        self.processed.clear();
-        self.processed.resize(count, false);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for block in self.order.iter().map(|block| block.index()) {
-                let predecessors = &graph.blocks[block].predecessors;
-                let new_idom = if predecessors.is_empty() {
-                    None
-                } else {
-                    let mut candidates = predecessors
-                        .iter()
-                        .filter(|predecessor| self.processed[predecessor.index()]);
-                    let Some(first) = candidates.next() else {
+        self.idom_rpo.clear();
+        self.idom_rpo.resize(rpo_len + 1, UNPROCESSED_RPO);
+        self.idom_rpo[0] = 0;
+
+        // First pass: if there are no reachable back edges, every predecessor is already finalized and
+        // no second verification pass is needed.
+        let compute_idom =
+            |predecessors: &[BlockId], rpo: u32, ranks: &[u32], idom_rpo: &[u32], has_back_edge: &mut bool| {
+                match predecessors {
+                    [] => Some(0),
+                    [pred] => {
+                        let pred_rpo = ranks[pred.index()];
+                        if pred_rpo >= rpo {
+                            *has_back_edge = true;
+                        }
+                        if pred_rpo == 0 || idom_rpo[pred_rpo as usize] == UNPROCESSED_RPO {
+                            None
+                        } else {
+                            Some(pred_rpo)
+                        }
+                    }
+                    preds => {
+                        let mut new_idom = UNPROCESSED_RPO;
+                        for &pred in preds {
+                            let pred_rpo = ranks[pred.index()];
+                            if pred_rpo >= rpo {
+                                *has_back_edge = true;
+                            }
+                            if pred_rpo == 0 || idom_rpo[pred_rpo as usize] == UNPROCESSED_RPO {
+                                continue;
+                            }
+                            new_idom = if new_idom == UNPROCESSED_RPO {
+                                pred_rpo
+                            } else {
+                                intersect_rpo(idom_rpo, new_idom, pred_rpo)
+                            };
+                        }
+                        (new_idom != UNPROCESSED_RPO).then_some(new_idom)
+                    }
+                }
+            };
+
+        let mut has_back_edge = false;
+        for (index, &block_id) in self.order.iter().enumerate() {
+            let rpo = index as u32 + 1;
+            let predecessors = &graph.blocks[block_id.index()].predecessors;
+            if let Some(new_idom) = compute_idom(predecessors, rpo, &self.ranks, &self.idom_rpo, &mut has_back_edge) {
+                self.idom_rpo[rpo as usize] = new_idom;
+            }
+        }
+
+        if has_back_edge {
+            let mut changed = true;
+            let mut ignored_back_edge = false;
+            while changed {
+                changed = false;
+                for (index, &block_id) in self.order.iter().enumerate() {
+                    let rpo = index as u32 + 1;
+                    let predecessors = &graph.blocks[block_id.index()].predecessors;
+                    let Some(new_idom) =
+                        compute_idom(predecessors, rpo, &self.ranks, &self.idom_rpo, &mut ignored_back_edge)
+                    else {
                         continue;
                     };
-                    let mut new_idom = Some(*first);
-                    for predecessor in candidates {
-                        new_idom = intersect(&self.idom, &self.ranks, new_idom, Some(*predecessor));
+                    if self.idom_rpo[rpo as usize] != new_idom {
+                        self.idom_rpo[rpo as usize] = new_idom;
+                        changed = true;
                     }
-                    new_idom
-                };
-                if !self.processed[block] || self.idom[block] != new_idom {
-                    self.processed[block] = true;
-                    self.idom[block] = new_idom;
-                    changed = true;
                 }
+            }
+        }
+
+        self.idom.clear();
+        self.idom.resize(count, None);
+        for (index, &block_id) in self.order.iter().enumerate() {
+            let parent_rpo = self.idom_rpo[index + 1];
+            if parent_rpo != 0 && parent_rpo != UNPROCESSED_RPO {
+                self.idom[block_id.index()] = Some(self.order[parent_rpo as usize - 1]);
             }
         }
         self.compute_children();
@@ -265,20 +317,48 @@ impl<'w> Dominators<'w> {
     }
 }
 
-/// The nearest common dominator of two blocks, `None` standing for the
-/// virtual root above every entry.
-fn intersect(
-    idom: &[Option<BlockId>],
-    ranks: &[u32],
-    mut a: Option<BlockId>,
-    mut b: Option<BlockId>,
-) -> Option<BlockId> {
-    let rank = |block: Option<BlockId>| block.map_or(0, |block| ranks[block.index()]);
+/// Lazily computed `Dominators` shared across consecutive CFG-preserving passes.
+pub struct CachedDominators<'w> {
+    dominators: Dominators<'w>,
+    valid: bool,
+}
+
+impl<'w> CachedDominators<'w> {
+    pub fn new_in(work: &'w Zone) -> Self {
+        Self {
+            dominators: Dominators::new_in(work),
+            valid: false,
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    pub fn get_or_compute(&mut self, graph: &Graph) -> &Dominators<'w> {
+        if !self.valid {
+            self.dominators.compute(graph);
+            self.valid = true;
+        }
+        &self.dominators
+    }
+
+    pub fn recompute(&mut self, graph: &Graph) -> &Dominators<'w> {
+        self.dominators.compute(graph);
+        self.valid = true;
+        &self.dominators
+    }
+}
+
+/// The nearest common dominator of two RPO ranks, 0 standing for the virtual root above every entry.
+#[inline(always)]
+fn intersect_rpo(idom_rpo: &[u32], mut a: u32, mut b: u32) -> u32 {
     while a != b {
-        if rank(a) > rank(b) {
-            a = a.and_then(|block| idom[block.index()]);
-        } else {
-            b = b.and_then(|block| idom[block.index()]);
+        while a > b {
+            a = idom_rpo[a as usize];
+        }
+        while b > a {
+            b = idom_rpo[b as usize];
         }
     }
     a

@@ -9,7 +9,7 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::ops::ControlFlow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ak::Zone;
 use libjs_jit::artifact::{Artifact, FrameView, Layout, Patch, SiteView};
@@ -496,29 +496,67 @@ fn split_function_cells(
     mut embedded_cells: Vec<Gc<CellHeader>>,
     _defer_gc: &DeferGc<'_>,
 ) -> (Vec<Gc<CellHeader>>, FunctionCells) {
-    let embedded: HashSet<usize> = embedded_cells.iter().map(|cell| cell.as_ptr().addr()).collect();
-    let mut function_cells = Vec::new();
-    for function in embedded_cells
+    if !embedded_cells
         .iter()
-        .filter_map(|cell| cell.downcast::<EcmascriptFunctionObject>())
+        .any(|cell| cell.downcast::<EcmascriptFunctionObject>().is_some())
     {
-        // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
-        //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
-        let environment = function.environment().map(Gc::upcast);
+        return (embedded_cells, Vec::new());
+    }
+    if embedded_cells.len() <= 32 {
+        let mut function_cells = Vec::new();
+        for &cell in &embedded_cells {
+            let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
+                continue;
+            };
+            // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
+            //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
+            if let Some(environment) = function.environment().map(Gc::upcast) {
+                function_cells.push((function.upcast(), environment));
+            }
+            let shared_data = function.shared_data();
+            let shared_cell = shared_data.upcast::<CellHeader>();
+            if embedded_cells.iter().any(|c| c.as_ptr() == shared_cell.as_ptr()) {
+                function_cells.push((function.upcast(), shared_cell));
+            }
+            if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>)
+                && embedded_cells.iter().any(|c| c.as_ptr() == exec_cell.as_ptr())
+            {
+                function_cells.push((function.upcast(), exec_cell));
+            }
+        }
+        if !function_cells.is_empty() {
+            embedded_cells.retain(|cell| !function_cells.iter().any(|&(_, owned)| owned.as_ptr() == cell.as_ptr()));
+        }
+        return (embedded_cells, function_cells);
+    }
+    let mut embedded_addrs: Vec<usize> = embedded_cells.iter().map(|cell| cell.as_ptr().addr()).collect();
+    embedded_addrs.sort_unstable();
+    embedded_addrs.dedup();
+    let mut function_cells = Vec::new();
+    for &cell in &embedded_cells {
+        let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
+            continue;
+        };
+        if let Some(environment) = function.environment().map(Gc::upcast::<CellHeader>) {
+            function_cells.push((function.upcast(), environment));
+        }
         let shared_data = function.shared_data();
-        let embedded_code = [
-            Some(shared_data.upcast::<CellHeader>()),
-            shared_data.executable().map(Gc::upcast),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|cell| embedded.contains(&cell.as_ptr().addr()));
-        for cell in environment.into_iter().chain(embedded_code) {
-            function_cells.push((function.upcast(), cell));
+        let shared_cell = shared_data.upcast::<CellHeader>();
+        if embedded_addrs.binary_search(&shared_cell.as_ptr().addr()).is_ok() {
+            function_cells.push((function.upcast(), shared_cell));
+        }
+        if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>)
+            && embedded_addrs.binary_search(&exec_cell.as_ptr().addr()).is_ok()
+        {
+            function_cells.push((function.upcast(), exec_cell));
         }
     }
-    let function_owned: HashSet<usize> = function_cells.iter().map(|&(_, cell)| cell.as_ptr().addr()).collect();
-    embedded_cells.retain(|cell| !function_owned.contains(&cell.as_ptr().addr()));
+    if !function_cells.is_empty() {
+        let mut owned_addrs: Vec<usize> = function_cells.iter().map(|&(_, cell)| cell.as_ptr().addr()).collect();
+        owned_addrs.sort_unstable();
+        owned_addrs.dedup();
+        embedded_cells.retain(|cell| owned_addrs.binary_search(&cell.as_ptr().addr()).is_err());
+    }
     (embedded_cells, function_cells)
 }
 
@@ -619,6 +657,10 @@ pub struct ExecutableJitState {
     /// The loads and stores of bindings of the environments of the executable's closure (see `jit::snapshot`). The
     /// bytecode never changes, so snapshots find them once.
     pub(crate) captured_binding_accesses: OnceCell<CapturedBindingAccesses>,
+    /// The `CompileQueue` job id currently queued for this executable, used to check targeted completion.
+    pub(crate) queued_job_id: Cell<u64>,
+    /// How many non-loop queued tier-up checks saw `queued_job_id` ready before forcing a small-batch install.
+    pub(crate) queued_ready_polls: Cell<u8>,
 }
 
 /// The loads and stores of bindings of the environments of an executable's closure, which are none if its code may

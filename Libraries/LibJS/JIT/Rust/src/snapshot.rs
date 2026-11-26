@@ -48,6 +48,48 @@ impl CellId {
     }
 }
 
+/// Bytecode bytes of an [`ExecutableSnapshot`]: either copied into the snapshot's [`RowBlock`] (for tests) or
+/// borrowed directly from an immutable owner (such as `Arc<ExecutableData>`) kept alive by the snapshot's owner for
+/// the duration of compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytecodeSlice {
+    Inline(List<u8>),
+    Borrowed { address: u64, len: u32 },
+}
+
+impl Default for BytecodeSlice {
+    fn default() -> Self {
+        Self::Inline(List::empty())
+    }
+}
+
+impl BytecodeSlice {
+    /// Borrows `bytes` without copying them into the snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep the memory behind `bytes` alive and immutable until the [`Snapshot`] holding this
+    /// `BytecodeSlice` is cleared or dropped.
+    pub unsafe fn borrowed(bytes: &[u8]) -> Self {
+        let len = u32::try_from(bytes.len()).expect("bytecode length fits in u32");
+        Self::Borrowed {
+            address: bytes.as_ptr() as u64,
+            len,
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self {
+            Self::Inline(list) => list.len(),
+            Self::Borrowed { len, .. } => len as usize,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// One bytecode executable: the function being compiled (index 0) or an
 /// inlining candidate.
 ///
@@ -67,8 +109,12 @@ pub struct ExecutableSnapshot {
     pub frames_read_private_environment_from_function: bool,
     /// The same, for the variable environment, which is the function's `[[Environment]]`.
     pub frames_read_variable_environment_from_function: bool,
-    /// A copy of the assembled bytecode, exactly as the interpreter runs it.
-    pub bytecode: List<u8>,
+    /// Whether this executable had no interpreter feedback array at snapshot time (e.g. an unprofiled inlined
+    /// callee), so every instruction with a feedback slot is treated as not yet having run without allocating a
+    /// zero-filled `ExecutableFeedback`.
+    pub unprofiled: bool,
+    /// The assembled bytecode, exactly as the interpreter runs it.
+    pub bytecode: BytecodeSlice,
     /// The address of the executable's own bytecode on the main thread
     /// (`Executable::bytecode.data()`). Slow paths receive pointers to
     /// instructions in it, which the code embeds as immediates.
@@ -1964,6 +2010,30 @@ impl Snapshot {
             List::empty()
         })
     }
+
+    /// Adds all items of an exact-size iterator directly into the snapshot's row block as a list.
+    pub fn add_exact_iter<T: Row, I: ExactSizeIterator<Item = T>>(&mut self, rows: I) -> List<T> {
+        self.rows.try_add_from_exact_iter(rows).unwrap_or_else(|_| {
+            self.overflowed = true;
+            List::empty()
+        })
+    }
+
+    /// Returns the bytecode slice referenced by `bytecode`.
+    #[inline]
+    pub fn bytecode(&self, bytecode: BytecodeSlice) -> &[u8] {
+        match bytecode {
+            BytecodeSlice::Inline(list) => &self[list],
+            BytecodeSlice::Borrowed { address, len } => {
+                if len == 0 {
+                    return &[];
+                }
+                // SAFETY: `BytecodeSlice::borrowed` requires the snapshot's owner to keep `address..address+len`
+                //         alive and immutable until this snapshot is cleared or dropped.
+                unsafe { ak::slice_from_raw_parts(address as *const u8, len as usize) }
+            }
+        }
+    }
 }
 
 impl Default for Snapshot {
@@ -1990,19 +2060,14 @@ impl<T: Row> IndexMut<List<T>> for Snapshot {
 /// that is ready is added in one go, with `Snapshot::add()`.
 pub struct SnapshotWriter<'a> {
     snapshot: &'a mut Snapshot,
-    lists: OpenLists,
+    lists: &'a mut OpenLists,
 }
 
 impl<'a> SnapshotWriter<'a> {
-    /// Writes into `snapshot`, with the memory of `lists` for the lists that are written row by row.
-    pub fn new(snapshot: &'a mut Snapshot, mut lists: OpenLists) -> Self {
+    /// Writes into `snapshot`, borrowing `lists` for the lists that are written row by row.
+    pub fn new(snapshot: &'a mut Snapshot, lists: &'a mut OpenLists) -> Self {
         lists.reset();
         Self { snapshot, lists }
-    }
-
-    /// The memory for lists that are written row by row, for the next capture. The snapshot keeps what was written.
-    pub fn finish(self) -> OpenLists {
-        self.lists
     }
 
     /// A zone for data that one step of the capture reads and then drops (see `Zone::scope()`). Its memory serves
@@ -2023,26 +2088,26 @@ impl<'a> SnapshotWriter<'a> {
     /// Adds a row to the list of its type that is being written.
     pub fn push<T: Row>(&mut self, row: T) {
         assert!(self.lists.open[T::INDEX], "no list of this type is being written");
-        if T::open_mut(&mut self.lists).try_push(row).is_err() {
+        if T::open_mut(self.lists).try_push(row).is_err() {
             self.snapshot.overflowed = true;
         }
     }
 
     /// The rows that the list that is being written has so far.
     pub fn rows_of<T: Row>(&self, _list: &ListStart<T>) -> &[T] {
-        T::open(&self.lists)
+        T::open(self.lists)
     }
 
     /// Drops the rows of the list that is being written.
     pub fn drop_rows<T: Row>(&mut self, _list: &ListStart<T>) {
-        T::open_mut(&mut self.lists).clear();
+        T::open_mut(self.lists).clear();
     }
 
     /// Ends the list that is being written, and adds it to the snapshot.
     pub fn end<T: Row>(&mut self, _list: ListStart<T>) -> List<T> {
         assert!(self.lists.open[T::INDEX], "no list of this type is being written");
         self.lists.open[T::INDEX] = false;
-        let rows = T::open_mut(&mut self.lists);
+        let rows = T::open_mut(self.lists);
         let list = self.snapshot.add(rows);
         rows.clear();
         list

@@ -29,6 +29,8 @@ struct State {
     next_client_id: u64,
     thread_count: usize,
     idle_thread_count: usize,
+    /// Sleeping threads already signalled by `notify_one()` that have not yet exited `wait()`.
+    waking_thread_count: usize,
 }
 
 impl State {
@@ -108,11 +110,18 @@ impl CompilePool {
     fn enqueue(self: &Arc<Self>, client: u64, task: Task) {
         let mut state = self.lock_state();
         state.enqueue(client, task);
+        let should_notify =
+            state.idle_thread_count > state.waking_thread_count && state.queued_task_count > state.waking_thread_count;
+        if should_notify {
+            state.waking_thread_count += 1;
+        }
         if state.queued_task_count > state.idle_thread_count && state.thread_count < self.max_thread_count {
             self.start_thread(&mut state);
         }
         drop(state);
-        self.task_available.notify_one();
+        if should_notify {
+            self.task_available.notify_one();
+        }
     }
 
     fn start_thread(self: &Arc<Self>, state: &mut State) {
@@ -163,6 +172,7 @@ impl CompilePool {
                 false
             };
             state.idle_thread_count -= 1;
+            state.waking_thread_count = state.waking_thread_count.saturating_sub(1).min(state.idle_thread_count);
             if timed_out && state.queued_task_count == 0 {
                 return None;
             }

@@ -41,7 +41,10 @@ impl GraphBuilder<'_, '_> {
         src: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some(entries) = self.cache_entries(cache) else {
+        let Some(entries) = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))
+        else {
             return Ok(false);
         };
         if !self.may_speculate(ExitKind::BadShape) {

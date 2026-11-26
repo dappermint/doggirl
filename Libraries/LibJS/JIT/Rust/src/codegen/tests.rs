@@ -939,7 +939,7 @@ impl Machine {
             state.bytecodes = snapshot
                 .executables
                 .iter()
-                .map(|executable| snapshot[executable.bytecode].to_vec())
+                .map(|executable| snapshot.bytecode(executable.bytecode).to_vec())
                 .collect();
             state.constants = snapshot
                 .executables

@@ -309,7 +309,7 @@ fn write_op(f: &mut fmt::Formatter<'_>, layout: &FrameLayout, op: &Op, inputs: &
             let stores = if *stores_operands { " storing operands" } else { "" };
             inputs.after(f, format_args!("CallNative {site}{frames}{stores}"))
         }
-        Op::CallNativeAccessor { pc, part, target } => {
+        Op::CallNativeAccessor { pc, part, target, .. } => {
             let direct = if target.direct_getter.is_some() { " direct" } else { "" };
             inputs.after(
                 f,
