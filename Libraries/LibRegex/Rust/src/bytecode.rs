@@ -270,17 +270,36 @@ pub enum SimpleMatch {
 pub struct CharRanges {
     ranges: Vec<CharRange>,
     ascii: [u64; 2],
+    #[cfg(target_arch = "aarch64")]
+    ascii_nibble_lo: [u8; 16],
+    #[cfg(target_arch = "aarch64")]
+    ascii_only: bool,
 }
 
 impl CharRanges {
     pub fn new(ranges: Vec<CharRange>) -> Self {
         let mut ascii = [0u64; 2];
+        #[cfg(target_arch = "aarch64")]
+        let mut ascii_nibble_lo = [0u8; 16];
         for range in &ranges {
             for code_point in range.start..=range.end.min(0x7F) {
                 ascii[(code_point / 64) as usize] |= 1 << (code_point % 64);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ascii_nibble_lo[(code_point & 0x0F) as usize] |= 1u8 << (code_point >> 4);
+                }
             }
         }
-        Self { ranges, ascii }
+        #[cfg(target_arch = "aarch64")]
+        let ascii_only = ranges.last().is_none_or(|range| range.end < 0x80);
+        Self {
+            ranges,
+            ascii,
+            #[cfg(target_arch = "aarch64")]
+            ascii_nibble_lo,
+            #[cfg(target_arch = "aarch64")]
+            ascii_only,
+        }
     }
 
     /// Whether `code_point` is in one of the ranges.
@@ -290,6 +309,20 @@ impl CharRanges {
             return self.ascii[(code_point / 64) as usize] & (1 << (code_point % 64)) != 0;
         }
         crate::vm::char_in_ranges(code_point, &self.ranges)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn ascii_nibble_lo(&self) -> &[u8; 16] {
+        &self.ascii_nibble_lo
+    }
+
+    /// Whether every range lies completely inside ASCII (`<= 0x7F`), so `ascii_nibble_lo()` fully determines
+    /// membership for all Latin-1 bytes (`0..=255`).
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub fn is_ascii_only(&self) -> bool {
+        self.ascii_only
     }
 
     pub fn into_vec(self) -> Vec<CharRange> {
