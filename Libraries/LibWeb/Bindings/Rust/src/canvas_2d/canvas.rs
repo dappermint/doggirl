@@ -141,12 +141,13 @@ struct ResolvedFontAbi {
     font_size: f64,
     /// An AK::Utf16String that the caller takes over.
     serialized: usize,
+    is_context_independent: bool,
 }
 
 /// `CanvasFontSelection` of Canvas2DContextBase.cpp: the text drawing styles of a context that select the fonts of
 /// its text beside its font, by the values of their enumerations.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FontSelection {
     font_kerning: CanvasFontKerning,
     font_stretch: CanvasFontStretch,
@@ -295,13 +296,19 @@ impl Canvas {
     }
 
     /// The font that a value of the font attribute describes, resolved against the canvas, unless the value is not a
-    /// CSS font.
-    pub(crate) fn resolve_font(self, font: &Utf16String, font_selection: FontSelection) -> Option<ResolvedFont> {
+    /// CSS font. Also reports whether the font string is independent of element/canvas/viewport context and safe to
+    /// cache across assignments while `environment_generation` and `font_selection` match.
+    pub(crate) fn resolve_font(
+        self,
+        font: &Utf16String,
+        font_selection: FontSelection,
+    ) -> Option<(ResolvedFont, bool)> {
         let mut resolved = ResolvedFontAbi {
             cascade: core::ptr::null(),
             environment_generation: 0,
             font_size: 0.0,
             serialized: 0,
+            is_context_independent: false,
         };
         let is_font = unsafe {
             web_canvas_2d_canvas_resolve_font(
@@ -315,14 +322,17 @@ impl Canvas {
         if !is_font {
             return None;
         }
-        Some(ResolvedFont {
-            // SAFETY: LibWeb hands over a reference to the cascade.
-            cascade: unsafe { FontCascadeListHandle::adopt(resolved.cascade) },
-            environment_generation: resolved.environment_generation,
-            font_size: resolved.font_size,
-            // SAFETY: LibWeb hands over the string.
-            serialized: unsafe { Utf16String::from_raw_owned(resolved.serialized) },
-        })
+        Some((
+            ResolvedFont {
+                // SAFETY: LibWeb hands over a reference to the cascade.
+                cascade: unsafe { FontCascadeListHandle::adopt(resolved.cascade) },
+                environment_generation: resolved.environment_generation,
+                font_size: resolved.font_size,
+                // SAFETY: LibWeb hands over the string.
+                serialized: unsafe { Utf16String::from_raw_owned(resolved.serialized) },
+            },
+            resolved.is_context_independent,
+        ))
     }
 
     /// The used color of a parsed CSS color, resolved against the canvas, in sRGB and in the color space.

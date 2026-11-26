@@ -122,6 +122,16 @@ struct ColorCacheEntry {
 const MAX_COLOR_CACHE_SIZE: usize = 8;
 const MAX_COLOR_CACHE_INPUT_LENGTH: usize = 128;
 
+/// A context-independent font string resolved against the canvas's font environment and text drawing styles.
+struct FontCacheEntry {
+    input: Utf16String,
+    font_selection: FontSelection,
+    resolved: ResolvedFont,
+}
+
+const MAX_FONT_CACHE_SIZE: usize = 8;
+const MAX_FONT_CACHE_INPUT_LENGTH: usize = 256;
+
 /// What a context is created with.
 pub(crate) struct ContextParameters {
     pub(crate) canvas: Canvas,
@@ -164,6 +174,11 @@ pub(crate) struct ContextState {
     cached_readback: RefCell<Option<CachedReadback>>,
     #[gc(untraced)]
     color_cache: RefCell<Vec<ColorCacheEntry>>,
+    #[gc(untraced)]
+    font_cache: RefCell<Vec<FontCacheEntry>>,
+    /// Reusable buffer for serializing paths into command records without per-draw heap allocation.
+    #[gc(untraced)]
+    encoded_path_scratch: RefCell<Vec<u8>>,
 }
 
 fn empty_path() -> Path {
@@ -207,6 +222,8 @@ impl ContextState {
             backing_storage: RefCell::new(None),
             cached_readback: RefCell::new(None),
             color_cache: RefCell::new(Vec::new()),
+            font_cache: RefCell::new(Vec::new()),
+            encoded_path_scratch: RefCell::new(Vec::new()),
         }
     }
 
@@ -276,9 +293,9 @@ impl ContextState {
         self.path.borrow_mut()
     }
 
-    /// Empties the list of subpaths of the current default path.
+    /// Empties the list of subpaths of the current default path, retaining its buffers for reuse.
     pub(crate) fn clear_path(&self) {
-        self.path.replace(empty_path());
+        self.path.borrow_mut().clear();
     }
 
     /// The matrix in whose coordinates the current default path is.
@@ -304,6 +321,9 @@ impl ContextState {
             .ok()
             .and_then(|readback| readback.as_ref().map(|readback| readback.pixels.size_in_bytes()))
             .unwrap_or(0);
+        if let Ok(scratch) = self.encoded_path_scratch.try_borrow() {
+            size = size.saturating_add(scratch.capacity());
+        }
         let has_backing_storage = self
             .backing_storage
             .try_borrow()
@@ -634,8 +654,40 @@ impl ContextState {
     /// Sets the font of the current drawing state, unless the value is not a CSS font.
     pub(crate) fn assign_font(&self, vm: &Vm, font: &Utf16String) {
         let font_selection = FontSelection::of(&self.drawing_state());
-        if let Some(font) = self.canvas.resolve_font(font, font_selection) {
-            self.drawing_state_mut(vm).font = Some(font);
+        let input_is_cacheable = font.length_in_code_units() <= MAX_FONT_CACHE_INPUT_LENGTH;
+        if input_is_cacheable {
+            let mut font_cache = self.font_cache.borrow_mut();
+            if let Some(index) = font_cache
+                .iter()
+                .position(|entry| entry.font_selection == font_selection && entry.input == *font)
+            {
+                let environment_generation = self.canvas.font_environment_generation();
+                if font_cache[index].resolved.environment_generation == environment_generation {
+                    let resolved = font_cache[index].resolved.clone();
+                    if index + 1 != font_cache.len() {
+                        let entry = font_cache.remove(index);
+                        font_cache.push(entry);
+                    }
+                    drop(font_cache);
+                    self.drawing_state_mut(vm).font = Some(resolved);
+                    return;
+                }
+                font_cache.remove(index);
+            }
+        }
+        if let Some((resolved, is_context_independent)) = self.canvas.resolve_font(font, font_selection) {
+            if input_is_cacheable && is_context_independent {
+                let mut font_cache = self.font_cache.borrow_mut();
+                if font_cache.len() == MAX_FONT_CACHE_SIZE {
+                    font_cache.remove(0);
+                }
+                font_cache.push(FontCacheEntry {
+                    input: font.clone(),
+                    font_selection,
+                    resolved: resolved.clone(),
+                });
+            }
+            self.drawing_state_mut(vm).font = Some(resolved);
         }
     }
 
@@ -756,6 +808,14 @@ impl ContextState {
         state.current_compositing_and_blending_operator == CompositingAndBlendingOperator::SourceOver
     }
 
+    fn trim_encoded_path_scratch(bytes: &mut Vec<u8>) {
+        const MAX_RETAINED_ENCODED_PATH_CAPACITY: usize = 256 * 1024;
+        bytes.clear();
+        if bytes.capacity() > MAX_RETAINED_ENCODED_PATH_CAPACITY {
+            *bytes = Vec::new();
+        }
+    }
+
     pub(crate) fn fill_internal(&self, path: &Path, winding_rule: WindingRule) {
         if !self.recorder_is_ready() {
             return;
@@ -767,15 +827,21 @@ impl ContextState {
             }
         }
 
-        let path_bytes = path.serialize_to_bytes();
         {
+            let mut path_bytes = self.encoded_path_scratch.borrow_mut();
+            path.serialize_into(&mut path_bytes);
             let state = self.drawing_state();
             self.record(|recorder| {
                 let paint = paint_of(recorder, &state.fill_style, self.context_attributes.color_space);
                 recorder.fill_path(&path_bytes, &paint, winding_rule, &Self::compositing(&state));
             });
+            Self::trim_encoded_path_scratch(&mut path_bytes);
         }
         self.did_draw();
+    }
+
+    pub(crate) fn fill_current_path(&self, winding_rule: WindingRule) {
+        self.fill_internal(&self.path.borrow(), winding_rule);
     }
 
     pub(crate) fn stroke_internal(&self, path: &Path) {
@@ -790,9 +856,9 @@ impl ContextState {
         }
 
         let dash_array = self.drawing_state().dash_array();
-        let path_bytes = path.serialize_to_bytes();
-
         {
+            let mut path_bytes = self.encoded_path_scratch.borrow_mut();
+            path.serialize_into(&mut path_bytes);
             let state = self.drawing_state();
             let stroke = Stroke {
                 thickness: state.line_width,
@@ -806,16 +872,27 @@ impl ContextState {
                 let paint = paint_of(recorder, &state.stroke_style, self.context_attributes.color_space);
                 recorder.stroke_path(&path_bytes, &paint, &stroke, &Self::compositing(&state));
             });
+            Self::trim_encoded_path_scratch(&mut path_bytes);
         }
         self.did_draw();
+    }
+
+    pub(crate) fn stroke_current_path(&self) {
+        self.stroke_internal(&self.path.borrow());
     }
 
     pub(crate) fn clip_internal(&self, path: &Path, winding_rule: WindingRule) {
         if !self.recorder_is_ready() {
             return;
         }
-        let path_bytes = path.serialize_to_bytes();
+        let mut path_bytes = self.encoded_path_scratch.borrow_mut();
+        path.serialize_into(&mut path_bytes);
         self.record(|recorder| recorder.clip_path(&path_bytes, winding_rule));
+        Self::trim_encoded_path_scratch(&mut path_bytes);
+    }
+
+    pub(crate) fn clip_current_path(&self, winding_rule: WindingRule) {
+        self.clip_internal(&self.path.borrow(), winding_rule);
     }
 }
 

@@ -83,16 +83,17 @@ pub struct Stroke<'a> {
 
 // The data a record carries after its command struct. Its spans are offsets into the payload, which starts with the
 // struct, at a multiple of the command alignment.
-struct InlineData {
+struct InlineData<'a> {
     struct_size: usize,
-    bytes: Vec<u8>,
+    bytes: &'a mut Vec<u8>,
 }
 
-impl InlineData {
-    fn new<C: DisplayListCommand>() -> Self {
+impl<'a> InlineData<'a> {
+    fn new<C: DisplayListCommand>(bytes: &'a mut Vec<u8>) -> Self {
+        bytes.clear();
         Self {
             struct_size: std::mem::size_of::<C>(),
-            bytes: Vec::new(),
+            bytes,
         }
     }
 
@@ -110,12 +111,25 @@ impl InlineData {
     }
 
     fn append_objects<T: FfiBytes>(&mut self, objects: &[T]) -> DisplayListDataSpan {
+        if objects.is_empty() {
+            return DisplayListDataSpan::default();
+        }
         let size = std::mem::size_of::<T>();
-        let mut bytes = vec![0u8; std::mem::size_of_val(objects)];
-        for (object, out) in objects.iter().zip(bytes.chunks_exact_mut(size)) {
+        let total = std::mem::size_of_val(objects);
+        let alignment = std::mem::align_of::<T>();
+        let offset = (self.struct_size + self.bytes.len()).next_multiple_of(alignment);
+        let start = offset - self.struct_size;
+        self.bytes.resize(start + total, 0);
+        for (object, out) in objects
+            .iter()
+            .zip(self.bytes[start..start + total].chunks_exact_mut(size))
+        {
             object.write_ffi_bytes(out);
         }
-        self.append(&bytes, std::mem::align_of::<T>())
+        DisplayListDataSpan {
+            offset: u32::try_from(offset).expect("canvas 2D record exceeds u32"),
+            size: u32::try_from(total).expect("canvas 2D record exceeds u32"),
+        }
     }
 
     fn append_paint(&mut self, paint: &Paint) -> Canvas2DPaint {
@@ -204,7 +218,10 @@ impl InlineData {
 #[derive(Default)]
 pub struct TapeWriter {
     bytes: Vec<u8>,
+    inline_scratch: Vec<u8>,
 }
+
+const MAX_RETAINED_INLINE_SCRATCH_CAPACITY: usize = 256 * 1024;
 
 impl TapeWriter {
     pub fn bytes(&self) -> &[u8] {
@@ -213,10 +230,19 @@ impl TapeWriter {
 
     pub fn clear(&mut self) {
         self.bytes.clear();
+        self.inline_scratch.clear();
+        if self.inline_scratch.capacity() > MAX_RETAINED_INLINE_SCRATCH_CAPACITY {
+            self.inline_scratch = Vec::new();
+        }
     }
 
-    fn append<C: DisplayListCommand>(&mut self, command: &C, inline_data: &InlineData) {
-        append_record(&mut self.bytes, command, &inline_data.bytes);
+    fn append_with_scratch<C: DisplayListCommand>(&mut self, build: impl FnOnce(&mut InlineData<'_>) -> C) {
+        let mut inline_data = InlineData::new::<C>(&mut self.inline_scratch);
+        let command = build(&mut inline_data);
+        append_record(&mut self.bytes, &command, &self.inline_scratch);
+        if self.inline_scratch.capacity() > MAX_RETAINED_INLINE_SCRATCH_CAPACITY {
+            self.inline_scratch = Vec::new();
+        }
     }
 
     fn append_plain<C: DisplayListCommand>(&mut self, command: &C) {
@@ -225,20 +251,17 @@ impl TapeWriter {
 
     /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn fill_path(&mut self, path: &[u8], paint: &Paint, winding_rule: WindingRule, compositing: &Compositing) {
-        let mut inline_data = InlineData::new::<Canvas2DFillPath>();
-        let command = Canvas2DFillPath {
+        self.append_with_scratch(|inline_data| Canvas2DFillPath {
             path_data: inline_data.append_path(path),
             paint: inline_data.append_paint(paint),
             winding_rule,
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn stroke_path(&mut self, path: &[u8], paint: &Paint, stroke: &Stroke, compositing: &Compositing) {
-        let mut inline_data = InlineData::new::<Canvas2DStrokePath>();
-        let command = Canvas2DStrokePath {
+        self.append_with_scratch(|inline_data| Canvas2DStrokePath {
             path_data: inline_data.append_path(path),
             paint: inline_data.append_paint(paint),
             thickness: stroke.thickness,
@@ -248,8 +271,7 @@ impl TapeWriter {
             dash_array: inline_data.append_objects(stroke.dash_array),
             dash_offset: stroke.dash_offset,
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn draw_glyph_runs(
@@ -261,16 +283,14 @@ impl TapeWriter {
         paint: &Paint,
         compositing: &Compositing,
     ) {
-        let mut inline_data = InlineData::new::<Canvas2DDrawGlyphRuns>();
-        let command = Canvas2DDrawGlyphRuns {
+        self.append_with_scratch(|inline_data| Canvas2DDrawGlyphRuns {
             runs: inline_data.append_objects(runs),
             glyphs: inline_data.append_objects(glyphs),
             translation,
             horizontal_scale,
             paint: inline_data.append_paint(paint),
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn clear_rect(&mut self, rect: FloatRect, color: Color) {
@@ -285,15 +305,13 @@ impl TapeWriter {
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
-        let mut inline_data = InlineData::new::<Canvas2DDrawImageFrame>();
-        let command = Canvas2DDrawImageFrame {
+        self.append_with_scratch(|inline_data| Canvas2DDrawImageFrame {
             frame_id,
             dst_rect,
             src_rect,
             scaling_mode,
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn draw_canvas(
@@ -304,15 +322,13 @@ impl TapeWriter {
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
-        let mut inline_data = InlineData::new::<Canvas2DDrawCanvas>();
-        let command = Canvas2DDrawCanvas {
+        self.append_with_scratch(|inline_data| Canvas2DDrawCanvas {
             source_canvas_id,
             dst_rect,
             src_rect,
             scaling_mode,
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn draw_video_frame(
@@ -324,16 +340,14 @@ impl TapeWriter {
         scaling_mode: ScalingMode,
         compositing: &Compositing,
     ) {
-        let mut inline_data = InlineData::new::<Canvas2DDrawVideoFrame>();
-        let command = Canvas2DDrawVideoFrame {
+        self.append_with_scratch(|inline_data| Canvas2DDrawVideoFrame {
             video_sink_handle,
             generation,
             dst_rect,
             src_rect,
             scaling_mode,
             compositing: inline_data.append_compositing(compositing),
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn set_transform(&mut self, transform: AffineTransform) {
@@ -350,12 +364,10 @@ impl TapeWriter {
 
     /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn clip_path(&mut self, path: &[u8], winding_rule: WindingRule) {
-        let mut inline_data = InlineData::new::<Canvas2DClipPath>();
-        let command = Canvas2DClipPath {
+        self.append_with_scratch(|inline_data| Canvas2DClipPath {
             path_data: inline_data.append_path(path),
             winding_rule,
-        };
-        self.append(&command, &inline_data);
+        });
     }
 
     pub fn reset(&mut self) {
