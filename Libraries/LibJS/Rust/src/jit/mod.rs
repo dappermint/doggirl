@@ -46,7 +46,7 @@ use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::execution_context::ExecutionContext;
 use code::DetachedJitCode;
 use code::EntryTrampoline;
-use code::SnapshotExecutable;
+use code::SnapshotExecutables;
 use compile_queue::{CompileQueue, CompileResult};
 use data_memory::DataAllocator;
 use executable_memory::{CodeAllocator, ExecutableMemory};
@@ -156,7 +156,7 @@ impl InterpreterTier {
 pub struct CompileJob {
     pub executable: Gc<Executable>,
     pub cells: Vec<Gc<CellHeader>>,
-    pub snapshot_executables: Vec<SnapshotExecutable>,
+    pub snapshot_executables: SnapshotExecutables,
     #[gc(untraced = "the cells keep the samples alive and in place until the code is installed")]
     pub sample_slots: allocation::SampleSlots,
 }
@@ -236,9 +236,10 @@ pub struct JitState {
     cached_allocation_info: OnceCell<Box<allocation::CachedAllocationInfo>>,
     /// VM-constant runtime info base (offsets, layout, dynamic calls, stubs) cached once per VM.
     cached_runtime_info: OnceCell<Box<libjs_jit::snapshot::RuntimeInfo>>,
-    /// Reusable open-list buffers for snapshot capture on this VM's thread (avoids moving `OpenLists` through the
-    /// global spare mutex and re-mapping virtual memory after compile threads go idle).
+    /// Reusable open-list and scratch buffers for snapshot capture on this VM's thread (avoids moving `OpenLists`
+    /// through the global spare mutex and per-capture transient vector allocations).
     snapshot_open_lists: RefCell<Option<Box<libjs_jit::snapshot::OpenLists>>>,
+    snapshot_scratch: RefCell<Option<Box<snapshot::SnapshotScratch>>>,
     /// How native code enters JIT code, generated the first time it does.
     entry_trampoline: OnceCell<(ExecutableMemory, EntryTrampoline)>,
     /// The call stub JIT code shares (see `libjs_jit::codegen::generate_call_stub()`), generated the first time a
@@ -298,6 +299,7 @@ impl JitState {
             cached_allocation_info: OnceCell::new(),
             cached_runtime_info: OnceCell::new(),
             snapshot_open_lists: RefCell::new(None),
+            snapshot_scratch: RefCell::new(None),
             entry_trampoline: OnceCell::new(),
             call_stub: OnceCell::new(),
             construct_stub: OnceCell::new(),
@@ -581,10 +583,16 @@ impl JitState {
             .get_or_init(|| Box::new(runtime_info::build_cached_runtime_info(vm)))
     }
 
-    pub(crate) fn with_snapshot_open_lists<R>(&self, f: impl FnOnce(&mut libjs_jit::snapshot::OpenLists) -> R) -> R {
-        let mut guard = self.snapshot_open_lists.borrow_mut();
-        let lists = guard.get_or_insert_with(|| Box::new(libjs_jit::snapshot::OpenLists::new()));
-        f(lists)
+    pub(crate) fn with_snapshot_buffers<R>(
+        &self,
+        f: impl FnOnce(&mut libjs_jit::snapshot::OpenLists, &mut snapshot::SnapshotScratch) -> R,
+    ) -> R {
+        let mut lists_guard = self.snapshot_open_lists.borrow_mut();
+        let lists = lists_guard.get_or_insert_with(|| Box::new(libjs_jit::snapshot::OpenLists::new()));
+        let mut scratch_guard = self.snapshot_scratch.borrow_mut();
+        let scratch = scratch_guard.get_or_insert_with(|| Box::new(snapshot::SnapshotScratch::default()));
+        scratch.clear();
+        f(lists, scratch)
     }
 }
 

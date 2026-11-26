@@ -179,6 +179,12 @@ struct OwnStringKeys {
     generation: u32,
     keys: Box<[Value]>,
     enumerable: Box<[bool]>,
+    /// Filtered enumerable string keys when some string keys are non-enumerable; `None` means every entry in `keys` is
+    /// enumerable so `&self.keys` can be returned directly without extra storage.
+    enumerable_keys: Option<Box<[Value]>>,
+    /// True when this is a non-dictionary shape whose properties are all enumerable string keys at contiguous offsets
+    /// `0..property_count`.
+    all_enumerable_contiguous: bool,
 }
 
 /// The parts of a shape the interpreter does not read: one word that is null, a forward transition (an owned GcWeak)
@@ -291,11 +297,15 @@ unsafe impl Trace for ShapeStorage {
     }
 }
 
-// SAFETY: Visits the keys.
+// SAFETY: Visits the keys and any filtered enumerable key slice so moving collections update both.
 unsafe impl Trace for OwnStringKeys {
     fn trace(&self, visitor: &mut Visitor) {
-        // SAFETY: The keys are the shape's own, which only with_own_string_keys() replaces, and nothing writes them.
+        // SAFETY: The keys are the shape's own, which only ensure_own_string_keys() replaces, and nothing writes them.
         unsafe { visitor.visit_owned_values(&self.keys) };
+        if let Some(enumerable_keys) = &self.enumerable_keys {
+            // SAFETY: Same lifetime and ownership invariants as `self.keys`.
+            unsafe { visitor.visit_owned_values(enumerable_keys) };
+        }
     }
 }
 
@@ -1137,10 +1147,7 @@ impl Shape {
         self.increment_dictionary_generation();
     }
 
-    /// Calls `callback` with the string keys of the properties of this shape in insertion order, as string values, and
-    /// whether each of the properties is enumerable. They are made the first time they are asked for, and kept on the
-    /// shape until its properties change. The callback must not allocate cells.
-    pub fn with_own_string_keys<R>(&self, vm: &Vm, callback: impl FnOnce(&[Value], &[bool]) -> R) -> R {
+    fn ensure_own_string_keys(&self, vm: &Vm) {
         let generation = self.dictionary_generation();
         let is_cached = self.rare_data().is_some_and(|rare_data| {
             rare_data
@@ -1148,35 +1155,106 @@ impl Shape {
                 .as_ref()
                 .is_some_and(|own_string_keys| own_string_keys.generation == generation)
         });
-        if !is_cached {
-            let mut property_keys = Vec::with_capacity(self.property_count() as usize);
-            self.for_each_property_in_insertion_order(|property_key, metadata| {
-                if property_key.is_string() {
-                    property_keys.push((
-                        NonSymbolPropertyKey::from(property_key.as_string().clone()),
-                        metadata.attributes.is_enumerable(),
-                    ));
-                }
-                ControlFlow::Continue(())
-            });
-            let keys = MarkedVec::with_capacity(vm, property_keys.len());
-            for (property_key, _) in &property_keys {
-                keys.push(property_key.to_value(vm));
-            }
-            self.with_rare_data(vm, |rare_data| {
-                rare_data.own_string_keys = Some(OwnStringKeys {
-                    generation,
-                    keys: keys.values().iter().copied().collect(),
-                    enumerable: property_keys.iter().map(|(_, enumerable)| *enumerable).collect(),
-                });
-            });
+        if is_cached {
+            return;
         }
+        let property_count = self.property_count();
+        let mut property_keys = Vec::with_capacity(property_count as usize);
+        let mut all_enumerable = true;
+        let mut all_enumerable_contiguous = !self.is_dictionary();
+        let mut expected_offset = 0u32;
+        self.for_each_property_in_insertion_order(|property_key, metadata| {
+            if property_key.is_string() {
+                let is_enumerable = metadata.attributes.is_enumerable();
+                if !is_enumerable {
+                    all_enumerable = false;
+                    all_enumerable_contiguous = false;
+                } else if metadata.offset != expected_offset {
+                    all_enumerable_contiguous = false;
+                }
+                expected_offset += 1;
+                property_keys.push((
+                    NonSymbolPropertyKey::from(property_key.as_string().clone()),
+                    is_enumerable,
+                ));
+            } else {
+                all_enumerable_contiguous = false;
+            }
+            ControlFlow::Continue(())
+        });
+        if expected_offset != property_count {
+            all_enumerable_contiguous = false;
+        }
+        let keys = MarkedVec::with_capacity(vm, property_keys.len());
+        for (property_key, _) in &property_keys {
+            keys.push(property_key.to_value(vm));
+        }
+        let enumerable: Box<[bool]> = property_keys.iter().map(|(_, enumerable)| *enumerable).collect();
+        let enumerable_keys = if all_enumerable {
+            None
+        } else {
+            Some(
+                keys.values()
+                    .iter()
+                    .zip(enumerable.iter())
+                    .filter_map(|(key, is_enum)| (*is_enum).then_some(*key))
+                    .collect(),
+            )
+        };
+        self.with_rare_data(vm, |rare_data| {
+            rare_data.own_string_keys = Some(OwnStringKeys {
+                generation,
+                keys: keys.values().iter().copied().collect(),
+                enumerable,
+                enumerable_keys,
+                all_enumerable_contiguous,
+            });
+        });
+    }
+
+    /// Calls `callback` with the string keys of the properties of this shape in insertion order, as string values, and
+    /// whether each of the properties is enumerable. They are made the first time they are asked for, and kept on the
+    /// shape until its properties change. The callback must not allocate cells.
+    pub fn with_own_string_keys<R>(&self, vm: &Vm, callback: impl FnOnce(&[Value], &[bool]) -> R) -> R {
+        self.ensure_own_string_keys(vm);
         let rare_data = self.rare_data().expect("the shape has its own string keys");
         let own_string_keys = rare_data
             .own_string_keys
             .as_ref()
             .expect("the shape has its own string keys");
         callback(&own_string_keys.keys, &own_string_keys.enumerable)
+    }
+
+    /// Calls `callback` with the enumerable string keys of this shape in insertion order and whether all properties of
+    /// this non-dictionary shape are contiguous enumerable string keys at offsets `0..property_count`.
+    pub fn with_own_enumerable_string_keys<R>(&self, vm: &Vm, callback: impl FnOnce(&[Value], bool) -> R) -> R {
+        self.ensure_own_string_keys(vm);
+        let rare_data = self.rare_data().expect("the shape has its own string keys");
+        let own_string_keys = rare_data
+            .own_string_keys
+            .as_ref()
+            .expect("the shape has its own string keys");
+        let keys = own_string_keys
+            .enumerable_keys
+            .as_deref()
+            .unwrap_or(&own_string_keys.keys);
+        callback(keys, own_string_keys.all_enumerable_contiguous)
+    }
+
+    /// Returns the `index`th cached enumerable string key of this shape after `with_own_enumerable_string_keys` has
+    /// populated the cache. Drops the borrow immediately so callers may allocate between elements.
+    #[inline]
+    pub fn cached_own_enumerable_string_key_at(&self, index: usize) -> Value {
+        let rare_data = self.rare_data().expect("the shape has its own string keys");
+        let own_string_keys = rare_data
+            .own_string_keys
+            .as_ref()
+            .expect("the shape has its own string keys");
+        let keys = own_string_keys
+            .enumerable_keys
+            .as_deref()
+            .unwrap_or(&own_string_keys.keys);
+        keys[index]
     }
 
     /// What Object.assign of an object with this shape onto an empty object made, if it was kept.
