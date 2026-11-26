@@ -13,6 +13,7 @@ use core::hash::{Hash, Hasher};
 
 use ak::{Utf16FlyString, Utf16String};
 
+use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak::GcWeak;
 use crate::interpreter::vm::Vm;
@@ -58,6 +59,7 @@ trait CodeUnit: Copy + Eq + Into<u32> + 'static {
     fn make_fly_string(units: &[Self], width: StringWidth) -> Utf16FlyString;
     fn equals_byte_slice(units: &[Self], bytes: &[u8]) -> bool;
     fn equals_u16_slice(units: &[Self], code_units: &[u16]) -> bool;
+    fn equals_simple_key(units: &[Self], simple: &SimpleByteKeys, start: usize, end: usize) -> bool;
 
     /// The position of the first unit at or after `position` that is a quotation mark, a reverse solidus or a
     /// control character, or the length of `units` if there is none. Widens `*width` if any ordinary unit scanned
@@ -90,6 +92,11 @@ impl CodeUnit for u8 {
                 .iter()
                 .zip(code_units)
                 .all(|(&byte, &code_unit)| u16::from(byte) == code_unit)
+    }
+
+    #[inline(always)]
+    fn equals_simple_key(units: &[u8], simple: &SimpleByteKeys, start: usize, end: usize) -> bool {
+        units == &simple.bytes[start..end]
     }
 
     fn skip_ordinary_string_units(units: &[u8], mut position: usize, _width: &mut StringWidth) -> usize {
@@ -143,6 +150,11 @@ impl CodeUnit for Latin1Byte {
                 .iter()
                 .zip(code_units)
                 .all(|(&byte, &code_unit)| u16::from(byte) == code_unit)
+    }
+
+    #[inline(always)]
+    fn equals_simple_key(units: &[Latin1Byte], simple: &SimpleByteKeys, start: usize, end: usize) -> bool {
+        Self::as_bytes(units) == &simple.bytes[start..end]
     }
 
     fn skip_ordinary_string_units(units: &[Latin1Byte], mut position: usize, width: &mut StringWidth) -> usize {
@@ -281,6 +293,11 @@ impl CodeUnit for u16 {
         units == code_units
     }
 
+    #[inline(always)]
+    fn equals_simple_key(units: &[u16], simple: &SimpleByteKeys, start: usize, end: usize) -> bool {
+        units == &simple.u16_units[start..end]
+    }
+
     fn skip_ordinary_string_units(units: &[u16], mut position: usize, width: &mut StringWidth) -> usize {
         #[inline(always)]
         fn record_bits(width: &mut StringWidth, bits: u16) {
@@ -372,14 +389,40 @@ impl CodeUnit for u16 {
     }
 }
 
+const STRING_VALUE_CACHE_SETS: usize = 256;
+const STRING_VALUE_CACHE_SLOTS: usize = STRING_VALUE_CACHE_SETS * 2;
+const STRING_VALUE_CACHE_MAX_LEN: usize = 128;
+
 /// What JSON.parse keeps between the texts it parses: the property keys and the shapes of the objects of the texts it
-/// parsed last, which later texts usually share, and the values of the arrays and objects it has not finished making.
-#[derive(Default)]
+/// parsed last, which later texts usually share, a weak cache of recently parsed string values, and the values of the
+/// arrays and objects it has not finished making.
 pub struct JsonParseCache {
     /// The elements of the arrays and the values of the properties of the objects that are being parsed, which the
     /// VM keeps alive until their array or object is made.
     values: RefCell<Vec<Value>>,
+    /// 2-way set-associative weak cache of recently parsed unescaped string values, swept on GC.
+    string_values: Box<[Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS]>,
     tables: Cell<Option<Box<JsonParseTables>>>,
+}
+
+impl Default for JsonParseCache {
+    fn default() -> Self {
+        Self {
+            values: RefCell::new(Vec::new()),
+            string_values: Box::new([const { Cell::new(None) }; STRING_VALUE_CACHE_SLOTS]),
+            tables: Cell::new(None),
+        }
+    }
+}
+
+impl JsonParseCache {
+    pub(crate) fn remove_dead_strings(&self, sweep: &Sweep<'_>) {
+        for slot in self.string_values.iter() {
+            if slot.get().is_some_and(|string| sweep.is_dead_or_moving(string)) {
+                slot.set(None);
+            }
+        }
+    }
 }
 
 // SAFETY: The values being parsed are the only cells the cache keeps alive; its keys are strings and its shapes are
@@ -423,13 +466,36 @@ fn json_malformed<T>(vm: &Vm) -> ThrowCompletionOr<T> {
     vm.throw_completion(ErrorKind::SyntaxError, ErrorType::JsonMalformed, &[])
 }
 
-/// Whether `units` are the code units of `key`.
+/// Whether `units` are the code units of `view`.
 #[inline(always)]
-fn are_code_units_of<C: CodeUnit>(units: &[C], key: &PropertyKey) -> bool {
-    match Utf16View::of_fly_string(key.as_string()) {
+fn are_code_units_of_view<C: CodeUnit>(units: &[C], view: Utf16View<'_>) -> bool {
+    match view {
         Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => C::equals_byte_slice(units, bytes),
         Utf16View::Utf16(code_units) => C::equals_u16_slice(units, code_units),
     }
+}
+
+/// Whether `units` are the code units of `key`.
+#[inline(always)]
+fn are_code_units_of<C: CodeUnit>(units: &[C], key: &PropertyKey) -> bool {
+    are_code_units_of_view(units, Utf16View::of_fly_string(key.as_string()))
+}
+
+#[inline(always)]
+fn string_value_cache_set<C: CodeUnit>(units: &[C]) -> usize {
+    let len = units.len();
+    let hash = (len as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(units[0].into())
+        .wrapping_mul(0x85EB_CA6B)
+        .wrapping_add(units[len >> 2].into())
+        .wrapping_mul(0xC2B2_AE35)
+        .wrapping_add(units[len >> 1].into())
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(units[(len * 3) >> 2].into())
+        .wrapping_mul(0x85EB_CA6B)
+        .wrapping_add(units[len - 1].into());
+    (hash ^ (hash >> 15)) as usize & (STRING_VALUE_CACHE_SETS - 1)
 }
 
 /// Property keys by their code units, in a small table indexed by a hash of them.
@@ -490,6 +556,7 @@ struct ShapeCache {
 
 struct SimpleByteKeys {
     bytes: Box<[u8]>,
+    u16_units: Box<[u16]>,
     ranges: Box<[(u32, u32)]>,
 }
 
@@ -522,6 +589,7 @@ fn build_simple_byte_keys(keys: &[NonSymbolPropertyKey]) -> Option<SimpleByteKey
         return None;
     }
     let mut flat = Vec::with_capacity(total_len);
+    let mut flat_u16 = Vec::with_capacity(total_len);
     let mut ranges = Vec::with_capacity(keys.len());
     for key in keys {
         let (Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes)) = Utf16View::of_fly_string(key.as_string()) else {
@@ -529,10 +597,12 @@ fn build_simple_byte_keys(keys: &[NonSymbolPropertyKey]) -> Option<SimpleByteKey
         };
         let start = flat.len() as u32;
         flat.extend_from_slice(bytes);
+        flat_u16.extend(bytes.iter().map(|&byte| u16::from(byte)));
         ranges.push((start, flat.len() as u32));
     }
     Some(SimpleByteKeys {
         bytes: flat.into_boxed_slice(),
+        u16_units: flat_u16.into_boxed_slice(),
         ranges: ranges.into_boxed_slice(),
     })
 }
@@ -648,6 +718,7 @@ struct Parser<'a, 'vm, C: CodeUnit> {
     realm: Gc<Realm>,
     tables: &'a mut JsonParseTables,
     values: &'vm RefCell<Vec<Value>>,
+    string_values: &'vm [Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS],
     units: &'a [C],
     position: usize,
 }
@@ -662,14 +733,54 @@ struct StringToken {
 
 impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
     fn new(vm: &'vm Vm, realm: Gc<Realm>, tables: &'a mut JsonParseTables, units: &'a [C]) -> Self {
+        let cache = vm.json_parse_cache();
         Self {
             vm,
             realm,
             tables,
-            values: &vm.json_parse_cache().values,
+            values: &cache.values,
+            string_values: &cache.string_values,
             units,
             position: 0,
         }
+    }
+
+    #[inline]
+    fn make_unescaped_primitive_string(&self, units: &[C], width: StringWidth) -> Gc<PrimitiveString> {
+        let len = units.len();
+        if len == 0 {
+            return self.vm.empty_string();
+        }
+        if len == 1 {
+            let unit: u32 = units[0].into();
+            if unit < 0x80 {
+                return self.vm.single_ascii_character_string(unit as u8);
+            }
+        }
+        if len <= STRING_VALUE_CACHE_MAX_LEN {
+            let base = string_value_cache_set(units) * 2;
+            let slot0 = &self.string_values[base];
+            if let Some(cached) = slot0.get()
+                && cached.length_in_utf16_code_units() == len
+                && are_code_units_of_view(units, cached.utf16_string_view())
+            {
+                return cached;
+            }
+            let slot1 = &self.string_values[base + 1];
+            if let Some(cached) = slot1.get()
+                && cached.length_in_utf16_code_units() == len
+                && are_code_units_of_view(units, cached.utf16_string_view())
+            {
+                slot1.set(slot0.get());
+                slot0.set(Some(cached));
+                return cached;
+            }
+            let created = C::make_primitive_string(self.vm, units, width);
+            slot1.set(slot0.get());
+            slot0.set(Some(created));
+            return created;
+        }
+        C::make_primitive_string(self.vm, units, width)
     }
 
     #[inline(always)]
@@ -727,8 +838,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             Some(0x22) => {
                 let token = self.scan_string()?;
                 if !token.has_escapes {
-                    return Ok(Value::from_string(C::make_primitive_string(
-                        self.vm,
+                    return Ok(Value::from_string(self.make_unescaped_primitive_string(
                         &self.units[token.start..token.end],
                         token.width,
                     )));
@@ -786,6 +896,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             }
             // Fast path: directly match the expected key of the predicted shape without scanning the string twice.
             let mut matched_predicted = false;
+            let mut consumed_colon = false;
             if let Some((slot, generation, key_count, true)) = predicted
                 && predicted_matched < key_count
                 && let Some(entry) = &self.tables.shapes.entries[slot]
@@ -794,13 +905,19 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 let start = self.position + 1;
                 if let Some(ref simple_keys) = entry.simple_byte_keys {
                     let (key_start, key_end) = simple_keys.ranges[predicted_matched];
-                    let expected_bytes = &simple_keys.bytes[key_start as usize..key_end as usize];
-                    let end = start + expected_bytes.len();
+                    let key_start = key_start as usize;
+                    let key_end = key_end as usize;
+                    let end = start + (key_end - key_start);
                     if let Some(slice) = self.units.get(start..end)
                         && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
-                        && C::equals_byte_slice(slice, expected_bytes)
+                        && C::equals_simple_key(slice, simple_keys, key_start, key_end)
                     {
-                        self.position = end + 1;
+                        if self.units.get(end + 1).map(|u| (*u).into()) == Some(0x3A) {
+                            self.position = end + 2;
+                            consumed_colon = true;
+                        } else {
+                            self.position = end + 1;
+                        }
                         matched_predicted = true;
                     }
                 } else {
@@ -847,8 +964,10 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             }
 
             if matched_predicted {
-                self.skip_whitespace();
-                self.consume(b':')?;
+                if !consumed_colon {
+                    self.skip_whitespace();
+                    self.consume(b':')?;
+                }
                 self.skip_whitespace();
                 let (slot, generation, _, _) = predicted.expect("predicted entry is active");
                 // Pin the predicted slot across nested containers so its entry cannot be evicted mid-object.
@@ -1081,18 +1200,18 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
 
         // Integer part: 0, or a digit other than 0 followed by digits.
         let integer_start = self.position;
-        let mut integer_value: i32 = 0;
+        let mut integer_value: u64 = 0;
         match self.peek() {
             Some(0x30) => self.position += 1,
             Some(first @ 0x31..=0x39) => {
-                integer_value = (first - 0x30) as i32;
+                integer_value = u64::from(first - 0x30);
                 self.position += 1;
                 while let Some(&unit) = self.units.get(self.position) {
                     let digit = unit.into().wrapping_sub(0x30);
                     if digit >= 10 {
                         break;
                     }
-                    integer_value = integer_value.wrapping_mul(10).wrapping_add(digit as i32);
+                    integer_value = integer_value.wrapping_mul(10).wrapping_add(u64::from(digit));
                     self.position += 1;
                 }
             }
@@ -1125,15 +1244,22 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             }
         }
 
-        // OPTIMIZATION: An integer of up to nine digits is exactly its value, which needs no float parsing.
-        if is_integer && integer_digits <= 9 {
+        // OPTIMIZATION: Every integer up to 15 digits is below 2^53 and converts exactly to i32 or f64 with no
+        //               decimal string float parsing.
+        if is_integer && integer_digits <= 15 {
             if is_negative {
                 if integer_value == 0 {
                     return Ok(Value::from_f64(-0.0));
                 }
-                integer_value = -integer_value;
+                if integer_value <= (i32::MAX as u64) + 1 {
+                    return Ok(Value::from_i32(integer_value.wrapping_neg() as i32));
+                }
+                return Ok(Value::from_f64(-(integer_value as f64)));
             }
-            return Ok(Value::from_i32(integer_value));
+            if integer_value <= i32::MAX as u64 {
+                return Ok(Value::from_i32(integer_value as i32));
+            }
+            return Ok(Value::from_f64(integer_value as f64));
         }
 
         // NB: The units of a number are ASCII digits and signs, so each one is a byte of its literal.

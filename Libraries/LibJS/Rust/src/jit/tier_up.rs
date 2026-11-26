@@ -15,7 +15,7 @@ use super::compile_queue::{CompileResult, Compiled};
 use super::data_memory::DataMemory;
 use super::executable_memory::ExecutableMemory;
 use super::snapshot::{CapturedSnapshot, capture_snapshot};
-use super::{CompileJob, JitState, executable_of};
+use super::{CompileJob, JitState};
 use crate::bytecode::executable::Executable;
 use crate::bytecode::feedback::tier_up_costs;
 use crate::gc::defer_gc::DeferGc;
@@ -415,8 +415,9 @@ fn install(
     vm.jit.dependents.register(vm, executable, id, artifact.dependencies());
     // NB: A callee's tier-up check may install the code while its caller still runs in the interpreter, possibly
     //     past the loop the code has an on-stack replacement entry at.
+    let executable_head = Some(Executable::head(executable));
     vm.for_each_live_execution_context(|frame| {
-        if !frame.runs_jit_code.get() && frame.executable.get().is_some() && executable_of(frame) == executable {
+        if !frame.runs_jit_code.get() && frame.executable.get() == executable_head {
             code.note_interpreted_frame(vm, frame, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL);
         }
         ControlFlow::Continue(())
