@@ -26,7 +26,7 @@ use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::iterator::get_iterator_values;
 use crate::runtime::native_function::{NativeFunction, define_native_function_class, raw_native};
 use crate::runtime::object::{IndexedStorageKind, IntegrityLevel, PropertyKind, ShouldThrowExceptions};
-use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
+use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, PropertyAttributes};
 use crate::runtime::property_descriptor::{from_property_descriptor, to_property_descriptor};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
@@ -307,6 +307,40 @@ impl ObjectConstructor {
         // 1. Let obj be ? ToObject(O).
         let object = vm.argument(0).to_object(vm)?;
 
+        // OPTIMIZATION: An ordinary non-dictionary object whose own enumerable string properties are contiguous
+        //               non-accessor data properties needs no per-property descriptor or [[Get]] calls.
+        if object.own_property_keys_are_those_of_its_shape()
+            && !object.has_intrinsic_accessors()
+            && !object.shape().is_dictionary()
+        {
+            let shape = object.shape();
+            let count = shape.property_count() as usize;
+            if count == 0 {
+                return Ok(Value::from_object(Array::create(vm, realm, 0, None).must()));
+            }
+            let (all_enumerable_contiguous, has_accessors) =
+                shape.with_own_enumerable_string_keys(vm, |_, contiguous| {
+                    let has_accessors = contiguous
+                        && object
+                            .named_properties_prefix(count)
+                            .iter()
+                            .any(|value| value.is_accessor());
+                    (contiguous, has_accessors)
+                });
+            if all_enumerable_contiguous && !has_accessors {
+                let entry_list = MarkedVec::with_capacity(vm, count);
+                for index in 0..count {
+                    let pair = Array::create(vm, realm, 0, None).must();
+                    // Read key and value fresh after `Array::create` in case GC moved cells.
+                    let key = object.shape().cached_own_enumerable_string_key_at(index);
+                    let value = object.get_direct(index as u32);
+                    pair.set_indexed_property_elements(&[key, value]);
+                    entry_list.push(Value::from_object(pair));
+                }
+                return Ok(Value::from_object(Array::create_from_list(vm, realm, &entry_list)));
+            }
+        }
+
         // 2. Let entryList be ? EnumerableOwnProperties(obj, key+value).
         let name_list = object.enumerable_own_property_names(vm, PropertyKind::KeyAndValue)?;
 
@@ -568,18 +602,12 @@ impl ObjectConstructor {
 
         // 2. Let keyList be ? EnumerableOwnProperties(obj, key).
         // OPTIMIZATION: The enumerable own keys of an object whose own keys are those of its shape are the enumerable
-        //               string keys of the shape, which the shape keeps as strings.
+        //               string keys of the shape, which the shape caches as a contiguous slice of string values.
         if object.own_property_keys_are_those_of_its_shape() {
             let array = Array::create(vm, realm, 0, None).must();
-            object.shape().with_own_string_keys(vm, |keys, enumerable| {
-                let count = enumerable.iter().filter(|enumerable| **enumerable).count();
-                array
-                    .set_indexed_property_elements_to_undefined(u32::try_from(count).expect("a key count fits in u32"));
-                let enumerable_keys = keys.iter().zip(enumerable).filter(|(_, enumerable)| **enumerable);
-                for (index, (key, _)) in enumerable_keys.enumerate() {
-                    array.set_packed_indexed_element(index as u32, *key);
-                }
-            });
+            object
+                .shape()
+                .with_own_enumerable_string_keys(vm, |keys, _| array.set_indexed_property_elements(keys));
             return Ok(Value::from_object(array));
         }
         let name_list = object.enumerable_own_property_names(vm, PropertyKind::Key)?;
@@ -674,6 +702,60 @@ impl ObjectConstructor {
         // 1. Let obj be ? ToObject(O).
         let object = vm.argument(0).to_object(vm)?;
 
+        // OPTIMIZATION: An ordinary non-dictionary object with no own accessors can copy its enumerable data property
+        //               values straight from named storage without descriptor checks or intermediate MarkedVec copies.
+        if object.own_property_keys_are_those_of_its_shape()
+            && !object.has_intrinsic_accessors()
+            && !object.shape().is_dictionary()
+        {
+            let shape = object.shape();
+            let property_count = shape.property_count();
+            if property_count == 0 {
+                return Ok(Value::from_object(Array::create(vm, realm, 0, None).must()));
+            }
+            let mut has_accessors = false;
+            let mut contiguous = true;
+            let mut enumerable_count = 0u32;
+            shape.for_each_property_in_insertion_order(|property_key, metadata| {
+                if !property_key.is_string() || !metadata.attributes.is_enumerable() {
+                    contiguous = false;
+                    return ControlFlow::Continue(());
+                }
+                if object.get_direct(metadata.offset).is_accessor() {
+                    has_accessors = true;
+                    return ControlFlow::Break(());
+                }
+                if metadata.offset != enumerable_count {
+                    contiguous = false;
+                }
+                enumerable_count += 1;
+                ControlFlow::Continue(())
+            });
+            if !has_accessors {
+                let array = Array::create(vm, realm, 0, None).must();
+                if enumerable_count > 0 {
+                    if contiguous {
+                        array.set_indexed_property_elements(object.named_properties_prefix(enumerable_count as usize));
+                    } else {
+                        array.set_indexed_property_elements_with(enumerable_count, |dst| {
+                            let mut index = 0usize;
+                            object
+                                .shape()
+                                .for_each_property_in_insertion_order(|property_key, metadata| {
+                                    if property_key.is_string() && metadata.attributes.is_enumerable() {
+                                        dst[index].write(object.get_direct(metadata.offset));
+                                        index += 1;
+                                    }
+                                    ControlFlow::Continue(())
+                                });
+                            debug_assert_eq!(index, dst.len());
+                        });
+                    }
+                }
+                return Ok(Value::from_object(array));
+            }
+        }
+
         // 2. Let valueList be ? EnumerableOwnProperties(obj, value).
         let name_list = object.enumerable_own_property_names(vm, PropertyKind::Value)?;
 
@@ -721,41 +803,126 @@ fn get_own_property_keys(
 }
 
 fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowCompletionOr<bool> {
+    let source_shape = source.shape();
     if !source.eligible_for_own_property_enumeration_fast_path()
         || source.has_intrinsic_accessors()
         || source.may_interfere_with_indexed_property_access()
         || source.has_parameter_map()
         || source.is_ecmascript_function_object()
         || source.indexed_storage_kind() != IndexedStorageKind::None
-        || source.shape().is_dictionary()
+        || source_shape.is_dictionary()
     {
         return Ok(false);
     }
 
+    let source_property_count = source_shape.property_count();
+    if source_property_count == 0 {
+        return Ok(true);
+    }
+
+    let target_shape = target.shape();
+    let target_ordinary_unwatched = target.has_ordinary_named_property_lookup_and_set()
+        && !target.has_intrinsic_accessors()
+        && !target_shape.has_watched_slots()
+        && !target_shape.is_prototype_shape()
+        && !target.has_global_object_flag();
+
+    // OPTIMIZATION: When target already owns every enumerable source property as a writable non-accessor data property
+    //               and source has no accessors or symbols, overwrite the slots directly without allocating a MarkedVec.
+    if target_ordinary_unwatched && !target_shape.is_dictionary() {
+        if target_shape == source_shape {
+            let mut fast_ok = true;
+            source_shape.for_each_property_in_insertion_order(|property_key, metadata| {
+                if !property_key.is_string() {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                }
+                if metadata.attributes.is_enumerable()
+                    && (!metadata.attributes.is_writable()
+                        || source.get_direct(metadata.offset).is_accessor()
+                        || target.get_direct(metadata.offset).is_accessor())
+                {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            if fast_ok {
+                if !core::ptr::eq(target, source) {
+                    source_shape.for_each_property_in_insertion_order(|_, metadata| {
+                        if metadata.attributes.is_enumerable() {
+                            target.put_direct_from_cache(metadata.offset, source.get_direct(metadata.offset));
+                        }
+                        ControlFlow::Continue(())
+                    });
+                }
+                return Ok(true);
+            }
+        } else if source_property_count <= 32 {
+            let mut copy_pairs = [(0u32, 0u32); 32];
+            let mut pair_count = 0usize;
+            let mut fast_ok = true;
+            source_shape.for_each_property_in_insertion_order(|property_key, metadata| {
+                if !property_key.is_string() {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                }
+                if !metadata.attributes.is_enumerable() {
+                    return ControlFlow::Continue(());
+                }
+                if source.get_direct(metadata.offset).is_accessor() {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                }
+                let Some(target_metadata) = target_shape.lookup(property_key) else {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                };
+                if !target_metadata.attributes.is_writable() || target.get_direct(target_metadata.offset).is_accessor()
+                {
+                    fast_ok = false;
+                    return ControlFlow::Break(());
+                }
+                copy_pairs[pair_count] = (metadata.offset, target_metadata.offset);
+                pair_count += 1;
+                ControlFlow::Continue(())
+            });
+            if fast_ok {
+                for &(src_offset, dst_offset) in &copy_pairs[..pair_count] {
+                    target.put_direct_from_cache(dst_offset, source.get_direct(src_offset));
+                }
+                return Ok(true);
+            }
+        }
+    }
+
     // The key, storage offset and enumerability of each property, read out first since nothing may allocate while
     // the shape is borrowed.
-    let properties: MarkedVec<(PropertyKey, u32, bool)> =
-        MarkedVec::with_capacity(vm, source.shape().property_count() as usize);
+    let properties: MarkedVec<(PropertyKey, u32, bool)> = MarkedVec::with_capacity(vm, source_property_count as usize);
     let mut has_non_string_keys = false;
-    source
-        .shape()
-        .for_each_property_in_insertion_order(|property_key, metadata| {
-            if !property_key.is_string() {
-                has_non_string_keys = true;
-                return ControlFlow::Break(());
-            }
-            properties.push((
-                property_key.clone(),
-                metadata.offset,
-                metadata.attributes.is_enumerable(),
-            ));
-            ControlFlow::Continue(())
-        });
+    let mut source_has_accessors = false;
+    source_shape.for_each_property_in_insertion_order(|property_key, metadata| {
+        if !property_key.is_string() {
+            has_non_string_keys = true;
+            return ControlFlow::Break(());
+        }
+        let is_enumerable = metadata.attributes.is_enumerable();
+        if is_enumerable && source.get_direct(metadata.offset).is_accessor() {
+            source_has_accessors = true;
+        }
+        properties.push((property_key.clone(), metadata.offset, is_enumerable));
+        ControlFlow::Continue(())
+    });
     if has_non_string_keys {
         return Ok(false);
     }
 
-    let source_shape = source.shape();
+    let mut can_define_direct_new = !source_has_accessors
+        && target_ordinary_unwatched
+        && !target.requires_slow_add_own_property()
+        && !target_shape.is_non_extensible()
+        && target.set_of_properties_of_creates_them(vm, source);
+
     for index in 0..properties.len() {
         let (property_key, offset, is_enumerable) = properties.get(index).expect("the index is in bounds");
         let mut value;
@@ -765,9 +932,11 @@ fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowComp
             }
             value = source.get_direct(offset);
             if value.is_accessor() {
+                can_define_direct_new = false;
                 value = source.get(vm, &property_key)?;
             }
         } else {
+            can_define_direct_new = false;
             let descriptor = source.internal_get_own_property(vm, &property_key)?;
             if !descriptor
                 .is_some_and(|descriptor| descriptor.enumerable.expect("an own property descriptor is complete"))
@@ -777,16 +946,20 @@ fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowComp
             value = source.get(vm, &property_key)?;
         }
         // OPTIMIZATION: [[Set]] of an own writable data property of an object with ordinary property lookup and [[Set]]
-        //               changes its value, and nothing else.
-        if target.has_ordinary_named_property_lookup_and_set()
-            && !target.has_intrinsic_accessors()
-            && let Some(metadata) = target.shape().lookup(&property_key)
-            && metadata.attributes.is_writable()
-            && !target.get_direct(metadata.offset).is_accessor()
-        {
-            target.replace_direct(vm, metadata.offset, value);
-            continue;
+        //               changes its value, and nothing else. When no accessors can run and target's prototype chain has
+        //               no blocking setters/read-only properties, missing properties can also be added directly.
+        if target.has_ordinary_named_property_lookup_and_set() && !target.has_intrinsic_accessors() {
+            if let Some(metadata) = target.shape().lookup(&property_key) {
+                if metadata.attributes.is_writable() && !target.get_direct(metadata.offset).is_accessor() {
+                    target.replace_direct(vm, metadata.offset, value);
+                    continue;
+                }
+            } else if can_define_direct_new {
+                target.define_direct_property(vm, &property_key, value, DEFAULT_ATTRIBUTES);
+                continue;
+            }
         }
+        can_define_direct_new = false;
         target.set(vm, &property_key, value, ShouldThrowExceptions::Yes)?;
     }
     Ok(true)

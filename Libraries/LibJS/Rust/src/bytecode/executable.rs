@@ -358,18 +358,6 @@ fn insert_megamorphic_entry(data: &MegamorphicData, entry: &PropertyLookupCacheE
     primary_entry.set(*entry);
 }
 
-/// The entries of a cache that may hold a shape, copied out by PropertyLookupCache::entries_for_shape().
-pub struct PropertyLookupCacheEntries {
-    entries: [PropertyLookupCacheEntryData; MAX_NUMBER_OF_SHAPES_TO_REMEMBER],
-    count: usize,
-}
-
-impl PropertyLookupCacheEntries {
-    pub fn as_slice(&self) -> &[PropertyLookupCacheEntryData] {
-        &self.entries[..self.count]
-    }
-}
-
 // Represents one tiered inline cache used for property lookups. The tier is in the low bits of the data pointer.
 impl PropertyLookupCache {
     pub fn new() -> Self {
@@ -494,26 +482,10 @@ impl PropertyLookupCache {
         &[]
     }
 
-    fn copy_entries(entries: &[PropertyLookupCacheEntry]) -> PropertyLookupCacheEntries {
-        let mut copied = PropertyLookupCacheEntries {
-            entries: [PropertyLookupCacheEntryData::default(); MAX_NUMBER_OF_SHAPES_TO_REMEMBER],
-            count: entries.len(),
-        };
-        for (copy, entry) in copied.entries.iter_mut().zip(entries) {
-            *copy = entry.get();
-        }
-        copied
-    }
-
-    /// The entries that may be for `shape` and `key` (see PropertyLookupCacheEntry::key; 0 for named accesses).
-    /// Callers check each entry's shape and key. A megamorphic cache finds the one for the shape and key and moves it
-    /// first, where the interpreter looks.
-    pub fn entries_for_shape(&self, shape: Gc<Shape>, key: u64) -> PropertyLookupCacheEntries {
-        Self::copy_entries(self.entry_slots_for_shape(shape, key))
-    }
-
-    /// entries_for_shape() in place, for the cache-only fast paths. The entries must not be held across anything that
-    /// may update the cache.
+    /// The entries that may be for `shape` and `key` (see PropertyLookupCacheEntry::key; 0 for named accesses),
+    /// borrowed in place for the cache-only fast paths. Callers check each entry's shape and key. A megamorphic cache
+    /// finds the one for the shape and key and moves it first, where the interpreter looks. The returned slice must
+    /// not be held across anything that may update the cache.
     #[inline]
     pub fn entry_slots_for_shape(&self, shape: Gc<Shape>, key: u64) -> &[PropertyLookupCacheEntry] {
         let Some(data) = self.megamorphic_data() else {
@@ -632,22 +604,26 @@ impl PropertyLookupCache {
         entries[0].set(new_entry);
     }
 
-    /// Boxing a MegamorphicData builds it on the stack first, in a frame of a few KB, so this stays out of line from
-    /// update(), which runs on every miss.
+    /// Allocates zero-initialized `MegamorphicData` directly on the heap, avoiding staging a multi-KB struct on the
+    /// stack and copying it into a `Box`.
     #[cold]
     #[inline(never)]
     fn move_full_polymorphic_entries_to_megamorphic_tier(&self, new_entry: &PropertyLookupCacheEntryData) {
+        const _: () = assert!(PropertyLookupCacheEntryType::Empty as u32 == 0);
         let entries = &self
             .polymorphic_data()
             .expect("only a polymorphic cache becomes megamorphic")
             .entries;
-        let new_data = Box::new(MegamorphicData {
-            entry: PropertyLookupCacheEntry::new(),
-            primary_entries: core::array::from_fn(|_| PropertyLookupCacheEntry::new()),
-            secondary_entries: core::array::from_fn(|_| PropertyLookupCacheEntry::new()),
-            keyed_misses: Cell::new(0),
-            vm_cache_lessons: Cell::new(0),
-        });
+        let layout = std::alloc::Layout::new::<MegamorphicData>();
+        // SAFETY: `MegamorphicData` has non-zero size, `PropertyLookupCacheEntryType::Empty == 0`, `false == 0`,
+        //         `Option<Gc<T>>::None` is represented as null (0), and all integer fields initialize to 0.
+        let new_data = unsafe {
+            let raw = std::alloc::alloc_zeroed(layout).cast::<MegamorphicData>();
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(raw)
+        };
         for entry in entries.iter().rev() {
             let entry = entry.get();
             if entry.shape.is_some() {

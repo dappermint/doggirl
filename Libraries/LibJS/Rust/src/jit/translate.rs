@@ -773,7 +773,10 @@ pub(super) fn exit(vm: &Vm, root: NonNull<ExecutionContext>, code: &JitCode, ind
         // NB: Sites in inlined callees are their executables', but the compiled code learns from them too.
         let new_site = executable.add_jit_exit_site((frame_state.pc(), kind)) >= snapshot_executable.known_exit_sites;
         let learned_shapes = kind == libjs_jit::code::ExitKind::BadShape
-            && executable.note_jit_shape_exit(frame_state.pc(), &snapshot_executable.property_cache_sizes);
+            && executable.note_jit_shape_exit(
+                frame_state.pc(),
+                code.snapshot_executable_property_cache_sizes(frame_state.executable()),
+            );
         new_site || learned_shapes
     };
     if learned && is_installed_code(vm, &compiled_executable, code) {
