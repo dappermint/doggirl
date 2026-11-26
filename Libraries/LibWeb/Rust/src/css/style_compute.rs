@@ -5498,6 +5498,136 @@ pub(crate) fn transition_entries(
     entries
 }
 
+/// Whether any `transition-property` entry naming `all` or a custom property has a positive
+/// combined duration and delay.
+pub(crate) fn has_active_custom_property_transition(longhands: crate::css::style::ViewLonghands<'_>) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+
+    let property_values = computed_value_list(longhands, prop::TRANSITION_PROPERTY);
+    let mut duration_values: Option<&[RetainedStyleValueData]> = None;
+    let mut delay_values: Option<&[RetainedStyleValueData]> = None;
+    for (index, property_value) in property_values.iter().enumerate() {
+        let StyleValueData::CustomIdent { custom_ident } = property_value.data() else {
+            continue;
+        };
+        let property = property_id_from_custom_ident(custom_ident);
+        if property != Some(prop::ALL) && property != Some(prop::CUSTOM) {
+            continue;
+        }
+        let durations =
+            *duration_values.get_or_insert_with(|| computed_value_list(longhands, prop::TRANSITION_DURATION));
+        let delays = *delay_values.get_or_insert_with(|| computed_value_list(longhands, prop::TRANSITION_DELAY));
+        let duration = time_value_to_milliseconds(durations[index % durations.len()].data());
+        let delay = time_value_to_milliseconds(delays[index % delays.len()].data());
+        if duration.max(0.0) + delay > 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any physical longhand named by a `transition-property` entry with positive combined
+/// duration and delay may differ between `before` and `after`, without allocating transition entry
+/// vectors. Returning `false` guarantees no longhand transition can start; returning `true` is
+/// conservative and defers to full transition decision.
+pub(crate) fn has_active_changed_longhand_transition(
+    before: crate::css::style::ViewLonghands<'_>,
+    after: crate::css::style::ViewLonghands<'_>,
+    to_compare: Option<&[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]>,
+    values_equal: impl Fn(*const StyleValueData, *const StyleValueData) -> bool,
+) -> bool {
+    use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, longhand_is_logical_alias, property_id as prop};
+
+    let property_values = computed_value_list(after, prop::TRANSITION_PROPERTY);
+    let duration_values = computed_value_list(after, prop::TRANSITION_DURATION);
+    let delay_values = computed_value_list(after, prop::TRANSITION_DELAY);
+    let mut axes: Option<(u8, u8)> = None;
+    let mut get_axes = || {
+        *axes.get_or_insert_with(|| {
+            writing_mode_and_direction_of(after.handle(prop::WRITING_MODE), after.handle(prop::DIRECTION))
+        })
+    };
+
+    let longhand_differs = |property_id: u16| -> bool {
+        if let Some(to_compare) = to_compare
+            && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+            && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
+        {
+            return false;
+        }
+        let Some(before_val) = before.handle(property_id) else {
+            return true;
+        };
+        let Some(after_val) = after.handle(property_id) else {
+            return true;
+        };
+        !values_equal(before_val.pointer(), after_val.pointer())
+    };
+
+    fn property_has_changed_longhand(
+        property: u16,
+        get_axes: &mut impl FnMut() -> (u8, u8),
+        longhand_differs: &impl Fn(u16) -> bool,
+    ) -> bool {
+        use crate::css::property_metadata::{longhand_is_logical_alias, property_id as prop};
+        if property == prop::ALL {
+            let (writing_mode, direction) = get_axes();
+            crate::css::computed_values::all_transition_longhands(writing_mode, direction)
+                .iter()
+                .copied()
+                .any(longhand_differs)
+        } else if property_is_shorthand(property) {
+            longhands_for_shorthand(property)
+                .iter()
+                .copied()
+                .any(|longhand| property_has_changed_longhand(longhand, get_axes, longhand_differs))
+        } else if property != prop::CUSTOM {
+            let physical = if longhand_is_logical_alias(property) {
+                let (writing_mode, direction) = get_axes();
+                map_logical_alias_to_physical(property, writing_mode, direction)
+            } else {
+                property
+            };
+            longhand_differs(physical)
+        } else {
+            false
+        }
+    }
+
+    for (index, property_value) in property_values.iter().enumerate() {
+        let transition_property = match property_value.data() {
+            StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => continue,
+            StyleValueData::CustomIdent { custom_ident } => property_id_from_custom_ident(custom_ident),
+            _ => unreachable!("computed transition-property must be none or a custom identifier"),
+        };
+        let Some(transition_property) = transition_property else {
+            continue;
+        };
+        if transition_property == prop::CUSTOM {
+            continue;
+        }
+        let duration = time_value_to_milliseconds(duration_values[index % duration_values.len()].data());
+        let delay = time_value_to_milliseconds(delay_values[index % delay_values.len()].data());
+        if duration.max(0.0) + delay <= 0.0 {
+            continue;
+        }
+        if transition_property != prop::ALL && !property_is_shorthand(transition_property) {
+            let physical = if longhand_is_logical_alias(transition_property) {
+                let (writing_mode, direction) = get_axes();
+                map_logical_alias_to_physical(transition_property, writing_mode, direction)
+            } else {
+                transition_property
+            };
+            if longhand_differs(physical) {
+                return true;
+            }
+        } else if property_has_changed_longhand(transition_property, &mut get_axes, &longhand_differs) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `transition-property` directly names `all` or `transform`, which always expands to include `transform`.
 pub(crate) fn transition_property_names_all_or_transform(longhands: crate::css::style::ViewLonghands<'_>) -> bool {
     use crate::css::property_metadata::property_id as prop;

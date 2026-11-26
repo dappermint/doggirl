@@ -890,7 +890,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::prepare_transition_step_for_insta
     if (has_flag(before_change.dependency_flags(), StyleRecordDependencyFlag::InDisplayNoneSubtree))
         return {};
     if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value()) {
-        if (auto parent_style = parent->computed_style(); parent_style && parent_style->in_display_none_subtree())
+        if (auto const& parent_style = parent->installed_style(); parent_style && has_flag(parent_style.dependency_flags(), StyleRecordDependencyFlag::InDisplayNoneSubtree))
             return {};
     }
 
@@ -1022,11 +1022,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         } else {
             bool const has_any_provisional = Animations::RustFFI::animations_document_animations_has_any_provisional_transitions(&document().document_animations());
             no_ancestor_animations = true;
-            for (auto ancestor = abstract_element.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
-                auto const ancestor_style = ancestor->installed_style();
+            for (GC::Ptr<DOM::Element const> ancestor = element.element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
+                auto const& ancestor_style = ancestor->installed_style();
                 if ((ancestor_style && ancestor_style.view().animated_overlay != nullptr)
-                    || ancestor->element().has_associated_animations()
-                    || (has_any_provisional && has_provisional_transition_states(*ancestor))) {
+                    || ancestor->has_associated_animations()
+                    || (has_any_provisional && has_provisional_transition_states(DOM::AbstractElement { *const_cast<DOM::Element*>(ancestor.ptr()) }))) {
                     no_ancestor_animations = false;
                     break;
                 }

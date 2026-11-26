@@ -1609,14 +1609,18 @@ pub(crate) unsafe fn decide_transitions(
     mut on_actions: impl FnMut(&[FfiTransitionAction]),
 ) {
     if existing.is_empty() && !records.before.is_null() && !records.after.is_null() {
-        // SAFETY: Guaranteed by the caller: `records.after` is a live host record.
+        // SAFETY: Guaranteed by the caller: `records.before` and `records.after` are live host records.
+        let before_ref = unsafe { &*records.before.cast::<crate::css::style::pipeline::Record>() };
         let after_ref = unsafe { &*records.after.cast::<crate::css::style::pipeline::Record>() };
         let after_base = after_ref
             .sample_of_animations()
             .map_or(after_ref, |sample| &sample.base);
         let after_longhands = crate::css::style::ViewLonghands::of_record(after_base);
         if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_longhands)
-            || (no_ancestor_animations && records.before == records.after && after_ref.sample_of_animations().is_none())
+            || (no_ancestor_animations
+                && before_ref.sample_of_animations().is_none()
+                && after_ref.sample_of_animations().is_none()
+                && crate::css::transition::is_noop_without_engine_unoverlaid_records(before_ref, after_ref))
         {
             on_actions(&[]);
             return;
@@ -1640,15 +1644,6 @@ pub(crate) unsafe fn decide_transitions(
         && host.answer_decided_transition_step(input.target_node, &decision, existing, &mut on_actions)
     {
         return;
-    }
-    if existing.is_empty() {
-        let after_view = crate::css::style::StyleRecordView::of_host_record(&decision.after);
-        if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_view.longhands())
-            || (no_ancestor_animations && decision.is_noop_without_engine())
-        {
-            on_actions(&[]);
-            return;
-        }
     }
     let element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,
