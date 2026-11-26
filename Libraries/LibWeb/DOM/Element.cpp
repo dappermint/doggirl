@@ -2101,11 +2101,8 @@ CSS::RequiredInvalidationAfterStyleChange Element::compose_style_pseudo_element_
 
 void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainEffects effects, CSS::LayoutTreeRebuildRoot rebuild_root, CSS::RequiredInvalidationAfterStyleChange const& invalidation, CSS::InstalledStyle const& old_style)
 {
+    VERIFY(has_style());
     auto& style_computer = document().style_computer();
-    auto new_computed_values = computed_style();
-    VERIFY(new_computed_values);
-    auto old_computed_values = old_style ? style_computer.computed_style_record_view(old_style) : CSS::ComputedStyleRecordView {};
-    CSS::ComputedValues const* old_values = old_computed_values ? &*old_computed_values : nullptr;
 
     if (has_flag(effects, CSS::MainEffects::ContainerEffects))
         record_engine_container_query_effects(read, *this);
@@ -2113,9 +2110,17 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
     // A style change that needs a relayout can change which nodes render and what generated content they have, and so
     // the accessible names that come from them. Of the changes that need just a repaint, only one of visibility can:
     // Content that isn't visible is left out of a name that comes from content.
-    auto visibility_changed = old_values && old_values->visibility() != new_computed_values->visibility();
-    if ((invalidation.needs_relayout() || visibility_changed) && document().page().accessibility_interested())
-        document().invalidate_cached_accessibility_data(*this);
+    if (document().page().accessibility_interested()) {
+        bool visibility_changed = false;
+        if (!invalidation.needs_relayout() && old_style) {
+            auto old_computed_values = style_computer.computed_style_record_view(old_style);
+            auto new_computed_values = computed_style();
+            VERIFY(new_computed_values);
+            visibility_changed = old_computed_values && old_computed_values->visibility() != new_computed_values->visibility();
+        }
+        if (invalidation.needs_relayout() || visibility_changed)
+            document().invalidate_cached_accessibility_data(*this);
+    }
 
     // The environment the record was published with: what the element inherits, or what the engine resolved its own
     // custom declarations to over that, and those of the pseudo-elements over the element's.
@@ -2124,7 +2129,7 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
         if (current_environment && custom_property_data_is_animation_overlay({}))
             current_environment = current_environment->parent();
         auto const current_identity = current_environment ? current_environment->identity() : 0;
-        if (!old_values || current_identity != installed_style().custom_property_environment())
+        if (!old_style || current_identity != installed_style().custom_property_environment())
             set_custom_property_data({}, style_custom_property_environment(read, installed_style()));
         for (auto pseudo_element : computed_pseudo_elements) {
             if (auto const& pseudo_style = installed_style(pseudo_element); pseudo_style)
@@ -2132,15 +2137,21 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
         }
     }
 
-    if (has_flag(effects, CSS::MainEffects::AnchorNames))
-        update_anchor_name_registry(old_values, *new_computed_values);
+    if (has_flag(effects, CSS::MainEffects::AnchorNames)) {
+        auto new_computed_values = computed_style();
+        VERIFY(new_computed_values);
+        auto old_computed_values = old_style ? style_computer.computed_style_record_view(old_style) : CSS::ComputedStyleRecordView {};
+        update_anchor_name_registry(old_computed_values ? &*old_computed_values : nullptr, *new_computed_values);
+    }
 
     if (has_flag(effects, CSS::MainEffects::RootFontMetrics) && is_document_element()) {
         // Root-relative units read document-global font metrics rather than inherited style.
+        auto new_computed_values = computed_style();
+        VERIFY(new_computed_values);
         auto const root_font_metrics_before = style_computer.root_element_font_metrics();
         auto const root_font_metrics_depended_on_viewport_before = style_computer.root_element_font_metrics_depend_on_viewport_metrics();
         style_computer.update_root_element_font_metrics(*new_computed_values);
-        if (old_values
+        if (old_style
             && (root_font_metrics_before != style_computer.root_element_font_metrics()
                 || root_font_metrics_depended_on_viewport_before != style_computer.root_element_font_metrics_depend_on_viewport_metrics()))
             document().bump_style_environment_version();

@@ -49,14 +49,14 @@ pub(super) use cache_audit::CacheAudit;
 pub(super) use cache_audit::mode_from_environment as cache_audit_mode_from_environment;
 
 /// How many elements a task hands to another at once.
-const WORK_UNIT: usize = 16;
+const WORK_UNIT: usize = 8;
 
 /// How many elements the calling thread keeps queued for itself before it hands work to the pool.
-const CALLING_THREAD_QUEUE_SIZE: usize = 32;
+const CALLING_THREAD_QUEUE_SIZE: usize = 12;
 
 /// How many elements a pass finds to style before the pool's threads join in. A pass styling fewer
 /// runs on the calling thread alone: starting the pool's threads costs more than they would save.
-const PARALLEL_PASS_SIZE: usize = 64;
+const PARALLEL_PASS_SIZE: usize = 24;
 
 /// The computed initial values every element's style starts from.
 pub(in crate::css::style) struct InitialStyle {
