@@ -394,8 +394,8 @@ void SettingsUI::make_default_browser(JsonValue const&)
         }
 
         auto failure = result.system_message.has_value()
-            ? MUST(String::formatted("Could not make Ladybird the default browser. The system reported: {}", *result.system_message))
-            : "Could not make Ladybird the default browser. Choose it in your system settings instead."_string;
+            ? MUST(String::formatted("Could not make Doggirl the default browser. The system reported: {}", *result.system_message))
+            : "Could not make Doggirl the default browser. Choose it in your system settings instead."_string;
         self->async_send_message("defaultBrowserResult"sv, move(failure));
     });
 }

@@ -253,7 +253,7 @@
                 if (download.status === "failed") return download.error || "The download failed.";
                 if (download.status === "paused" && download.error) return download.error;
                 if (download.status === "in-progress" && download.isWaitingToRetry)
-                    return "The server asked us to slow down, so Ladybird is waiting to retry.";
+                    return "The server asked us to slow down, so Doggirl is waiting to retry.";
                 if (download.status !== "completed" && download.totalSize > 0) {
                     const unit = unitForDownloadSize(download.totalSize);
                     const parts = [

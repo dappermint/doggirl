@@ -628,7 +628,7 @@ void Tab::initialize(Optional<u64> hub_view_id)
         m_color_picker_dialog = new QColorDialog(QColor(current_color.red(), current_color.green(), current_color.blue()), &view());
 
         auto& dialog = *m_color_picker_dialog;
-        dialog.setWindowTitle("Ladybird");
+        dialog.setWindowTitle("Doggirl");
         dialog.setOption(QColorDialog::ShowAlphaChannel, false);
         QObject::connect(&dialog, &QColorDialog::currentColorChanged, this, [this](QColor const& color) {
             view().color_picker_update(Color(color.red(), color.green(), color.blue()), Web::HTML::ColorPickerUpdateState::Update);
@@ -690,7 +690,7 @@ void Tab::initialize(Optional<u64> hub_view_id)
                                                     : QStringLiteral("HH:mm");
         auto* dialog = new QDialog(&view());
         m_date_picker_dialog = dialog;
-        dialog->setWindowTitle("Ladybird");
+        dialog->setWindowTitle("Doggirl");
         auto* layout = new QVBoxLayout(dialog);
 
         QCalendarWidget* calendar = nullptr;
@@ -1275,7 +1275,7 @@ void Tab::set_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
     case Web::ScreenWakeLockState::Acquired:
         if (m_screen_display_sleep_inhibitor.has_value())
             break;
-        if (auto inhibitor = WakeLock::DisplaySleepInhibitor::create("Ladybird Content"sv); !inhibitor.is_error())
+        if (auto inhibitor = WakeLock::DisplaySleepInhibitor::create("Doggirl Content"sv); !inhibitor.is_error())
             m_screen_display_sleep_inhibitor = inhibitor.release_value();
         break;
     }
@@ -1550,7 +1550,7 @@ void Tab::close_popovers()
 static QString explanation_for_page_without_site(URL::URL const& url)
 {
     if (url.scheme() == "about"sv)
-        return QStringLiteral("Ladybird pages have no site settings.");
+        return QStringLiteral("Doggirl pages have no site settings.");
     if (url.scheme() == "file"sv)
         return QStringLiteral("Files on this computer have no site settings.");
     // NB: A page from a website can still have no origin of its own to keep settings for, for example when its

@@ -3,20 +3,16 @@
 <component type="desktop-application">
   <id>org.ladybird.Ladybird</id>
 
-  <name>Ladybird</name>
-  <summary>Truly independent web browser</summary>
+  <name>Doggirl</name>
+  <summary>Fast, independent web browser</summary>
 
-  <developer id="org.ladybird">
-    <name>Ladybird Browser Initiative</name>
+  <developer id="dev.dappermint">
+    <name>dappermint</name>
   </developer>
 
-  <url type="homepage">https://ladybird.org</url>
-  <url type="bugtracker">https://github.com/LadybirdBrowser/ladybird/issues</url>
-  <url type="faq">https://ladybird.org/#faq</url>
-  <url type="donation">https://donorbox.org/ladybird</url>
-  <url type="contact">https://ladybird.org/organization/#initiative</url>
-  <url type="vcs-browser">https://github.com/LadybirdBrowser/ladybird</url>
-  <url type="contribute">https://ladybird.org/#gi</url>
+  <url type="homepage">https://github.com/dappermint/doggirl</url>
+  <url type="bugtracker">https://github.com/dappermint/doggirl/issues</url>
+  <url type="vcs-browser">https://github.com/dappermint/doggirl</url>
 
   <metadata_license>0BSD</metadata_license>
   <project_license>BSD-2-Clause</project_license>
@@ -24,8 +20,7 @@
 
   <description>
     <p>
-      Ladybird is a brand-new browser and web engine.
-      Driven by a web standards first approach, Ladybird aims to render the modern web with good performance, stability and security.
+      Doggirl is an independent web browser built on an original standards-first web engine, focused on speed, stability and declarative configuration.
     </p>
   </description>
 

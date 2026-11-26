@@ -34,7 +34,7 @@ static StringView plain_process_name(StringView process)
         return "Video decoder"sv;
     if (process == "WebRTCClient"sv)
         return "WebRTC process"sv;
-    return "Ladybird"sv;
+    return "Doggirl"sv;
 }
 
 static Optional<String> website_host(String const& website)

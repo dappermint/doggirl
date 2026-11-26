@@ -11,15 +11,15 @@
         <key>CFBundlePackageType</key>
         <string>APPL</string>
         <key>CFBundleGetInfoString</key>
-        <string>Ladybird</string>
+        <string>Doggirl</string>
         <key>CFBundleName</key>
-        <string>Ladybird</string>
+        <string>Doggirl</string>
         <key>CFBundleDisplayName</key>
-        <string>Ladybird</string>
+        <string>Doggirl</string>
         <key>CFBundleSignature</key>
         <string></string>
         <key>CFBundleExecutable</key>
-        <string>Ladybird</string>
+        <string>Doggirl</string>
         <key>CFBundleIdentifier</key>
         <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
         <key>CFBundleShortVersionString</key>
@@ -33,11 +33,11 @@
         <key>NSHighResolutionCapable</key>
         <string>True</string>
         <key>NSLocationUsageDescription</key>
-        <string>Ladybird needs your location to provide it to websites that request geolocation access.</string>
+        <string>Doggirl needs your location to provide it to websites that request geolocation access.</string>
         <key>NSLocationWhenInUseUsageDescription</key>
-        <string>Ladybird needs your location to provide it to websites that request geolocation access.</string>
+        <string>Doggirl needs your location to provide it to websites that request geolocation access.</string>
         <key>NSMicrophoneUsageDescription</key>
-        <string>Ladybird needs access to your microphone to provide audio capture to websites that request it.</string>
+        <string>Doggirl needs access to your microphone to provide audio capture to websites that request it.</string>
         <key>CFBundleDocumentTypes</key>
         <array>
             <dict>

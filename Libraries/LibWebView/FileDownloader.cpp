@@ -179,7 +179,7 @@ static void mark_as_downloaded([[maybe_unused]] Core::File& file, [[maybe_unused
 
     // Without a quarantine event the system tells the user that we created the file, but it does check the file. These
     // are the quarantine flags of a download, and the time of the download in hexadecimal seconds.
-    auto quarantine = ByteString::formatted("0083;{:08x};Ladybird;", UnixDateTime::now().seconds_since_epoch());
+    auto quarantine = ByteString::formatted("0083;{:08x};Doggirl;", UnixDateTime::now().seconds_since_epoch());
     if (::fsetxattr(file.fd(), "com.apple.quarantine", quarantine.characters(), quarantine.length(), 0, 0) < 0)
         dbgln("Unable to quarantine a download: {}", Error::from_errno(errno));
 #endif

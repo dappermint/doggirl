@@ -76,7 +76,7 @@ void verify_diagnostics()
     VERIFY(!report.has_page_dumps());
 
     auto diagnostics = report.diagnostics(WebCompatReport::IncludePageDumps::Yes);
-    VERIFY(diagnostics.starts_with("Ladybird web compatibility report, format 1\n"sv));
+    VERIFY(diagnostics.starts_with("Doggirl web compatibility report, format 1\n"sv));
     VERIFY(diagnostics.contains("\nURL: https://example.com/broken?query\n"sv));
     VERIFY(diagnostics.contains("\nUser agent: Mozilla/5.0 Ladybird/1.0\n"sv));
     VERIFY(diagnostics.contains("\nViewport size: 1280x720\n"sv));
@@ -232,8 +232,8 @@ TEST_CASE(new_bug_report_url)
 {
     auto plain_url = WebView::new_bug_report_url({}).serialize();
     auto plain = plain_url.bytes_as_string_view();
-    EXPECT(plain.starts_with("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml&"sv));
-    EXPECT(plain.contains("&build-flags=Ladybird%20"sv));
+    EXPECT(plain.starts_with("https://github.com/dappermint/doggirl/issues/new?template=bug_report.yml&"sv));
+    EXPECT(plain.contains("&build-flags=Doggirl%20"sv));
     EXPECT(!plain.contains("sandbox"sv));
     EXPECT(!plain.contains("painting"sv));
 

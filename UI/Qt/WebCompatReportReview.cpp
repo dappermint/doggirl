@@ -494,7 +494,7 @@ void WebCompatReportReview::show_retry(String const& reason, u32 retry_number, u
 void WebCompatReportReview::show_sent()
 {
     m_progress->setValue(100);
-    show_status(tr("Report sent"), tr("Thanks for helping make the web work in Ladybird."), { m_back_to_site_button, m_close_button }, nullptr);
+    show_status(tr("Report sent"), tr("Thanks for helping make the web work in Doggirl."), { m_back_to_site_button, m_close_button }, nullptr);
     m_progress->hide();
     auto sent_color = Theme::is_dark() ? QColor(0x30b14f) : QColor(0x208a3a);
     m_status_icon->setPixmap(create_chrome_icon(ChromeIcon::CheckCircle, sent_color).pixmap(QSize(40, 40), devicePixelRatioF()));

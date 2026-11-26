@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=Ladybird
+Name=Doggirl
 GenericName=Web Browser
 GenericName[eo]=Retumilo
 GenericName[fr]=Navigateur Web
 GenericName[ru]=Веб-браузер
 GenericName[sv]=Webbläsare
-Exec=Ladybird %U
+Exec=Doggirl %U
 Icon=org.ladybird.Ladybird
 DBusActivatable=false
 Type=Application
@@ -22,4 +22,4 @@ Name[eo]=Nova fenestro
 Name[fr]=Nouvelle Fenêtre
 Name[ru]=Новое окно
 Name[sv]=Nytt fönster
-Exec=Ladybird --new-window
+Exec=Doggirl --new-window

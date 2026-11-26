@@ -50,7 +50,7 @@ static ReportSubmission::Contents describe_report(CrashReportSubmission::Options
 
     auto version = diagnostics.header("Version"sv);
     auto build = diagnostics.header("Build configuration"sv);
-    contents.client_version = version.is_empty() ? ByteString { "Unknown Ladybird version"sv } : move(version);
+    contents.client_version = version.is_empty() ? ByteString { "Unknown Doggirl version"sv } : move(version);
     contents.build = build.is_empty() ? ByteString { "Unknown build"sv } : move(build);
     return contents;
 }

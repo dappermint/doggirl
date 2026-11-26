@@ -18,7 +18,7 @@ Optional<PlatformFeatures::GpuFacts> describe_gpu_through_vulkan(Optional<Gfx::G
 {
     VkApplicationInfo application_info {};
     application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    application_info.pApplicationName = "Ladybird";
+    application_info.pApplicationName = "Doggirl";
     application_info.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo instance_info {};

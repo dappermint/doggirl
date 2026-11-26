@@ -78,7 +78,7 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(ByteString const& rep
         }
     }
     add_field("Termination signal"sv, signal("Termination signal"sv));
-    add_field("Ladybird version"sv, diagnostics.header("Version"sv), true);
+    add_field("Doggirl version"sv, diagnostics.header("Version"sv), true);
     add_field("Platform"sv, diagnostics.header("Platform"sv));
     add_field("Process"sv, diagnostics.header("Process"sv));
     add_field("Architecture"sv, diagnostics.header("Architecture"sv));

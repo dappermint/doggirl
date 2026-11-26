@@ -80,10 +80,10 @@ ErrorOr<void> TerminalWebView::take_over_terminal()
     s_terminal_fd = TRY(Core::System::dup(STDOUT_FILENO));
     TRY(Core::System::fcntl(s_terminal_fd, F_SETFD, FD_CLOEXEC));
 
-    *s_log_path = ByteString::formatted("/tmp/ladybird-terminal-{}.log", getpid());
+    *s_log_path = ByteString::formatted("/tmp/doggirl-terminal-{}.log", getpid());
     auto log_fd = TRY(Core::System::open(*s_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
 
-    auto message = ByteString::formatted("Ladybird logs to {}\r\n", *s_log_path);
+    auto message = ByteString::formatted("Doggirl logs to {}\r\n", *s_log_path);
     (void)Core::System::write(s_terminal_fd, message.bytes());
 
     // Helper processes inherit these, so what any of them prints goes to the log rather than over the page.

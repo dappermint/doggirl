@@ -31,7 +31,7 @@ document.addEventListener("WebUIMessage", event => {
         updateChecks.checked = false;
         updateChecks.disabled = true;
         document.querySelector("#update-checks-description").textContent =
-            "Updates for this build of Ladybird are managed externally.";
+            "Updates for this build of Doggirl are managed externally.";
     }
     document.querySelector("#services-paused-note").classList.toggle("hidden", settings.enabled);
 });

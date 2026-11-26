@@ -256,7 +256,7 @@ def resign(app: Path, build_directory: Path) -> list[str]:
     already has and reseals the bundle over everything copied in. Code in nested bundles keeps the signatures the build
     gave it, since signing its files one by one would break the seals of those bundles; verify() checks them."""
     executables_directory = app / "Contents" / "MacOS"
-    main_executable = executables_directory / "Ladybird"
+    main_executable = executables_directory / "Doggirl"
     resigned = []
     for library in bundle_binaries(app):
         if library.parent != executables_directory and not is_in_nested_bundle(app, library):
@@ -308,9 +308,9 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path, help="the .tar.gz to write, holding Ladybird.app")
     args = parser.parse_args()
 
-    app = args.install_dir / "bundle" / "Ladybird.app"
-    built_app_binary = args.build_dir / "bin" / "Ladybird.app" / "Contents" / "MacOS" / "Ladybird"
-    if not (app / "Contents" / "MacOS" / "Ladybird").is_file():
+    app = args.install_dir / "bundle" / "Doggirl.app"
+    built_app_binary = args.build_dir / "bin" / "Doggirl.app" / "Contents" / "MacOS" / "Doggirl"
+    if not (app / "Contents" / "MacOS" / "Doggirl").is_file():
         sys.exit(f"error: no installed app bundle at {app}")
     if not built_app_binary.is_file():
         sys.exit(f"error: no built app binary at {built_app_binary}")
