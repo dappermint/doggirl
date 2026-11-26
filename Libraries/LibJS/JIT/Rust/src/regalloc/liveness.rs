@@ -89,7 +89,7 @@ pub(super) struct ValueLiveness<'w> {
     live: ZoneVec<'w, u32>,
     /// The values that were live at some place of the block that is walked.
     touched: ZoneVec<'w, NodeId>,
-    live_since: ZoneVec<'w, Option<(BlockId, Clobbers)>>,
+    live_since: ZoneVec<'w, Clobbers>,
 }
 
 /// Whether a node is a value the register allocator tracks.
@@ -195,7 +195,7 @@ impl<'w> ValueLiveness<'w> {
             seed_lists: Lists::new_in(work),
             live: ZoneVec::from_elem_in(0, size.nodes, work),
             touched: ZoneVec::with_capacity_in(size.nodes.min(256), work),
-            live_since: ZoneVec::from_elem_in(None, size.nodes, work),
+            live_since: ZoneVec::from_elem_in(Clobbers::default(), size.nodes, work),
         };
         liveness.fill(graph, work)?;
         Ok(liveness)
@@ -231,6 +231,8 @@ impl<'w> ValueLiveness<'w> {
     }
 
     /// Lists the allocated values of the frame state `frame`, if they are not listed yet.
+    /// When `!has_virtual_objects`, only `frame`'s own values are listed (parents are walked on demand
+    /// and deduplicated per block so shared inlined caller frames are neither copied nor re-scanned).
     fn list_frame_uses(
         &mut self,
         graph: &Graph,
@@ -242,26 +244,6 @@ impl<'w> ValueLiveness<'w> {
             return Ok(());
         }
         if !has_virtual_objects {
-            // NB: Without virtual objects in the graph, a frame state's values are simply its own values plus its
-            //     parent chain's values. Listing each parent once avoids quadratic re-walks across inlined frames.
-            if let Some(parent) = graph.frame_state(frame).parent {
-                self.list_frame_uses(graph, parent, false, work)?;
-                let parent_range = self.frame_runs[parent.index()].range();
-                let own_values = &graph.frame_state(frame).values;
-                let start = self.frame_uses.len();
-                self.frame_uses.reserve(parent_range.len() + own_values.len());
-                for &(_, value) in own_values {
-                    if is_allocated_value(graph, value) {
-                        self.frame_uses.push(value);
-                    }
-                }
-                for index in parent_range {
-                    let value = self.frame_uses[index];
-                    self.frame_uses.push(value);
-                }
-                self.frame_runs[frame.index()] = Run::new(start, self.frame_uses.len());
-                return check_items(self.frame_uses.len());
-            }
             let own_values = &graph.frame_state(frame).values;
             let start = self.frame_uses.len();
             self.frame_uses.reserve(own_values.len());
@@ -346,11 +328,26 @@ impl<'w> ValueLiveness<'w> {
                     }
                 }
                 if let Some(frame) = node.frame_state {
-                    self.list_frame_uses(graph, frame, has_virtual_objects, work)?;
-                    if self.frame_seen_block[frame.index()] != block_mark {
-                        self.frame_seen_block[frame.index()] = block_mark;
-                        for use_index in self.frame_runs[frame.index()].range() {
-                            self.add_seed(self.frame_uses[use_index], index, false)?;
+                    if has_virtual_objects {
+                        self.list_frame_uses(graph, frame, true, work)?;
+                        if self.frame_seen_block[frame.index()] != block_mark {
+                            self.frame_seen_block[frame.index()] = block_mark;
+                            for use_index in self.frame_runs[frame.index()].range() {
+                                self.add_seed(self.frame_uses[use_index], index, false)?;
+                            }
+                        }
+                    } else {
+                        let mut current = Some(frame);
+                        while let Some(id) = current {
+                            if self.frame_seen_block[id.index()] == block_mark {
+                                break;
+                            }
+                            self.frame_seen_block[id.index()] = block_mark;
+                            self.list_frame_uses(graph, id, false, work)?;
+                            for use_index in self.frame_runs[id.index()].range() {
+                                self.add_seed(self.frame_uses[use_index], index, false)?;
+                            }
+                            current = graph.frame_state(id).parent;
                         }
                     }
                 }
@@ -464,13 +461,10 @@ impl<'w> ValueLiveness<'w> {
         //               (like a large array literal of arrays), the walk counts those nodes, notes the counts where
         //               each value becomes live, and compares them where the value is defined or the block starts.
         let mut clobbers = Clobbers::default();
+        let back_mark_base = block_count as u32;
         for (index, block) in graph.blocks.iter().enumerate() {
             let block_id = BlockId::from_index(index);
             let block_start = clobbers;
-            let since = |live_since: &[Option<(BlockId, Clobbers)>], value: usize| match live_since[value] {
-                Some((since_block, since)) if since_block == block_id => since,
-                _ => block_start,
-            };
             let check_spill = |flags: &mut [u8], since: Clobbers, clobbers: Clobbers, value: usize| {
                 let is_float = graph.nodes[value].repr == Some(crate::code::Repr::Float64);
                 if clobbers.calls != since.calls || (is_float && clobbers.float_clobbers != since.float_clobbers) {
@@ -480,9 +474,11 @@ impl<'w> ValueLiveness<'w> {
             // Walk the block backwards from the values live at its end. A value is live where the walk is if `live`
             // has the mark of the block for it.
             let mark = index as u32 + 1;
+            let parent_back_mark = back_mark_base + mark;
             self.touched.clear();
             for value in self.live_out.get(index) {
                 self.live[value.index()] = mark;
+                self.live_since[value.index()] = block_start;
                 self.touched.push(*value);
             }
             let mut prev_frame: Option<FrameStateId> = None;
@@ -497,7 +493,7 @@ impl<'w> ValueLiveness<'w> {
                 if node_was_live {
                     check_spill(
                         &mut self.flags,
-                        since(&self.live_since, node_id.index()),
+                        self.live_since[node_id.index()],
                         clobbers,
                         node_id.index(),
                     );
@@ -519,6 +515,21 @@ impl<'w> ValueLiveness<'w> {
                             self.flags[value.index()] |= NEEDS_SPILL;
                         }
                     }
+                    if !has_virtual_objects && let Some(frame) = node.frame_state {
+                        let mut parent = graph.frame_state(frame).parent;
+                        while let Some(id) = parent {
+                            if self.frame_seen_block[id.index()] == parent_back_mark {
+                                break;
+                            }
+                            for value in &self.frame_uses[self.frame_runs[id.index()].range()] {
+                                let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
+                                if value != node_id && (is_call || is_float) {
+                                    self.flags[value.index()] |= NEEDS_SPILL;
+                                }
+                            }
+                            parent = graph.frame_state(id).parent;
+                        }
+                    }
                 }
                 let deaths = self.dying.len();
                 self.live[node_id.index()] = 0;
@@ -529,7 +540,7 @@ impl<'w> ValueLiveness<'w> {
                             self_used = true;
                             if !node_was_live {
                                 self.dying.push(value);
-                                self.live_since[value.index()] = Some((block_id, clobbers));
+                                self.live_since[value.index()] = clobbers;
                             }
                         }
                         return;
@@ -537,7 +548,7 @@ impl<'w> ValueLiveness<'w> {
                     if self.live[value.index()] != mark {
                         self.live[value.index()] = mark;
                         self.dying.push(value);
-                        self.live_since[value.index()] = Some((block_id, clobbers));
+                        self.live_since[value.index()] = clobbers;
                         self.touched.push(value);
                     }
                 };
@@ -562,6 +573,19 @@ impl<'w> ValueLiveness<'w> {
                     for &value in &self.frame_uses[frame_uses] {
                         mark_use(value);
                     }
+                    if !has_virtual_objects && let Some(frame) = node.frame_state {
+                        let mut parent = graph.frame_state(frame).parent;
+                        while let Some(id) = parent {
+                            if self.frame_seen_block[id.index()] == parent_back_mark {
+                                break;
+                            }
+                            self.frame_seen_block[id.index()] = parent_back_mark;
+                            for &value in &self.frame_uses[self.frame_runs[id.index()].range()] {
+                                mark_use(value);
+                            }
+                            parent = graph.frame_state(id).parent;
+                        }
+                    }
                 }
                 prev_frame = node.frame_state;
                 if self_used {
@@ -570,31 +594,17 @@ impl<'w> ValueLiveness<'w> {
                 }
                 self.deaths[node_id.index()] = Run::new(deaths, self.dying.len());
             }
+            // NB: The phis of the block are live from its start if anything uses them.
             for phi in &block.phis {
-                self.live[phi.index()] = 0;
+                if self.live[phi.index()] == mark {
+                    check_spill(&mut self.flags, self.live_since[phi.index()], clobbers, phi.index());
+                    self.live[phi.index()] = 0;
+                }
             }
             // NB: `touched` may have a value more than one time, which does no harm here.
             for value in &self.touched {
                 if self.live[value.index()] == mark {
-                    check_spill(
-                        &mut self.flags,
-                        since(&self.live_since, value.index()),
-                        clobbers,
-                        value.index(),
-                    );
-                }
-            }
-            // NB: The phis of the block are live from its start if anything uses them.
-            for phi in &block.phis {
-                let is_live = self.live_since[phi.index()].is_some_and(|(since_block, _)| since_block == block_id)
-                    || self.live_out.get(index).binary_search(phi).is_ok();
-                if is_live {
-                    check_spill(
-                        &mut self.flags,
-                        since(&self.live_since, phi.index()),
-                        clobbers,
-                        phi.index(),
-                    );
+                    check_spill(&mut self.flags, self.live_since[value.index()], clobbers, value.index());
                 }
             }
             // NB: Most merges start with the register state of one of their

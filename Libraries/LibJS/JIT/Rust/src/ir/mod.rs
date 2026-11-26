@@ -1477,6 +1477,42 @@ impl<'z> Op<'z> {
         }
     }
 
+    /// Whether this control node can continue directly at `target`.
+    #[inline(always)]
+    pub fn has_successor(&self, target: BlockId) -> bool {
+        match self {
+            Op::Jump { target: t } => *t == target,
+            Op::Branch { if_true, if_false, .. } | Op::BranchOnPc { if_true, if_false, .. } => {
+                *if_true == target || *if_false == target
+            }
+            Op::BranchTruthy {
+                if_true,
+                if_false,
+                fallback,
+            } => *if_true == target || *if_false == target || *fallback == target,
+            Op::ShapeSwitch { targets, .. } => targets.contains(&target),
+            _ => false,
+        }
+    }
+
+    /// How many outgoing edges this control node has to `target`.
+    #[inline(always)]
+    pub fn count_successor(&self, target: BlockId) -> usize {
+        match self {
+            Op::Jump { target: t } => usize::from(*t == target),
+            Op::Branch { if_true, if_false, .. } | Op::BranchOnPc { if_true, if_false, .. } => {
+                usize::from(*if_true == target) + usize::from(*if_false == target)
+            }
+            Op::BranchTruthy {
+                if_true,
+                if_false,
+                fallback,
+            } => usize::from(*if_true == target) + usize::from(*if_false == target) + usize::from(*fallback == target),
+            Op::ShapeSwitch { targets, .. } => targets.iter().filter(|block| **block == target).count(),
+            _ => 0,
+        }
+    }
+
     /// Makes a control node continue at `map(block)` where it continued at `block`. A shape switch that changes
     /// gets its new list of blocks from `zone`.
     fn map_successors(&mut self, zone: &'z Zone, map: impl Fn(BlockId) -> BlockId) {
@@ -2070,12 +2106,17 @@ impl<'z> Graph<'z> {
         if order.len() == self.blocks.len() && order.iter().enumerate().all(|(index, block)| block.index() == index) {
             return;
         }
-        let mut new_index = ZoneVec::from_elem_in(None, self.blocks.len(), work);
+        const DROPPED: u32 = u32::MAX;
+        let mut new_index = ZoneVec::from_elem_in(DROPPED, self.blocks.len(), work);
         for (index, block) in order.iter().enumerate() {
-            assert!(new_index[block.index()].is_none(), "blocks appear once in the order");
-            new_index[block.index()] = Some(BlockId::from_index(index));
+            assert!(new_index[block.index()] == DROPPED, "blocks appear once in the order");
+            new_index[block.index()] = u32::try_from(index).expect("block count fits in u32");
         }
-        let new_id = |block: BlockId| new_index[block.index()].expect("reordering keeps every referenced block");
+        let new_id = |block: BlockId| {
+            let mapped = new_index[block.index()];
+            assert!(mapped != DROPPED, "reordering keeps every referenced block");
+            BlockId(mapped)
+        };
         let zone = self.zone;
         for block in order {
             let block = &mut self.blocks[block.index()];
@@ -2092,12 +2133,13 @@ impl<'z> Graph<'z> {
         // Move each retained block to its destination, carrying the displaced
         // block's destination with it. Dropped blocks end up past the new end.
         for index in 0..self.blocks.len() {
-            while let Some(target) = new_index[index] {
-                if target.index() == index {
+            while new_index[index] != DROPPED {
+                let target = new_index[index] as usize;
+                if target == index {
                     break;
                 }
-                self.blocks.swap(index, target.index());
-                new_index.swap(index, target.index());
+                self.blocks.swap(index, target);
+                new_index.swap(index, target);
             }
         }
         self.blocks.truncate(order.len());
