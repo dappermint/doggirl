@@ -3,12 +3,12 @@
   stdenv,
   runCommand,
   bash,
-  libicns,
+  python3,
   repoRoot,
   unwrapped ? null,
   localAppPath ? null,
   appName ? "Doggirl",
-  bundleIdentifier ? "org.ladybird.Ladybird.Development",
+  bundleIdentifier ? "dev.dappermint.doggirl.Development",
   extraArgs ? [ ],
   extraEnv ? { },
 }:
@@ -28,7 +28,7 @@ let
     else if stdenv.hostPlatform.isDarwin then
       "${unwrapped}"
     else
-      "${unwrapped}/bin/Ladybird";
+      "${unwrapped}/bin/Doggirl";
 
   launcherScript = ''
     #!${bash}/bin/bash
@@ -51,14 +51,20 @@ let
       fi
 
       if [ -n "$candidate" ]; then
-        if [ -x "$candidate/Contents/MacOS/Ladybird" ]; then
+        if [ -x "$candidate/Contents/MacOS/Doggirl" ]; then
+          printf '%s\n' "$candidate/Contents/MacOS/Doggirl"
+          return 0
+        elif [ -x "$candidate/Applications/Doggirl.app/Contents/MacOS/Doggirl" ]; then
+          printf '%s\n' "$candidate/Applications/Doggirl.app/Contents/MacOS/Doggirl"
+          return 0
+        elif [ -x "$candidate/bundle/Doggirl.app/Contents/MacOS/Doggirl" ]; then
+          printf '%s\n' "$candidate/bundle/Doggirl.app/Contents/MacOS/Doggirl"
+          return 0
+        elif [ -x "$candidate/bin/Doggirl" ]; then
+          printf '%s\n' "$candidate/bin/Doggirl"
+          return 0
+        elif [ -x "$candidate/Contents/MacOS/Ladybird" ]; then
           printf '%s\n' "$candidate/Contents/MacOS/Ladybird"
-          return 0
-        elif [ -x "$candidate/Applications/Ladybird.app/Contents/MacOS/Ladybird" ]; then
-          printf '%s\n' "$candidate/Applications/Ladybird.app/Contents/MacOS/Ladybird"
-          return 0
-        elif [ -x "$candidate/bundle/Ladybird.app/Contents/MacOS/Ladybird" ]; then
-          printf '%s\n' "$candidate/bundle/Ladybird.app/Contents/MacOS/Ladybird"
           return 0
         elif [ -x "$candidate/bin/Ladybird" ]; then
           printf '%s\n' "$candidate/bin/Ladybird"
@@ -72,14 +78,14 @@ let
       fi
 
       for probe in \
-        "$PWD/Build/distribution/bin/Ladybird.app/Contents/MacOS/Ladybird" \
-        "$PWD/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird" \
-        "$PWD/Build/debug/bin/Ladybird.app/Contents/MacOS/Ladybird" \
-        "$PWD/Build/distribution/bin/Ladybird" \
-        "$PWD/Build/release/bin/Ladybird" \
-        "$PWD/Build/debug/bin/Ladybird" \
-        "/Applications/Ladybird.app/Contents/MacOS/Ladybird" \
-        "$HOME/Applications/Ladybird.app/Contents/MacOS/Ladybird"; do
+        "$PWD/Build/distribution/bin/Doggirl.app/Contents/MacOS/Doggirl" \
+        "$PWD/Build/release/bin/Doggirl.app/Contents/MacOS/Doggirl" \
+        "$PWD/Build/debug/bin/Doggirl.app/Contents/MacOS/Doggirl" \
+        "$PWD/Build/distribution/bin/Doggirl" \
+        "$PWD/Build/release/bin/Doggirl" \
+        "$PWD/Build/debug/bin/Doggirl" \
+        "/Applications/Doggirl.app/Contents/MacOS/Doggirl" \
+        "$HOME/Applications/Doggirl.app/Contents/MacOS/Doggirl"; do
         if [ -x "$probe" ]; then
           printf '%s\n' "$probe"
           return 0
@@ -87,9 +93,9 @@ let
       done
 
       cat >&2 <<'EOF'
-    doggirl: could not locate a built Ladybird/doggirl executable.
+    doggirl: could not locate a built Doggirl executable.
     Set programs.doggirl.localAppPath or programs.doggirl.unwrappedPackage, or export
-    DOGGIRL_APP_PATH=/path/to/Ladybird.app before launching.
+    DOGGIRL_APP_PATH=/path/to/Doggirl.app before launching.
     EOF
       return 1
     }
@@ -173,7 +179,7 @@ runCommand "doggirl-wrapped-0.1.0"
       "infoPlist"
     ];
     inherit launcherScript infoPlist;
-    nativeBuildInputs = lib.optionals stdenv.hostPlatform.isDarwin [ libicns ];
+    nativeBuildInputs = lib.optionals stdenv.hostPlatform.isDarwin [ python3 ];
     meta = {
       description = "Declarative launcher and bundle wrapper for doggirl (Ladybird fork)";
       homepage = "https://github.com/dappermint/doggirl";
@@ -195,12 +201,33 @@ runCommand "doggirl-wrapped-0.1.0"
       chmod 0755 "$app_dir/Contents/MacOS/${appName}"
       cp "$infoPlistPath" "$app_dir/Contents/Info.plist"
 
-      png2icns "$app_dir/Contents/Resources/app_icon.icns" \
-        "${iconsetDir}/icon_16x16.png" \
-        "${iconsetDir}/icon_32x32.png" \
-        "${iconsetDir}/icon_128x128.png" \
-        "${iconsetDir}/icon_256x256.png" \
-        "${iconsetDir}/icon_512x512.png"
+      python3 - "${iconsetDir}" "$app_dir/Contents/Resources/app_icon.icns" <<'PY'
+      import os
+      import struct
+      import sys
+
+      iconset_dir, output_path = sys.argv[1], sys.argv[2]
+      entries = [
+          (b"icp4", "icon_16x16.png"),
+          (b"icp5", "icon_32x32.png"),
+          (b"ic11", "icon_16x16@2x.png"),
+          (b"ic12", "icon_32x32@2x.png"),
+          (b"ic07", "icon_128x128.png"),
+          (b"ic13", "icon_128x128@2x.png"),
+          (b"ic08", "icon_256x256.png"),
+          (b"ic14", "icon_256x256@2x.png"),
+          (b"ic09", "icon_512x512.png"),
+          (b"ic10", "icon_512x512@2x.png"),
+      ]
+      chunks = []
+      for icon_type, filename in entries:
+          with open(os.path.join(iconset_dir, filename), "rb") as f:
+              data = f.read()
+          chunks.append(icon_type + struct.pack(">I", len(data) + 8) + data)
+      body = b"".join(chunks)
+      with open(output_path, "wb") as f:
+          f.write(b"icns" + struct.pack(">I", len(body) + 8) + body)
+      PY
     ''}
 
     ${lib.optionalString stdenv.hostPlatform.isLinux ''

@@ -306,7 +306,7 @@ let
         users.users.tester.home = "/Users/tester";
         programs.doggirl = {
           enable = true;
-          localAppPath = "/Applications/Ladybird.app";
+          localAppPath = "/Applications/Doggirl.app";
           appName = "Doggirl";
           defaultProfile = "developer";
           manageMode = "overwrite";
@@ -400,11 +400,11 @@ in
       builtins.length darwinEval.config.environment.systemPackages == 1
     ) "expected 1 system package";
     assert lib.assertMsg (
-      darwinEval.config.system.defaults.CustomUserPreferences."org.ladybird.Ladybird".NSWindowShouldDragOnGesture
+      darwinEval.config.system.defaults.CustomUserPreferences."dev.dappermint.doggirl".NSWindowShouldDragOnGesture
       == true
     ) "expected macOS default NSWindowShouldDragOnGesture = true";
     assert lib.assertMsg (
-      darwinEval.config.system.defaults.CustomUserPreferences."org.ladybird.Ladybird.Development".SUEnableAutomaticChecks
+      darwinEval.config.system.defaults.CustomUserPreferences."dev.dappermint.doggirl.Development".SUEnableAutomaticChecks
       == false
     ) "expected Sparkle auto checks disabled";
     assert lib.assertMsg
@@ -652,9 +652,9 @@ in
         home_over="$TMPDIR/home-overwrite"
         cfg_over="$home_over/cfg"
         data_over="$home_over/data"
-        mkdir -p "$cfg_over/Ladybird/Profiles/developer"
+        mkdir -p "$cfg_over/Doggirl/Profiles/developer"
         printf '{"window":{"size":{"width":800,"height":600}},"extraOld":1}\n' \
-          > "$cfg_over/Ladybird/Profiles/developer/Settings.json"
+          > "$cfg_over/Doggirl/Profiles/developer/Settings.json"
 
         doggirl-config-apply \
           --manifest "$manifest" \
@@ -664,25 +664,25 @@ in
           --mode overwrite \
           --backup
 
-        test -f "$cfg_over/Ladybird/Profiles/developer/Settings.json"
-        test -f "$cfg_over/Ladybird/Profiles/developer/Settings.json.bak"
-        test -f "$cfg_over/Ladybird/Profiles/developer/Permissions.json"
-        test -f "$cfg_over/Ladybird/Profiles/developer/Bookmarks.json"
-        test -f "$data_over/Ladybird/Profiles/developer/ContentBlocking/Lists/local-blocklist.txt"
-        test -f "$cfg_over/Ladybird/Profiles/default/Settings.json"
-        test ! -e "$cfg_over/Ladybird/Profiles/default/Permissions.json"
-        test ! -e "$cfg_over/Ladybird/Profiles/default/Bookmarks.json"
+        test -f "$cfg_over/Doggirl/Profiles/developer/Settings.json"
+        test -f "$cfg_over/Doggirl/Profiles/developer/Settings.json.bak"
+        test -f "$cfg_over/Doggirl/Profiles/developer/Permissions.json"
+        test -f "$cfg_over/Doggirl/Profiles/developer/Bookmarks.json"
+        test -f "$data_over/Doggirl/Profiles/developer/ContentBlocking/Lists/local-blocklist.txt"
+        test -f "$cfg_over/Doggirl/Profiles/default/Settings.json"
+        test ! -e "$cfg_over/Doggirl/Profiles/default/Permissions.json"
+        test ! -e "$cfg_over/Doggirl/Profiles/default/Bookmarks.json"
         test -f "$TMPDIR/doggirl-custom-profile/config/Settings.json"
         jq -e '.extraOld == null and .appearance.colorTheme == "lavender"' \
-          "$cfg_over/Ladybird/Profiles/developer/Settings.json" >/dev/null
+          "$cfg_over/Doggirl/Profiles/developer/Settings.json" >/dev/null
 
         # 2. Merge mode preserves undeclared keys (such as existing runtime window geometry)
         home_merge="$TMPDIR/home-merge"
         cfg_merge="$home_merge/cfg"
         data_merge="$home_merge/data"
-        mkdir -p "$cfg_merge/Ladybird/Profiles/default"
+        mkdir -p "$cfg_merge/Doggirl/Profiles/default"
         printf '{"window":{"size":{"width":1600,"height":1000},"maximized":true},"runtimeOnly":42}\n' \
-          > "$cfg_merge/Ladybird/Profiles/default/Settings.json"
+          > "$cfg_merge/Doggirl/Profiles/default/Settings.json"
 
         doggirl-config-apply \
           --manifest "$manifest" \
@@ -693,7 +693,7 @@ in
           --no-backup
 
         jq -e '.window.size.width == 1600 and .runtimeOnly == 42 and .searchEngine.engine == "DuckDuckGo"' \
-          "$cfg_merge/Ladybird/Profiles/default/Settings.json" >/dev/null
+          "$cfg_merge/Doggirl/Profiles/default/Settings.json" >/dev/null
 
         # 3. Symlink mode links directly into the Nix store
         home_sym="$TMPDIR/home-symlink"
@@ -707,10 +707,10 @@ in
           --mode symlink \
           --no-backup
 
-        test -L "$cfg_sym/Ladybird/Profiles/developer/Settings.json"
-        test -L "$cfg_sym/Ladybird/Profiles/developer/Permissions.json"
-        test -L "$cfg_sym/Ladybird/Profiles/developer/Bookmarks.json"
-        test -L "$data_sym/Ladybird/Profiles/developer/ContentBlocking/Lists/local-blocklist.txt"
+        test -L "$cfg_sym/Doggirl/Profiles/developer/Settings.json"
+        test -L "$cfg_sym/Doggirl/Profiles/developer/Permissions.json"
+        test -L "$cfg_sym/Doggirl/Profiles/developer/Bookmarks.json"
+        test -L "$data_sym/Doggirl/Profiles/developer/ContentBlocking/Lists/local-blocklist.txt"
 
         touch "$out"
       '';
@@ -721,9 +721,9 @@ in
         nativeBuildInputs = [ pkgs.python3 ];
       }
       ''
-        mock_app="$TMPDIR/MockLadybird.app"
+        mock_app="$TMPDIR/MockDoggirl.app"
         mkdir -p "$mock_app/Contents/MacOS"
-        cat > "$mock_app/Contents/MacOS/Ladybird" <<'EOF'
+        cat > "$mock_app/Contents/MacOS/Doggirl" <<'EOF'
         #!${pkgs.bash}/bin/bash
         printf 'LIBJS_JIT=%s\n' "''${LIBJS_JIT:-}"
         printf 'LIBJS_CODE_FLUSH=%s\n' "''${LIBJS_CODE_FLUSH:-}"
@@ -732,7 +732,7 @@ in
         printf 'CUSTOM_FLAG=%s\n' "''${CUSTOM_FLAG:-}"
         printf 'ARGS=%s\n' "$*"
         EOF
-        chmod +x "$mock_app/Contents/MacOS/Ladybird"
+        chmod +x "$mock_app/Contents/MacOS/Doggirl"
 
         output="$(DOGGIRL_APP_PATH="$mock_app" "${wrapperForSmoke}/bin/doggirl" https://example.org)"
         printf '%s\n' "$output"
