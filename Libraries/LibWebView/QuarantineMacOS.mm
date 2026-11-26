@@ -18,7 +18,7 @@ bool mark_as_web_download(ByteString const& path)
     @autoreleasepool {
         auto* url = [NSURL fileURLWithFileSystemRepresentation:path.characters() isDirectory:NO relativeToURL:nil];
         auto* properties = @ {
-            (__bridge NSString*)kLSQuarantineAgentNameKey : @"Ladybird",
+            (__bridge NSString*)kLSQuarantineAgentNameKey : @"Doggirl",
             (__bridge NSString*)kLSQuarantineTypeKey : (__bridge NSString*)kLSQuarantineTypeWebDownload,
         };
 

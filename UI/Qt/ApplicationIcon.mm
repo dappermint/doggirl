@@ -36,12 +36,12 @@ void set_profile_application_icon(StringView identifier, ByteString const& ident
                                    alpha:1];
     };
     NSArray<NSColor*>* badge_colors = @[
-        ns_color(BrandColors::SlateBlue500),
-        ns_color(BrandColors::Indigo30),
-        ns_color(BrandColors::Violet100),
-        ns_color(BrandColors::Violet900),
-        ns_color(BrandColors::SlateBlue900),
-        ns_color(BrandColors::Indigo60),
+        ns_color(qRgb(0x4A, 0xB3, 0xE6)),
+        ns_color(qRgb(0xE0, 0x7A, 0x9F)),
+        ns_color(qRgb(0x7B, 0x86, 0xE8)),
+        ns_color(qRgb(0xB8, 0x7C, 0xDC)),
+        ns_color(qRgb(0x52, 0xB8, 0xCC)),
+        ns_color(qRgb(0xD9, 0x82, 0xB5)),
     ];
     auto* badge_color = badge_colors[identity.hash() % [badge_colors count]];
 

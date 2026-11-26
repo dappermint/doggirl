@@ -96,7 +96,7 @@ NowPlayingState MediaSessionCoordinator::now_playing_state_for(SourceState const
 {
     auto state = source.state;
     if (source.source.is_private) {
-        state.title = "Ladybird"_string;
+        state.title = "Doggirl"_string;
         state.artist = {};
         state.album = {};
         state.artwork = nullptr;

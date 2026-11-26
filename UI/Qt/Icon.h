@@ -90,8 +90,7 @@ QPixmap create_chrome_icon_pixmap(ChromeIcon, QColor, qreal device_pixel_ratio);
 
 QSize physical_size_for_device_pixel_ratio(QSize size, qreal device_pixel_ratio);
 
-// Strokes Ladybird's logomark, a Lissajous figure, to fill the given rect. The stroke width is on the logomark's own
-// 22 by 18.4 box.
+// Paints Doggirl's paw logomark to fill the given rect.
 void paint_logomark(QPainter&, QRectF const&, QColor const&, qreal stroke_width);
 
 }

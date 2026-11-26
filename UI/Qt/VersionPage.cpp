@@ -38,6 +38,7 @@ void VersionPage::load_version_info()
     version_info.set("browserName"_string, *browser_name);
     version_info.set("browserVersion"_string, *browser_version);
     version_info.set("releaseStage"_string, *release_stage);
+    version_info.set("isReleaseBuild"_string, static_cast<bool>(BROWSER_IS_RELEASE_BUILD));
     version_info.set("productName"_string, *product_name);
     version_info.set("browserCommit"_string, *browser_commit);
     version_info.set("arch"_string, *arch);

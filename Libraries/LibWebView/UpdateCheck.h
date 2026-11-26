@@ -77,7 +77,7 @@ WEBVIEW_API SystemDescription describe_current_system();
 
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
 
-constexpr StringView RELEASES_FEED_URL = "https://download.ladybird.org/releases.json"sv;
+constexpr StringView RELEASES_FEED_URL = ""sv;
 
 WEBVIEW_API Optional<Vector<u64>> parse_version(StringView);
 WEBVIEW_API bool is_newer_version(StringView candidate, StringView current);

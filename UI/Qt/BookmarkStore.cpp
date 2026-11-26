@@ -151,8 +151,8 @@ static Vector<BookmarkItem> create_default_bookmarks()
             .date_added = now,
             .last_modified = now,
             .data = BookmarkItem::Bookmark {
-                .url = URL::Parser::basic_parse("https://ladybird.org/"sv).release_value(),
-                .title = "Ladybird"_string,
+                .url = URL::Parser::basic_parse("https://github.com/dappermint/doggirl"sv).release_value(),
+                .title = "Doggirl"_string,
                 .favicon_hash = {},
             },
         },
@@ -161,18 +161,8 @@ static Vector<BookmarkItem> create_default_bookmarks()
             .date_added = now,
             .last_modified = now,
             .data = BookmarkItem::Bookmark {
-                .url = URL::Parser::basic_parse("https://github.com/LadybirdBrowser/ladybird"sv).release_value(),
-                .title = "Ladybird GitHub"_string,
-                .favicon_hash = {},
-            },
-        },
-        {
-            .id = generate_random_uuid(),
-            .date_added = now,
-            .last_modified = now,
-            .data = BookmarkItem::Bookmark {
-                .url = URL::Parser::basic_parse("https://discord.com/invite/nvfjVJ4Svh"sv).release_value(),
-                .title = "Ladybird Discord"_string,
+                .url = URL::Parser::basic_parse("https://github.com/dappermint/doggirl/releases"sv).release_value(),
+                .title = "Doggirl Releases"_string,
                 .favicon_hash = {},
             },
         },
@@ -192,7 +182,7 @@ BookmarkStore BookmarkStore::create(ByteString bookmarks_path, WebView::FaviconS
 
     auto bookmarks_json = WebView::read_json_file(store.m_bookmarks_path);
     if (bookmarks_json.is_error()) {
-        warnln("Unable to read Ladybird bookmarks: {}", bookmarks_json.error());
+        warnln("Unable to read Doggirl bookmarks: {}", bookmarks_json.error());
         return store;
     }
 
@@ -564,7 +554,7 @@ void BookmarkStore::persist_bookmarks()
 
     if (!m_bookmarks_path.is_empty()) {
         if (auto result = WebView::write_json_file(m_bookmarks_path, root); result.is_error())
-            warnln("Unable to persist Ladybird bookmarks: {}", result.error());
+            warnln("Unable to persist Doggirl bookmarks: {}", result.error());
     }
 }
 

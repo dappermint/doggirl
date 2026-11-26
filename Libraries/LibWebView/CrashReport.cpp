@@ -163,7 +163,7 @@ ErrorOr<void> CrashReport::save(int wait_status, ByteString const& path, Optiona
     auto crashed_time = crashed_at.value_or(UnixDateTime::now());
 
     StringBuilder builder;
-    builder.appendff("Ladybird crash report, format 1\nProcess: {}\n", process_name_from_type(m_process_type));
+    builder.appendff("Doggirl crash report, format 1\nProcess: {}\n", process_name_from_type(m_process_type));
     if (auto time = crashed_time.to_string("%Y-%m-%dT%H:%M:%SZ"sv, UnixDateTime::LocalTime::No); !time.is_error())
         builder.appendff("Crashed at: {}\n", time.value());
     if (m_process_type == ProcessType::Browser) {

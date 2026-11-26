@@ -62,7 +62,7 @@ namespace Web {
 #    error Unknown OS
 #endif
 
-#define BROWSER_NAME "Ladybird"
+#define BROWSER_NAME "Doggirl"
 
 // NB: Some web servers treat us very badly unless we pretend to be one of the major browsers.
 //     This token is appended to the User-Agent string to improve compatibility.

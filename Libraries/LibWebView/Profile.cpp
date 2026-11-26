@@ -17,7 +17,7 @@ namespace WebView {
 
 static ByteString profile_path(StringView root, StringView identifier)
 {
-    return LexicalPath::join(root, "Ladybird"sv, "Profiles"sv, identifier).string();
+    return LexicalPath::join(root, "Doggirl"sv, "Profiles"sv, identifier).string();
 }
 
 static ErrorOr<void> create_profile_directories(ProfilePaths const& paths)
@@ -68,7 +68,7 @@ void Profile::remove_temporary_root()
         return;
     if (FileSystem::exists(*m_temporary_root)) {
         if (auto result = FileSystem::remove(*m_temporary_root, FileSystem::RecursionMode::Allowed); result.is_error())
-            warnln("Unable to remove temporary Ladybird profile '{}': {}", *m_temporary_root, result.error());
+            warnln("Unable to remove temporary Doggirl profile '{}': {}", *m_temporary_root, result.error());
     }
     m_temporary_root.clear();
 }
@@ -124,7 +124,7 @@ ErrorOr<Profile> Profile::create(ProfileSelection const& selection, ProfileRoots
     if (selection.temporary) {
         TRY(Core::Directory::create(roots.temporary, Core::Directory::CreateDirectories::Yes, 0700));
 
-        auto root = LexicalPath::join(roots.temporary, ByteString::formatted("ladybird-profile-{:016x}-{:016x}", get_random<u64>(), get_random<u64>())).string();
+        auto root = LexicalPath::join(roots.temporary, ByteString::formatted("doggirl-profile-{:016x}-{:016x}", get_random<u64>(), get_random<u64>())).string();
         TRY(Core::Directory::create(root, Core::Directory::CreateDirectories::Yes, 0700));
         root = TRY(FileSystem::real_path(root));
 
@@ -161,11 +161,11 @@ ErrorOr<Profile> Profile::create(ProfileSelection const& selection, ProfileRoots
 ErrorOr<Profile> Profile::create_legacy(ProfileRoots const& roots)
 {
     ProfilePaths paths {
-        .config = LexicalPath::join(roots.config, "Ladybird"sv).string(),
-        .data = LexicalPath::join(roots.data, "Ladybird"sv).string(),
-        .cache = LexicalPath::join(roots.cache, "Ladybird"sv).string(),
+        .config = LexicalPath::join(roots.config, "Doggirl"sv).string(),
+        .data = LexicalPath::join(roots.data, "Doggirl"sv).string(),
+        .cache = LexicalPath::join(roots.cache, "Doggirl"sv).string(),
         .runtime = roots.runtime,
-        .identity = LexicalPath::join(roots.data, "Ladybird"sv).string(),
+        .identity = LexicalPath::join(roots.data, "Doggirl"sv).string(),
     };
 
     TRY(create_profile_directories(paths));

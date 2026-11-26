@@ -231,7 +231,7 @@ static Optional<pid_t> read_pid_file(StringView pid_path)
 
 ErrorOr<BrowserProcess::ProcessDisposition> BrowserProcess::connect(Vector<ByteString> const& raw_urls, NewWindow new_window, StringView runtime_directory, [[maybe_unused]] StringView profile_identity, Optional<pid_t> ui_pid, Optional<UnixDateTime> replace_browser_from_before)
 {
-    static constexpr auto process_name = "Ladybird"sv;
+    static constexpr auto process_name = "Doggirl"sv;
 
     auto startup_lock_path = LexicalPath::join(runtime_directory, "startup.lock"sv).string();
     auto startup_lock = TRY(Core::File::open(startup_lock_path, Core::File::OpenMode::ReadWrite));
@@ -413,7 +413,7 @@ ErrorOr<BrowserProcess::HandoverResult> BrowserProcess::connect_as_client(pid_t 
 {
     // NB: Only the browser of this profile with this PID has a server of this name. A PID file that an earlier browser
     //     left behind does not lead to one, whichever process has that PID now.
-    auto process_name = ByteString::formatted("Ladybird-{}", profile_identity);
+    auto process_name = ByteString::formatted("Doggirl-{}", profile_identity);
     auto server_port = Core::MachPort::look_up_from_bootstrap_server(mach_server_name_for_process(process_name, pid));
     if (server_port.is_error())
         return HandoverResult { Handover::BrowserIsGone };

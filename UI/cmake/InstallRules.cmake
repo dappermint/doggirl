@@ -2,10 +2,10 @@
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
-set(package Ladybird)
+set(package Doggirl)
 
 if (APPLE)
-    set(ladybird_executable_install_dir bundle/Ladybird.app/Contents/MacOS)
+    set(ladybird_executable_install_dir bundle/Doggirl.app/Contents/MacOS)
     set(ladybird_helper_install_dir ${ladybird_executable_install_dir})
 else()
     set(ladybird_executable_install_dir ${CMAKE_INSTALL_BINDIR})
@@ -77,7 +77,7 @@ if (APPLE)
     # CMake strips every executable it installs except the one inside an application bundle, so strip that one here.
     # Remove the symlink we created at build time for the lib directory first
     install(CODE "
-    set(contents_dir \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/bundle/Ladybird.app/Contents)
+    set(contents_dir \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/bundle/Doggirl.app/Contents)
     file(REMOVE \${contents_dir}/lib)
     set(lib_dir \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
     if (IS_ABSOLUTE ${CMAKE_INSTALL_LIBDIR})
@@ -97,7 +97,7 @@ if (APPLE)
             COMPONENT ladybird_Runtime)
 
     install(FILES "${LADYBIRD_SOURCE_DIR}/Meta/Entitlements.plist" DESTINATION entitlements
-        RENAME Ladybird.release.entitlements COMPONENT ladybird_Runtime)
+        RENAME Doggirl.release.entitlements COMPONENT ladybird_Runtime)
 endif()
 
 install(TARGETS ${all_required_lagom_libraries}
@@ -118,9 +118,9 @@ if (vcpkg_runtime_dependencies)
     set(vcpkg_library_install_dir ${CMAKE_INSTALL_LIBDIR})
     set(qt_plugins "")
     if (APPLE)
-        set(vcpkg_library_install_dir bundle/Ladybird.app/Contents/lib)
-        set(qt_plugins_dir bundle/Ladybird.app/Contents/PlugIns)
-        set(qt_conf_dir bundle/Ladybird.app/Contents/Resources)
+        set(vcpkg_library_install_dir bundle/Doggirl.app/Contents/lib)
+        set(qt_plugins_dir bundle/Doggirl.app/Contents/PlugIns)
+        set(qt_conf_dir bundle/Doggirl.app/Contents/Resources)
         set(qt_conf_plugins PlugIns)
 
         get_target_property(qt_core_type Qt6::Core TYPE)
@@ -178,7 +178,7 @@ if (vcpkg_runtime_dependencies)
             cmake_path(GET plugin PARENT_PATH plugin_type)
             cmake_path(GET plugin FILENAME plugin_target)
             if (NOT TARGET Qt6::${plugin_target})
-                message(FATAL_ERROR "Ladybird needs the Qt plugin ${plugin_target}, which Qt was built without.")
+                message(FATAL_ERROR "Doggirl needs the Qt plugin ${plugin_target}, which Qt was built without.")
             endif()
             set(plugin_install_dir "${qt_plugins_dir}/${plugin_type}")
             install(IMPORTED_RUNTIME_ARTIFACTS Qt6::${plugin_target}
@@ -361,16 +361,16 @@ endif()
 # and the debug symbols to the rest of the system.
 if (LINUX)
     set(system_integration_dir "${CMAKE_CURRENT_BINARY_DIR}/system_integration")
-    set(packaged_ladybird "${LADYBIRD_PACKAGE_INSTALL_PREFIX}/bin/Ladybird")
+    set(packaged_ladybird "${LADYBIRD_PACKAGE_INSTALL_PREFIX}/bin/Doggirl")
     foreach (file IN ITEMS org.ladybird.Ladybird.desktop org.ladybird.Ladybird.service)
         file(READ "${FREEDESKTOP_RESOURCE_DIR}/${file}" contents)
-        string(REGEX REPLACE "Exec=Ladybird( |\n|$)" "Exec=${packaged_ladybird}\\1" contents "${contents}")
+        string(REGEX REPLACE "Exec=Doggirl( |\n|$)" "Exec=${packaged_ladybird}\\1" contents "${contents}")
         file(WRITE "${system_integration_dir}/${file}" "${contents}")
     endforeach()
     file(MAKE_DIRECTORY "${system_integration_dir}/bin")
-    file(CREATE_LINK "${packaged_ladybird}" "${system_integration_dir}/bin/ladybird" SYMBOLIC)
+    file(CREATE_LINK "${packaged_ladybird}" "${system_integration_dir}/bin/doggirl" SYMBOLIC)
 
-    install(FILES "${system_integration_dir}/bin/ladybird"
+    install(FILES "${system_integration_dir}/bin/doggirl"
         DESTINATION /usr/bin
         COMPONENT ladybird_SystemIntegration
         EXCLUDE_FROM_ALL

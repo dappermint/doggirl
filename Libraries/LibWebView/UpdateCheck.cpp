@@ -472,7 +472,7 @@ static ByteString update_check_header(SystemDescription const& system, StringVie
 
 String release_page_url(StringView version)
 {
-    return MUST(String::formatted("https://github.com/LadybirdBrowser/ladybird/releases/tag/{}", version));
+    return MUST(String::formatted("https://github.com/dappermint/doggirl/releases/tag/{}", version));
 }
 
 static AK::Duration update_check_interval()
@@ -625,8 +625,13 @@ void UpdateChecker::check(UpdateCheckTrigger trigger)
 
     auto headers = HTTP::HeaderList::create();
     headers->set({ "User-Agent"sv, Web::default_user_agent });
-    headers->set({ "Ladybird-Update-Check"sv, update_check_header(describe_current_system(), BROWSER_VERSION ""sv, counted) });
-    m_request = client.value()->start_request("GET"sv, URL::Parser::basic_parse(RELEASES_FEED_URL).release_value(), {}, *headers, {},
+    headers->set({ "Doggirl-Update-Check"sv, update_check_header(describe_current_system(), BROWSER_VERSION ""sv, counted) });
+    auto feed_url = URL::Parser::basic_parse(RELEASES_FEED_URL);
+    if (!feed_url.has_value()) {
+        finish(Error::from_string_literal("No update feed is configured for Doggirl"));
+        return;
+    }
+    m_request = client.value()->start_request("GET"sv, *feed_url, {}, *headers, {},
         HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::No);
     if (!m_request) {
         finish(Error::from_string_literal("Unable to start the request for releases.json"));

@@ -45,7 +45,7 @@ ErrorOr<ByteString> audio_daemon_socket_path()
         return Error::from_string_literal("Unable to create a PulseAudio main loop");
     ScopeGuard free_main_loop = [&] { pa_mainloop_free(main_loop); };
 
-    auto* context = pa_context_new(pa_mainloop_get_api(main_loop), "Ladybird");
+    auto* context = pa_context_new(pa_mainloop_get_api(main_loop), "Doggirl");
     if (!context)
         return Error::from_string_literal("Unable to create a PulseAudio context");
     ScopeGuard free_context = [&] {

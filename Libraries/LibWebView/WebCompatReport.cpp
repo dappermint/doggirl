@@ -97,7 +97,7 @@ Vector<ReportDetail> WebCompatReport::details() const
     details.append({ "Viewport size"_string, format_viewport_size(m_page.viewport_size), false });
     details.append({ "Device pixel ratio"_string, MUST(String::formatted("{}", m_page.device_pixel_ratio)), false });
     details.append({ "Zoom level"_string, format_zoom_level(m_page.zoom_level), false });
-    details.append({ "Ladybird version"_string, to_string(browser_version), true });
+    details.append({ "Doggirl version"_string, to_string(browser_version), true });
     details.append({ "Platform"_string, to_string(platform), false });
     details.append({ "Architecture"_string, to_string(architecture), false });
     details.append({ "Git commit"_string, to_string(LADYBIRD_COMMIT), true });
@@ -122,7 +122,7 @@ void WebCompatReport::set_page_dumps(String dumps)
 ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps, IncludePlatformFeatures include_platform_features) const
 {
     StringBuilder builder;
-    builder.append("Ladybird web compatibility report, format 1\n"sv);
+    builder.append("Doggirl web compatibility report, format 1\n"sv);
     append_build_information_for_process(builder, ProcessType::Browser);
     builder.appendff("URL: {}\n", m_page.url.serialize());
     builder.appendff("User agent: {}\n", m_page.user_agent);
@@ -237,7 +237,7 @@ void WebCompatReport::start_submission()
 URL::URL new_bug_report_url(BugReportDetails const& details)
 {
     StringBuilder url;
-    url.append("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml"sv);
+    url.append("https://github.com/dappermint/doggirl/issues/new?template=bug_report.yml"sv);
     auto append_field = [&](StringView id, StringView value) {
         url.appendff("&{}={}", id, URL::percent_encode(value, URL::PercentEncodeSet::Component));
     };
@@ -249,7 +249,7 @@ URL::URL new_bug_report_url(BugReportDetails const& details)
     append_field("commit"sv, LADYBIRD_COMMIT);
 
     StringBuilder build_flags;
-    build_flags.appendff("Ladybird {}, {}", browser_version, build_configuration);
+    build_flags.appendff("Doggirl {}, {}", browser_version, build_configuration);
     if (details.disable_sandbox == DisableSandbox::Yes)
         build_flags.append(", sandbox: off"sv);
     if (!details.gpu_painting_enabled)

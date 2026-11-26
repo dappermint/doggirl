@@ -133,7 +133,7 @@ if (NOT LADYBIRD_VERSION STREQUAL "")
         set(browser_is_final_release 1)
     endif()
 endif()
-string(JOIN " " browser_product_name "Ladybird" ${browser_release_stage})
+string(JOIN " " browser_product_name "Doggirl" ${browser_release_stage})
 configure_file(BrowserVersion.h.in BrowserVersion.h @ONLY)
 if (ENABLE_INSTALL_HEADERS)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/BrowserVersion.h" COMPONENT Lagom_Development

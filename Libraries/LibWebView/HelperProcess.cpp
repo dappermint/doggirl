@@ -47,8 +47,8 @@ struct CPUProfiler {
 static ErrorOr<CPUProfiler> launch_cpu_profiler(StringView server_name, pid_t pid, Optional<ByteString> const& configured_output)
 {
 #if defined(AK_OS_MACOS)
-    auto output = configured_output.value_or(ByteString::formatted("Ladybird-{}-{}.trace", server_name, pid));
-    auto notification_name = ByteString::formatted("org.ladybird.cpu-profiler-ready.{}.{}", Core::System::getpid(), pid);
+    auto output = configured_output.value_or(ByteString::formatted("Doggirl-{}-{}.trace", server_name, pid));
+    auto notification_name = ByteString::formatted("dev.dappermint.doggirl.cpu-profiler-ready.{}.{}", Core::System::getpid(), pid);
 
     int notification_token = 0;
     if (notify_register_check(notification_name.characters(), &notification_token) != NOTIFY_STATUS_OK)
