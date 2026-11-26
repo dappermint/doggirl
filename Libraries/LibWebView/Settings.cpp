@@ -129,7 +129,7 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .id = ConfigVariableID::ShowAdvancedDebugMenu,
         .name = "debug.ui.show_advanced_debug_menu"sv,
         .title = "Show Debug menu"sv,
-        .description = "Show the Debug menu, with tools for inspecting Ladybird itself."sv,
+        .description = "Show the Debug menu, with tools for inspecting Doggirl itself."sv,
         .default_value = false,
         .array_element_type = {},
     },
@@ -217,7 +217,7 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .id = ConfigVariableID::OfferToTrustSelfSignedCertificates,
         .name = "security.certificates.offer_to_trust_self_signed"sv,
         .title = "Offer to trust self-signed certificates"sv,
-        .description = "When a site presents a self-signed certificate, ask whether to trust it until Ladybird is closed, instead of refusing to connect. Meant for local and development servers: on a public site, a self-signed certificate may mean someone is intercepting the connection."sv,
+        .description = "When a site presents a self-signed certificate, ask whether to trust it until Doggirl is closed, instead of refusing to connect. Meant for local and development servers: on a public site, a self-signed certificate may mean someone is intercepting the connection."sv,
         .default_value = false,
         .array_element_type = {},
     },
@@ -226,7 +226,7 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .id = ConfigVariableID::UpdateCheckInterval,
         .name = "updates.check_interval_minutes"sv,
         .title = "Update check interval"sv,
-        .description = "How many minutes Ladybird waits after one check for a newer release before it checks again, while it checks for updates by itself. At least 5."sv,
+        .description = "How many minutes Doggirl waits after one check for a newer release before it checks again, while it checks for updates by itself. At least 5."sv,
         .default_value = 4 * 60,
         .array_element_type = {},
     },
@@ -763,7 +763,7 @@ Settings Settings::create(ByteString settings_path, Vector<String> platform_lang
 
     auto settings_json = read_json_file(settings.m_settings_path);
     if (settings_json.is_error()) {
-        warnln("Unable to read Ladybird settings: {}", settings_json.error());
+        warnln("Unable to read Doggirl settings: {}", settings_json.error());
         return settings;
     }
 
@@ -1755,7 +1755,7 @@ void Settings::persist_settings()
 
     if (!m_settings_path.is_empty()) {
         if (auto result = write_json_file(m_settings_path, settings); result.is_error())
-            warnln("Unable to persist Ladybird settings: {}", result.error());
+            warnln("Unable to persist Doggirl settings: {}", result.error());
     }
 
     if (on_persist)

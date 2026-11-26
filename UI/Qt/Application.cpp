@@ -815,9 +815,9 @@ Hub::UIInfo Application::current_ui_info() const
 {
     QMessageBox dialog;
     dialog.setIcon(QMessageBox::Warning);
-    dialog.setText(QObject::tr("Ladybird is already running, but it is not responding."));
-    dialog.setInformativeText(QObject::tr("To open Ladybird with this profile, the Ladybird that is running must be closed first. What its pages have not saved will be lost."));
-    auto* close_button = dialog.addButton(QObject::tr("Close Ladybird"), QMessageBox::DestructiveRole);
+    dialog.setText(QObject::tr("Doggirl is already running, but it is not responding."));
+    dialog.setInformativeText(QObject::tr("To open Doggirl with this profile, the Doggirl that is running must be closed first. What its pages have not saved will be lost."));
+    auto* close_button = dialog.addButton(QObject::tr("Close Doggirl"), QMessageBox::DestructiveRole);
     dialog.setDefaultButton(dialog.addButton(QMessageBox::Cancel));
     // NB: Nothing else of this launch is on the screen yet, so the question has to be where the user sees it.
     dialog.setWindowFlag(Qt::WindowStaysOnTopHint);
@@ -873,7 +873,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     // NB: This must answer while the main thread waits for the Hub to initialize, so it answers on its own thread.
     //     Every round uses the same server, as its name cannot be registered again right after it was let go of.
     auto hub_bootstrap = adopt_ref(*new HubBootstrap);
-    IPC::MachBootstrapListener bootstrap_listener { WebView::mach_server_name_for_process("Ladybird-UI"sv, Core::System::getpid()) };
+    IPC::MachBootstrapListener bootstrap_listener { WebView::mach_server_name_for_process("Doggirl-UI"sv, Core::System::getpid()) };
     if (!bootstrap_listener.is_initialized())
         return Error::from_string_literal("Unable to start the Mach server for the Hub");
     bootstrap_listener.on_bootstrap_request = [hub_bootstrap](IPC::MachBootstrapListener::BootstrapRequest request) {
@@ -1104,7 +1104,7 @@ Optional<int> Application::exit_status_if_done() const
         return {};
     if (hub().browser_is_unresponsive()) {
         // FIXME: Offer to end the unresponsive browser, as is done when the Hub is in its own process.
-        warnln("Ladybird is already running with this profile, but it is not responding");
+        warnln("Doggirl is already running with this profile, but it is not responding");
         return WebView::BrowserProcess::unresponsive_browser_exit_status;
     }
     outln("Opening in existing process");
@@ -1572,7 +1572,7 @@ void Application::create_session_store(ByteString const& data_directory, bool pe
         // Fall back without modifying the existing Sessions database.
         auto session_database = TRY(Database::Database::create(data_directory, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
         if (TRY(SessionStore::migrate_schema(session_database)) != Database::MigrationOutcome::Success)
-            return Error::from_string_literal("Sessions database was created by a newer Ladybird version");
+            return Error::from_string_literal("Sessions database was created by a newer Doggirl version");
         return SessionStore::create(session_database, launch_restore_policy());
     }();
     if (session_store.is_error()) {
@@ -1639,7 +1639,7 @@ void Application::create_history_store(ByteString const& data_directory, bool us
     if (created.is_error())
         dbgln("Unable to open the History database: {}", created.error());
     else
-        dbgln("History database was created by a newer Ladybird version; favicons and history will not be persisted this session");
+        dbgln("History database was created by a newer Doggirl version; favicons and history will not be persisted this session");
     m_favicon_store = WebView::FaviconStore::create();
     m_history_store = WebView::HistoryStore::create(*m_favicon_store);
     create_autocomplete_service({});
@@ -1801,7 +1801,7 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
     Vector<PageCard::Button> buttons;
     buttons.append({ "Not now", PageCard::ButtonRole::Secondary, {} });
     buttons.append({ "Restore tabs", PageCard::ButtonRole::Primary, AK::move(restore_tabs) });
-    window.show_page_card(BrowserWindow::PageCardSlot::RestoreSession, "Ladybird quit unexpectedly", question, AK::move(buttons));
+    window.show_page_card(BrowserWindow::PageCardSlot::RestoreSession, "Doggirl quit unexpectedly", question, AK::move(buttons));
 }
 
 void Application::open_startup_tabs(BrowserWindow& window, Vector<URL::URL> const& urls)
@@ -2189,7 +2189,7 @@ bool Application::confirm_stop_active_downloads(QWidget* parent)
 
     if (downloader.has_unresumable_downloads()) {
         QMessageBox dialog(parent ? parent : active_window_if_any());
-        dialog.setWindowTitle("Ladybird");
+        dialog.setWindowTitle("Doggirl");
         dialog.setIcon(QMessageBox::Warning);
         dialog.setText("Downloads are still in progress.");
         dialog.setInformativeText("Quitting will cancel downloads that cannot be resumed.");
@@ -2518,7 +2518,7 @@ static QMessageBox* create_message_box(QMessageBox::Icon icon, StringView text, 
 {
     auto* dialog = new QMessageBox(parent);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle("Ladybird");
+    dialog->setWindowTitle("Doggirl");
     dialog->setIcon(icon);
     dialog->setTextFormat(Qt::PlainText);
     dialog->setText(qstring_from_ak_string(text));
@@ -2562,9 +2562,9 @@ void Application::show_openssl_mismatch_card(BrowserWindow& window)
 
     Vector<PageCard::Button> buttons;
     buttons.append({ "Dismiss", PageCard::ButtonRole::Primary, {} });
-    auto text = qformatted("Ladybird was built against OpenSSL {}, but your system's curl uses OpenSSL {}. Secure connections work without some of Ladybird's own checks until Ladybird is rebuilt.",
+    auto text = qformatted("Doggirl was built against OpenSSL {}, but your system's curl uses OpenSSL {}. Secure connections work without some of Doggirl's own checks until Doggirl is rebuilt.",
         mismatch.linked_openssl_version, mismatch.curl_openssl_version);
-    window.show_page_card(BrowserWindow::PageCardSlot::RebuildNeeded, "This build of Ladybird is out of date", text, move(buttons));
+    window.show_page_card(BrowserWindow::PageCardSlot::RebuildNeeded, "This build of Doggirl is out of date", text, move(buttons));
 }
 
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
@@ -2574,13 +2574,13 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
 
     switch (kind) {
     case WebView::UpdateCheckResult::Kind::UpToDate:
-        create_message_box(QMessageBox::Information, MUST(String::formatted("Ladybird {} is the newest version.", current_version)), active_window_if_any())->open();
+        create_message_box(QMessageBox::Information, MUST(String::formatted("Doggirl {} is the newest version.", current_version)), active_window_if_any())->open();
         return;
     case WebView::UpdateCheckResult::Kind::DevelopmentBuild:
-        create_message_box(QMessageBox::Information, "Development builds of Ladybird do not check for updates."sv, active_window_if_any())->open();
+        create_message_box(QMessageBox::Information, "Development builds of Doggirl do not check for updates."sv, active_window_if_any())->open();
         return;
     case WebView::UpdateCheckResult::Kind::Failed:
-        display_error_dialog("Ladybird could not check for updates. Check your internet connection, and try again."sv);
+        display_error_dialog("Doggirl could not check for updates. Check your internet connection, and try again."sv);
         return;
     case WebView::UpdateCheckResult::Kind::UpdateAvailable:
         break;
@@ -2589,7 +2589,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
     if (!version.has_value())
         return;
 
-    // Once the system has installed a newer Ladybird in place of this one, restarting is what updates it.
+    // Once the system has installed a newer Doggirl in place of this one, restarting is what updates it.
     if (m_installation_replaced) {
         if (trigger != WebView::UpdateCheckTrigger::Automatic)
             offer_restart_after_update();
@@ -2611,9 +2611,9 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
                             HubConnection::the().async_skip_update_version(version);
                     } });
 
-    auto text = qformatted("You have Ladybird {}.", current_version);
+    auto text = qformatted("You have Doggirl {}.", current_version);
     if (first_is_one_of(install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM, WebView::InstallMethod::Flatpak)) {
-        text = qformatted("You have Ladybird {}. Update it with your system's software updater.", current_version);
+        text = qformatted("You have Doggirl {}. Update it with your system's software updater.", current_version);
         buttons.append({ "Remind me later", PageCard::ButtonRole::Primary, {} });
 #    if defined(LADYBIRD_HAS_SPARKLE)
     } else if (install_method == WebView::InstallMethod::MacOSApp) {
@@ -2636,7 +2636,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
                         } });
     }
 
-    window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Ladybird {} is available", *version), text, move(buttons));
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Doggirl {} is available", *version), text, move(buttons));
 }
 #endif
 
@@ -2689,8 +2689,8 @@ void Application::offer_restart_after_update()
     // A temporary profile is gone once Ladybird quits, and its windows and tabs with it. A session that could not be
     // saved, as when its database would not open, is gone as well.
     auto reopens = !m_profile_is_temporary && m_session_store && m_session_store->is_persistent();
-    auto text = reopens ? "Restart Ladybird to use the new version. Your windows and tabs will reopen, except private ones."_string : "Restart Ladybird to use the new version."_string;
-    window->show_page_card(BrowserWindow::PageCardSlot::Update, "Ladybird was updated", qstring_from_ak_string(text), move(buttons));
+    auto text = reopens ? "Restart Doggirl to use the new version. Your windows and tabs will reopen, except private ones."_string : "Restart Doggirl to use the new version."_string;
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, "Doggirl was updated", qstring_from_ak_string(text), move(buttons));
 }
 
 void Application::restart()

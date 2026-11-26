@@ -90,7 +90,7 @@ static MakeDefaultBrowserResult result_from_error(NSError* error)
     if (is_user_cancellation(cause))
         return {};
 
-    warnln("Unable to make Ladybird the default browser: {}", ns_string_to_string(error.description));
+    warnln("Unable to make Doggirl the default browser: {}", ns_string_to_string(error.description));
     return { .failed = true, .system_message = ns_string_to_string(cause.localizedDescription) };
 }
 

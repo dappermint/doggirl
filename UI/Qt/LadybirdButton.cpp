@@ -107,8 +107,8 @@ LadybirdButton::LadybirdButton(WebView::IsPrivate is_private, QWidget* parent)
     , m_is_private(is_private)
 {
     setObjectName("LadybirdButton");
-    setAccessibleName(is_private == WebView::IsPrivate::Yes ? "Ladybird menu, private window" : "Ladybird menu");
-    setToolTip(is_private == WebView::IsPrivate::Yes ? "Ladybird menu, private window" : "Ladybird menu");
+    setAccessibleName(is_private == WebView::IsPrivate::Yes ? "Doggirl menu, private window" : "Doggirl menu");
+    setToolTip(is_private == WebView::IsPrivate::Yes ? "Doggirl menu, private window" : "Doggirl menu");
     setFocusPolicy(Qt::TabFocus);
     setPopupMode(QToolButton::InstantPopup);
     setFixedSize(sizeHint());

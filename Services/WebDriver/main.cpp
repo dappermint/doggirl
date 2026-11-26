@@ -207,7 +207,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
         auto launch_browser_callback = [&](ByteString const& webdriver_endpoint, bool headless, Optional<ByteString> const& proxy_autoconfig_url) {
             auto arguments = create_arguments(webdriver_endpoint, profile_name, profile_path, headless, expose_experimental_interfaces, expose_internals_object, force_cpu_painting, disable_sandbox, debug_process, default_time_zone, resource_substitution_map_path, proxy_autoconfig_url);
-            return launch_process("Ladybird"sv, arguments.span());
+            return launch_process("Doggirl"sv, arguments.span());
         };
 
         auto maybe_client = WebDriver::Client::try_create(maybe_buffered_socket.release_value(), move(launch_browser_callback));

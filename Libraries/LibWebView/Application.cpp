@@ -385,12 +385,12 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool file_scheme_urls_have_tuple_origins = false;
 
     Core::ArgsParser args_parser;
-    args_parser.set_general_help("The Ladybird web browser :^)");
+    args_parser.set_general_help("The Doggirl web browser");
     args_parser.add_positional_argument(raw_urls, "URLs to open", "url", Core::ArgsParser::Required::No);
 
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Optional,
-        .help_string = "Run Ladybird without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', 'manual', or 'terminal'.",
+        .help_string = "Run Doggirl without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', 'manual', or 'terminal'.",
         .long_name = "headless",
         .value_name = "mode",
         .accept_value = [&](StringView value) {
@@ -550,7 +550,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     create_platform_arguments(args_parser);
     args_parser.parse(m_arguments);
 
-    m_stats_log = TRY(Core::StatsLog::create(stats_log_directory, "Ladybird"sv));
+    m_stats_log = TRY(Core::StatsLog::create(stats_log_directory, "Doggirl"sv));
 
     if (!dns_server_port.has_value())
         dns_server_port = use_dns_over_tls ? 853 : 53;
@@ -813,7 +813,7 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     profile_roots.cache = LexicalPath { profile_roots.cache }.parent().string();
 #endif
 
-    m_instance_data_directory = LexicalPath::join(profile_roots.data, "Ladybird"sv).string();
+    m_instance_data_directory = LexicalPath::join(profile_roots.data, "Doggirl"sv).string();
 
 #if defined(AK_OS_ANDROID)
     m_profile = TRY(Profile::create_legacy(profile_roots));
@@ -827,7 +827,7 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
 void Application::create_mach_port_server([[maybe_unused]] ByteString const& profile_identity)
 {
 #if defined(AK_OS_MACOS)
-    auto mach_process_name = ByteString::formatted("Ladybird-{}", profile_identity);
+    auto mach_process_name = ByteString::formatted("Doggirl-{}", profile_identity);
     m_mach_port_server = make<IPC::MachBootstrapListener>(mach_server_name_for_process(mach_process_name, Core::System::getpid()));
     set_mach_server_name(m_mach_port_server->server_port_name());
 
@@ -1897,7 +1897,7 @@ ErrorOr<void> Application::launch_services()
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         auto database_path = profile().paths().data;
-        auto database = TRY(Database::Database::create(database_path, "Ladybird"sv));
+        auto database = TRY(Database::Database::create(database_path, "Doggirl"sv));
 
         // The browsing database is shared by several stores, so the decision to fall back is
         // made for the file as a whole: if any store's schema is too new, none of them may
@@ -1927,7 +1927,7 @@ ErrorOr<void> Application::launch_services()
         // between the preflight and an apply above, none of them may persist this session, even if
         // an earlier store already migrated. Otherwise, we would keep writing to a vetoed database.
         if (cookies_outcome != Database::MigrationOutcome::Success || hsts_outcome != Database::MigrationOutcome::Success || storage_outcome != Database::MigrationOutcome::Success || downloads_outcome != Database::MigrationOutcome::Success) {
-            warnln("Browsing database was created by a newer Ladybird version; cookies, web storage, HSTS policies and unfinished downloads will not be persisted this session");
+            warnln("Browsing database was created by a newer Doggirl version; cookies, web storage, HSTS policies and unfinished downloads will not be persisted this session");
             cookies_outcome = Database::MigrationOutcome::DatabaseTooNew;
             hsts_outcome = Database::MigrationOutcome::DatabaseTooNew;
             storage_outcome = Database::MigrationOutcome::DatabaseTooNew;
@@ -2111,7 +2111,7 @@ void Application::system_facts_arrived(SystemFacts const& facts)
     // RequestServer leaves curl's TLS configuration alone in this case, rather than corrupt memory, but the user can only
     // fix it by rebuilding Ladybird.
     if (facts.openssl.has_value() && facts.openssl->curl_uses_another_openssl()) {
-        warnln("The system's curl uses OpenSSL {}, but Ladybird was built against OpenSSL {}. Rebuild Ladybird against the system's OpenSSL.",
+        warnln("The system's curl uses OpenSSL {}, but Doggirl was built against OpenSSL {}. Rebuild Doggirl against the system's OpenSSL.",
             *facts.openssl->curl_version, facts.openssl->linked_version);
         display_openssl_mismatch(*facts.openssl);
     }

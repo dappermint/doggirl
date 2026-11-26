@@ -27,7 +27,7 @@
 
 namespace WebView {
 
-static constexpr auto default_endpoint = "https://reports.app.ladybird.org"sv;
+static constexpr auto default_endpoint = ""sv;
 static constexpr auto challenge_path = "/api/v1/challenges"sv;
 static constexpr auto report_path = "/api/v1/reports"sv;
 static constexpr auto challenge_algorithm = "sha256-seed-nonce-le-v1"sv;
@@ -389,6 +389,8 @@ void ReportSubmission::send_report(ProofOfWork proof)
 static Optional<URL::URL> report_server_url(StringView path)
 {
     auto endpoint = Core::Environment::get("LADYBIRD_REPORTS_ENDPOINT"sv).value_or(default_endpoint);
+    if (endpoint.is_empty())
+        return {};
     auto url = URL::Parser::basic_parse(MUST(String::formatted("{}{}{}", endpoint,
         endpoint.ends_with('/') ? ""sv : "/"sv, path.substring_view(1))));
     if (!url.has_value() || (url->scheme() != "https"sv && url->scheme() != "http"sv))
@@ -410,7 +412,7 @@ void ReportSubmission::post(StringView path, StringView activity, StringView con
 {
     auto url = report_server_url(path);
     if (!url.has_value()) {
-        fail("Invalid report server configuration."_string, ShouldRetry::No);
+        fail("No report server is configured for Doggirl."_string, ShouldRetry::No);
         return;
     }
 

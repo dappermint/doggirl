@@ -1100,15 +1100,38 @@ QSize physical_size_for_device_pixel_ratio(QSize size, qreal device_pixel_ratio)
     };
 }
 
-// The logomark traces x = sin 2t, y = sin 3t, scaled 179 : 145, on a box of 22 by 18.4 around its middle.
-static constexpr auto LOGOMARK_PATH = "M0 0 L1.39 1.68 L2.76 3.29 L4.07 4.76 L5.30 6.02 L6.43 7.02 L7.43 7.70 L8.29 8.06 L8.99 8.06 L9.51 7.70 L9.85 7.02 L9.99 6.02 L9.95 4.76 L9.70 3.29 L9.27 1.68 L8.66 0 L7.88 -1.68 L6.95 -3.29 L5.88 -4.76 L4.69 -6.02 L3.42 -7.02 L2.08 -7.70 L0.70 -8.06 L-0.70 -8.06 L-2.08 -7.70 L-3.42 -7.02 L-4.69 -6.02 L-5.88 -4.76 L-6.95 -3.29 L-7.88 -1.68 L-8.66 0 L-9.27 1.68 L-9.70 3.29 L-9.95 4.76 L-9.99 6.02 L-9.85 7.02 L-9.51 7.70 L-8.99 8.06 L-8.29 8.06 L-7.43 7.70 L-6.43 7.02 L-5.30 6.02 L-4.07 4.76 L-2.76 3.29 L-1.39 1.68 L0 0 L1.39 -1.68 L2.76 -3.29 L4.07 -4.76 L5.30 -6.02 L6.43 -7.02 L7.43 -7.70 L8.29 -8.06 L8.99 -8.06 L9.51 -7.70 L9.85 -7.02 L9.99 -6.02 L9.95 -4.76 L9.70 -3.29 L9.27 -1.68 L8.66 0 L7.88 1.68 L6.95 3.29 L5.88 4.76 L4.69 6.02 L3.42 7.02 L2.08 7.70 L0.70 8.06 L-0.70 8.06 L-2.08 7.70 L-3.42 7.02 L-4.69 6.02 L-5.88 4.76 L-6.95 3.29 L-7.88 1.68 L-8.66 0 L-9.27 -1.68 L-9.70 -3.29 L-9.95 -4.76 L-9.99 -6.02 L-9.85 -7.02 L-9.51 -7.70 L-8.99 -8.06 L-8.29 -8.06 L-7.43 -7.70 L-6.43 -7.02 L-5.30 -6.02 L-4.07 -4.76 L-2.76 -3.29 L-1.39 -1.68 Z"sv;
-static constexpr QRectF LOGOMARK_BOUNDS { -11, -9.2, 22, 18.4 };
+static constexpr QRectF LOGOMARK_BOUNDS { 168, 194, 688, 618 };
 
-void paint_logomark(QPainter& painter, QRectF const& rect, QColor const& color, qreal stroke_width)
+void paint_logomark(QPainter& painter, QRectF const& rect, QColor const& color, [[maybe_unused]] qreal stroke_width)
 {
-    static auto const path = parse_svg_path(LOGOMARK_PATH);
+    static auto const main_pad = [] {
+        QPainterPath path;
+        path.moveTo(512, 464);
+        path.cubicTo(582, 464, 636, 522, 682, 592);
+        path.cubicTo(726, 660, 740, 738, 688, 786);
+        path.cubicTo(646, 824, 582, 800, 538, 784);
+        path.cubicTo(521, 778, 503, 778, 486, 784);
+        path.cubicTo(442, 800, 378, 824, 336, 786);
+        path.cubicTo(284, 738, 298, 660, 342, 592);
+        path.cubicTo(388, 522, 442, 464, 512, 464);
+        path.closeSubpath();
+        return path;
+    }();
 
-    // NB: The stroke width is given on the logomark's own box, as the design gives it, so it scales along with the path.
+    struct ToePad {
+        qreal cx;
+        qreal cy;
+        qreal rx;
+        qreal ry;
+        qreal angle;
+    };
+    static constexpr ToePad toe_pads[] {
+        { 256, 446, 76, 108, -24.0 },
+        { 416, 312, 80, 116, -8.0 },
+        { 608, 312, 80, 116, 8.0 },
+        { 768, 446, 76, 108, 24.0 },
+    };
+
     auto scale = min(rect.width() / LOGOMARK_BOUNDS.width(), rect.height() / LOGOMARK_BOUNDS.height());
 
     painter.save();
@@ -1116,9 +1139,16 @@ void paint_logomark(QPainter& painter, QRectF const& rect, QColor const& color, 
     painter.translate(rect.center());
     painter.scale(scale, scale);
     painter.translate(-LOGOMARK_BOUNDS.center());
-    painter.setBrush(Qt::NoBrush);
-    painter.setPen(QPen(color, stroke_width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    painter.drawPath(path);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(color);
+    for (auto const& toe : toe_pads) {
+        painter.save();
+        painter.translate(toe.cx, toe.cy);
+        painter.rotate(toe.angle);
+        painter.drawEllipse(QPointF(0, 0), toe.rx, toe.ry);
+        painter.restore();
+    }
+    painter.drawPath(main_pad);
     painter.restore();
 }
 

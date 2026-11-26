@@ -112,7 +112,7 @@ function updateDefaultBrowser() {
     defaultBrowser.classList.toggle("hidden", !isDefault && !canMakeDefault);
     defaultBrowserDescription.textContent =
         defaultBrowserFailure ??
-        (isDefault ? "Links from other apps open in Ladybird." : "Open links from other apps in Ladybird.");
+        (isDefault ? "Links from other apps open in Doggirl." : "Open links from other apps in Doggirl.");
     makeDefaultBrowser.classList.toggle("hidden", !canMakeDefault);
 
     // A control row is filled under the pointer, and a click anywhere on it reaches the control its label names. This

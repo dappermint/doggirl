@@ -203,7 +203,7 @@ DefaultBrowserLinux::DesktopAnswer DefaultBrowserLinux::ask_desktop(ByteString c
             auto message = String::from_utf8_with_replacement_character({ error->message, strlen(error->message) });
             g_clear_error(&error);
 
-            warnln("Unable to make Ladybird the default application for {}: {}", content_type, message);
+            warnln("Unable to make Doggirl the default application for {}: {}", content_type, message);
             if (!answer.error_message.has_value())
                 answer.error_message = move(message);
         }
@@ -213,7 +213,7 @@ DefaultBrowserLinux::DesktopAnswer DefaultBrowserLinux::ask_desktop(ByteString c
         // that setting.
         auto result = run_xdg_settings("set", desktop_id);
         if (result.has_value() && !result->succeeded) {
-            warnln("Unable to make Ladybird the default browser with xdg-settings: {}", result->standard_error);
+            warnln("Unable to make Doggirl the default browser with xdg-settings: {}", result->standard_error);
             if (!answer.error_message.has_value() && !result->standard_error.is_empty())
                 answer.error_message = move(result->standard_error);
         }

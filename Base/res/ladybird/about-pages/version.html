@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="color-scheme" content="light dark" />
-        <title>About Ladybird</title>
+        <title>About Doggirl</title>
         <link rel="icon" type="image/png" href="resource://icons/48x48/app-browser.png" />
         <link rel="stylesheet" type="text/css" href="resource://ladybird/ladybird.css" />
         <style>
@@ -16,23 +16,135 @@
                 padding: 100px 24px 26px;
             }
 
+            .paw-stage {
+                position: relative;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .logomark-button {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 4px;
+                border: none;
+                border-radius: 28px;
+                background: transparent;
+                cursor: pointer;
+                transition: transform 120ms ease;
+            }
+
+            .logomark-button:hover {
+                transform: scale(1.03);
+            }
+
+            .logomark-button:active {
+                transform: scale(0.95);
+            }
+
+            .logomark-button:focus-visible {
+                outline: 2px solid var(--link);
+                outline-offset: 6px;
+            }
+
             .logomark {
-                width: 168px;
-                height: 141px;
+                width: 152px;
+                height: 140px;
+                display: block;
             }
 
-            .logomark path {
-                stroke: var(--brand-mark);
-                stroke-width: 0.95;
+            .paw-toe-blue {
+                fill: url(#paw-blue-light);
             }
 
-            :root {
-                --brand-mark: #6a39db;
+            .paw-toe-pink {
+                fill: url(#paw-pink-light);
+            }
+
+            .paw-main {
+                fill: url(#paw-main-light);
+                stroke: url(#paw-rim-light);
+                stroke-width: 12;
             }
 
             @media (prefers-color-scheme: dark) {
-                :root {
-                    --brand-mark: #b496ff;
+                .paw-toe-blue {
+                    fill: url(#paw-blue-dark);
+                }
+
+                .paw-toe-pink {
+                    fill: url(#paw-pink-dark);
+                }
+
+                .paw-main {
+                    fill: url(#paw-main-dark);
+                    stroke: none;
+                }
+            }
+
+            @keyframes paw-bark {
+                0% {
+                    transform: scale(1) rotate(0deg);
+                }
+                22% {
+                    transform: scale(1.12) rotate(-8deg);
+                }
+                52% {
+                    transform: scale(1.06) rotate(7deg);
+                }
+                78% {
+                    transform: scale(0.98) rotate(-3deg);
+                }
+                100% {
+                    transform: scale(1) rotate(0deg);
+                }
+            }
+
+            .logomark-button.is-barking .logomark {
+                animation: paw-bark 340ms cubic-bezier(0.22, 1, 0.36, 1);
+            }
+
+            .woof-bubble {
+                position: absolute;
+                top: -12px;
+                right: -28px;
+                padding: 4px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.01em;
+                color: #242130;
+                background: linear-gradient(135deg, #9de6ff, #ffccd9);
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+                opacity: 0;
+                visibility: hidden;
+                transform: translateY(6px) scale(0.86);
+                pointer-events: none;
+                transition:
+                    opacity 160ms ease,
+                    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+                    visibility 0ms linear 160ms;
+            }
+
+            .woof-bubble.visible {
+                opacity: 1;
+                visibility: visible;
+                transform: translateY(-4px) scale(1);
+                transition:
+                    opacity 160ms ease,
+                    transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+                    visibility 0ms linear 0ms;
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+                .logomark-button,
+                .woof-bubble {
+                    transition: none;
+                }
+
+                .logomark-button.is-barking .logomark {
+                    animation: none;
                 }
             }
 
@@ -148,23 +260,59 @@
         </style>
     </head>
     <body>
-        <svg
-            class="logomark"
-            viewBox="-11 -9.2 22 18.4"
-            fill="none"
-            stroke-linejoin="round"
-            role="img"
-            aria-label="Ladybird logomark"
-        >
-            <path
-                d="M0.00 0.00 L0.17 0.21 L0.35 0.42 L0.52 0.63 L0.70 0.84 L0.87 1.05 L1.05 1.26 L1.22 1.47 L1.39 1.68 L1.56 1.88 L1.74 2.09 L1.91 2.29 L2.08 2.49 L2.25 2.69 L2.42 2.89 L2.59 3.08 L2.76 3.28 L2.92 3.47 L3.09 3.66 L3.26 3.85 L3.42 4.03 L3.58 4.21 L3.75 4.39 L3.91 4.57 L4.07 4.74 L4.23 4.91 L4.38 5.07 L4.54 5.23 L4.69 5.39 L4.85 5.55 L5.00 5.70 L5.15 5.85 L5.30 5.99 L5.45 6.13 L5.59 6.26 L5.74 6.39 L5.88 6.52 L6.02 6.64 L6.16 6.76 L6.29 6.87 L6.43 6.98 L6.56 7.08 L6.69 7.18 L6.82 7.27 L6.95 7.36 L7.07 7.45 L7.19 7.52 L7.31 7.60 L7.43 7.67 L7.55 7.73 L7.66 7.79 L7.77 7.84 L7.88 7.88 L7.99 7.93 L8.09 7.96 L8.19 7.99 L8.29 8.02 L8.39 8.04 L8.48 8.05 L8.57 8.06 L8.66 8.06 L8.75 8.06 L8.83 8.05 L8.91 8.04 L8.99 8.02 L9.06 7.99 L9.14 7.96 L9.21 7.93 L9.27 7.88 L9.34 7.84 L9.40 7.79 L9.46 7.73 L9.51 7.67 L9.56 7.60 L9.61 7.52 L9.66 7.45 L9.70 7.36 L9.74 7.27 L9.78 7.18 L9.82 7.08 L9.85 6.98 L9.88 6.87 L9.90 6.76 L9.93 6.64 L9.95 6.52 L9.96 6.39 L9.98 6.26 L9.99 6.13 L9.99 5.99 L10.00 5.85 L10.00 5.70 L10.00 5.55 L9.99 5.39 L9.99 5.23 L9.98 5.07 L9.96 4.91 L9.95 4.74 L9.93 4.57 L9.90 4.39 L9.88 4.21 L9.85 4.03 L9.82 3.85 L9.78 3.66 L9.74 3.47 L9.70 3.28 L9.66 3.08 L9.61 2.89 L9.56 2.69 L9.51 2.49 L9.46 2.29 L9.40 2.09 L9.34 1.88 L9.27 1.68 L9.21 1.47 L9.14 1.26 L9.06 1.05 L8.99 0.84 L8.91 0.63 L8.83 0.42 L8.75 0.21 L8.66 0.00 L8.57 -0.21 L8.48 -0.42 L8.39 -0.63 L8.29 -0.84 L8.19 -1.05 L8.09 -1.26 L7.99 -1.47 L7.88 -1.68 L7.77 -1.88 L7.66 -2.09 L7.55 -2.29 L7.43 -2.49 L7.31 -2.69 L7.19 -2.89 L7.07 -3.08 L6.95 -3.28 L6.82 -3.47 L6.69 -3.66 L6.56 -3.85 L6.43 -4.03 L6.29 -4.21 L6.16 -4.39 L6.02 -4.57 L5.88 -4.74 L5.74 -4.91 L5.59 -5.07 L5.45 -5.23 L5.30 -5.39 L5.15 -5.55 L5.00 -5.70 L4.85 -5.85 L4.69 -5.99 L4.54 -6.13 L4.38 -6.26 L4.23 -6.39 L4.07 -6.52 L3.91 -6.64 L3.75 -6.76 L3.58 -6.87 L3.42 -6.98 L3.26 -7.08 L3.09 -7.18 L2.92 -7.27 L2.76 -7.36 L2.59 -7.45 L2.42 -7.52 L2.25 -7.60 L2.08 -7.67 L1.91 -7.73 L1.74 -7.79 L1.56 -7.84 L1.39 -7.88 L1.22 -7.93 L1.05 -7.96 L0.87 -7.99 L0.70 -8.02 L0.52 -8.04 L0.35 -8.05 L0.17 -8.06 L0.00 -8.06 L-0.17 -8.06 L-0.35 -8.05 L-0.52 -8.04 L-0.70 -8.02 L-0.87 -7.99 L-1.05 -7.96 L-1.22 -7.93 L-1.39 -7.88 L-1.56 -7.84 L-1.74 -7.79 L-1.91 -7.73 L-2.08 -7.67 L-2.25 -7.60 L-2.42 -7.52 L-2.59 -7.45 L-2.76 -7.36 L-2.92 -7.27 L-3.09 -7.18 L-3.26 -7.08 L-3.42 -6.98 L-3.58 -6.87 L-3.75 -6.76 L-3.91 -6.64 L-4.07 -6.52 L-4.23 -6.39 L-4.38 -6.26 L-4.54 -6.13 L-4.69 -5.99 L-4.85 -5.85 L-5.00 -5.70 L-5.15 -5.55 L-5.30 -5.39 L-5.45 -5.23 L-5.59 -5.07 L-5.74 -4.91 L-5.88 -4.74 L-6.02 -4.57 L-6.16 -4.39 L-6.29 -4.21 L-6.43 -4.03 L-6.56 -3.85 L-6.69 -3.66 L-6.82 -3.47 L-6.95 -3.28 L-7.07 -3.08 L-7.19 -2.89 L-7.31 -2.69 L-7.43 -2.49 L-7.55 -2.29 L-7.66 -2.09 L-7.77 -1.88 L-7.88 -1.68 L-7.99 -1.47 L-8.09 -1.26 L-8.19 -1.05 L-8.29 -0.84 L-8.39 -0.63 L-8.48 -0.42 L-8.57 -0.21 L-8.66 -0.00 L-8.75 0.21 L-8.83 0.42 L-8.91 0.63 L-8.99 0.84 L-9.06 1.05 L-9.14 1.26 L-9.21 1.47 L-9.27 1.68 L-9.34 1.88 L-9.40 2.09 L-9.46 2.29 L-9.51 2.49 L-9.56 2.69 L-9.61 2.89 L-9.66 3.08 L-9.70 3.28 L-9.74 3.47 L-9.78 3.66 L-9.82 3.85 L-9.85 4.03 L-9.88 4.21 L-9.90 4.39 L-9.93 4.57 L-9.95 4.74 L-9.96 4.91 L-9.98 5.07 L-9.99 5.23 L-9.99 5.39 L-10.00 5.55 L-10.00 5.70 L-10.00 5.85 L-9.99 5.99 L-9.99 6.13 L-9.98 6.26 L-9.96 6.39 L-9.95 6.52 L-9.93 6.64 L-9.90 6.76 L-9.88 6.87 L-9.85 6.98 L-9.82 7.08 L-9.78 7.18 L-9.74 7.27 L-9.70 7.36 L-9.66 7.45 L-9.61 7.52 L-9.56 7.60 L-9.51 7.67 L-9.46 7.73 L-9.40 7.79 L-9.34 7.84 L-9.27 7.88 L-9.21 7.93 L-9.14 7.96 L-9.06 7.99 L-8.99 8.02 L-8.91 8.04 L-8.83 8.05 L-8.75 8.06 L-8.66 8.06 L-8.57 8.06 L-8.48 8.05 L-8.39 8.04 L-8.29 8.02 L-8.19 7.99 L-8.09 7.96 L-7.99 7.93 L-7.88 7.88 L-7.77 7.84 L-7.66 7.79 L-7.55 7.73 L-7.43 7.67 L-7.31 7.60 L-7.19 7.52 L-7.07 7.45 L-6.95 7.36 L-6.82 7.27 L-6.69 7.18 L-6.56 7.08 L-6.43 6.98 L-6.29 6.87 L-6.16 6.76 L-6.02 6.64 L-5.88 6.52 L-5.74 6.39 L-5.59 6.26 L-5.45 6.13 L-5.30 5.99 L-5.15 5.85 L-5.00 5.70 L-4.85 5.55 L-4.69 5.39 L-4.54 5.23 L-4.38 5.07 L-4.23 4.91 L-4.07 4.74 L-3.91 4.57 L-3.75 4.39 L-3.58 4.21 L-3.42 4.03 L-3.26 3.85 L-3.09 3.66 L-2.92 3.47 L-2.76 3.28 L-2.59 3.08 L-2.42 2.89 L-2.25 2.69 L-2.08 2.49 L-1.91 2.29 L-1.74 2.09 L-1.56 1.88 L-1.39 1.68 L-1.22 1.47 L-1.05 1.26 L-0.87 1.05 L-0.70 0.84 L-0.52 0.63 L-0.35 0.42 L-0.17 0.21 L-0.00 0.00 L0.17 -0.21 L0.35 -0.42 L0.52 -0.63 L0.70 -0.84 L0.87 -1.05 L1.05 -1.26 L1.22 -1.47 L1.39 -1.68 L1.56 -1.88 L1.74 -2.09 L1.91 -2.29 L2.08 -2.49 L2.25 -2.69 L2.42 -2.89 L2.59 -3.08 L2.76 -3.28 L2.92 -3.47 L3.09 -3.66 L3.26 -3.85 L3.42 -4.03 L3.58 -4.21 L3.75 -4.39 L3.91 -4.57 L4.07 -4.74 L4.23 -4.91 L4.38 -5.07 L4.54 -5.23 L4.69 -5.39 L4.85 -5.55 L5.00 -5.70 L5.15 -5.85 L5.30 -5.99 L5.45 -6.13 L5.59 -6.26 L5.74 -6.39 L5.88 -6.52 L6.02 -6.64 L6.16 -6.76 L6.29 -6.87 L6.43 -6.98 L6.56 -7.08 L6.69 -7.18 L6.82 -7.27 L6.95 -7.36 L7.07 -7.45 L7.19 -7.52 L7.31 -7.60 L7.43 -7.67 L7.55 -7.73 L7.66 -7.79 L7.77 -7.84 L7.88 -7.88 L7.99 -7.93 L8.09 -7.96 L8.19 -7.99 L8.29 -8.02 L8.39 -8.04 L8.48 -8.05 L8.57 -8.06 L8.66 -8.06 L8.75 -8.06 L8.83 -8.05 L8.91 -8.04 L8.99 -8.02 L9.06 -7.99 L9.14 -7.96 L9.21 -7.93 L9.27 -7.88 L9.34 -7.84 L9.40 -7.79 L9.46 -7.73 L9.51 -7.67 L9.56 -7.60 L9.61 -7.52 L9.66 -7.45 L9.70 -7.36 L9.74 -7.27 L9.78 -7.18 L9.82 -7.08 L9.85 -6.98 L9.88 -6.87 L9.90 -6.76 L9.93 -6.64 L9.95 -6.52 L9.96 -6.39 L9.98 -6.26 L9.99 -6.13 L9.99 -5.99 L10.00 -5.85 L10.00 -5.70 L10.00 -5.55 L9.99 -5.39 L9.99 -5.23 L9.98 -5.07 L9.96 -4.91 L9.95 -4.74 L9.93 -4.57 L9.90 -4.39 L9.88 -4.21 L9.85 -4.03 L9.82 -3.85 L9.78 -3.66 L9.74 -3.47 L9.70 -3.28 L9.66 -3.08 L9.61 -2.89 L9.56 -2.69 L9.51 -2.49 L9.46 -2.29 L9.40 -2.09 L9.34 -1.88 L9.27 -1.68 L9.21 -1.47 L9.14 -1.26 L9.06 -1.05 L8.99 -0.84 L8.91 -0.63 L8.83 -0.42 L8.75 -0.21 L8.66 -0.00 L8.57 0.21 L8.48 0.42 L8.39 0.63 L8.29 0.84 L8.19 1.05 L8.09 1.26 L7.99 1.47 L7.88 1.68 L7.77 1.88 L7.66 2.09 L7.55 2.29 L7.43 2.49 L7.31 2.69 L7.19 2.89 L7.07 3.08 L6.95 3.28 L6.82 3.47 L6.69 3.66 L6.56 3.85 L6.43 4.03 L6.29 4.21 L6.16 4.39 L6.02 4.57 L5.88 4.74 L5.74 4.91 L5.59 5.07 L5.45 5.23 L5.30 5.39 L5.15 5.55 L5.00 5.70 L4.85 5.85 L4.69 5.99 L4.54 6.13 L4.38 6.26 L4.23 6.39 L4.07 6.52 L3.91 6.64 L3.75 6.76 L3.58 6.87 L3.42 6.98 L3.26 7.08 L3.09 7.18 L2.92 7.27 L2.76 7.36 L2.59 7.45 L2.42 7.52 L2.25 7.60 L2.08 7.67 L1.91 7.73 L1.74 7.79 L1.56 7.84 L1.39 7.88 L1.22 7.93 L1.05 7.96 L0.87 7.99 L0.70 8.02 L0.52 8.04 L0.35 8.05 L0.17 8.06 L0.00 8.06 L-0.17 8.06 L-0.35 8.05 L-0.52 8.04 L-0.70 8.02 L-0.87 7.99 L-1.05 7.96 L-1.22 7.93 L-1.39 7.88 L-1.56 7.84 L-1.74 7.79 L-1.91 7.73 L-2.08 7.67 L-2.25 7.60 L-2.42 7.52 L-2.59 7.45 L-2.76 7.36 L-2.92 7.27 L-3.09 7.18 L-3.26 7.08 L-3.42 6.98 L-3.58 6.87 L-3.75 6.76 L-3.91 6.64 L-4.07 6.52 L-4.23 6.39 L-4.38 6.26 L-4.54 6.13 L-4.69 5.99 L-4.85 5.85 L-5.00 5.70 L-5.15 5.55 L-5.30 5.39 L-5.45 5.23 L-5.59 5.07 L-5.74 4.91 L-5.88 4.74 L-6.02 4.57 L-6.16 4.39 L-6.29 4.21 L-6.43 4.03 L-6.56 3.85 L-6.69 3.66 L-6.82 3.47 L-6.95 3.28 L-7.07 3.08 L-7.19 2.89 L-7.31 2.69 L-7.43 2.49 L-7.55 2.29 L-7.66 2.09 L-7.77 1.88 L-7.88 1.68 L-7.99 1.47 L-8.09 1.26 L-8.19 1.05 L-8.29 0.84 L-8.39 0.63 L-8.48 0.42 L-8.57 0.21 L-8.66 0.00 L-8.75 -0.21 L-8.83 -0.42 L-8.91 -0.63 L-8.99 -0.84 L-9.06 -1.05 L-9.14 -1.26 L-9.21 -1.47 L-9.27 -1.68 L-9.34 -1.88 L-9.40 -2.09 L-9.46 -2.29 L-9.51 -2.49 L-9.56 -2.69 L-9.61 -2.89 L-9.66 -3.08 L-9.70 -3.28 L-9.74 -3.47 L-9.78 -3.66 L-9.82 -3.85 L-9.85 -4.03 L-9.88 -4.21 L-9.90 -4.39 L-9.93 -4.57 L-9.95 -4.74 L-9.96 -4.91 L-9.98 -5.07 L-9.99 -5.23 L-9.99 -5.39 L-10.00 -5.55 L-10.00 -5.70 L-10.00 -5.85 L-9.99 -5.99 L-9.99 -6.13 L-9.98 -6.26 L-9.96 -6.39 L-9.95 -6.52 L-9.93 -6.64 L-9.90 -6.76 L-9.88 -6.87 L-9.85 -6.98 L-9.82 -7.08 L-9.78 -7.18 L-9.74 -7.27 L-9.70 -7.36 L-9.66 -7.45 L-9.61 -7.52 L-9.56 -7.60 L-9.51 -7.67 L-9.46 -7.73 L-9.40 -7.79 L-9.34 -7.84 L-9.27 -7.88 L-9.21 -7.93 L-9.14 -7.96 L-9.06 -7.99 L-8.99 -8.02 L-8.91 -8.04 L-8.83 -8.05 L-8.75 -8.06 L-8.66 -8.06 L-8.57 -8.06 L-8.48 -8.05 L-8.39 -8.04 L-8.29 -8.02 L-8.19 -7.99 L-8.09 -7.96 L-7.99 -7.93 L-7.88 -7.88 L-7.77 -7.84 L-7.66 -7.79 L-7.55 -7.73 L-7.43 -7.67 L-7.31 -7.60 L-7.19 -7.52 L-7.07 -7.45 L-6.95 -7.36 L-6.82 -7.27 L-6.69 -7.18 L-6.56 -7.08 L-6.43 -6.98 L-6.29 -6.87 L-6.16 -6.76 L-6.02 -6.64 L-5.88 -6.52 L-5.74 -6.39 L-5.59 -6.26 L-5.45 -6.13 L-5.30 -5.99 L-5.15 -5.85 L-5.00 -5.70 L-4.85 -5.55 L-4.69 -5.39 L-4.54 -5.23 L-4.38 -5.07 L-4.23 -4.91 L-4.07 -4.74 L-3.91 -4.57 L-3.75 -4.39 L-3.58 -4.21 L-3.42 -4.03 L-3.26 -3.85 L-3.09 -3.66 L-2.92 -3.47 L-2.76 -3.28 L-2.59 -3.08 L-2.42 -2.89 L-2.25 -2.69 L-2.08 -2.49 L-1.91 -2.29 L-1.74 -2.09 L-1.56 -1.88 L-1.39 -1.68 L-1.22 -1.47 L-1.05 -1.26 L-0.87 -1.05 L-0.70 -0.84 L-0.52 -0.63 L-0.35 -0.42 L-0.17 -0.21 Z"
-            />
-        </svg>
+        <div class="paw-stage">
+            <button class="logomark-button" id="about-paw" type="button" aria-label="Doggirl paw logomark">
+                <svg class="logomark" viewBox="140 164 744 680" role="img" aria-hidden="true">
+                    <defs>
+                        <linearGradient id="paw-blue-light" x1="0.2" y1="0" x2="0.8" y2="1">
+                            <stop offset="0%" stop-color="#89DDFC" />
+                            <stop offset="100%" stop-color="#5BC5F2" />
+                        </linearGradient>
+                        <linearGradient id="paw-pink-light" x1="0.2" y1="0" x2="0.8" y2="1">
+                            <stop offset="0%" stop-color="#FBC0D0" />
+                            <stop offset="100%" stop-color="#F29BB5" />
+                        </linearGradient>
+                        <linearGradient id="paw-main-light" x1="0" y1="0.15" x2="1" y2="0.9">
+                            <stop offset="0%" stop-color="#FFFFFF" />
+                            <stop offset="55%" stop-color="#FDFBFE" />
+                            <stop offset="100%" stop-color="#F3EEF9" />
+                        </linearGradient>
+                        <linearGradient id="paw-rim-light" x1="0" y1="0" x2="1" y2="0">
+                            <stop offset="0%" stop-color="#7AD6FA" />
+                            <stop offset="50%" stop-color="#F5AFC4" />
+                            <stop offset="100%" stop-color="#7AD6FA" />
+                        </linearGradient>
+                        <linearGradient id="paw-blue-dark" x1="0.2" y1="0" x2="0.8" y2="1">
+                            <stop offset="0%" stop-color="#9DE6FF" />
+                            <stop offset="100%" stop-color="#69CEF8" />
+                        </linearGradient>
+                        <linearGradient id="paw-pink-dark" x1="0.2" y1="0" x2="0.8" y2="1">
+                            <stop offset="0%" stop-color="#FFCCD9" />
+                            <stop offset="100%" stop-color="#F6A4BC" />
+                        </linearGradient>
+                        <linearGradient id="paw-main-dark" x1="0" y1="0.1" x2="1" y2="0.95">
+                            <stop offset="0%" stop-color="#FFFFFF" />
+                            <stop offset="55%" stop-color="#F8F5FC" />
+                            <stop offset="100%" stop-color="#EAE5F5" />
+                        </linearGradient>
+                    </defs>
+                    <ellipse class="paw-toe-blue" cx="256" cy="446" rx="76" ry="108" transform="rotate(-24 256 446)" />
+                    <ellipse class="paw-toe-pink" cx="416" cy="312" rx="80" ry="116" transform="rotate(-8 416 312)" />
+                    <ellipse class="paw-toe-pink" cx="608" cy="312" rx="80" ry="116" transform="rotate(8 608 312)" />
+                    <ellipse class="paw-toe-blue" cx="768" cy="446" rx="76" ry="108" transform="rotate(24 768 446)" />
+                    <path
+                        class="paw-main"
+                        d="M512 464 C582 464, 636 522, 682 592 C726 660, 740 738, 688 786 C646 824, 582 800, 538 784 C521 778, 503 778, 486 784 C442 800, 378 824, 336 786 C284 738, 298 660, 342 592 C388 522, 442 464, 512 464 Z"
+                    />
+                </svg>
+            </button>
+            <span class="woof-bubble" id="woof-bubble" aria-live="polite" aria-hidden="true">woof!</span>
+        </div>
         <div class="name">
-            <h1 id="browser-name">Ladybird</h1>
+            <h1 id="browser-name">Doggirl</h1>
             <span class="badge" id="release-stage" hidden></span>
         </div>
-        <p class="tagline">A truly independent web browser.</p>
+        <p class="tagline">A fast, independent web browser.</p>
         <div class="details">
             <div class="summary">
                 <dl>
@@ -190,20 +338,85 @@
                 </button>
             </div>
             <div class="links">
-                <a href="https://ladybird.org/privacy/" target="_blank">Privacy Policy</a>
-                <a href="https://ladybird.org/trademark/" target="_blank">Trademark Policy</a>
+                <a href="https://github.com/dappermint/doggirl" target="_blank">GitHub</a>
+                <a href="https://github.com/dappermint/doggirl/issues" target="_blank">Issues</a>
                 <a href="about:licenses" target="_blank">Licenses</a>
             </div>
         </div>
         <script type="module">
             const copyButton = document.querySelector("#copy");
+            const pawButton = document.querySelector("#about-paw");
+            const woofBubble = document.querySelector("#woof-bubble");
+            const BARK_SOUND_URL = "resource://ladybird/about-pages/bark.wav";
+            const BARK_UNLOCK_CLICKS = 5;
             let detailsText = "";
+            let pawClicks = 0;
+            let audioContext = null;
+            let barkBufferPromise = null;
+            let woofTimer = null;
+
+            async function playBarkSound() {
+                const pitch = 0.88 + Math.random() * 0.24;
+                try {
+                    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                    if (AudioCtx) {
+                        if (!audioContext) audioContext = new AudioCtx();
+                        if (audioContext.state === "suspended") await audioContext.resume();
+                        if (!barkBufferPromise) {
+                            barkBufferPromise = fetch(BARK_SOUND_URL)
+                                .then(response => {
+                                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                                    return response.arrayBuffer();
+                                })
+                                .then(data => audioContext.decodeAudioData(data));
+                        }
+                        const buffer = await barkBufferPromise;
+                        const source = audioContext.createBufferSource();
+                        source.buffer = buffer;
+                        source.playbackRate.value = pitch;
+                        source.connect(audioContext.destination);
+                        source.start(0);
+                        return;
+                    }
+                } catch {
+                    barkBufferPromise = null;
+                }
+
+                try {
+                    const audio = new Audio(BARK_SOUND_URL);
+                    audio.preservesPitch = false;
+                    audio.playbackRate = pitch;
+                    await audio.play();
+                } catch {}
+            }
+
+            pawButton.addEventListener("click", () => {
+                pawClicks += 1;
+                if (pawClicks < BARK_UNLOCK_CLICKS) return;
+
+                pawButton.classList.remove("is-barking");
+                void pawButton.offsetWidth;
+                pawButton.classList.add("is-barking");
+
+                woofBubble.setAttribute("aria-hidden", "false");
+                woofBubble.classList.add("visible");
+                if (woofTimer !== null) clearTimeout(woofTimer);
+                woofTimer = setTimeout(() => {
+                    woofBubble.classList.remove("visible");
+                    woofBubble.setAttribute("aria-hidden", "true");
+                    woofTimer = null;
+                }, 900);
+
+                void playBarkSound();
+            });
 
             function renderVersionInfo(versionInfo) {
                 document.title = `About ${versionInfo.productName}`;
                 document.querySelector("#browser-name").innerText = versionInfo.browserName;
-                document.querySelector("#release-stage").innerText = versionInfo.releaseStage || "Development";
-                document.querySelector("#release-stage").hidden = false;
+                const stageBadge = document.querySelector("#release-stage");
+                const stageText = versionInfo.releaseStage || (versionInfo.isReleaseBuild ? "" : "Development");
+                stageBadge.innerText = stageText;
+                stageBadge.hidden = stageText.length === 0;
                 document.querySelector("#browser-version").innerText = versionInfo.browserVersion;
                 document.querySelector("#browser-commit").innerText = `from ${versionInfo.browserCommit.slice(0, 10)}`;
                 document.querySelector("#platform").innerText = `${versionInfo.platformName}, ${versionInfo.arch}`;

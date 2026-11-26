@@ -37,8 +37,8 @@ option(LADYBIRD_BUILD_QT "Build and bundle Qt with vcpkg on Linux" OFF)
 option(ENABLE_INSTALL_HEADERS "Enable installing headers" ON)
 option(ENABLE_INSTALL_FREEDESKTOP_FILES "Enable installing .desktop and .service files" ${freedesktop_files_default})
 option(LADYBIRD_ENABLE_CPPTRACE "Enable use of cpptrace as the default library for stacktraces. If not available falls back to backtrace.h" ON)
-option(LADYBIRD_ENABLE_UPDATE_CHECK "Check for newer releases of Ladybird" ON)
-option(LADYBIRD_ENABLE_SPARKLE "Update the macOS app with Sparkle" ON)
+option(LADYBIRD_ENABLE_UPDATE_CHECK "Check for newer releases of Doggirl" OFF)
+option(LADYBIRD_ENABLE_SPARKLE "Update the macOS app with Sparkle" OFF)
 if (NOT LADYBIRD_ENABLE_UPDATE_CHECK)
     # Sparkle only installs the releases that the update check finds.
     set(LADYBIRD_ENABLE_SPARKLE OFF)
@@ -54,17 +54,17 @@ set(LADYBIRD_VERSION "" CACHE STRING "Version of a release, such as 2026.46.0")
 set(LADYBIRD_BROWSER_VERSION "${PROJECT_VERSION}")
 
 # Development builds have a bundle identifier of their own, so that macOS does not take them for copies of the release.
-set(LADYBIRD_BUNDLE_IDENTIFIER "org.ladybird.Ladybird.Development")
+set(LADYBIRD_BUNDLE_IDENTIFIER "dev.dappermint.doggirl.Development")
 if (NOT LADYBIRD_VERSION STREQUAL "")
     set(LADYBIRD_BROWSER_VERSION "${LADYBIRD_VERSION}")
-    set(LADYBIRD_BUNDLE_IDENTIFIER "org.ladybird.Ladybird")
+    set(LADYBIRD_BUNDLE_IDENTIFIER "dev.dappermint.doggirl")
 endif()
 
 # The stage of development that releases are in, if any, such as Alpha or Beta.
-set(LADYBIRD_RELEASE_STAGE "Alpha")
+set(LADYBIRD_RELEASE_STAGE "")
 
-# Like other browsers, our Linux packages keep Ladybird in a directory of its own.
-set(LADYBIRD_PACKAGE_INSTALL_PREFIX "/opt/ladybird")
+# Like other browsers, our Linux packages keep Doggirl in a directory of its own.
+set(LADYBIRD_PACKAGE_INSTALL_PREFIX "/opt/doggirl")
 
 option(ENABLE_ADDRESS_SANITIZER "Enable address sanitizer testing in gcc/clang" OFF)
 option(ENABLE_MEMORY_SANITIZER "Enable memory sanitizer testing in gcc/clang" OFF)

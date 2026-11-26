@@ -554,7 +554,7 @@ ProcessManagerWindow::ProcessManagerWindow(Source source)
     m_summary = new QLabel(m_footer);
     m_summary->setObjectName("LadybirdTaskManagerSummary");
     m_summary->setTextFormat(Qt::RichText);
-    m_summary->setToolTip(tr("Total CPU and memory for all Ladybird processes. Updates every second."));
+    m_summary->setToolTip(tr("Total CPU and memory for all Doggirl processes. Updates every second."));
     footer_layout->addWidget(m_summary);
     footer_layout->addStretch();
     m_end_action = new QAction(tr("End Process"), this);

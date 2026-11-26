@@ -38,7 +38,7 @@ using namespace Core::CrashReportData;
 
 ByteString CrashReportStore::default_directory()
 {
-    return LexicalPath::join(Core::StandardPaths::user_data_directory(), "Ladybird"sv, "CrashReports"sv).string();
+    return LexicalPath::join(Core::StandardPaths::user_data_directory(), "Doggirl"sv, "CrashReports"sv).string();
 }
 
 // The browser's own store. It moves into the profile once the profile is known.

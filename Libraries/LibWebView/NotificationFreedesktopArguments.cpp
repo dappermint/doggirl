@@ -69,7 +69,7 @@ static FreedesktopImageData image_data_for(Gfx::Bitmap const& bitmap)
 FreedesktopNotifyArguments build_notify_arguments(PlatformNotification const& notification, FreedesktopCapabilities const& capabilities, u32 replaces_daemon_id)
 {
     FreedesktopNotifyArguments arguments;
-    arguments.app_name = "Ladybird"_string;
+    arguments.app_name = "Doggirl"_string;
     arguments.replaces_id = replaces_daemon_id;
     arguments.app_icon = "org.ladybird.Ladybird"_string;
     auto title = platform_text(notification.data.title);

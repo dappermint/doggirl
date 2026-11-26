@@ -92,7 +92,7 @@ PermissionPromptPopover::PermissionPromptPopover(QWidget* parent, WebView::Permi
     header->addWidget(m_icon_tile, 0, Qt::AlignTop);
     auto is_notice = request.kind == WebView::PermissionPromptKind::SystemDeniedNotice;
     auto title_text = is_notice
-        ? QStringLiteral("Ladybird can't %1").arg(feature_text(request.name))
+        ? QStringLiteral("Doggirl can't %1").arg(feature_text(request.name))
         : QStringLiteral("%1 wants to %2").arg(requester_text(request), feature_text(request.name));
     auto* title = new QLabel(title_text, &card());
     title->setObjectName("LadybirdPermissionPromptTitle");
@@ -101,15 +101,15 @@ PermissionPromptPopover::PermissionPromptPopover(QWidget* parent, WebView::Permi
     header->addWidget(title, 1);
     layout->addLayout(header);
 
-    // Shown while the system hasn't yet been asked whether Ladybird may use the feature: it asks right after this prompt.
-    auto* hint = new QLabel(QStringLiteral("Your system will then ask you to let Ladybird %1.").arg(feature_text(request.name)), &card());
+    // Shown while the system hasn't yet been asked whether Doggirl may use the feature: it asks right after this prompt.
+    auto* hint = new QLabel(QStringLiteral("Your system will then ask you to let Doggirl %1.").arg(feature_text(request.name)), &card());
     hint->setObjectName("LadybirdPermissionPromptHint");
     hint->setWordWrap(true);
     hint->setVisible(request.show_os_hint);
     layout->addWidget(hint);
 
     if (is_notice) {
-        auto* body = new QLabel(QStringLiteral("Your system's privacy settings don't let Ladybird %1.").arg(feature_text(request.name)), &card());
+        auto* body = new QLabel(QStringLiteral("Your system's privacy settings don't let Doggirl %1.").arg(feature_text(request.name)), &card());
         body->setObjectName("LadybirdPermissionPromptBody");
         body->setWordWrap(true);
         layout->addWidget(body);

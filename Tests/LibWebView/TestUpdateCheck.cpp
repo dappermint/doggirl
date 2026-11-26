@@ -218,5 +218,5 @@ TEST_CASE(a_check_is_due_once_the_interval_has_passed)
 
 TEST_CASE(the_release_page_is_the_tag_on_github)
 {
-    EXPECT_EQ(WebView::release_page_url("2026.46.2"sv), "https://github.com/LadybirdBrowser/ladybird/releases/tag/2026.46.2"sv);
+    EXPECT_EQ(WebView::release_page_url("2026.46.2"sv), "https://github.com/dappermint/doggirl/releases/tag/2026.46.2"sv);
 }
