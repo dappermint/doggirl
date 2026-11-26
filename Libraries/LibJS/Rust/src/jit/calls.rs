@@ -21,7 +21,10 @@ use crate::bytecode::executable::{Executable, PropertyLookupCache};
 use crate::bytecode::instruction::OpCode;
 use crate::bytecode::instruction_at;
 use crate::bytecode::op;
-use crate::bytecode::property_access::remember_vm_cache_get;
+use crate::bytecode::property_access::{
+    cached_property_slot_and_getter_validated, lookup_vm_keyed_cache_and_remember, record_validated_direct_getter,
+    remember_vm_cache_get,
+};
 use crate::gc::class::cast_ref;
 use crate::gc::root::MarkedVec;
 use crate::interpreter::runtime_functions::{Runtime, RuntimeFunctions, SlowPathControl, handle_asm_exception};
@@ -30,14 +33,17 @@ use crate::interpreter::slow_paths::calls::{
     ArgumentStorage, CallType, execute_asm_call, record_callback, throw_error, throw_if_needed_for_asm_call,
 };
 use crate::interpreter::slow_paths::feedback::record_forwarded_call;
-use crate::interpreter::slow_paths::property_access::{CachedAccessors, try_get_by_id_cache_with};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::feedback::CallFeedbackForwarding;
-use crate::layout::function_object::{EcmascriptFunctionObject, FunctionObject, NativeFunction, RawNativeFunction};
+use crate::layout::function_object::{
+    DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, NativeFunction, RawNativeFunction,
+};
+use crate::layout::member::COMPRESSED_POINTER_SHIFT;
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
+use crate::layout_forward::heap_region_base;
 use crate::runtime::abstract_operations::{
     call_function_object, call_raw_native_function_fast, create_unmapped_arguments_object, function_object_as_object,
     length_of_array_like, throw_if_too_many_arguments,
@@ -187,11 +193,17 @@ fn call_builtin_from_jit(
     Some(run_callee_frame_from_jit(vm, site, callee_frame))
 }
 
+/// Direct realm check for an `EcmascriptFunctionObject` without virtual dispatch through `ObjectMethods`.
+#[inline(always)]
+fn ecmascript_function_is_in_current_realm(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
+    Some(function.shape().realm()) == vm.current_realm()
+}
+
 /// Whether constructs from JIT code with `function` as the constructor run its bytecode in an inline frame.
 fn constructs_in_inline_frame(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
     function.kind() == FunctionKind::Normal
         && function.has_constructor()
-        && vm.is_in_current_realm(function.as_function_object_gc())
+        && ecmascript_function_is_in_current_realm(vm, function)
         && function.bytecode_executable().is_some()
 }
 
@@ -409,7 +421,7 @@ fn call_from_jit(
         return None;
     }
     if let Some(function) = value_as_ecmascript_function_object(callee) {
-        if function.can_inline_call() && vm.is_in_current_realm(function.as_function_object_gc()) {
+        if function.can_inline_call() && ecmascript_function_is_in_current_realm(vm, function) {
             return Some(call_ecmascript_function_from_jit(
                 vm, site, function, this_value, arguments,
             ));
@@ -1543,6 +1555,65 @@ pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, s
     Value::from_object(Array::create_from(vm, realm, &arguments.values())).0
 }
 
+/// Reads a validated `DirectGetterFunction` directly out of `receiver`, mirroring JIT's `emit_direct_getter_load`.
+/// Returns `None` if the fallback native getter must run (non-platform object, missing/non-main-world wrapper, or
+/// global object).
+#[inline]
+fn try_read_direct_getter_inline(getter: &DirectGetterFunction, receiver: Gc<Object>) -> Option<Value> {
+    if !receiver.is_platform_object() {
+        return None;
+    }
+    let receiver_ptr = receiver.as_ptr().cast::<u8>();
+    let word_size = size_of::<usize>();
+    let wrapper_impl_offset = getter.wrapper_implementation_word_offset.get() as usize * word_size;
+    let main_world_offset = getter.main_world_wrapper_word_offset.get() as usize * word_size;
+    let weak_val_offset = getter.weak_impl_value_word_offset.get() as usize * word_size;
+    // SAFETY: `getter` was validated on an object of `receiver`'s shape, and `receiver` is a platform object.
+    //         No allocation occurs in this function, so no GC cell can move.
+    unsafe {
+        let implementation = *receiver_ptr.add(wrapper_impl_offset).cast::<*const u8>();
+        if implementation.is_null() {
+            return None;
+        }
+        let weak_impl = *implementation.add(main_world_offset).cast::<*const u8>();
+        if weak_impl.is_null() {
+            return None;
+        }
+        let weak_wrapper = *weak_impl.add(weak_val_offset).cast::<*const u8>();
+        if weak_wrapper != receiver_ptr {
+            return None;
+        }
+        let value_ptr = implementation.add(getter.implementation_value_offset.get() as usize);
+        let target_impl: *const u8 = if getter.implementation_value_is_compressed.get() != 0 {
+            let compressed = *value_ptr.cast::<u32>();
+            if compressed == 0 {
+                return Some(Value::NULL);
+            }
+            core::ptr::without_provenance(heap_region_base() + ((compressed as usize) << COMPRESSED_POINTER_SHIFT))
+        } else {
+            let raw = *value_ptr.cast::<*const u8>();
+            if raw.is_null() {
+                return Some(Value::NULL);
+            }
+            raw
+        };
+        let result_weak = *target_impl.add(main_world_offset).cast::<*const u8>();
+        if result_weak.is_null() {
+            return None;
+        }
+        let result_wrapper = *result_weak.add(weak_val_offset).cast::<*const Object>();
+        if result_wrapper.is_null() {
+            return None;
+        }
+        if (&*result_wrapper).is_global_object() {
+            return None;
+        }
+        Some(Value::from_object(Gc::from_non_null(NonNull::new_unchecked(
+            result_wrapper.cast_mut(),
+        ))))
+    }
+}
+
 /// The GetById slow path of JIT code, before the full one. Generic GetById nodes have no inline cache check, so this
 /// tries the property lookup cache first, like the interpreter's GetById does. Getters found there are called the way
 /// calls from JIT code call their callees. Returns nothing if the full slow path should run.
@@ -1552,12 +1623,23 @@ pub fn get_by_id_from_jit(
     instruction: &op::GetById,
     values: &mut op::GetByIdValues,
 ) -> Option<SlowPathControl> {
-    let executable = vm.current_executable();
-    let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let value = try_get_by_id_cache_with(values.base, cache, CachedAccessors::Return);
-    if value == Value::EMPTY {
+    if !values.base.is_object() {
         return None;
     }
+    let object = values.base.as_object();
+    let executable = vm.current_executable();
+    let cache = executable.property_lookup_cache(instruction.cache as usize);
+    let (value, direct_getter_validated) = match cached_property_slot_and_getter_validated(object, cache, 0) {
+        Some(hit) => hit,
+        None if cache.is_megamorphic() => {
+            let property_key = executable.get_property_key(&instruction.property);
+            (
+                lookup_vm_keyed_cache_and_remember(vm, object, property_key, cache)?,
+                false,
+            )
+        }
+        None => return None,
+    };
     if !value.is_accessor() {
         values.dst = value;
         return Some(SlowPathControl::continue_at(pc + op::GetById::LENGTH));
@@ -1568,9 +1650,23 @@ pub fn get_by_id_from_jit(
     };
     let getter_object = getter.upcast::<Object>();
     if getter_object.is_raw_native_function() {
+        let is_direct_getter = getter_object.is_direct_getter_function();
+        if is_direct_getter
+            && direct_getter_validated
+            && let Some(result) =
+                try_read_direct_getter_inline(cast_ref::<Object, DirectGetterFunction>(&getter_object), object)
+        {
+            values.dst = result;
+            return Some(SlowPathControl::continue_at(pc + op::GetById::LENGTH));
+        }
         let raw_native = Gc::from_ref(cast_ref::<Object, RawNativeFunction>(&getter_object));
         return Some(match call_raw_native_function_fast(vm, raw_native, values.base, &[]) {
             Ok(result) => {
+                if is_direct_getter && !direct_getter_validated {
+                    let executable = vm.current_executable();
+                    let cache = executable.property_lookup_cache(instruction.cache as usize);
+                    record_validated_direct_getter(object, cache, getter);
+                }
                 values.dst = result;
                 SlowPathControl::continue_at(pc + op::GetById::LENGTH)
             }
@@ -1578,7 +1674,7 @@ pub fn get_by_id_from_jit(
         });
     }
     let function = as_ecmascript_function_object(getter)
-        .filter(|function| function.can_inline_call() && vm.is_in_current_realm(function.as_function_object_gc()))?;
+        .filter(|function| function.can_inline_call() && ecmascript_function_is_in_current_realm(vm, *function))?;
     let frame = vm.running_execution_context().expect("a frame is running");
     let site = JitCallSite {
         frame,

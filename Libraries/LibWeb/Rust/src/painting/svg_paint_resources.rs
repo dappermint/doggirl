@@ -220,7 +220,7 @@ impl SvgPaintResources {
     }
 
     pub(crate) fn forget_slot(&mut self, slot: NodeSlotId) {
-        if self.rows.contains_key(&slot) {
+        if !self.rows.is_empty() && self.rows.contains_key(&slot) {
             let rows = self.rows_mut();
             rows.remove(&slot);
             let any_enrolled = !rows.is_empty();

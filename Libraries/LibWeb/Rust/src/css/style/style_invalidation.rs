@@ -760,11 +760,16 @@ fn filter_colors_differ(old: &ComputedFilter, new: &ComputedFilter) -> bool {
 /// the old color.
 fn baked_filter_color_damage(old: ComputedValuesView<'_>, new: ComputedValuesView<'_>) -> StyleInvalidation {
     let (old_effects, new_effects) = (old.effects(), new.effects());
+    if core::ptr::eq(old_effects, new_effects) {
+        return StyleInvalidation::default();
+    }
     let mut damage = StyleInvalidation::default();
-    if filter_colors_differ(&old_effects.filter, &new_effects.filter) {
+    if old_effects.filter.operations.length != 0 && filter_colors_differ(&old_effects.filter, &new_effects.filter) {
         damage.merge(property_invalidation(property_id::FILTER, old, new));
     }
-    if filter_colors_differ(&old_effects.backdrop_filter, &new_effects.backdrop_filter) {
+    if old_effects.backdrop_filter.operations.length != 0
+        && filter_colors_differ(&old_effects.backdrop_filter, &new_effects.backdrop_filter)
+    {
         damage.merge(property_invalidation(property_id::BACKDROP_FILTER, old, new));
     }
     damage
@@ -1436,37 +1441,11 @@ pub(crate) fn element_record_damage_of_views(facts: ElementDamageFacts, record_m
     }
     let old_values = record_move.old.computed_values();
     let new_values = record_move.new.computed_values();
-    let stroke_uses_current_color = |values: ComputedValuesView<'_>| {
-        let stroke = &values.inherited_svg().stroke;
-        stroke.kind != SVG_PAINT_NONE && stroke.color.is_current_color
-    };
-    // The table fixup algorithm needs an authored box's display from before box type
-    // transformation. A flex or grid item can therefore keep the same blockified display
-    // while changing whether it needs anonymous table wrappers.
-    let is_table_fixup_child = |values: ComputedValuesView<'_>| {
-        let display = values.display_before_box_type_transformation();
-        display.is_table_row_group()
-            || display.is_table_header_group()
-            || display.is_table_footer_group()
-            || display.is_table_column_group()
-            || display.is_table_caption()
-    };
-    // An absolutely positioned box takes its static position from where its display before box type transformation
-    // would have placed it, so it can keep the same blockified display and still belong elsewhere among its siblings.
-    let is_inline_level_absolutely_positioned = |values: ComputedValuesView<'_>| {
-        values.is_absolutely_positioned() && values.display_before_box_type_transformation().is_inline_outside()
-    };
-    let font_lists_equal = old_values
-        .font()
-        .font_cascade_list
-        .resolves_like(&new_values.font().font_cascade_list);
-    let color_changed = old_values.inherited_text().color != new_values.inherited_text().color;
-    let stroke_uses_current_color = stroke_uses_current_color(old_values) || stroke_uses_current_color(new_values);
-    let table_fixup_child_changed = is_table_fixup_child(old_values) != is_table_fixup_child(new_values);
-    let inline_level_absolutely_positioned_changed =
-        is_inline_level_absolutely_positioned(old_values) != is_inline_level_absolutely_positioned(new_values);
-    let overflow_changed =
-        old_values.overflow_x() != new_values.overflow_x() || old_values.overflow_y() != new_values.overflow_y();
+    let font_lists_equal = core::ptr::eq(old_values.font(), new_values.font())
+        || old_values
+            .font()
+            .font_cascade_list
+            .resolves_like(&new_values.font().font_cascade_list);
     let packed = compare_record_views(
         record_move,
         font_lists_equal,
@@ -1477,31 +1456,70 @@ pub(crate) fn element_record_damage_of_views(facts: ElementDamageFacts, record_m
     let mut damage = StyleInvalidation::unpack(packed);
     // Fieldsets with a rendered legend or flex or grid contents transfer overflow, and their flex or grid container
     // properties, to an anonymous content box during tree construction. Rebuild to refresh both boxes' overrides.
-    let fieldset_content_box_properties_changed = facts.is_field_set
-        && (overflow_changed
+    if facts.is_field_set
+        && (old_values.overflow_x() != new_values.overflow_x()
+            || old_values.overflow_y() != new_values.overflow_y()
             || old_values.alignment() != new_values.alignment()
             || old_values.grid_values() != new_values.grid_values()
             || old_values.grid_auto_flow_row() != new_values.grid_auto_flow_row()
-            || old_values.grid_auto_flow_dense() != new_values.grid_auto_flow_dense());
-    if fieldset_content_box_properties_changed {
+            || old_values.grid_auto_flow_dense() != new_values.grid_auto_flow_dense())
+    {
         damage.merge(StyleInvalidation::rebuild_layout_tree_from(REBUILD_ROOT_SELF));
     }
-    // An SVG currentColor stroke stores its resolved color alongside the fact that it came from
-    // currentColor. A color-only change can therefore alter the visible stroke width and the SVG
-    // container bounds without changing the stroke longhand itself.
-    if facts.is_svg_graphics_element && color_changed && stroke_uses_current_color {
-        damage.ensure_level(INVALIDATION_RELAYOUT);
-    }
-    // The layout of SVG text places its text decoration lines along with its glyphs, so a change to the lines has to
-    // reach it.
-    if facts.is_svg_graphics_element && damage.repaint_text_decorations {
-        damage.ensure_level(INVALIDATION_RELAYOUT);
+    if facts.is_svg_graphics_element {
+        // An SVG currentColor stroke stores its resolved color alongside the fact that it came from
+        // currentColor. A color-only change can therefore alter the visible stroke width and the SVG
+        // container bounds without changing the stroke longhand itself.
+        let old_text = old_values.inherited_text();
+        let new_text = new_values.inherited_text();
+        let color_changed = !core::ptr::eq(old_text, new_text) && old_text.color != new_text.color;
+        if color_changed {
+            let stroke_uses_current_color = |values: ComputedValuesView<'_>| {
+                let stroke = &values.inherited_svg().stroke;
+                stroke.kind != SVG_PAINT_NONE && stroke.color.is_current_color
+            };
+            if stroke_uses_current_color(old_values) || stroke_uses_current_color(new_values) {
+                damage.ensure_level(INVALIDATION_RELAYOUT);
+            }
+        }
+        // The layout of SVG text places its text decoration lines along with its glyphs, so a change to the lines has to
+        // reach it.
+        if damage.repaint_text_decorations {
+            damage.ensure_level(INVALIDATION_RELAYOUT);
+        }
     }
     // Generated pseudo-element boxes are anonymous, so table fixup uses their adjusted display
     // instead.
-    if !facts.is_pseudo_element && (table_fixup_child_changed || inline_level_absolutely_positioned_changed) {
-        damage.any_computed_value_changed = true;
-        damage.merge(StyleInvalidation::full());
+    if !facts.is_pseudo_element {
+        let old_display_before = old_values.display_before_box_type_transformation();
+        let new_display_before = new_values.display_before_box_type_transformation();
+        let old_abspos = old_values.is_absolutely_positioned();
+        let new_abspos = new_values.is_absolutely_positioned();
+        if old_display_before != new_display_before || old_abspos != new_abspos {
+            // The table fixup algorithm needs an authored box's display from before box type
+            // transformation. A flex or grid item can therefore keep the same blockified display
+            // while changing whether it needs anonymous table wrappers.
+            let old_is_table_fixup_child = old_display_before.is_table_row_group()
+                || old_display_before.is_table_header_group()
+                || old_display_before.is_table_footer_group()
+                || old_display_before.is_table_column_group()
+                || old_display_before.is_table_caption();
+            let new_is_table_fixup_child = new_display_before.is_table_row_group()
+                || new_display_before.is_table_header_group()
+                || new_display_before.is_table_footer_group()
+                || new_display_before.is_table_column_group()
+                || new_display_before.is_table_caption();
+            // An absolutely positioned box takes its static position from where its display before box type
+            // transformation would have placed it, so it can keep the same blockified display and still belong
+            // elsewhere among its siblings.
+            let table_fixup_child_changed = old_is_table_fixup_child != new_is_table_fixup_child;
+            let inline_level_absolutely_positioned_changed = (old_abspos && old_display_before.is_inline_outside())
+                != (new_abspos && new_display_before.is_inline_outside());
+            if table_fixup_child_changed || inline_level_absolutely_positioned_changed {
+                damage.any_computed_value_changed = true;
+                damage.merge(StyleInvalidation::full());
+            }
+        }
     }
     // NB: An element that leaves `display: none` has no box to build again, so whatever else changed along with its
     //     display, its box appears: its layout parent takes the box in as a change of its child list, as it takes in

@@ -2675,6 +2675,7 @@ impl<'a> Planner<'a> {
 
         let svg_attributes = self.arena.style_node_svg_attribute_facts(element);
         if svg_attributes.is_graphics_element {
+            let svg_attributes = *svg_attributes;
             // NB: The box of an SVG resource a graphics element references is built again with the element's list.
             let in_unit_list = std::mem::take(&mut self.in_unit_list);
             self.plan_svg_resources(element, node, svg_attributes);
