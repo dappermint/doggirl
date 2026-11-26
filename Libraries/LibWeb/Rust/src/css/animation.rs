@@ -6114,6 +6114,38 @@ fn pad_transform_lists(
     Some(())
 }
 
+/// Whether interpolating `value` as a `transform` property could read `FfiAnimationContext`'s
+/// transform reference box (only `translate*` functions with non-Length/Number/Angle arguments).
+pub(crate) fn transform_value_needs_reference_box(value: &StyleValueData) -> bool {
+    if matches!(value, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword()) {
+        return false;
+    }
+    let Some((values, _, _)) = transform_list_values(value) else {
+        return true;
+    };
+    values.iter().any(|item| {
+        let StyleValueData::Transformation(payload) = item.data() else {
+            return true;
+        };
+        if matches!(
+            payload.transform_function,
+            TRANSFORM_FUNCTION_TRANSLATE
+                | TRANSFORM_FUNCTION_TRANSLATE_X
+                | TRANSFORM_FUNCTION_TRANSLATE_Y
+                | TRANSFORM_FUNCTION_TRANSLATE_3D
+        ) {
+            payload.values.as_slice().iter().any(|arg| {
+                !matches!(
+                    arg.data(),
+                    StyleValueData::Length { .. } | StyleValueData::Number { .. } | StyleValueData::Angle { .. }
+                )
+            })
+        } else {
+            false
+        }
+    })
+}
+
 fn interpolate_transform_list(
     context: Option<&FfiAnimationContext>,
     property_id: u16,

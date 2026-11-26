@@ -287,10 +287,15 @@ impl DocumentHost {
         if change.stales_paint_preparation() {
             self.note_render_state_write();
         }
-        if let ArenaChange::Style(change) = &change
-            && !change.only_keeps_records_alive()
-        {
-            self.engine_memo.follow(change);
+        if let ArenaChange::Style(change) = &change {
+            if let crate::css::style::boundary::StyleChange::SetHeldStyleRecord { node, .. } = change
+                && let Some(answer) = self.style_update.borrow().as_ref()
+            {
+                answer.invalidate_transition_length_inputs_if_document_element(*node);
+            }
+            if !change.only_keeps_records_alive() {
+                self.engine_memo.follow(change);
+            }
         }
         self.changes
             .push(change, |queued| self.engine_memo.follow_queued(queued));
@@ -1478,22 +1483,24 @@ impl DocumentHost {
             .map(crate::css::style::style_job::StyleJobAnswer::take_installation)
     }
 
-    /// Hands `hand_over` the actions of the transition step `decision` asks of a target with the `existing` transitions,
-    /// where the style update the host took last decided it beside the row of the step's element, `node`, over the
-    /// same inputs. Answers whether it did. The transitions such a step starts are what the host samples next, which
-    /// reads the transaction's first sample of them.
+    /// Hands `hand_over` the actions of the transition step over `before` and `after` for a target with the `existing`
+    /// transitions, where the style update the host took last decided it beside the row of the step's element, `node`,
+    /// over the same inputs. Answers whether it did. The transitions such a step starts are what the host samples next,
+    /// which reads the transaction's first sample of them.
     pub(crate) fn answer_decided_transition_step(
         &self,
         node: u32,
-        decision: &crate::css::transition::TransitionDecision,
+        before: *const crate::css::style::pipeline::Record,
+        after: *const crate::css::style::pipeline::Record,
         existing: &[crate::css::transition::FfiExistingTransition],
+        no_ancestor_animations: bool,
         hand_over: impl FnOnce(&[crate::css::transition::FfiTransitionAction]),
     ) -> bool {
         let transaction = self.style_update.borrow();
         let step = transaction
             .as_ref()
             .and_then(|answer| answer.decided_transition_step(node))
-            .and_then(|step| Some((step, step.answer(decision, existing)?)));
+            .and_then(|step| Some((step, step.answer_raw(before, after, existing, no_ancestor_animations)?)));
         self.fresh_transition_sample
             .set(step.and_then(|(step, _)| Some((node, step.take_fresh_sample()?))));
         let Some((_, actions)) = step else {
@@ -1501,6 +1508,18 @@ impl DocumentHost {
         };
         hand_over(actions);
         true
+    }
+
+    /// Viewport and root font metrics from the current style update transaction, if still valid.
+    pub(crate) fn transition_length_inputs(&self) -> Option<crate::css::style::engine_sample::TransitionLengthInputs> {
+        self.style_update.borrow().as_ref()?.transition_length_inputs()
+    }
+
+    /// Invalidates cached transition length inputs for the current style update transaction.
+    pub(crate) fn invalidate_transition_length_inputs(&self) {
+        if let Some(answer) = self.style_update.borrow().as_ref() {
+            answer.invalidate_transition_length_inputs_if_document_element(None);
+        }
     }
 
     /// Answers the sample `input` from the transaction's first sample of the transitions the step the host read last

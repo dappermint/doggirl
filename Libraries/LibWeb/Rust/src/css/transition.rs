@@ -500,6 +500,152 @@ pub(crate) fn is_noop_without_engine_unoverlaid_records(
 }
 
 impl TransitionDecision {
+    /// Lock-free Main-Thread decision when no ancestor animations are active and no custom-property or
+    /// percentage-based `transform` transition needs the style engine or layout reference box.
+    pub(crate) fn try_decide_without_engine(
+        before_record: &crate::css::style::pipeline::Record,
+        after_record: &crate::css::style::pipeline::Record,
+        existing: &[FfiExistingTransition],
+        length_inputs: crate::css::style::engine_sample::TransitionLengthInputs,
+    ) -> Option<Vec<FfiTransitionAction>> {
+        use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, property_id as prop};
+
+        if existing.iter().any(|existing| existing.custom_name != 0) {
+            return None;
+        }
+        let (before_longhands, before_overlay) = crate::css::style::ViewLonghands::split_record(before_record);
+        let (after_longhands, after_overlay) = crate::css::style::ViewLonghands::split_record(after_record);
+        let single_zero = crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_longhands);
+        if existing.is_empty() && single_zero {
+            return Some(Vec::new());
+        }
+        if !same_custom_properties(before_record, after_record)
+            && crate::css::style_compute::has_active_custom_property_transition(after_longhands)
+        {
+            return None;
+        }
+        let no_overlays = before_overlay.is_none() && after_overlay.is_none();
+        if existing.is_empty() && no_overlays && before_longhands.same_record_as(after_longhands) {
+            return Some(Vec::new());
+        }
+        let entries = crate::css::style_compute::transition_entries_compact(after_longhands);
+        // O(1) pre-check before iterating longhands: only fall back to the render arena if a changing or
+        // existing `transform` transition actually has percentage/calc translation values that read the
+        // element's reference box.
+        let existing_transform = existing.iter().find(|item| item.property_id == prop::TRANSFORM);
+        let transform_entry = entries.entry_for_transform();
+        if existing_transform.is_some()
+            || transform_entry.is_some_and(|entry| entry.duration.max(0.0) + entry.delay > 0.0)
+        {
+            let before_transform = before_longhands.effective_value(before_overlay, prop::TRANSFORM);
+            let after_transform = after_longhands.effective_value(after_overlay, prop::TRANSFORM);
+            let transform_needs_box = (existing_transform.is_some()
+                || !values_equal(before_transform.pointer(), after_transform.pointer()))
+                && (crate::css::animation::transform_value_needs_reference_box(before_transform.data())
+                    || crate::css::animation::transform_value_needs_reference_box(after_transform.data())
+                    || existing_transform.is_some_and(|item| {
+                        (!item.end_value.is_null()
+                            && crate::css::animation::transform_value_needs_reference_box(unsafe { &*item.end_value }))
+                            || (!item.reversing_adjusted_start_value.is_null()
+                                && crate::css::animation::transform_value_needs_reference_box(unsafe {
+                                    &*item.reversing_adjusted_start_value
+                                }))
+                    }));
+            if transform_needs_box {
+                return None;
+            }
+        }
+        let to_compare = no_overlays
+            .then(|| {
+                before_longhands
+                    .shared_with(after_longhands)
+                    .map(|shared| shared.longhands_to_compare())
+            })
+            .flatten();
+        if existing.is_empty()
+            && let Some(words) = to_compare
+            && words.iter().all(|&word| word == 0)
+        {
+            return Some(Vec::new());
+        }
+        let context = std::cell::OnceCell::new();
+        let get_context = || {
+            context.get_or_init(|| crate::css::animation::FfiAnimationContext {
+                allow_discrete: false,
+                allow_keyword_size_interpolation: crate::css::animation::allows_keyword_size_interpolation(
+                    after_longhands,
+                    after_overlay,
+                ),
+                current_color: Some(after_longhands.effective_value(after_overlay, prop::COLOR)),
+                has_length_resolution_context: true,
+                length_resolution_context: length_inputs.for_record(after_record),
+                has_transform_reference_box: false,
+                transform_reference_box_width: 0.0,
+                transform_reference_box_height: 0.0,
+            })
+        };
+        let existing_for = |property_id| existing.iter().find(|existing| existing.property_id == property_id);
+        let mut actions = Vec::new();
+
+        let mut decide_property = |property_id: u16,
+                                   entry: Option<&TransitionEntry>,
+                                   existing_item: Option<&FfiExistingTransition>| {
+            let mut property = TransitionProperty::new(property_id, entry, existing_item);
+            let overlay_values_originate_from_current_color = prepare_transition_values(
+                (before_longhands, before_overlay),
+                after_longhands,
+                after_overlay,
+                None,
+                &mut property,
+            );
+            if existing_item.is_none() && values_equal(property.before_change_value, property.after_change_value) {
+                return;
+            }
+            let values_originate_from_current_color =
+                overlay_values_originate_from_current_color.unwrap_or_else(|| {
+                    !std::ptr::eq(property.before_change_value, property.after_change_value)
+                        && originates_from_current_color(before_longhands, property_id)
+                        && originates_from_current_color(after_longhands, property_id)
+                });
+            let action = decide_transition(get_context(), &property, values_originate_from_current_color);
+            if action.kind != FfiTransitionActionKind::None || !action.start_value.is_null() || existing_item.is_some()
+            {
+                actions.push(action);
+            }
+        };
+
+        let _ = entries.for_each_entry(|entry| {
+            let property_id = entry.property_id;
+            let existing_item = if existing.is_empty() {
+                None
+            } else {
+                existing_for(property_id)
+            };
+            if existing_item.is_none() {
+                if entry.duration.max(0.0) + entry.delay <= 0.0 {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                if let Some(to_compare) = to_compare
+                    && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
+                {
+                    return std::ops::ControlFlow::Continue(());
+                }
+            }
+            decide_property(property_id, Some(entry), existing_item);
+            std::ops::ControlFlow::Continue(())
+        });
+
+        for existing_item in existing {
+            if existing_item.custom_name != 0 || entries.contains_property(existing_item.property_id) {
+                continue;
+            }
+            decide_property(existing_item.property_id, None, Some(existing_item));
+        }
+
+        Some(actions)
+    }
+
     /// Runs the CSS Transitions decision algorithm for every property the after-change style's `transition-*` values
     /// name, then for every property of an `existing` transition they do not name, and answers one action per property
     /// in that order. The transitions resolve their transforms against `reference_box`, the transform reference box of
@@ -529,19 +675,120 @@ impl TransitionDecision {
         {
             return Vec::new();
         }
-        let entries = crate::css::style_compute::transition_entries(after_longhands);
-        self.decide_entries(engine, reference_box, &entries, existing)
+        let entries = crate::css::style_compute::transition_entries_compact(after_longhands);
+        self.decide_over_compact(engine, reference_box, None, &entries, existing)
     }
 
-    /// As `decide`, for the after-change style's `entries`.
-    fn decide_entries(
+    /// As `decide_entries`, with `after_overlay` in place of the after-change record's overlay where it is given: the
+    /// current values of the target's running transitions, which the record holds none of.
+    fn decide_over_compact(
         &self,
         engine: &crate::css::style::StyleEngine,
         reference_box: Option<crate::css::css_pixels::CssPixelRect>,
-        entries: &[TransitionEntry],
+        after_overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
+        entries: &crate::css::style_compute::TransitionEntries,
         existing: &[FfiExistingTransition],
     ) -> Vec<FfiTransitionAction> {
-        self.decide_over(engine, reference_box, None, entries, existing)
+        use crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID;
+
+        let element = self.element;
+        let before = crate::css::style::StyleRecordView::of_host_record(&self.before);
+        let after = crate::css::style::StyleRecordView::of_host_record(&self.after);
+        let (before_longhands, before_overlay) = (before.longhands(), before.animated_overlay);
+        let after_longhands = after.longhands();
+        let after_overlay = after_overlay.or(after.animated_overlay);
+        let no_overlays = before_overlay.is_none() && after_overlay.is_none();
+        let ancestors_hold_animated_values = std::cell::OnceCell::new();
+        let inherits_animated_values = |element: crate::css::style::tree::StyleNodeID| {
+            *ancestors_hold_animated_values.get_or_init(|| engine.ancestors_hold_animated_values(element))
+        };
+        if existing.is_empty()
+            && no_overlays
+            && before_longhands.same_record_as(after_longhands)
+            && element.is_none_or(|element| !inherits_animated_values(element))
+        {
+            return Vec::new();
+        }
+        let to_compare = no_overlays
+            .then(|| {
+                before_longhands
+                    .shared_with(after_longhands)
+                    .map(|shared| shared.longhands_to_compare())
+            })
+            .flatten();
+        let context = std::cell::OnceCell::new();
+        let get_context = || context.get_or_init(|| self.animation_context(engine, reference_box, after_overlay));
+        let existing_for = |property_id| existing.iter().find(|existing| existing.property_id == property_id);
+        let mut actions = Vec::new();
+
+        let mut decide_property = |property_id: u16,
+                                   entry: Option<&TransitionEntry>,
+                                   existing_item: Option<&FfiExistingTransition>| {
+            let mut property = TransitionProperty::new(property_id, entry, existing_item);
+            let inherited_animation = element
+                .filter(|&element| {
+                    after_longhands.is_inherited(property_id)
+                        && after_overlay
+                            .and_then(|overlay| overlay.get(property_id))
+                            .is_none_or(|entry| !entry.inherited)
+                        && inherits_animated_values(element)
+                })
+                .and_then(|element| engine.inherited_animated_value(element, after_longhands, property_id));
+            let overlay_values_originate_from_current_color = prepare_transition_values(
+                (before_longhands, before_overlay),
+                after_longhands,
+                after_overlay,
+                inherited_animation,
+                &mut property,
+            );
+            if existing_item.is_none() && values_equal(property.before_change_value, property.after_change_value) {
+                return;
+            }
+            let values_originate_from_current_color =
+                overlay_values_originate_from_current_color.unwrap_or_else(|| {
+                    !std::ptr::eq(property.before_change_value, property.after_change_value)
+                        && originates_from_current_color(before_longhands, property_id)
+                        && originates_from_current_color(after_longhands, property_id)
+                });
+            let action = decide_transition(get_context(), &property, values_originate_from_current_color);
+            if action.kind != FfiTransitionActionKind::None || !action.start_value.is_null() || existing_item.is_some()
+            {
+                actions.push(action);
+            }
+        };
+
+        let _ = entries.for_each_entry(|entry| {
+            let property_id = entry.property_id;
+            let existing_item = if existing.is_empty() {
+                None
+            } else {
+                existing_for(property_id)
+            };
+            if existing_item.is_none() {
+                if entry.duration.max(0.0) + entry.delay <= 0.0 {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                if let Some(to_compare) = to_compare
+                    && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
+                    && (!after_longhands.is_inherited(property_id)
+                        || element.is_none_or(|element| !inherits_animated_values(element)))
+                {
+                    return std::ops::ControlFlow::Continue(());
+                }
+            }
+            decide_property(property_id, Some(entry), existing_item);
+            std::ops::ControlFlow::Continue(())
+        });
+
+        for existing_item in existing {
+            if existing_item.custom_name != 0 || entries.contains_property(existing_item.property_id) {
+                continue;
+            }
+            decide_property(existing_item.property_id, None, Some(existing_item));
+        }
+
+        actions
     }
 
     /// What the values of the decision interpolate in, with `after_overlay` over the after-change record.
@@ -799,6 +1046,8 @@ pub(crate) struct RowTransitions {
     /// from, kept until the values it compared are retained.
     #[expect(dead_code, reason = "the actions point into it")]
     after_overlay: Option<Box<crate::css::animated_overlay::AnimatedOverlay>>,
+    /// Whether this decision relied on no inheritance ancestor animating when the host applies it.
+    needs_no_ancestor_animations: bool,
 }
 
 /// Whether `before` and `after` hold the same custom-property environment.
@@ -986,6 +1235,7 @@ impl RowTransitions {
         reference_box: Option<crate::css::css_pixels::CssPixelRect>,
         at: Option<f64>,
         lane: Option<LaneTransitions<'_>>,
+        allow_inherited_without_at: bool,
     ) -> Result<Self, &'static str> {
         use crate::css::property_metadata::property_id as prop;
         use crate::css::style::bridge::element_adjustment_fact::HAS_ANIMATIONS;
@@ -1048,14 +1298,17 @@ impl RowTransitions {
             return Err("a transition of transform");
         }
         // An inherited value moves with the animations of the ancestors it comes from, which the host composes. Only a
-        // caller that knows the time of the style change takes the values of ancestors that run none.
-        if entries
+        // caller that knows the time of the style change (or checks `no_ancestor_animations` on the host) takes the
+        // values of ancestors that run none.
+        let has_inherited_entry = entries
             .iter()
-            .any(|entry| after_longhands.is_inherited(entry.property_id))
-            && (at.is_none() || engine.inheritance_ancestors_animate(node))
+            .any(|entry| after_longhands.is_inherited(entry.property_id));
+        if has_inherited_entry
+            && ((!allow_inherited_without_at && at.is_none()) || engine.inheritance_ancestors_animate(node))
         {
             return Err("a transition of an inherited value");
         }
+        let needs_no_ancestor_animations = has_inherited_entry && at.is_none();
         let before = before_ref.clone();
         let after = after_ref.clone();
         // The transitions the element runs, as the host's step hands them to the decision.
@@ -1119,6 +1372,7 @@ impl RowTransitions {
             running,
             host_seen_before,
             after_overlay,
+            needs_no_ancestor_animations,
         })
     }
 }
@@ -1148,6 +1402,8 @@ pub(crate) struct DecidedTransitionStep {
     before: std::sync::Arc<crate::css::style::pipeline::Record>,
     after: std::sync::Arc<crate::css::style::pipeline::Record>,
     actions: Box<[FfiTransitionAction]>,
+    /// Whether this decision relied on no inheritance ancestor animating when the host applies it.
+    needs_no_ancestor_animations: bool,
     /// The first sample of the transitions the step starts, until a host step that reads the decision takes it.
     fresh_sample: std::cell::Cell<Option<FreshTransitionSample>>,
 }
@@ -1158,10 +1414,10 @@ unsafe impl Send for DecidedTransitionStep {}
 impl DecidedTransitionStep {
     /// Decides the step `row` owes where the host's step decides over nothing but what the engine holds: the element
     /// runs no animation and owes no animation plan, so the record the row moves it to is its after-change style; its
-    /// before-change style is the one the epoch keeps for it, or else the record it held; and no property its
-    /// transitions name reads a value it inherits, which an ancestor's animation can move before the host decides, or
-    /// its box, which a frame can lay out first. Each transition is decided as one the element has none of yet, which
-    /// the host checks.
+    /// before-change style is the one the epoch keeps for it, or else the record it held; and no changing property its
+    /// transitions name reads its box, which a frame can lay out first. Inherited properties are decided assuming no
+    /// ancestor animates, which the host verifies via `no_ancestor_animations`. Each transition is decided as one the
+    /// element has none of yet, which the host checks.
     pub(crate) fn of_row(
         engine: &mut crate::css::style::StyleEngine,
         row: &crate::css::style::bridge::FfiStyleDelta,
@@ -1183,14 +1439,16 @@ impl DecidedTransitionStep {
             before,
             after,
             actions,
+            needs_no_ancestor_animations,
             ..
-        } = RowTransitions::decide(engine, row, None, None, None).ok()?;
+        } = RowTransitions::decide(engine, row, None, None, None, true).ok()?;
         let fresh_sample = FreshTransitionSample::of_step(engine, node, &after, &actions);
         Some(Self {
             node: row.style_node,
             before,
             after,
             actions: actions.into_boxed_slice(),
+            needs_no_ancestor_animations,
             fresh_sample: std::cell::Cell::new(fresh_sample),
         })
     }
@@ -1199,17 +1457,20 @@ impl DecidedTransitionStep {
         self.node
     }
 
-    /// Answers the step `decision` asks from this one, where it asks the same: from the same records, of a target with
-    /// no `existing` transition.
-    pub(crate) fn answer(
+    /// Answers the step over `before` and `after` from this one, where it asks the same: from the same records, of a
+    /// target with no `existing` transition, and with no ancestor animations when required.
+    pub(crate) fn answer_raw(
         &self,
-        decision: &TransitionDecision,
+        before: *const crate::css::style::pipeline::Record,
+        after: *const crate::css::style::pipeline::Record,
         existing: &[FfiExistingTransition],
+        no_ancestor_animations: bool,
     ) -> Option<&[FfiTransitionAction]> {
-        (std::sync::Arc::ptr_eq(&decision.before, &self.before)
-            && std::sync::Arc::ptr_eq(&decision.after, &self.after)
-            && existing.is_empty())
-        .then_some(&self.actions)
+        (std::ptr::eq(before, std::sync::Arc::as_ptr(&self.before))
+            && std::ptr::eq(after, std::sync::Arc::as_ptr(&self.after))
+            && existing.is_empty()
+            && (!self.needs_no_ancestor_animations || no_ancestor_animations))
+            .then_some(&self.actions)
     }
 
     /// The first sample of the transitions the step starts, which only the host step that read its decision samples.
@@ -1560,7 +1821,7 @@ impl HoverTransitions {
         if RowTransitions::moves_from_display_none(engine, row) {
             return Ok(None);
         }
-        let decision = RowTransitions::decide(engine, row, reference_box, Some(at), lane)?;
+        let decision = RowTransitions::decide(engine, row, reference_box, Some(at), lane, false)?;
         let (effects, runs) = hover_transition_effects(&decision)?;
         let (node, after) = (decision.node, row.new_style_record);
         let decided_over_running = !decision.running.is_empty();
@@ -1768,6 +2029,7 @@ impl HoverTransitions {
 
 /// One `transition-property` entry's attributes, as they apply to one physical longhand. The timing function is
 /// borrowed from the computed longhand table the entry was read from.
+#[derive(Clone, Copy)]
 pub(crate) struct TransitionEntry {
     pub(crate) property_id: u16,
     pub(crate) delay: f64,
