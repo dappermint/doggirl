@@ -150,6 +150,9 @@ pub struct AssignCopy {
     pub prototype_validity: Gc<WatchpointSet>,
     /// The shape the empty object ends up with.
     pub copy_shape: Gc<Shape>,
+    /// True when every property in the source shape is an enumerable string key at contiguous offsets `0..count`,
+    /// allowing direct named-storage validation and bulk copy without walking the descriptor array.
+    pub identical_layout: bool,
 }
 
 /// A shape and its dictionary generation, which changes when a dictionary shape changes its properties in place. Shapes
@@ -189,8 +192,8 @@ pub struct ShapeStorage {
 
 const SHAPE_EXTRA_TAG: usize = 1;
 
-// NB: Every shape has these bytes.
-const _: () = assert!(size_of::<Shape>() == 40);
+// NB: Every shape has these bytes (includes 8-byte key bloom filter).
+const _: () = assert!(size_of::<Shape>() == 48);
 
 enum ShapeStorageState<'a> {
     Empty,
@@ -508,7 +511,25 @@ impl Default for PrototypeTransitionCache {
     }
 }
 
+#[inline(always)]
+fn property_key_bloom_mask(raw_bits: usize) -> u64 {
+    let h = (raw_bits as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (1u64 << (h >> 58)) | (1u64 << ((h >> 52) & 63))
+}
+
 impl Shape {
+    #[inline(always)]
+    fn add_key_to_bloom(&self, property_key: &PropertyKey) {
+        self.key_bloom
+            .set(self.key_bloom.get() | property_key_bloom_mask(property_key.raw_bits()));
+    }
+
+    #[inline(always)]
+    fn may_contain_key(&self, property_key: &PropertyKey) -> bool {
+        let mask = property_key_bloom_mask(property_key.raw_bits());
+        (self.key_bloom.get() & mask) == mask
+    }
+
     fn new(defer_gc: &DeferGc<'_>, realm: Gc<Realm>) -> Self {
         Self {
             realm: Member::new(realm),
@@ -521,6 +542,7 @@ impl Shape {
             dictionary_generation: Cell::new(0),
             property_storage: NullableMember::null(),
             storage: ShapeStorage::new(defer_gc),
+            key_bloom: Cell::new(0),
         }
     }
 
@@ -533,6 +555,7 @@ impl Shape {
         shape.flags.set(previous_shape.flags.get() & shape_flag::INHERITED);
         shape.prototype.set(previous_shape.prototype());
         shape.previous.set(Some(previous_shape.as_gc()));
+        shape.key_bloom.set(previous_shape.key_bloom.get());
         let mut property_count = previous_shape.property_count();
         match property_count_change {
             PropertyCountChange::Preserve => {}
@@ -562,6 +585,7 @@ impl Shape {
         //     its prototype time and again (like a WindowProxy as its browsing context navigates) would otherwise keep
         //     every prototype it ever had alive, and with them the realms they belong to.
         shape.property_count.set(previous_shape.property_count());
+        shape.key_bloom.set(previous_shape.key_bloom.get());
         shape
     }
 
@@ -676,6 +700,7 @@ impl Shape {
         new_shape.prototype.set(self.prototype());
         self.invalidate_prototype_if_needed_for_new_prototype(vm, new_shape);
         self.copy_properties_to_dictionary_shape(vm, &new_shape);
+        new_shape.key_bloom.set(self.key_bloom.get());
         new_shape
     }
 
@@ -847,6 +872,7 @@ impl Shape {
                 descriptors.set(vm, property_key, metadata, property_count);
             }
         }
+        new_shape.add_key_to_bloom(property_key);
         self.invalidate_prototype_if_needed_for_new_prototype(vm, new_shape);
         if !self.is_prototype_shape() {
             self.cache_put_transition(vm, key, new_shape);
@@ -999,19 +1025,26 @@ impl Shape {
     }
 
     fn copy_descriptors(&self, vm: &Vm) -> Gc<DescriptorArray> {
-        assert!(self.property_count() <= MAX_DESCRIPTOR_COUNT);
+        let property_count = self.property_count();
+        assert!(property_count <= MAX_DESCRIPTOR_COUNT);
         if !self.is_dictionary()
             && let Some(descriptors) = self.descriptors()
         {
-            return DescriptorArray::create_copy(vm, &descriptors, self.property_count());
+            return DescriptorArray::create_copy(vm, &descriptors, property_count);
         }
 
-        let descriptors = DescriptorArray::create(vm);
-        self.for_each_property_in_insertion_order(|property_key, metadata| {
-            descriptors.set(vm, property_key, metadata, descriptors.size());
-            ControlFlow::Continue(())
-        });
-        descriptors
+        DescriptorArray::create_from_insertion_order(vm, property_count as usize, |entries| {
+            self.for_each_property_in_insertion_order(|property_key, metadata| {
+                let enum_index = entries.len() as u16;
+                entries.push(crate::runtime::descriptor_array::Entry {
+                    property_key: property_key.clone(),
+                    offset: metadata.offset,
+                    attributes: u16::from(metadata.attributes.bits()),
+                    enum_index,
+                });
+                ControlFlow::Continue(())
+            });
+        })
     }
 
     fn copy_properties_to_dictionary_shape(&self, vm: &Vm, shape: &Shape) {
@@ -1039,6 +1072,7 @@ impl Shape {
             let inserted_new_entry = self.with_property_table(vm, |property_table| {
                 property_table.insert(property_key.clone(), metadata).is_none()
             });
+            self.add_key_to_bloom(property_key);
             if inserted_new_entry {
                 assert!(property_count < u32::MAX);
                 self.property_count.set(property_count + 1);
@@ -1052,13 +1086,19 @@ impl Shape {
         //     stays 0 like that of every other shape that is no dictionary, which caches compare it with.
         self.ensure_descriptor_array(vm);
         let descriptors = self.descriptors().expect("the shape has a descriptor array");
-        if descriptors.lookup(property_key, property_count).is_none() {
+        if !self.may_contain_key(property_key)
+            || descriptors
+                .lookup_without_hash_index(property_key, property_count)
+                .is_none()
+        {
             assert!(property_count < u32::MAX);
             descriptors.set(vm, property_key, metadata, property_count);
             self.property_count.set(property_count + 1);
+            self.add_key_to_bloom(property_key);
             return;
         }
         descriptors.set(vm, property_key, metadata, property_count);
+        self.add_key_to_bloom(property_key);
     }
 
     pub fn set_property_attributes_without_transition(
@@ -1188,6 +1228,7 @@ impl Shape {
             new_shape.set_descriptors(self.descriptors());
             new_shape.property_count.set(self.property_count());
         }
+        new_shape.key_bloom.set(self.key_bloom.get());
         new_shape.prototype_chain_validity.set(Some(WatchpointSet::create(vm)));
         if let Some(prototype) = new_shape.prototype() {
             prototype.shape().add_child_prototype_shape(vm, new_shape);
@@ -1292,6 +1333,7 @@ impl Shape {
         }
     }
 
+    #[inline]
     pub fn is_dictionary(&self) -> bool {
         self.flags.get() & shape_flag::DICTIONARY != 0
     }
@@ -1490,12 +1532,14 @@ impl Shape {
         self.prototype.get()
     }
 
+    #[inline]
     pub fn property_count(&self) -> u32 {
         self.property_count.get()
     }
 
+    #[inline]
     pub fn lookup(&self, property_key: &PropertyKey) -> Option<PropertyMetadata> {
-        if self.property_count() == 0 {
+        if self.property_count() == 0 || !self.may_contain_key(property_key) {
             return None;
         }
         if self.is_dictionary() {
@@ -1507,6 +1551,22 @@ impl Shape {
                 .copied();
         }
         self.descriptors()?.lookup(property_key, self.property_count())
+    }
+
+    pub fn property_metadata_at_offset(&self, offset: u32) -> Option<PropertyMetadata> {
+        if self.property_count() == 0 {
+            return None;
+        }
+        if self.is_dictionary() {
+            return self
+                .dictionary_property_table()
+                .table
+                .borrow()
+                .values()
+                .find(|metadata| metadata.offset == offset)
+                .copied();
+        }
+        self.descriptors()?.metadata_at_offset(offset, self.property_count())
     }
 
     /// Calls `callback` with each property in insertion order, until it breaks. The shape stays borrowed meanwhile, so

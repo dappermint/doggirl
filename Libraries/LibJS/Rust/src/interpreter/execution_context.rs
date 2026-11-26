@@ -162,6 +162,7 @@ impl ExecutionContext {
     /// # Safety
     ///
     /// `context` must point to writable memory for the context and its slots, which nothing else uses.
+    #[inline(always)]
     pub(crate) unsafe fn initialize_at(
         context: *mut ExecutionContext,
         registers_and_locals_count: u32,

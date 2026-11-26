@@ -527,39 +527,49 @@ pub fn sort_indexed_properties<'vm>(
     holes: Holes,
 ) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
     // 1. Let items be a new empty List.
-    let items = MarkedVec::new(vm);
+    // OPTIMIZATION: A packed object without indexed interceptors has every index 0..length present as a plain own
+    //               data property, so bulk-copy its elements instead of probing HasProperty + Get per index.
+    let items = if !object.may_interfere_with_indexed_property_access()
+        && object.indexed_storage_kind() == IndexedStorageKind::Packed
+        && u64::from(object.indexed_packed_elements_span_size()) >= length
+    {
+        object.indexed_packed_elements_prefix(vm, length as u32)
+    } else {
+        let items = MarkedVec::new(vm);
 
-    // 2. Let k be 0.
-    // 3. Repeat, while k < len,
-    for k in 0..length {
-        // a. Let Pk be ! ToString(𝔽(k)).
-        let property_key = PropertyKey::from_number(k);
+        // 2. Let k be 0.
+        // 3. Repeat, while k < len,
+        for k in 0..length {
+            // a. Let Pk be ! ToString(𝔽(k)).
+            let property_key = PropertyKey::from_number(k);
 
-        // b. If holes is skip-holes, then
-        let k_read = if holes == Holes::SkipHoles {
-            // i. Let kRead be ? HasProperty(obj, Pk).
-            object.has_property(vm, &property_key)?
+            // b. If holes is skip-holes, then
+            let k_read = if holes == Holes::SkipHoles {
+                // i. Let kRead be ? HasProperty(obj, Pk).
+                object.has_property(vm, &property_key)?
+            }
+            // c. Else,
+            else {
+                // i. Assert: holes is read-through-holes.
+                assert!(holes == Holes::ReadThroughHoles);
+
+                // ii. Let kRead be true.
+                true
+            };
+
+            // d. If kRead is true, then
+            if k_read {
+                // i. Let kValue be ? Get(obj, Pk).
+                let k_value = object.get(vm, &property_key)?;
+
+                // ii. Append kValue to items.
+                items.push(k_value);
+            }
+
+            // e. Set k to k + 1.
         }
-        // c. Else,
-        else {
-            // i. Assert: holes is read-through-holes.
-            assert!(holes == Holes::ReadThroughHoles);
-
-            // ii. Let kRead be true.
-            true
-        };
-
-        // d. If kRead is true, then
-        if k_read {
-            // i. Let kValue be ? Get(obj, Pk).
-            let k_value = object.get(vm, &property_key)?;
-
-            // ii. Append kValue to items.
-            items.push(k_value);
-        }
-
-        // e. Set k to k + 1.
-    }
+        items
+    };
 
     // 4. Sort items using an implementation-defined sequence of calls to SortCompare. If any such call returns an abrupt completion, stop before performing any further calls to SortCompare or steps in this algorithm and return that Completion Record.
 

@@ -202,8 +202,10 @@ impl ExecutableFeedback {
 
     /// Forgets the call targets and keys that died in this collection, which the feedback holds weakly. The value
     /// buckets are not references, but they are folded into the value feedback here as well.
-    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>) {
-        self.update_value_feedback();
+    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>, fold_value_feedback: bool) {
+        if fold_value_feedback {
+            self.update_value_feedback();
+        }
         let clear_if_dead = |cell: &Cell<Option<Gc<CellHeader>>>| {
             if decode_weak_reference(cell).is_some_and(|cell| sweep.is_dead_or_moving(cell)) {
                 cell.set(None);
@@ -221,12 +223,22 @@ impl ExecutableFeedback {
     /// Folds the value buckets, the call sites' too, into the value feedback bits. The buckets are not references, so
     /// this runs when the feedback is about to be used and at every garbage collection.
     pub fn update_value_feedback(&self) {
-        let buckets = self.value_buckets().iter().zip(self.value());
-        let cache_buckets = self.cache_value_buckets().iter().rev().zip(self.cache_value());
-        for (bucket, value) in buckets.chain(cache_buckets) {
-            let bits = bucket.get();
-            if bits != value_feedback::EMPTY_VALUE_BUCKET {
-                value.set(value.get() | value_feedback::for_bits(bits));
+        if self.has_value_buckets() {
+            for (bucket, value) in self.value_buckets().iter().zip(self.value()) {
+                let bits = bucket.get();
+                if bits != value_feedback::EMPTY_VALUE_BUCKET {
+                    value.set(value.get() | value_feedback::for_bits(bits));
+                }
+            }
+            let cache_buckets = self.cache_value_buckets();
+            let cache_values = self.cache_value();
+            let count = cache_buckets.len();
+            for index in 0..count {
+                let bits = cache_buckets[count - 1 - index].get();
+                if bits != value_feedback::EMPTY_VALUE_BUCKET {
+                    let value = &cache_values[index];
+                    value.set(value.get() | value_feedback::for_bits(bits));
+                }
             }
         }
         for call in self.call() {

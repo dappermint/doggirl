@@ -17,7 +17,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::member::Member;
-use crate::layout::object::Object;
+use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
     call, call_function_object, create_list_from_array_like, is_compatible_property_descriptor,
@@ -29,8 +29,8 @@ use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
 use crate::runtime::function_prototype::STACK_ARGUMENT_CAPACITY;
 use crate::runtime::object::{
-    CacheableGetPropertyMetadata, CacheableSetPropertyMetadata, MayInterfereWithIndexedPropertyAccess, ObjectMethods,
-    PropertyLookupPhase, StackFrameInfo,
+    CacheableGetPropertyMetadata, CacheableSetPropertyMetadata, MayInterfereWithIndexedPropertyAccess,
+    ORDINARY_OBJECT_METHODS, ObjectMethods, PropertyLookupPhase, StackFrameInfo,
 };
 use crate::runtime::property_descriptor::{PropertyDescriptor, from_property_descriptor, to_property_descriptor};
 use crate::runtime::property_key::{NonSymbolPropertyKey, PropertyKey};
@@ -41,34 +41,86 @@ use crate::runtime::value::same_value;
 //       since the compiler may decide to optimize tail/sibling calls into loops.
 //       So instead we keep track of the recursion depth and throw a TypeError if it exceeds a certain limit.
 
-thread_local! {
-    static RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
-
 const MAX_PROXY_RECURSION_DEPTH: u32 = 10000;
 
-struct RecursionDepthUpdater;
+struct RecursionDepthUpdater<'vm> {
+    depth: &'vm Cell<u32>,
+}
 
-impl RecursionDepthUpdater {
-    fn new() -> Self {
-        RECURSION_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        Self
+impl<'vm> RecursionDepthUpdater<'vm> {
+    #[inline(always)]
+    fn new(vm: &'vm Vm) -> (Self, u32) {
+        let next = vm.proxy_recursion_depth.get() + 1;
+        vm.proxy_recursion_depth.set(next);
+        (
+            Self {
+                depth: &vm.proxy_recursion_depth,
+            },
+            next,
+        )
     }
 }
 
-impl Drop for RecursionDepthUpdater {
+impl Drop for RecursionDepthUpdater<'_> {
+    #[inline(always)]
     fn drop(&mut self) {
-        RECURSION_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        self.depth.set(self.depth.get() - 1);
     }
 }
 
 /// LIMIT_PROXY_RECURSION_DEPTH(): counts the running trap for as long as the returned updater lives.
-fn limit_proxy_recursion_depth(vm: &Vm) -> ThrowCompletionOr<RecursionDepthUpdater> {
-    let recursion_depth_updater = RecursionDepthUpdater::new();
-    if RECURSION_DEPTH.with(Cell::get) >= MAX_PROXY_RECURSION_DEPTH {
+#[inline(always)]
+fn limit_proxy_recursion_depth(vm: &Vm) -> ThrowCompletionOr<RecursionDepthUpdater<'_>> {
+    let (recursion_depth_updater, depth) = RecursionDepthUpdater::new(vm);
+    if depth >= MAX_PROXY_RECURSION_DEPTH {
         return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
     }
     Ok(recursion_depth_updater)
+}
+
+/// Fast path for `GetMethod(handler, trap_name)` when `handler` is an ordinary object holding the trap as an own
+/// data property. Falls back to `Value::get_method` for accessors, inherited traps, or exotic handlers.
+#[inline]
+fn get_proxy_trap(
+    vm: &Vm,
+    handler: Gc<Object>,
+    trap_name: &PropertyKey,
+) -> ThrowCompletionOr<Option<Gc<FunctionObject>>> {
+    if core::ptr::fn_addr_eq(handler.methods().internal_get, ORDINARY_OBJECT_METHODS.internal_get)
+        && handler.own_string_keyed_properties_are_in_shape()
+        && !handler.has_intrinsic_accessors()
+        && let Some(metadata) = handler.shape().lookup(trap_name)
+    {
+        let value = handler.get_direct(metadata.offset);
+        if !value.is_accessor() {
+            if value.is_function() {
+                return Ok(Some(value.as_function()));
+            }
+            if value.is_nullish() {
+                return Ok(None);
+            }
+        }
+    }
+    Value::from_object(handler).get_method(vm, trap_name)
+}
+
+/// Returns true if `target.[[GetOwnProperty]](property_key)` is guaranteed either absent or configurable, so no
+/// non-configurable proxy invariant check can fail.
+#[inline]
+fn target_own_property_is_absent_or_configurable(vm: &Vm, target: Gc<Object>, property_key: &PropertyKey) -> bool {
+    if !target.has_ordinary_get_own_property_for(vm, property_key) {
+        return false;
+    }
+    if property_key.is_number() {
+        // Dense (None/Packed/Holey) indexed elements always carry DEFAULT_ATTRIBUTES (configurable + writable),
+        // and shapes never store array-index keys.
+        debug_assert!(target.shape().lookup(property_key).is_none());
+        return target.indexed_storage_kind() != IndexedStorageKind::Dictionary;
+    }
+    match target.shape().lookup(property_key) {
+        None => true,
+        Some(metadata) => metadata.attributes.is_configurable(),
+    }
 }
 
 /// A field of a descriptor that [[GetOwnProperty]] returned, which is fully populated.
@@ -785,7 +837,7 @@ impl ProxyObject {
         }
 
         // 5. Let trap be ? GetMethod(handler, "get").
-        let trap = Value::from_object(handler).get_method(vm, &vm.names.get)?;
+        let trap = get_proxy_trap(vm, handler, &vm.names.get)?;
 
         // 6. If trap is undefined, then
         let Some(trap) = trap else {
@@ -802,9 +854,12 @@ impl ProxyObject {
         )?;
 
         // 8. Let targetDesc be ? target.[[GetOwnProperty]](P).
+        // 9. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
+        if target_own_property_is_absent_or_configurable(vm, target, property_key) {
+            return Ok(trap_result);
+        }
         let target_descriptor = target.internal_get_own_property(vm, property_key)?;
 
-        // 9. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
         if let Some(target_descriptor) = target_descriptor
             && !fully_populated(target_descriptor.configurable)
         {
@@ -871,7 +926,7 @@ impl ProxyObject {
         }
 
         // 5. Let trap be ? GetMethod(handler, "set").
-        let trap = Value::from_object(handler).get_method(vm, &vm.names.set)?;
+        let trap = get_proxy_trap(vm, handler, &vm.names.set)?;
 
         // 6. If trap is undefined, then
         let Some(trap) = trap else {
@@ -901,9 +956,12 @@ impl ProxyObject {
         }
 
         // 9. Let targetDesc be ? target.[[GetOwnProperty]](P).
+        // 10. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
+        if target_own_property_is_absent_or_configurable(vm, target, property_key) {
+            return Ok(true);
+        }
         let target_descriptor = target.internal_get_own_property(vm, property_key)?;
 
-        // 10. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
         if let Some(target_descriptor) = target_descriptor
             && !fully_populated(target_descriptor.configurable)
         {

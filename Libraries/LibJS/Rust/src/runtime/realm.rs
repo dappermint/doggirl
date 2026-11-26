@@ -22,6 +22,7 @@ use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
 use crate::layout::function_object::FunctionObject;
 use crate::layout::object::Object;
 pub use crate::layout::realm::Realm;
+use crate::runtime::array::Array;
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::global_object::{GlobalObject, set_default_global_bindings};
 use crate::runtime::intrinsics::Intrinsics;
@@ -48,6 +49,10 @@ pub struct RealmStorage {
     /// Whether ToPrimitive of a String object that inherits from %String.prototype% gives its [[StringData]] (see
     /// `runtime::realm_watchpoints`).
     pub(crate) string_objects_convert_to_their_string_data: WatchedCondition,
+    /// Cached pristine plain Object and empty Array instances used as byte templates by JIT snapshots, avoiding
+    /// fresh GC allocations on every compilation while staying traced for moving collections.
+    pub(crate) jit_object_template: Cell<Option<Gc<Object>>>,
+    pub(crate) jit_array_template: Cell<Option<Gc<Array>>>,
     /// Whether this is the VM's empty realm, which nothing may fill (see `Vm::empty_realm()`).
     empty: bool,
 }
@@ -70,6 +75,8 @@ unsafe impl Trace for Realm {
             .array_prototypes_without_is_concat_spreadable
             .trace(visitor);
         self.storage.string_objects_convert_to_their_string_data.trace(visitor);
+        self.storage.jit_object_template.trace(visitor);
+        self.storage.jit_array_template.trace(visitor);
         self.array_iterator_next_watchpoint_set.trace(visitor);
         self.array_iterator_return_watchpoint_set.trace(visitor);
     }

@@ -11,7 +11,6 @@ use ak::{Utf16FlyString, Utf16String, Utf16StringUnits};
 use libjs_runtime_macros::Trace;
 
 use crate::gc::class::{Class, ExternalMemorySize, GcCell, define_cell};
-use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::{CHARACTERS_TO_ATOM_CACHE_SIZE, StringToAtomCacheEntry, Vm};
 use crate::layout::cell::{CellHeader, Gc};
@@ -176,7 +175,7 @@ impl PrimitiveString {
         }
 
         if has_short_ascii_storage(&string) {
-            return Self::create_from_fly_string(vm, &to_utf16_fly_string(&string));
+            return Self::create_from_non_trivial_fly_string(vm, &to_utf16_fly_string(&string));
         }
 
         vm.heap().allocate(|_| Self::new(string))
@@ -226,6 +225,11 @@ impl PrimitiveString {
             }
         }
 
+        Self::create_from_non_trivial_fly_string(vm, string)
+    }
+
+    #[inline]
+    fn create_from_non_trivial_fly_string(vm: &Vm, string: &Utf16FlyString) -> Gc<PrimitiveString> {
         let string_cache = vm.fly_string_cache();
         let cache_slot = &string_cache[Self::fly_string_cache_hash(string) & (string_cache.len() - 1)];
         if let Some(cached_string) = cache_slot.get()
@@ -851,8 +855,8 @@ impl RopeString {
     }
 
     fn concatenate_pieces(&self) -> Utf16String {
-        // OPTIMIZATION: Most ropes have a few pieces, which are gathered without allocating.
-        const INLINE_PIECES: usize = 8;
+        // OPTIMIZATION: Most ropes have at most a few dozen pieces, which are gathered without allocating.
+        const INLINE_PIECES: usize = 32;
         let mut pieces = [self.lhs(); INLINE_PIECES];
         let mut piece_count = 0;
         let mut stack = [self.lhs(); INLINE_PIECES];
@@ -887,15 +891,13 @@ impl RopeString {
     }
 
     fn concatenate_many_pieces(&self) -> Utf16String {
-        let vm = Vm::of_cell(self);
-
-        // This list will hold all the pieces of the rope that need to be assembled
-        // into the resolved string.
-        let pieces = MarkedVec::with_capacity(vm, 2);
+        // Resolving rope pieces only allocates AK UTF-16 buffers and cannot trigger GC, so plain
+        // vectors avoid GC root-list registration and capacity-2 growth churn.
+        let mut pieces: Vec<Gc<PrimitiveString>> = Vec::with_capacity(32);
 
         // NOTE: We traverse the rope tree without using recursion, since we'd run out of
         //       stack space quickly when handling a long sequence of unresolved concatenations.
-        let stack = MarkedVec::with_capacity(vm, 2);
+        let mut stack: Vec<Gc<PrimitiveString>> = Vec::with_capacity(32);
         stack.push(self.rhs());
         stack.push(self.lhs());
         while let Some(current) = stack.pop() {
@@ -909,7 +911,6 @@ impl RopeString {
             pieces.push(current);
         }
 
-        let pieces = pieces.values();
         let views: Vec<Utf16View<'_>> = pieces.iter().map(|piece| piece.utf16_string_view()).collect();
         concatenate(&views)
     }

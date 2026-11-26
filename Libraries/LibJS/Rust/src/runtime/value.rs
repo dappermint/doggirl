@@ -1998,34 +1998,32 @@ pub fn is_strictly_equal(lhs: Value, rhs: Value) -> bool {
 
 // 7.2.14 IsLooselyEqual ( x, y ), https://tc39.es/ecma262/#sec-islooselyequal
 pub fn is_loosely_equal(vm: &Vm, lhs: Value, rhs: Value) -> ThrowCompletionOr<bool> {
+    if lhs.0 == rhs.0 {
+        return Ok(!lhs.is_nan());
+    }
+
+    if rhs.is_nullish() {
+        if lhs.is_nullish() {
+            return Ok(true);
+        }
+        if lhs.is_object() {
+            return Ok(lhs.as_object().is_htmldda());
+        }
+        return Ok(false);
+    }
+
+    if lhs.is_nullish() {
+        if rhs.is_object() {
+            return Ok(rhs.as_object().is_htmldda());
+        }
+        return Ok(false);
+    }
+
     // 1. If Type(x) is the same as Type(y), then
     if same_type_for_equality(lhs, rhs) {
         // a. Return IsStrictlyEqual(x, y).
         return Ok(is_strictly_equal(lhs, rhs));
     }
-
-    // 2. If x is null and y is undefined, return true.
-    // 3. If x is undefined and y is null, return true.
-    if lhs.is_nullish() && rhs.is_nullish() {
-        return Ok(true);
-    }
-
-    // 4. NOTE: This step is replaced in section B.3.6.2.
-    // B.3.6.2 Changes to IsLooselyEqual, https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot-aec
-    // 4. Perform the following steps:
-    // a. If Type(x) is Object and x has an [[IsHTMLDDA]] internal slot and y is either null or undefined, return true.
-    if lhs.is_object() && rhs.is_nullish() {
-        // OPTIMIZATION: We can return early here since non-HTMLDDA objects and nullish values are never equal.
-        return Ok(lhs.as_object().is_htmldda());
-    }
-
-    // b. If x is either null or undefined and Type(y) is Object and y has an [[IsHTMLDDA]] internal slot, return true.
-    if lhs.is_nullish() && rhs.is_object() {
-        // OPTIMIZATION: We can return early here since non-HTMLDDA objects and nullish values are never equal.
-        return Ok(rhs.as_object().is_htmldda());
-    }
-
-    // == End of B.3.6.2 ==
 
     // 5. If Type(x) is Number and Type(y) is String, return ! IsLooselyEqual(x, ! ToNumber(y)).
     if lhs.is_number() && rhs.is_string() {

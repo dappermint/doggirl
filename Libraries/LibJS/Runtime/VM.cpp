@@ -20,6 +20,8 @@
 #include <LibJS/ScriptAndModuleABIConversions.h>
 #include <LibJS/SourceTextModule.h>
 
+extern "C" void js_vm_note_htmldda_objects_may_exist(JSVM*);
+
 namespace JS {
 
 using namespace EmbeddingABI;
@@ -462,6 +464,11 @@ bool VM::debugging_enabled() const
 void VM::request_interrupt()
 {
     js_vm_request_interrupt(vm_abi(*this));
+}
+
+void VM::note_htmldda_objects_may_exist()
+{
+    js_vm_note_htmldda_objects_may_exist(vm_abi(*this));
 }
 
 bool VM::interrupt_requested() const
