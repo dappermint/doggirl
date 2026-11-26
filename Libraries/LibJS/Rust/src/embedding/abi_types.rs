@@ -35,6 +35,7 @@ use crate::layout::host_class::{
     JSStringSink, JSVM, JSValue, JSValueSink,
 };
 use crate::layout::object::Object;
+use crate::layout::shape::Shape;
 use crate::layout::value::Value;
 use crate::runtime::big_int::BigInt;
 use crate::runtime::completion::{Throw, ThrowCompletionOr};
@@ -52,6 +53,11 @@ use crate::utf16::Utf16View;
 
 /// A realm.
 pub struct JSRealm {
+    _opaque: [u8; 0],
+}
+
+/// An object shape.
+pub struct JSShape {
     _opaque: [u8; 0],
 }
 
@@ -93,6 +99,10 @@ impl CellAbi for JSObject {
 
 impl CellAbi for JSRealm {
     type Cell = Realm;
+}
+
+impl CellAbi for JSShape {
+    type Cell = Shape;
 }
 
 impl CellAbi for JSPrimitiveString {

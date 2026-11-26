@@ -52,6 +52,9 @@
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
@@ -2670,6 +2673,104 @@ void record_subtree_disconnecting(DOM::Node& root)
     // identity.
     for (auto const& shadow_root : shadow_roots)
         record_shadow_root_disconnecting(shadow_root);
+}
+
+void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* layout_arena)
+{
+    auto* style_engine = style_engine_for(parent);
+    if (!style_engine && !layout_arena)
+        return;
+
+    if (style_engine) {
+        if (auto const* hovered = hovered_element_of(parent.document().hovered_node()); hovered && hovered != &parent && parent.is_shadow_including_inclusive_ancestor_of(*hovered))
+            style_engine->record_hover({});
+    }
+
+    Vector<u32, 64> layout_style_nodes;
+    Vector<StyleNodeID, 64> unlinked_top_level;
+    Vector<u32, 64> departing_element_ids;
+    GC::RootVector<GC::Ref<DOM::Element>> departing_elements;
+    Vector<StyleNodeID, 64> departing_text_ids;
+    GC::RootVector<GC::Ref<DOM::Text>> departing_texts;
+    GC::RootVector<GC::Ref<DOM::ShadowRoot>> shadow_roots;
+    bool had_non_empty_direct_text_child = false;
+
+    for (auto* child = parent.first_child(); child; child = child->next_sibling()) {
+        if (auto* direct_text = as_if<DOM::Text>(*child); direct_text && !direct_text->data().is_empty())
+            had_non_empty_direct_text_child = true;
+        if (style_engine) {
+            if (auto identity = dom_order_identity_of(*child); identity != no_style_node)
+                unlinked_top_level.append(identity);
+        }
+        child->for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
+            if (layout_arena) {
+                if (auto style_node = Layout::Node::style_node_of(&node).value())
+                    layout_style_nodes.append(style_node);
+            }
+            if (!style_engine)
+                return TraversalDecision::Continue;
+            if (auto* element = as_if<DOM::Element>(node)) {
+                element->set_child_style_arrivals_wait(false);
+                if (auto id = element->style_node_id(); id != no_style_node) {
+                    if (auto* slot = as_if<HTML::HTMLSlotElement>(*element)) {
+                        slot->assign_slottables_if_needed();
+                        for (auto const& slottable : slot->assigned_nodes_internal()) {
+                            auto const* assigned_element = slottable.get_pointer<GC::Ref<DOM::Element>>();
+                            if (!assigned_element || (*assigned_element)->style_node_id() == no_style_node)
+                                continue;
+                            auto old_relations = relations_of(**assigned_element, *style_engine);
+                            auto new_relations = old_relations;
+                            new_relations.assigned_slot = no_style_node.value();
+                            record_element_relinked(*style_engine, (*assigned_element)->style_node_id(), old_relations, new_relations);
+                        }
+                    }
+                    style_engine->cancel_deferred_element_initial_features(*element);
+                    departing_element_ids.append(id.value());
+                    departing_elements.append(*element);
+                }
+            } else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node)) {
+                shadow_roots.append(*shadow_root);
+            } else if (auto* text = as_if<DOM::Text>(node); text && text->style_node_id() != no_style_node) {
+                departing_text_ids.append(text->style_node_id());
+                departing_texts.append(*text);
+            }
+            return TraversalDecision::Continue;
+        });
+    }
+
+    if (layout_arena && !layout_style_nodes.is_empty())
+        Layout::RustFFI::render_state_detach_remaining_rows_for_removal(layout_arena->host(), layout_style_nodes.span());
+
+    if (!style_engine)
+        return;
+
+    auto& style_computer = parent.document().style_computer();
+    if (!unlinked_top_level.is_empty())
+        StyleEngineFFI::style_engine_unlink_style_nodes_from_dom_order(style_engine->host(), unlinked_top_level.span(), dom_order_parent_of(&parent));
+
+    if (!departing_element_ids.is_empty()) {
+        style_engine->record_all_children_departures(dom_order_parent_of(&parent), departing_element_ids.span());
+        for (size_t i = 0; i < departing_elements.size(); ++i) {
+            style_computer.unregister_style_node(StyleNodeID { departing_element_ids[i] });
+            departing_elements[i]->set_style_node_id(no_style_node);
+        }
+    }
+
+    if (!departing_text_ids.is_empty()) {
+        for (size_t i = 0; i < departing_texts.size(); ++i) {
+            style_computer.unregister_style_node(departing_text_ids[i]);
+            departing_texts[i]->set_style_node_id(no_style_node);
+        }
+        StyleEngineFFI::style_engine_retire_text_style_nodes(style_engine->host(), departing_text_ids.span());
+    }
+
+    for (auto const& shadow_root : shadow_roots)
+        record_shadow_root_disconnecting(shadow_root);
+
+    if (had_non_empty_direct_text_child) {
+        if (auto* parent_element = as_if<DOM::Element>(parent); parent_element && parent_element->style_node_id() != no_style_node)
+            record_feature(*parent_element, StyleEngineFFI::FfiFeatureKind::Emptiness, 0, StyleEngineFFI::FfiFeatureValueKind::Present, 0);
+    }
 }
 
 void record_shadow_root_connected(DOM::ShadowRoot& shadow_root)

@@ -27,15 +27,29 @@ enum FirstUnitScan {
     #[cfg(target_arch = "aarch64")]
     AsciiLut {
         lut: vm::AsciiNibbleLut,
-        table: Box<[bool; 256]>,
+        bits: [u64; 4],
     },
-    ByteTable(Box<[bool; 256]>),
+    ByteBitset([u64; 4]),
     General,
 }
 
+#[derive(Clone, Copy)]
+struct AltEntry {
+    start: u32,
+    len: u16,
+    first: u16,
+}
+
 struct LiteralAltMatcher {
-    /// Alternatives stay in source order to preserve leftmost-first semantics.
-    alts: Vec<Vec<u16>>,
+    /// Contiguous UTF-16 storage for all alternatives.
+    alt_units: Vec<u16>,
+    /// Contiguous Latin-1 storage when every alternative fits in u8; pre-lowercased when `ignore_case` is true.
+    alt_latin1: Option<Vec<u8>>,
+    /// Alternatives grouped by ASCII first code unit (preserving source order within each bucket),
+    /// followed by any non-ASCII-first alternatives starting at `non_ascii_start`.
+    entries: Vec<AltEntry>,
+    ascii_buckets: Box<[(u16, u16); 128]>,
+    non_ascii_start: u16,
     min_len: usize,
     all_single_unit: bool,
     first_scan: FirstUnitScan,
@@ -78,26 +92,105 @@ impl LiteralAltMatcher {
                 [a, b] => FirstUnitScan::Two(*a, *b),
                 [a, b, c] => FirstUnitScan::Three(*a, *b, *c),
                 _ if all_latin1 => {
-                    let mut table = Box::new([false; 256]);
+                    #[cfg(target_arch = "aarch64")]
+                    let mut table = [false; 256];
+                    let mut bits = [0u64; 4];
                     for &unit in &distinct {
-                        table[unit as usize] = true;
+                        let b = unit as usize;
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            table[b] = true;
+                        }
+                        bits[b >> 6] |= 1u64 << (b & 63);
                     }
                     #[cfg(target_arch = "aarch64")]
                     if let Some(lut) = vm::AsciiNibbleLut::from_byte_table(&table) {
-                        FirstUnitScan::AsciiLut { lut, table }
+                        FirstUnitScan::AsciiLut { lut, bits }
                     } else {
-                        FirstUnitScan::ByteTable(table)
+                        FirstUnitScan::ByteBitset(bits)
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
-                        FirstUnitScan::ByteTable(table)
+                        FirstUnitScan::ByteBitset(bits)
                     }
                 }
                 _ => FirstUnitScan::General,
             }
         };
+
+        // Flatten alternatives into contiguous storage and bucket by ASCII first unit while preserving
+        // source order inside each bucket (preserving ECMAScript leftmost-first semantics).
+        let total_units: usize = alts.iter().map(Vec::len).sum();
+        let all_alts_latin1 = alts.iter().all(|alt| alt.iter().all(|&cu| cu <= 0xFF));
+        let mut alt_units = Vec::with_capacity(total_units);
+        let mut alt_latin1 = all_alts_latin1.then(|| Vec::with_capacity(total_units));
+        let mut raw_entries = Vec::with_capacity(alts.len());
+        let mut bucket_counts = [0u16; 128];
+        let mut non_ascii_count = 0usize;
+
+        for alt in &alts {
+            if alt.is_empty() {
+                continue;
+            }
+            let start = alt_units.len() as u32;
+            let len = u16::try_from(alt.len()).unwrap_or(u16::MAX);
+            let first = if ignore_case {
+                fold_ascii_for_compare(alt[0])
+            } else {
+                alt[0]
+            };
+            alt_units.extend_from_slice(alt);
+            if let Some(ref mut latin1) = alt_latin1 {
+                if ignore_case {
+                    latin1.extend(alt.iter().map(|&cu| fold_ascii_for_compare(cu) as u8));
+                } else {
+                    latin1.extend(alt.iter().map(|&cu| cu as u8));
+                }
+            }
+            if first < 128 {
+                bucket_counts[first as usize] += 1;
+            } else {
+                non_ascii_count += 1;
+            }
+            raw_entries.push(AltEntry { start, len, first });
+        }
+
+        let mut ascii_buckets = Box::new([(0u16, 0u16); 128]);
+        let mut bucket_cursor = [0u16; 128];
+        let mut running = 0u16;
+        for (i, &count) in bucket_counts.iter().enumerate() {
+            ascii_buckets[i] = (running, count);
+            bucket_cursor[i] = running;
+            running += count;
+        }
+        let non_ascii_start = running;
+        let mut entries = vec![
+            AltEntry {
+                start: 0,
+                len: 0,
+                first: 0,
+            };
+            running as usize + non_ascii_count
+        ];
+        let mut non_ascii_cursor = non_ascii_start as usize;
+        for entry in raw_entries {
+            if entry.first < 128 {
+                let idx = entry.first as usize;
+                let dst = bucket_cursor[idx] as usize;
+                entries[dst] = entry;
+                bucket_cursor[idx] += 1;
+            } else {
+                entries[non_ascii_cursor] = entry;
+                non_ascii_cursor += 1;
+            }
+        }
+
         Self {
-            alts,
+            alt_units,
+            alt_latin1,
+            entries,
+            ascii_buckets,
+            non_ascii_start,
             min_len,
             all_single_unit,
             first_scan,
@@ -111,9 +204,20 @@ impl LiteralAltMatcher {
             FirstUnitScan::Two(a, b) => input.find_code_unit2(start, end, *a, *b),
             FirstUnitScan::Three(a, b, c) => input.find_code_unit3(start, end, *a, *b, *c),
             #[cfg(target_arch = "aarch64")]
-            FirstUnitScan::AsciiLut { lut, table } => input.find_ascii_lut(start, end, lut, table),
-            FirstUnitScan::ByteTable(table) => input.find_byte_in_table(start, end, table),
+            FirstUnitScan::AsciiLut { lut, bits } => input.find_ascii_lut_bitset(start, end, lut, bits),
+            FirstUnitScan::ByteBitset(bits) => input.find_byte_in_bitset(start, end, bits),
             FirstUnitScan::General => (start < end).then_some(start),
+        }
+    }
+
+    #[inline(always)]
+    fn bucket_for_first(&self, first: u16) -> &[AltEntry] {
+        if first < 128 {
+            let (start, count) = self.ascii_buckets[first as usize];
+            let start = start as usize;
+            &self.entries[start..start + count as usize]
+        } else {
+            &self.entries[self.non_ascii_start as usize..]
         }
     }
 }
@@ -456,20 +560,44 @@ impl Regex {
             };
             pos = candidate_pos;
             let first_ch = input.code_unit(pos);
-            for alt in &matcher.alts {
-                if alt[0] != first_ch {
-                    continue;
-                }
-                let alt_len = alt.len();
-                if pos + alt_len > input.len() {
-                    continue;
-                }
-                if input.matches_u16_at(pos, alt) {
-                    if out.len() >= 2 {
-                        out[0] = pos as i32;
-                        out[1] = (pos + alt_len) as i32;
+            let bucket = matcher.bucket_for_first(first_ch);
+            if let Some(ref latin1) = matcher.alt_latin1 {
+                for entry in bucket {
+                    if first_ch >= 128 && entry.first != first_ch {
+                        continue;
                     }
-                    return true;
+                    let alt_len = entry.len as usize;
+                    if pos + alt_len > input.len() {
+                        continue;
+                    }
+                    let alt_start = entry.start as usize;
+                    if alt_len == 1 || input.matches_latin1_at(pos + 1, &latin1[alt_start + 1..alt_start + alt_len]) {
+                        if out.len() >= 2 {
+                            out[0] = pos as i32;
+                            out[1] = (pos + alt_len) as i32;
+                        }
+                        return true;
+                    }
+                }
+            } else {
+                for entry in bucket {
+                    if first_ch >= 128 && entry.first != first_ch {
+                        continue;
+                    }
+                    let alt_len = entry.len as usize;
+                    if pos + alt_len > input.len() {
+                        continue;
+                    }
+                    let alt_start = entry.start as usize;
+                    if alt_len == 1
+                        || input.matches_u16_at(pos + 1, &matcher.alt_units[alt_start + 1..alt_start + alt_len])
+                    {
+                        if out.len() >= 2 {
+                            out[0] = pos as i32;
+                            out[1] = (pos + alt_len) as i32;
+                        }
+                        return true;
+                    }
                 }
             }
             pos += 1;
@@ -498,6 +626,10 @@ impl Regex {
             }
             return true;
         }
+        let latin1 = matcher
+            .alt_latin1
+            .as_deref()
+            .expect("ascii ignore-case literal alternatives are always ASCII");
         let mut pos = start;
         while pos < end {
             let Some(candidate_pos) = matcher.find_next_candidate(input, pos, end) else {
@@ -505,21 +637,26 @@ impl Regex {
             };
             pos = candidate_pos;
 
-            let folded_first_code_unit = fold_ascii_for_compare(input.code_unit(pos));
-            for alt in &matcher.alts {
-                if fold_ascii_for_compare(alt[0]) != folded_first_code_unit {
-                    continue;
-                }
-                let alt_len = alt.len();
-                if pos + alt_len > input.len() {
-                    continue;
-                }
-                if matches_ascii_case_insensitive_u16_at(input, pos, alt) {
-                    if out.len() >= 2 {
-                        out[0] = pos as i32;
-                        out[1] = (pos + alt_len) as i32;
+            let folded_first = fold_ascii_for_compare(input.code_unit(pos));
+            if folded_first < 128 {
+                let (bucket_start, bucket_count) = matcher.ascii_buckets[folded_first as usize];
+                let bucket_start = bucket_start as usize;
+                for entry in &matcher.entries[bucket_start..bucket_start + bucket_count as usize] {
+                    let alt_len = entry.len as usize;
+                    if pos + alt_len > input.len() {
+                        continue;
                     }
-                    return true;
+                    let alt_start = entry.start as usize;
+                    if alt_len == 1
+                        || input
+                            .matches_ascii_ignore_case_latin1_at(pos + 1, &latin1[alt_start + 1..alt_start + alt_len])
+                    {
+                        if out.len() >= 2 {
+                            out[0] = pos as i32;
+                            out[1] = (pos + alt_len) as i32;
+                        }
+                        return true;
+                    }
                 }
             }
             pos += 1;

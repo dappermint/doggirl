@@ -72,6 +72,9 @@ void invalidate_style_after_validity_change(DOM::Element& element)
 
     visit(element);
 
+    if (!element.document().has_form_or_fieldset_element())
+        return;
+
     if (auto* html_element = as_if<HTML::HTMLElement>(element)) {
         if (auto form = html_element->form())
             visit(*form);

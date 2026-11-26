@@ -186,7 +186,7 @@ GC::Ref<JS::HostObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_r
     }
 
     auto wrapper = wrappable->create_wrapper(actual_wrapper_realm);
-    if (auto* element = as_if<DOM::Element>(wrappable.ptr()))
+    if (auto* element = as_if<DOM::Element>(wrappable.ptr()); element && element->is_custom())
         set_prototype_from_custom_element_definition_if_needed(*element, wrapper);
     wrapper_world.set_wrapper(wrappable, wrapper);
     return wrapper;
