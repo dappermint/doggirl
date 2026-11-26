@@ -5268,49 +5268,47 @@ fn adjusted_foreign_tag_name(tag_name: &HtmlName, namespace_: RustFfiHtmlNamespa
     // If the adjusted current node is an element in the SVG namespace, and the token's tag name is one of the ones in
     // the first column of the following table, change the tag name to the name given in the corresponding cell in the
     // second column.
-    let adjustments = [
-        ("altglyph", "altGlyph"),
-        ("altglyphdef", "altGlyphDef"),
-        ("altglyphitem", "altGlyphItem"),
-        ("animatecolor", "animateColor"),
-        ("animatemotion", "animateMotion"),
-        ("animatetransform", "animateTransform"),
-        ("clippath", "clipPath"),
-        ("feblend", "feBlend"),
-        ("fecolormatrix", "feColorMatrix"),
-        ("fecomponenttransfer", "feComponentTransfer"),
-        ("fecomposite", "feComposite"),
-        ("feconvolvematrix", "feConvolveMatrix"),
-        ("fediffuselighting", "feDiffuseLighting"),
-        ("fedisplacementmap", "feDisplacementMap"),
-        ("fedistantlight", "feDistantLight"),
-        ("fedropshadow", "feDropShadow"),
-        ("feflood", "feFlood"),
-        ("fefunca", "feFuncA"),
-        ("fefuncb", "feFuncB"),
-        ("fefuncg", "feFuncG"),
-        ("fefuncr", "feFuncR"),
-        ("fegaussianblur", "feGaussianBlur"),
-        ("feimage", "feImage"),
-        ("femerge", "feMerge"),
-        ("femergenode", "feMergeNode"),
-        ("femorphology", "feMorphology"),
-        ("feoffset", "feOffset"),
-        ("fepointlight", "fePointLight"),
-        ("fespecularlighting", "feSpecularLighting"),
-        ("fespotlight", "feSpotLight"),
-        ("fetile", "feTile"),
-        ("feturbulence", "feTurbulence"),
-        ("foreignobject", "foreignObject"),
-        ("glyphref", "glyphRef"),
-        ("lineargradient", "linearGradient"),
-        ("radialgradient", "radialGradient"),
-        ("textpath", "textPath"),
-    ];
-    adjustments
-        .iter()
-        .find_map(|(name, adjusted_name)| tag_name.equals(name).then(|| HtmlName::from_utf8(adjusted_name)))
-        .unwrap_or_else(|| tag_name.clone())
+    let adjusted = match tag_name.as_latin1_bytes() {
+        Some(b"altglyph") => Some("altGlyph"),
+        Some(b"altglyphdef") => Some("altGlyphDef"),
+        Some(b"altglyphitem") => Some("altGlyphItem"),
+        Some(b"animatecolor") => Some("animateColor"),
+        Some(b"animatemotion") => Some("animateMotion"),
+        Some(b"animatetransform") => Some("animateTransform"),
+        Some(b"clippath") => Some("clipPath"),
+        Some(b"feblend") => Some("feBlend"),
+        Some(b"fecolormatrix") => Some("feColorMatrix"),
+        Some(b"fecomponenttransfer") => Some("feComponentTransfer"),
+        Some(b"fecomposite") => Some("feComposite"),
+        Some(b"feconvolvematrix") => Some("feConvolveMatrix"),
+        Some(b"fediffuselighting") => Some("feDiffuseLighting"),
+        Some(b"fedisplacementmap") => Some("feDisplacementMap"),
+        Some(b"fedistantlight") => Some("feDistantLight"),
+        Some(b"fedropshadow") => Some("feDropShadow"),
+        Some(b"feflood") => Some("feFlood"),
+        Some(b"fefunca") => Some("feFuncA"),
+        Some(b"fefuncb") => Some("feFuncB"),
+        Some(b"fefuncg") => Some("feFuncG"),
+        Some(b"fefuncr") => Some("feFuncR"),
+        Some(b"fegaussianblur") => Some("feGaussianBlur"),
+        Some(b"feimage") => Some("feImage"),
+        Some(b"femerge") => Some("feMerge"),
+        Some(b"femergenode") => Some("feMergeNode"),
+        Some(b"femorphology") => Some("feMorphology"),
+        Some(b"feoffset") => Some("feOffset"),
+        Some(b"fepointlight") => Some("fePointLight"),
+        Some(b"fespecularlighting") => Some("feSpecularLighting"),
+        Some(b"fespotlight") => Some("feSpotLight"),
+        Some(b"fetile") => Some("feTile"),
+        Some(b"feturbulence") => Some("feTurbulence"),
+        Some(b"foreignobject") => Some("foreignObject"),
+        Some(b"glyphref") => Some("glyphRef"),
+        Some(b"lineargradient") => Some("linearGradient"),
+        Some(b"radialgradient") => Some("radialGradient"),
+        Some(b"textpath") => Some("textPath"),
+        _ => None,
+    };
+    adjusted.map_or_else(|| tag_name.clone(), HtmlName::from_utf8)
 }
 
 fn adjusted_foreign_attribute_name(
@@ -5325,76 +5323,92 @@ fn adjusted_foreign_attribute_name(
         };
     }
 
-    let adjusted_name = if namespace_ == RustFfiHtmlNamespace::MathMl && attribute_name.equals("definitionurl") {
-        HtmlName::from_utf8("definitionURL")
-    } else if namespace_ == RustFfiHtmlNamespace::Svg {
-        let adjustments = [
-            ("attributename", "attributeName"),
-            ("attributetype", "attributeType"),
-            ("basefrequency", "baseFrequency"),
-            ("baseprofile", "baseProfile"),
-            ("calcmode", "calcMode"),
-            ("clippathunits", "clipPathUnits"),
-            ("diffuseconstant", "diffuseConstant"),
-            ("edgemode", "edgeMode"),
-            ("filterunits", "filterUnits"),
-            ("glyphref", "glyphRef"),
-            ("gradienttransform", "gradientTransform"),
-            ("gradientunits", "gradientUnits"),
-            ("kernelmatrix", "kernelMatrix"),
-            ("kernelunitlength", "kernelUnitLength"),
-            ("keypoints", "keyPoints"),
-            ("keysplines", "keySplines"),
-            ("keytimes", "keyTimes"),
-            ("lengthadjust", "lengthAdjust"),
-            ("limitingconeangle", "limitingConeAngle"),
-            ("markerheight", "markerHeight"),
-            ("markerunits", "markerUnits"),
-            ("markerwidth", "markerWidth"),
-            ("maskcontentunits", "maskContentUnits"),
-            ("maskunits", "maskUnits"),
-            ("numoctaves", "numOctaves"),
-            ("pathlength", "pathLength"),
-            ("patterncontentunits", "patternContentUnits"),
-            ("patterntransform", "patternTransform"),
-            ("patternunits", "patternUnits"),
-            ("pointsatx", "pointsAtX"),
-            ("pointsaty", "pointsAtY"),
-            ("pointsatz", "pointsAtZ"),
-            ("preservealpha", "preserveAlpha"),
-            ("preserveaspectratio", "preserveAspectRatio"),
-            ("primitiveunits", "primitiveUnits"),
-            ("refx", "refX"),
-            ("refy", "refY"),
-            ("repeatcount", "repeatCount"),
-            ("repeatdur", "repeatDur"),
-            ("requiredextensions", "requiredExtensions"),
-            ("requiredfeatures", "requiredFeatures"),
-            ("specularconstant", "specularConstant"),
-            ("specularexponent", "specularExponent"),
-            ("spreadmethod", "spreadMethod"),
-            ("startoffset", "startOffset"),
-            ("stddeviation", "stdDeviation"),
-            ("stitchtiles", "stitchTiles"),
-            ("surfacescale", "surfaceScale"),
-            ("systemlanguage", "systemLanguage"),
-            ("tablevalues", "tableValues"),
-            ("targetx", "targetX"),
-            ("targety", "targetY"),
-            ("textlength", "textLength"),
-            ("viewbox", "viewBox"),
-            ("viewtarget", "viewTarget"),
-            ("xchannelselector", "xChannelSelector"),
-            ("ychannelselector", "yChannelSelector"),
-            ("zoomandpan", "zoomAndPan"),
-        ];
-        adjustments
-            .iter()
-            .find_map(|(name, adjusted_name)| attribute_name.equals(name).then(|| HtmlName::from_utf8(adjusted_name)))
-            .unwrap_or_else(|| attribute_name.clone())
-    } else {
-        attribute_name.clone()
+    let Some(bytes) = attribute_name.as_latin1_bytes() else {
+        return AdjustedAttributeName {
+            local_name: attribute_name.clone(),
+            prefix: None,
+            namespace_: RustFfiHtmlAttributeNamespace::None,
+        };
     };
+
+    if namespace_ == RustFfiHtmlNamespace::MathMl && bytes == b"definitionurl" {
+        return AdjustedAttributeName {
+            local_name: HtmlName::from_utf8("definitionURL"),
+            prefix: None,
+            namespace_: RustFfiHtmlAttributeNamespace::None,
+        };
+    }
+
+    if namespace_ == RustFfiHtmlNamespace::Svg {
+        let svg_adjusted = match bytes {
+            b"attributename" => Some("attributeName"),
+            b"attributetype" => Some("attributeType"),
+            b"basefrequency" => Some("baseFrequency"),
+            b"baseprofile" => Some("baseProfile"),
+            b"calcmode" => Some("calcMode"),
+            b"clippathunits" => Some("clipPathUnits"),
+            b"diffuseconstant" => Some("diffuseConstant"),
+            b"edgemode" => Some("edgeMode"),
+            b"filterunits" => Some("filterUnits"),
+            b"glyphref" => Some("glyphRef"),
+            b"gradienttransform" => Some("gradientTransform"),
+            b"gradientunits" => Some("gradientUnits"),
+            b"kernelmatrix" => Some("kernelMatrix"),
+            b"kernelunitlength" => Some("kernelUnitLength"),
+            b"keypoints" => Some("keyPoints"),
+            b"keysplines" => Some("keySplines"),
+            b"keytimes" => Some("keyTimes"),
+            b"lengthadjust" => Some("lengthAdjust"),
+            b"limitingconeangle" => Some("limitingConeAngle"),
+            b"markerheight" => Some("markerHeight"),
+            b"markerunits" => Some("markerUnits"),
+            b"markerwidth" => Some("markerWidth"),
+            b"maskcontentunits" => Some("maskContentUnits"),
+            b"maskunits" => Some("maskUnits"),
+            b"numoctaves" => Some("numOctaves"),
+            b"pathlength" => Some("pathLength"),
+            b"patterncontentunits" => Some("patternContentUnits"),
+            b"patterntransform" => Some("patternTransform"),
+            b"patternunits" => Some("patternUnits"),
+            b"pointsatx" => Some("pointsAtX"),
+            b"pointsaty" => Some("pointsAtY"),
+            b"pointsatz" => Some("pointsAtZ"),
+            b"preservealpha" => Some("preserveAlpha"),
+            b"preserveaspectratio" => Some("preserveAspectRatio"),
+            b"primitiveunits" => Some("primitiveUnits"),
+            b"refx" => Some("refX"),
+            b"refy" => Some("refY"),
+            b"repeatcount" => Some("repeatCount"),
+            b"repeatdur" => Some("repeatDur"),
+            b"requiredextensions" => Some("requiredExtensions"),
+            b"requiredfeatures" => Some("requiredFeatures"),
+            b"specularconstant" => Some("specularConstant"),
+            b"specularexponent" => Some("specularExponent"),
+            b"spreadmethod" => Some("spreadMethod"),
+            b"startoffset" => Some("startOffset"),
+            b"stddeviation" => Some("stdDeviation"),
+            b"stitchtiles" => Some("stitchTiles"),
+            b"surfacescale" => Some("surfaceScale"),
+            b"systemlanguage" => Some("systemLanguage"),
+            b"tablevalues" => Some("tableValues"),
+            b"targetx" => Some("targetX"),
+            b"targety" => Some("targetY"),
+            b"textlength" => Some("textLength"),
+            b"viewbox" => Some("viewBox"),
+            b"viewtarget" => Some("viewTarget"),
+            b"xchannelselector" => Some("xChannelSelector"),
+            b"ychannelselector" => Some("yChannelSelector"),
+            b"zoomandpan" => Some("zoomAndPan"),
+            _ => None,
+        };
+        if let Some(adjusted) = svg_adjusted {
+            return AdjustedAttributeName {
+                local_name: HtmlName::from_utf8(adjusted),
+                prefix: None,
+                namespace_: RustFfiHtmlAttributeNamespace::None,
+            };
+        }
+    }
 
     // https://html.spec.whatwg.org/multipage/parsing.html#adjust-foreign-attributes
     // When the steps below require the user agent to adjust foreign attributes for a token, then, if any of the
@@ -5402,66 +5416,60 @@ fn adjusted_foreign_attribute_name(
     // a namespaced attribute, with the prefix being the string given in the corresponding cell in the second column,
     // the local name being the string given in the corresponding cell in the third column, and the namespace being the
     // namespace given in the corresponding cell in the fourth column.
-    let namespaced_adjustments = [
-        (
-            "xlink:actuate",
-            "actuate",
+    let (local_name, prefix, namespace_) = match bytes {
+        b"xlink:actuate" => (
+            HtmlName::from_utf8("actuate"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:arcrole",
-            "arcrole",
+        b"xlink:arcrole" => (
+            HtmlName::from_utf8("arcrole"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:href",
-            "href",
+        b"xlink:href" => (
+            HtmlName::from_utf8("href"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:role",
-            "role",
+        b"xlink:role" => (
+            HtmlName::from_utf8("role"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:show",
-            "show",
+        b"xlink:show" => (
+            HtmlName::from_utf8("show"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:title",
-            "title",
+        b"xlink:title" => (
+            HtmlName::from_utf8("title"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        (
-            "xlink:type",
-            "type",
+        b"xlink:type" => (
+            HtmlName::from_utf8("type"),
             Some("xlink"),
             RustFfiHtmlAttributeNamespace::XLink,
         ),
-        ("xml:lang", "lang", Some("xml"), RustFfiHtmlAttributeNamespace::Xml),
-        ("xml:space", "space", Some("xml"), RustFfiHtmlAttributeNamespace::Xml),
-        ("xmlns", "xmlns", None, RustFfiHtmlAttributeNamespace::Xmlns),
-        (
-            "xmlns:xlink",
-            "xlink",
+        b"xml:lang" => (
+            HtmlName::from_utf8("lang"),
+            Some("xml"),
+            RustFfiHtmlAttributeNamespace::Xml,
+        ),
+        b"xml:space" => (
+            HtmlName::from_utf8("space"),
+            Some("xml"),
+            RustFfiHtmlAttributeNamespace::Xml,
+        ),
+        b"xmlns" => (HtmlName::from_utf8("xmlns"), None, RustFfiHtmlAttributeNamespace::Xmlns),
+        b"xmlns:xlink" => (
+            HtmlName::from_utf8("xlink"),
             Some("xmlns"),
             RustFfiHtmlAttributeNamespace::Xmlns,
         ),
-    ];
-    let adjusted_namespace = namespaced_adjustments
-        .iter()
-        .find(|(name, ..)| adjusted_name.equals(name));
-    let (local_name, prefix, namespace_) = adjusted_namespace.map_or_else(
-        || (adjusted_name, None, RustFfiHtmlAttributeNamespace::None),
-        |(_, local_name, prefix, namespace_)| (HtmlName::from_utf8(local_name), *prefix, *namespace_),
-    );
+        _ => (attribute_name.clone(), None, RustFfiHtmlAttributeNamespace::None),
+    };
 
     AdjustedAttributeName {
         local_name,

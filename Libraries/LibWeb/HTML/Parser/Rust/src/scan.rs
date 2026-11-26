@@ -24,13 +24,19 @@ pub trait CodeUnit: Copy + Default + Eq + Into<u16> + From<u8> {
     /// `BLOCK_SIZE` code units must be readable at `code_units`.
     unsafe fn load_block(code_units: *const Self) -> block::Block;
 
-    /// One bit for each code unit of a block: whether it is a surrogate.
+    /// One bit (or vector lane on ARM64) for each code unit of a block: whether it is a surrogate.
     ///
     /// # Safety
     /// `BLOCK_SIZE` code units must be readable at `code_units`.
-    unsafe fn surrogates_in_block(code_units: *const Self) -> u32;
+    unsafe fn surrogates_in_block(code_units: *const Self) -> block::Mask;
 
     fn view(code_units: &[Self]) -> Utf16View<'_>;
+
+    /// Returns the underlying byte slice when this code unit is stored as `u8`.
+    #[inline(always)]
+    fn as_byte_slice(_code_units: &[Self]) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl CodeUnit for u8 {
@@ -40,13 +46,18 @@ impl CodeUnit for u8 {
     }
 
     #[inline(always)]
-    unsafe fn surrogates_in_block(_: *const u8) -> u32 {
-        0
+    unsafe fn surrogates_in_block(_: *const u8) -> block::Mask {
+        block::zero_mask()
     }
 
     #[inline(always)]
     fn view(code_units: &[u8]) -> Utf16View<'_> {
         Utf16View::Latin1(code_units)
+    }
+
+    #[inline(always)]
+    fn as_byte_slice(code_units: &[u8]) -> Option<&[u8]> {
+        Some(code_units)
     }
 }
 
@@ -57,7 +68,7 @@ impl CodeUnit for u16 {
     }
 
     #[inline(always)]
-    unsafe fn surrogates_in_block(code_units: *const u16) -> u32 {
+    unsafe fn surrogates_in_block(code_units: *const u16) -> block::Mask {
         unsafe { block::surrogates(code_units) }
     }
 
@@ -75,6 +86,7 @@ mod block {
 
     pub(super) const BLOCK_SIZE: usize = 16;
     pub type Block = __m128i;
+    pub type Mask = u32;
 
     #[inline(always)]
     pub unsafe fn load_narrow(code_units: *const u8) -> Block {
@@ -95,7 +107,12 @@ mod block {
     }
 
     #[inline(always)]
-    pub unsafe fn surrogates(code_units: *const u16) -> u32 {
+    pub fn zero_mask() -> Mask {
+        0
+    }
+
+    #[inline(always)]
+    pub unsafe fn surrogates(code_units: *const u16) -> Mask {
         unsafe {
             let top_bits = _mm_set1_epi16(0xF800u16 as i16);
             let surrogate = _mm_set1_epi16(0xD800u16 as i16);
@@ -107,16 +124,45 @@ mod block {
         }
     }
 
-    /// One bit for each code unit of a block: whether it is `byte`.
     #[inline(always)]
-    pub fn equal_to(block: Block, byte: u8) -> u32 {
+    pub fn equal_mask(block: Block, byte: u8) -> Mask {
         unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(block, _mm_set1_epi8(byte as i8))) as u32 }
+    }
+
+    #[inline(always)]
+    pub fn or_mask(a: Mask, b: Mask) -> Mask {
+        a | b
+    }
+
+    #[inline(always)]
+    pub fn mask_word(mask: Mask) -> u64 {
+        u64::from(mask)
+    }
+
+    #[inline(always)]
+    pub fn first_in_word(word: u64) -> u32 {
+        word.trailing_zeros()
+    }
+
+    #[inline(always)]
+    pub fn end_sentinel(remaining: usize) -> u64 {
+        1u64 << remaining
+    }
+
+    #[inline(always)]
+    pub fn any_non_ascii(block: Block) -> bool {
+        non_ascii_word(block) != 0
+    }
+
+    #[inline(always)]
+    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
+        non_ascii_word(block) & ((1u64 << stop) - 1) != 0
     }
 
     /// One bit for each code unit of a block: whether it is above U+007F.
     #[inline(always)]
-    pub fn non_ascii(block: Block) -> u32 {
-        unsafe { _mm_movemask_epi8(block) as u32 }
+    fn non_ascii_word(block: Block) -> u64 {
+        unsafe { _mm_movemask_epi8(block) as u32 as u64 }
     }
 }
 
@@ -126,6 +172,7 @@ mod block {
 
     pub(super) const BLOCK_SIZE: usize = 16;
     pub type Block = uint8x16_t;
+    pub type Mask = uint8x16_t;
 
     #[inline(always)]
     pub unsafe fn load_narrow(code_units: *const u8) -> Block {
@@ -142,37 +189,62 @@ mod block {
         }
     }
 
-    /// One bit per byte, from a vector whose bytes are all ones or all zeros.
+    /// Packs a 16-byte all-0x00/0xFF vector into 16 four-bit nibbles inside one u64.
     #[inline(always)]
-    fn bits_of(bytes: Block) -> u32 {
-        const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        unsafe {
-            let masked = vandq_u8(bytes, vld1q_u8(BITS.as_ptr()));
-            vaddv_u8(vget_low_u8(masked)) as u32 | (vaddv_u8(vget_high_u8(masked)) as u32) << 8
-        }
+    fn nibble_mask(bytes: Block) -> u64 {
+        unsafe { vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(bytes), 4)), 0) }
     }
 
     #[inline(always)]
-    pub unsafe fn surrogates(code_units: *const u16) -> u32 {
+    pub fn zero_mask() -> Mask {
+        unsafe { vdupq_n_u8(0) }
+    }
+
+    #[inline(always)]
+    pub unsafe fn surrogates(code_units: *const u16) -> Mask {
         unsafe {
             let top_bits = vdupq_n_u16(0xF800);
             let surrogate = vdupq_n_u16(0xD800);
             let low = vceqq_u16(vandq_u16(vld1q_u16(code_units), top_bits), surrogate);
             let high = vceqq_u16(vandq_u16(vld1q_u16(code_units.add(8)), top_bits), surrogate);
-            bits_of(vcombine_u8(vmovn_u16(low), vmovn_u16(high)))
+            vcombine_u8(vmovn_u16(low), vmovn_u16(high))
         }
     }
 
-    /// One bit for each code unit of a block: whether it is `byte`.
     #[inline(always)]
-    pub fn equal_to(block: Block, byte: u8) -> u32 {
-        unsafe { bits_of(vceqq_u8(block, vdupq_n_u8(byte))) }
+    pub fn equal_mask(block: Block, byte: u8) -> Mask {
+        unsafe { vceqq_u8(block, vdupq_n_u8(byte)) }
     }
 
-    /// One bit for each code unit of a block: whether it is above U+007F.
     #[inline(always)]
-    pub fn non_ascii(block: Block) -> u32 {
-        unsafe { bits_of(vcgeq_u8(block, vdupq_n_u8(0x80))) }
+    pub fn or_mask(a: Mask, b: Mask) -> Mask {
+        unsafe { vorrq_u8(a, b) }
+    }
+
+    #[inline(always)]
+    pub fn mask_word(mask: Mask) -> u64 {
+        nibble_mask(mask)
+    }
+
+    #[inline(always)]
+    pub fn first_in_word(word: u64) -> u32 {
+        word.trailing_zeros() >> 2
+    }
+
+    #[inline(always)]
+    pub fn end_sentinel(remaining: usize) -> u64 {
+        1u64 << (remaining * 4)
+    }
+
+    #[inline(always)]
+    pub fn any_non_ascii(block: Block) -> bool {
+        unsafe { vmaxvq_u8(block) >= 0x80 }
+    }
+
+    #[inline(always)]
+    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
+        let non_ascii = unsafe { nibble_mask(vcgeq_u8(block, vdupq_n_u8(0x80))) };
+        non_ascii & ((1u64 << (stop * 4)) - 1) != 0
     }
 }
 
@@ -180,6 +252,7 @@ mod block {
 mod block {
     pub(super) const BLOCK_SIZE: usize = 16;
     pub type Block = [u8; BLOCK_SIZE];
+    pub type Mask = u32;
 
     #[inline(always)]
     pub unsafe fn load_narrow(code_units: *const u8) -> Block {
@@ -192,7 +265,12 @@ mod block {
     }
 
     #[inline(always)]
-    pub unsafe fn surrogates(code_units: *const u16) -> u32 {
+    pub fn zero_mask() -> Mask {
+        0
+    }
+
+    #[inline(always)]
+    pub unsafe fn surrogates(code_units: *const u16) -> Mask {
         (0..BLOCK_SIZE).fold(0, |bits, i| {
             let code_unit = unsafe { core::ptr::read_unaligned(code_units.add(i)) };
             bits | u32::from(code_unit & 0xF800 == 0xD800) << i
@@ -207,16 +285,45 @@ mod block {
             .fold(0, |bits, (i, &byte)| bits | u32::from(test(byte)) << i)
     }
 
-    /// One bit for each code unit of a block: whether it is `byte`.
     #[inline(always)]
-    pub fn equal_to(block: Block, byte: u8) -> u32 {
+    pub fn equal_mask(block: Block, byte: u8) -> Mask {
         bits_of(block, |code_unit| code_unit == byte)
+    }
+
+    #[inline(always)]
+    pub fn or_mask(a: Mask, b: Mask) -> Mask {
+        a | b
+    }
+
+    #[inline(always)]
+    pub fn mask_word(mask: Mask) -> u64 {
+        u64::from(mask)
+    }
+
+    #[inline(always)]
+    pub fn first_in_word(word: u64) -> u32 {
+        word.trailing_zeros()
+    }
+
+    #[inline(always)]
+    pub fn end_sentinel(remaining: usize) -> u64 {
+        1u64 << remaining
+    }
+
+    #[inline(always)]
+    pub fn any_non_ascii(block: Block) -> bool {
+        non_ascii_word(block) != 0
+    }
+
+    #[inline(always)]
+    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
+        non_ascii_word(block) & ((1u64 << stop) - 1) != 0
     }
 
     /// One bit for each code unit of a block: whether it is above U+007F.
     #[inline(always)]
-    pub fn non_ascii(block: Block) -> u32 {
-        bits_of(block, |code_unit| code_unit >= 0x80)
+    fn non_ascii_word(block: Block) -> u64 {
+        u64::from(bits_of(block, |code_unit| code_unit >= 0x80))
     }
 }
 
@@ -226,35 +333,43 @@ const CHUNK_SIZE: usize = 32;
 /// none. `seen_non_ascii` is set if a code unit before it is above U+007F.
 #[inline(always)]
 fn find_first<T: CodeUnit, const N: usize>(code_units: &[T], stops: [u8; N], seen_non_ascii: &mut bool) -> usize {
-    // One bit for each code unit of the block at `block`: whether it ends the scan, and whether it isn't ASCII.
     let scan_block = |block: *const T| {
         // SAFETY: Both callers pass a pointer to `BLOCK_SIZE` code units.
         let (bytes, surrogates) = unsafe { (T::load_block(block), T::surrogates_in_block(block)) };
-        let stops = stops
-            .iter()
-            .fold(surrogates, |bits, &stop| bits | block::equal_to(bytes, stop));
-        (stops, block::non_ascii(bytes))
+        let stop_mask = stops.iter().fold(surrogates, |mask, &stop| {
+            block::or_mask(mask, block::equal_mask(bytes, stop))
+        });
+        (bytes, block::mask_word(stop_mask))
     };
 
     let mut offset = 0;
     while offset + BLOCK_SIZE <= code_units.len() {
-        let (stops, non_ascii) = scan_block(code_units[offset..].as_ptr());
-        if stops != 0 {
-            let stop = stops.trailing_zeros();
-            *seen_non_ascii |= non_ascii & ((1 << stop) - 1) != 0;
+        let (bytes, stop_word) = scan_block(code_units[offset..].as_ptr());
+        if stop_word != 0 {
+            let stop = block::first_in_word(stop_word);
+            if !*seen_non_ascii && stop > 0 && block::any_non_ascii(bytes) {
+                *seen_non_ascii |= block::non_ascii_before(bytes, stop);
+            }
             return offset + stop as usize;
         }
-        *seen_non_ascii |= non_ascii != 0;
+        if !*seen_non_ascii && block::any_non_ascii(bytes) {
+            *seen_non_ascii = true;
+        }
         offset += BLOCK_SIZE;
     }
 
-    // NB: What is left is less than a block, and is looked at as the start of one that ends the scan after it.
     let remaining = code_units.len() - offset;
+    if remaining == 0 {
+        return offset;
+    }
+    // NB: What is left is less than a block, and is looked at as the start of one that ends the scan after it.
     let mut last_block = [T::default(); BLOCK_SIZE];
     last_block[..remaining].copy_from_slice(&code_units[offset..]);
-    let (stops, non_ascii) = scan_block(last_block.as_ptr());
-    let stop = (stops | 1 << remaining).trailing_zeros();
-    *seen_non_ascii |= non_ascii & ((1 << stop) - 1) != 0;
+    let (bytes, stop_word) = scan_block(last_block.as_ptr());
+    let stop = block::first_in_word(stop_word | block::end_sentinel(remaining));
+    if !*seen_non_ascii && stop > 0 && block::any_non_ascii(bytes) {
+        *seen_non_ascii |= block::non_ascii_before(bytes, stop);
+    }
     offset + stop as usize
 }
 
