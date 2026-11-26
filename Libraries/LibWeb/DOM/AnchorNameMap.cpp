@@ -26,6 +26,7 @@ void AnchorNameMap::register_name(Utf16FlyString const& name, GC::Ref<Element> e
     else
         elements.append(element);
 
+    element->document().set_has_anchor_names();
     publish(name, element->document(), scope_host);
 }
 

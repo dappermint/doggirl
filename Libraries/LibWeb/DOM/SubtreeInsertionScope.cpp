@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/SubtreeInsertionScope.h>
@@ -64,6 +65,44 @@ ReadonlySpan<GC::Ref<Element>> SubtreeInsertionScope::inclusive_fieldset_ancesto
     if (!m_inclusive_fieldset_ancestors_of_parent.has_value())
         return {};
     return *m_inclusive_fieldset_ancestors_of_parent;
+}
+
+SubtreeRemovalScope::SubtreeRemovalScope(Node& parent)
+    : m_parent(parent)
+    , m_document(parent.document())
+    , m_enclosing_scope(m_document->subtree_removal_scope())
+{
+    m_document->set_subtree_removal_scope({}, this);
+}
+
+SubtreeRemovalScope::~SubtreeRemovalScope()
+{
+    m_document->set_subtree_removal_scope({}, m_enclosing_scope);
+}
+
+Layout::RenderDocument const& SubtreeRemovalScope::render_document()
+{
+    if (!m_render_document)
+        m_render_document = &m_document->style_computer().style_engine().render_document();
+    return *m_render_document;
+}
+
+ReadonlySpan<GC::Ref<Element>> SubtreeRemovalScope::inclusive_form_and_fieldset_ancestors_of_parent()
+{
+    if (!m_has_collected_form_and_fieldset_ancestors) {
+        m_has_collected_form_and_fieldset_ancestors = true;
+        // NB: Most removed subtrees do not sit under a <form> or <fieldset>, so the list is rooted only once it has one.
+        for (GC::Ptr<Element> element = as_if<Element>(*m_parent); element; element = element->parent_element()) {
+            if (!is<HTML::HTMLFormElement>(*element) && !is<HTML::HTMLFieldSetElement>(*element))
+                continue;
+            if (!m_inclusive_form_and_fieldset_ancestors_of_parent.has_value())
+                m_inclusive_form_and_fieldset_ancestors_of_parent.emplace();
+            m_inclusive_form_and_fieldset_ancestors_of_parent->append(*element);
+        }
+    }
+    if (!m_inclusive_form_and_fieldset_ancestors_of_parent.has_value())
+        return {};
+    return *m_inclusive_form_and_fieldset_ancestors_of_parent;
 }
 
 }

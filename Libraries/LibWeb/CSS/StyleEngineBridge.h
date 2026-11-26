@@ -188,6 +188,11 @@ public:
     void defer_element_initial_features(DOM::Element&);
     void note_element_awaiting_preparation_for_style_computation(DOM::Element&);
     void cancel_deferred_element_initial_features(DOM::Element&);
+    void cancel_deferred_element_initial_features_for_style_node(StyleNodeID id)
+    {
+        if (!m_nodes_awaiting_preparation_for_style_computation.is_empty()) [[unlikely]]
+            m_nodes_awaiting_preparation_for_style_computation.remove(id);
+    }
     // Whether any element waits to have its initial features published, or to be prepared for style computation.
     [[nodiscard]] bool has_elements_awaiting_initial_style_work() const { return !m_nodes_with_pending_initial_features.is_empty() || !m_nodes_awaiting_preparation_for_style_computation.is_empty(); }
     Vector<StyleNodeID> take_deferred_element_initial_features();

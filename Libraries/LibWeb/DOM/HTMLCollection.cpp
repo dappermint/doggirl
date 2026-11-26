@@ -34,6 +34,8 @@ GC::Ref<HTMLCollection> HTMLCollection::create_all(ParentNode& root, Scope scope
 
 GC::Ref<HTMLCollection> HTMLCollection::create_by_tag_name_html(ParentNode& root, Utf16FlyString qualified_name, Utf16FlyString lowercase_qualified_name)
 {
+    if (qualified_name == lowercase_qualified_name)
+        return create_by_tag_name_exact(root, move(qualified_name));
     auto collection = GC::Heap::the().allocate<HTMLCollection>(root, Scope::Descendants, nullptr, AttributeInvalidationType::None, nullptr, Kind::Generic, MatcherKind::TagNameHTML);
     collection->m_primary_name = move(qualified_name);
     collection->m_secondary_name = move(lowercase_qualified_name);
@@ -205,13 +207,15 @@ void HTMLCollection::collect_elements_with(AppendFn&& append) const
             return TraversalDecision::Continue;
         });
         return;
-    case MatcherKind::TagNameExact:
+    case MatcherKind::TagNameExact: {
+        auto const expected_identity = m_primary_name.raw_identity();
         m_root->for_each_in_subtree_of_type<Element>([&](auto& element) {
-            if (element.qualified_name() == m_primary_name)
+            if (element.qualified_name().raw_identity() == expected_identity)
                 append(element);
             return TraversalDecision::Continue;
         });
         return;
+    }
     case MatcherKind::TagNameHTML:
         m_root->for_each_in_subtree_of_type<Element>([&](auto& element) {
             auto const& expected = element.namespace_uri() == Namespace::HTML ? m_secondary_name : m_primary_name;

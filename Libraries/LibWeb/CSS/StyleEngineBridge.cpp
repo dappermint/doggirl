@@ -152,7 +152,8 @@ void StyleEngine::note_element_awaiting_preparation_for_style_computation(DOM::E
 void StyleEngine::cancel_deferred_element_initial_features(DOM::Element& element)
 {
     element.set_initial_style_features_pending(false);
-    m_nodes_awaiting_preparation_for_style_computation.remove(element.style_node_id());
+    if (!m_nodes_awaiting_preparation_for_style_computation.is_empty()) [[unlikely]]
+        m_nodes_awaiting_preparation_for_style_computation.remove(element.style_node_id());
 }
 
 Vector<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
