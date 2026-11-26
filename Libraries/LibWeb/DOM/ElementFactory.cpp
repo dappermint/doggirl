@@ -343,22 +343,27 @@ bool is_unknown_html_element(Utf16FlyString const& tag_name)
 // https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom%3Aelement-interface
 using HTMLElementFactory = GC::Ref<Element> (*)(Document&, QualifiedName);
 
+struct HTMLElementFactoryEntry {
+    HTMLElementFactory factory;
+    QualifiedName qualified_name;
+};
+
 template<typename ElementType>
 static GC::Ref<Element> create_html_element_on_heap(Document& document, QualifiedName qualified_name)
 {
     return create_element_on_heap<ElementType>(document, move(qualified_name));
 }
 
-static HashMap<FlatPtr, HTMLElementFactory> const& html_element_factories()
+static HashMap<FlatPtr, HTMLElementFactoryEntry> const& html_element_factories()
 {
-    static NeverDestroyed<HashMap<FlatPtr, HTMLElementFactory>> factories = [] {
-        HashMap<FlatPtr, HTMLElementFactory> factories;
+    static NeverDestroyed<HashMap<FlatPtr, HTMLElementFactoryEntry>> factories = [] {
+        HashMap<FlatPtr, HTMLElementFactoryEntry> factories;
 
-#define __ENUMERATE_HTML_TAG(name, tag) factories.set(HTML::TagNames::name.raw_identity(), &create_html_element_on_heap<HTML::HTMLUnknownElement>);
+#define __ENUMERATE_HTML_TAG(name, tag) factories.set(HTML::TagNames::name.raw_identity(), { &create_html_element_on_heap<HTML::HTMLUnknownElement>, QualifiedName { HTML::TagNames::name, {}, Namespace::HTML } });
         ENUMERATE_HTML_TAGS
 #undef __ENUMERATE_HTML_TAG
 
-#define REGISTER_HTML_ELEMENT(tag_name, element_type) factories.set(HTML::TagNames::tag_name.raw_identity(), &create_html_element_on_heap<HTML::element_type>)
+#define REGISTER_HTML_ELEMENT(tag_name, element_type) factories.set(HTML::TagNames::tag_name.raw_identity(), { &create_html_element_on_heap<HTML::element_type>, QualifiedName { HTML::TagNames::tag_name, {}, Namespace::HTML } })
         REGISTER_HTML_ELEMENT(a, HTMLAnchorElement);
         REGISTER_HTML_ELEMENT(area, HTMLAreaElement);
         REGISTER_HTML_ELEMENT(audio, HTMLAudioElement);
@@ -507,8 +512,8 @@ static GC::Ref<Element> create_html_element(Document& document, QualifiedName qu
 {
     auto const& tag_name = qualified_name.local_name();
 
-    if (auto factory = html_element_factories().get(tag_name.raw_identity()); factory.has_value())
-        return factory.value()(document, move(qualified_name));
+    if (auto entry = html_element_factories().get(tag_name.raw_identity()); entry.has_value())
+        return entry->factory(document, move(qualified_name));
 
     if (HTML::is_valid_custom_element_name(qualified_name.local_name()))
         return create_element_on_heap<HTML::HTMLElement>(document, move(qualified_name));
@@ -516,133 +521,100 @@ static GC::Ref<Element> create_html_element(Document& document, QualifiedName qu
     return create_element_on_heap<HTML::HTMLUnknownElement>(document, move(qualified_name));
 }
 
+using SVGElementFactory = GC::Ref<SVG::SVGElement> (*)(Document&, QualifiedName);
+
+template<typename ElementType>
+static GC::Ref<SVG::SVGElement> create_svg_element_on_heap(Document& document, QualifiedName qualified_name)
+{
+    return create_element_on_heap<ElementType>(document, move(qualified_name));
+}
+
+static HashMap<FlatPtr, SVGElementFactory> const& svg_element_factories()
+{
+    static NeverDestroyed<HashMap<FlatPtr, SVGElementFactory>> factories = [] {
+        HashMap<FlatPtr, SVGElementFactory> factories;
+#define REGISTER_SVG_ELEMENT(tag_name, element_type) factories.set(SVG::TagNames::tag_name.raw_identity(), &create_svg_element_on_heap<SVG::element_type>)
+        REGISTER_SVG_ELEMENT(svg, SVGSVGElement);
+        REGISTER_SVG_ELEMENT(animate, SVGAnimateElement);
+        REGISTER_SVG_ELEMENT(animateMotion, SVGAnimateMotionElement);
+        REGISTER_SVG_ELEMENT(clipPath, SVGClipPathElement);
+        REGISTER_SVG_ELEMENT(circle, SVGCircleElement);
+        REGISTER_SVG_ELEMENT(defs, SVGDefsElement);
+        REGISTER_SVG_ELEMENT(desc, SVGDescElement);
+        REGISTER_SVG_ELEMENT(ellipse, SVGEllipseElement);
+        REGISTER_SVG_ELEMENT(feBlend, SVGFEBlendElement);
+        REGISTER_SVG_ELEMENT(feColorMatrix, SVGFEColorMatrixElement);
+        REGISTER_SVG_ELEMENT(feComponentTransfer, SVGFEComponentTransferElement);
+        REGISTER_SVG_ELEMENT(feComposite, SVGFECompositeElement);
+        REGISTER_SVG_ELEMENT(feConvolveMatrix, SVGFEConvolveMatrixElement);
+        REGISTER_SVG_ELEMENT(feDiffuseLighting, SVGFEDiffuseLightingElement);
+        REGISTER_SVG_ELEMENT(feDisplacementMap, SVGFEDisplacementMapElement);
+        REGISTER_SVG_ELEMENT(feDistantLight, SVGFEDistantLightElement);
+        REGISTER_SVG_ELEMENT(feDropShadow, SVGFEDropShadowElement);
+        REGISTER_SVG_ELEMENT(feFlood, SVGFEFloodElement);
+        REGISTER_SVG_ELEMENT(feFuncA, SVGFEFuncAElement);
+        REGISTER_SVG_ELEMENT(feFuncB, SVGFEFuncBElement);
+        REGISTER_SVG_ELEMENT(feFuncG, SVGFEFuncGElement);
+        REGISTER_SVG_ELEMENT(feFuncR, SVGFEFuncRElement);
+        REGISTER_SVG_ELEMENT(feGaussianBlur, SVGFEGaussianBlurElement);
+        REGISTER_SVG_ELEMENT(feImage, SVGFEImageElement);
+        REGISTER_SVG_ELEMENT(feMerge, SVGFEMergeElement);
+        REGISTER_SVG_ELEMENT(feMergeNode, SVGFEMergeNodeElement);
+        REGISTER_SVG_ELEMENT(feMorphology, SVGFEMorphologyElement);
+        REGISTER_SVG_ELEMENT(feOffset, SVGFEOffsetElement);
+        REGISTER_SVG_ELEMENT(fePointLight, SVGFEPointLightElement);
+        REGISTER_SVG_ELEMENT(feSpecularLighting, SVGFESpecularLightingElement);
+        REGISTER_SVG_ELEMENT(feSpotLight, SVGFESpotLightElement);
+        REGISTER_SVG_ELEMENT(feTurbulence, SVGFETurbulenceElement);
+        REGISTER_SVG_ELEMENT(filter, SVGFilterElement);
+        REGISTER_SVG_ELEMENT(foreignObject, SVGForeignObjectElement);
+        REGISTER_SVG_ELEMENT(line, SVGLineElement);
+        REGISTER_SVG_ELEMENT(linearGradient, SVGLinearGradientElement);
+        REGISTER_SVG_ELEMENT(marker, SVGMarkerElement);
+        REGISTER_SVG_ELEMENT(mask, SVGMaskElement);
+        REGISTER_SVG_ELEMENT(metadata, SVGMetadataElement);
+        REGISTER_SVG_ELEMENT(mpath, SVGMPathElement);
+        REGISTER_SVG_ELEMENT(path, SVGPathElement);
+        REGISTER_SVG_ELEMENT(pattern, SVGPatternElement);
+        REGISTER_SVG_ELEMENT(polygon, SVGPolygonElement);
+        REGISTER_SVG_ELEMENT(polyline, SVGPolylineElement);
+        REGISTER_SVG_ELEMENT(radialGradient, SVGRadialGradientElement);
+        REGISTER_SVG_ELEMENT(rect, SVGRectElement);
+        REGISTER_SVG_ELEMENT(g, SVGGElement);
+        REGISTER_SVG_ELEMENT(set, SVGSetElement);
+        REGISTER_SVG_ELEMENT(stop, SVGStopElement);
+        REGISTER_SVG_ELEMENT(style, SVGStyleElement);
+        REGISTER_SVG_ELEMENT(switch_, SVGSwitchElement);
+        REGISTER_SVG_ELEMENT(symbol, SVGSymbolElement);
+        REGISTER_SVG_ELEMENT(text, SVGTextElement);
+        REGISTER_SVG_ELEMENT(textPath, SVGTextPathElement);
+        REGISTER_SVG_ELEMENT(title, SVGTitleElement);
+        REGISTER_SVG_ELEMENT(tspan, SVGTSpanElement);
+        REGISTER_SVG_ELEMENT(use, SVGUseElement);
+        REGISTER_SVG_ELEMENT(script, SVGScriptElement);
+        REGISTER_SVG_ELEMENT(view, SVGViewElement);
+        REGISTER_SVG_ELEMENT(a, SVGAElement);
+        REGISTER_SVG_ELEMENT(image, SVGImageElement);
+#undef REGISTER_SVG_ELEMENT
+        return factories;
+    }();
+    return *factories;
+}
+
 static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, QualifiedName qualified_name)
 {
     auto const& local_name = qualified_name.local_name();
 
-    if (local_name == SVG::TagNames::svg)
-        return create_element_on_heap<SVG::SVGSVGElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::animate)
-        return create_element_on_heap<SVG::SVGAnimateElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::animateMotion)
-        return create_element_on_heap<SVG::SVGAnimateMotionElement>(document, move(qualified_name));
+    if (auto factory = svg_element_factories().get(local_name.raw_identity()); factory.has_value())
+        return factory.value()(document, move(qualified_name));
+
     // FIXME: Support SVG's mixedCase tag names properly.
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::clipPath))
         return create_element_on_heap<SVG::SVGClipPathElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::circle)
-        return create_element_on_heap<SVG::SVGCircleElement>(document, move(qualified_name));
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::defs))
         return create_element_on_heap<SVG::SVGDefsElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::desc)
-        return create_element_on_heap<SVG::SVGDescElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::ellipse)
-        return create_element_on_heap<SVG::SVGEllipseElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feBlend)
-        return create_element_on_heap<SVG::SVGFEBlendElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feColorMatrix)
-        return create_element_on_heap<SVG::SVGFEColorMatrixElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feComponentTransfer)
-        return create_element_on_heap<SVG::SVGFEComponentTransferElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feComposite)
-        return create_element_on_heap<SVG::SVGFECompositeElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feConvolveMatrix)
-        return create_element_on_heap<SVG::SVGFEConvolveMatrixElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feDiffuseLighting)
-        return create_element_on_heap<SVG::SVGFEDiffuseLightingElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feDisplacementMap)
-        return create_element_on_heap<SVG::SVGFEDisplacementMapElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feDistantLight)
-        return create_element_on_heap<SVG::SVGFEDistantLightElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feDropShadow)
-        return create_element_on_heap<SVG::SVGFEDropShadowElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFlood)
-        return create_element_on_heap<SVG::SVGFEFloodElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFuncA)
-        return create_element_on_heap<SVG::SVGFEFuncAElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFuncB)
-        return create_element_on_heap<SVG::SVGFEFuncBElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFuncG)
-        return create_element_on_heap<SVG::SVGFEFuncGElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFuncR)
-        return create_element_on_heap<SVG::SVGFEFuncRElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feGaussianBlur)
-        return create_element_on_heap<SVG::SVGFEGaussianBlurElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feImage)
-        return create_element_on_heap<SVG::SVGFEImageElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feMerge)
-        return create_element_on_heap<SVG::SVGFEMergeElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feMergeNode)
-        return create_element_on_heap<SVG::SVGFEMergeNodeElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feMorphology)
-        return create_element_on_heap<SVG::SVGFEMorphologyElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feOffset)
-        return create_element_on_heap<SVG::SVGFEOffsetElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::fePointLight)
-        return create_element_on_heap<SVG::SVGFEPointLightElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feSpecularLighting)
-        return create_element_on_heap<SVG::SVGFESpecularLightingElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feSpotLight)
-        return create_element_on_heap<SVG::SVGFESpotLightElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feTurbulence)
-        return create_element_on_heap<SVG::SVGFETurbulenceElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::filter)
-        return create_element_on_heap<SVG::SVGFilterElement>(document, move(qualified_name));
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::foreignObject))
         return create_element_on_heap<SVG::SVGForeignObjectElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::line)
-        return create_element_on_heap<SVG::SVGLineElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::linearGradient)
-        return create_element_on_heap<SVG::SVGLinearGradientElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::marker)
-        return create_element_on_heap<SVG::SVGMarkerElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::mask)
-        return create_element_on_heap<SVG::SVGMaskElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::metadata)
-        return create_element_on_heap<SVG::SVGMetadataElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::mpath)
-        return create_element_on_heap<SVG::SVGMPathElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::path)
-        return create_element_on_heap<SVG::SVGPathElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::pattern)
-        return create_element_on_heap<SVG::SVGPatternElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::polygon)
-        return create_element_on_heap<SVG::SVGPolygonElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::polyline)
-        return create_element_on_heap<SVG::SVGPolylineElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::radialGradient)
-        return create_element_on_heap<SVG::SVGRadialGradientElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::rect)
-        return create_element_on_heap<SVG::SVGRectElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::g)
-        return create_element_on_heap<SVG::SVGGElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::set)
-        return create_element_on_heap<SVG::SVGSetElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::stop)
-        return create_element_on_heap<SVG::SVGStopElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::style)
-        return create_element_on_heap<SVG::SVGStyleElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::switch_)
-        return create_element_on_heap<SVG::SVGSwitchElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::symbol)
-        return create_element_on_heap<SVG::SVGSymbolElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::text)
-        return create_element_on_heap<SVG::SVGTextElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::textPath)
-        return create_element_on_heap<SVG::SVGTextPathElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::title)
-        return create_element_on_heap<SVG::SVGTitleElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::tspan)
-        return create_element_on_heap<SVG::SVGTSpanElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::use)
-        return create_element_on_heap<SVG::SVGUseElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::script)
-        return create_element_on_heap<SVG::SVGScriptElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::view)
-        return create_element_on_heap<SVG::SVGViewElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::a)
-        return create_element_on_heap<SVG::SVGAElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::image)
-        return create_element_on_heap<SVG::SVGImageElement>(document, move(qualified_name));
 
     // https://svgwg.org/svg2-draft/types.html#ElementsInTheSVGDOM
     // Elements in the SVG namespace whose local name does not match an element defined in any
@@ -683,7 +655,7 @@ GC::Ref<Element> create_element_internal(Document& document, Interface interface
     //    to prefix, local name set to localName, custom element registry set to registry, custom element state set to
     //    state, custom element definition set to null, is value set to is, and node document set to document.
     auto qualified_name = QualifiedName { local_name, prefix, namespace_ };
-    auto element = interface(document, qualified_name);
+    auto element = interface(document, move(qualified_name));
     element->set_custom_element_registry(registry);
     element->set_custom_element_state(custom_element_state);
     element->set_is_value(move(is_value));
@@ -693,6 +665,17 @@ GC::Ref<Element> create_element_internal(Document& document, Interface interface
     VERIFY(!element->has_attributes());
 
     // 3. Return element.
+    return element;
+}
+
+GC::Ref<Element> create_builtin_html_element_by_raw_local_name(Document& document, FlatPtr raw_local_name, GC::Ptr<HTML::CustomElementRegistry> registry)
+{
+    auto entry = html_element_factories().get(raw_local_name);
+    VERIFY(entry.has_value());
+    auto element = entry->factory(document, entry->qualified_name);
+    element->set_custom_element_registry(registry);
+    element->set_custom_element_state(CustomElementState::Uncustomized);
+    VERIFY(!element->has_attributes());
     return element;
 }
 
@@ -711,6 +694,21 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16Fl
         [](GC::Ptr<HTML::CustomElementRegistry> pointer) {
             return pointer;
         });
+
+    // OPTIMIZATION: Built-in HTML tag names never contain a hyphen, so without an `is` attribute they can neither
+    //               match a custom element definition nor be a valid custom element name.
+    if (namespace_ == Namespace::HTML && !is_value.has_value()) {
+        if (auto entry = html_element_factories().get(local_name.raw_identity()); entry.has_value()) {
+            if (!prefix.has_value()) {
+                auto element = entry->factory(document, entry->qualified_name);
+                element->set_custom_element_registry(registry);
+                element->set_custom_element_state(CustomElementState::Uncustomized);
+                VERIFY(!element->has_attributes());
+                return element;
+            }
+            return create_element_internal(document, entry->factory, move(local_name), move(namespace_), move(prefix), CustomElementState::Uncustomized, {}, registry);
+        }
+    }
 
     // 3. Let definition be the result of looking up a custom element definition given registry, namespace, localName,
     //    and is.

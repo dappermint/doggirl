@@ -169,8 +169,9 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
 
     // 2. If CSP list contains a header-delivered Content Security Policy, and element has a
     //    nonce content attribute whose value is not the empty string, then:
-    // OPTIMIZATION: Most elements have no nonce attribute, which is cheaper to rule out than to find the CSP list.
-    if (element.has_attribute(HTML::AttributeNames::nonce) && element.document().policy_container()->csp_list.contains_header_delivered_policy()) {
+    // OPTIMIZATION: The subtree attribute name filter rules out the attribute for most elements without a lookup.
+    auto might_have_nonce = (element.subtree_name_filter() & DOM::Element::name_filter_bit(HTML::AttributeNames::nonce)) != 0;
+    if (might_have_nonce && element.has_attribute(HTML::AttributeNames::nonce) && element.document().policy_container()->csp_list.contains_header_delivered_policy()) {
         // 2.1. Let nonce be element's [[CryptographicNonce]].
         auto nonce = this->nonce();
 

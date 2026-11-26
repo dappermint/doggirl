@@ -531,7 +531,7 @@ GC::Ptr<CustomElementRegistry> look_up_a_custom_element_registry(DOM::Node const
 GC::Ptr<CustomElementDefinition> look_up_a_custom_element_definition(GC::Ptr<CustomElementRegistry> registry, Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name, Optional<Utf16FlyString> const& is)
 {
     // 1. If registry is null, then return null.
-    if (!registry)
+    if (!registry || !registry->has_definitions())
         return nullptr;
 
     // 2. If namespace is not the HTML namespace, then return null.

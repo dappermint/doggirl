@@ -81,17 +81,6 @@ static JS::ThrowCompletionOr<bool> ordinary_prevent_extensions_and_preserve_wrap
     return result;
 }
 
-void finalize_platform_object(JS::HostObject& wrapper)
-{
-    auto* wrappable = wrappable_of(wrapper);
-    if (!wrappable)
-        return;
-
-    auto& realm = wrapper_realm(wrapper);
-    if (realm.host_defined())
-        host_defined_wrapper_world(realm).clear_wrapper(*wrappable, wrapper);
-}
-
 static Utf16FlyString property_key_to_utf16_fly_string(JS::PropertyKey const& property_key)
 {
     return Utf16FlyString { property_key.to_utf16_string() };
@@ -383,11 +372,6 @@ struct PlatformObjectTraits {
     {
         preserve_identity_of_platform_object(wrapper);
     }
-
-    static void finalize(JS::HostObject& wrapper)
-    {
-        finalize_platform_object(wrapper);
-    }
 };
 
 struct DOMExceptionWrapperTraits : PlatformObjectTraits {
@@ -411,11 +395,6 @@ struct GlobalPlatformObjectTraits {
     static void preserve_identity(JS::HostObject& wrapper)
     {
         preserve_identity_of_platform_object(wrapper);
-    }
-
-    static void finalize(JS::HostObject& wrapper)
-    {
-        finalize_platform_object(wrapper);
     }
 };
 
@@ -622,11 +601,6 @@ struct LegacyPlatformObjectTraits {
     static void preserve_identity(JS::HostObject& wrapper)
     {
         preserve_identity_of_platform_object(wrapper);
-    }
-
-    static void finalize(JS::HostObject& wrapper)
-    {
-        finalize_platform_object(wrapper);
     }
 };
 

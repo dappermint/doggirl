@@ -78,6 +78,7 @@ void SVGElement::set_corresponding_element(Badge<SVGUseElement>, SVGElement& cor
 SVGElement::SVGElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : Element(document, move(qualified_name))
 {
+    set_wrappable_flag(WrappableFlag::IsSVGElement);
 }
 
 CSS::ElementBoxKind SVGElement::box_kind() const
@@ -586,14 +587,15 @@ void SVGElement::children_changed(ChildrenChangedMetadata const& metadata)
 
 void SVGElement::update_use_elements_that_reference_this()
 {
-    if (is<SVGUseElement>(this)
-        // If this element is in a shadow root, it already represents a clone and is not itself referenced.
-        || is<DOM::ShadowRoot>(this->root())
-        // If this does not have an id it cannot be referenced, no point in notifying use elements.
-        || !id().has_value()
+    if (document().svg_use_elements().is_empty()
         // An unconnected node cannot have valid references.
         // This also prevents searches for elements that are in the process of being constructed - as clones.
-        || !this->is_connected()) {
+        || !this->is_connected()
+        // If this does not have an id it cannot be referenced, no point in notifying use elements.
+        || !id().has_value()
+        || is<SVGUseElement>(this)
+        // If this element is in a shadow root, it already represents a clone and is not itself referenced.
+        || is<DOM::ShadowRoot>(this->root())) {
 
         return;
     }
@@ -609,7 +611,7 @@ void SVGElement::update_use_elements_that_reference_this()
 void SVGElement::invalidate_element_instances(ElementInstancesToInvalidate element_instances_to_invalidate)
 {
     auto* data = static_cast<RareData*>(rare_data());
-    if (!data)
+    if (!data || data->element_instances.is_empty())
         return;
 
     GC::RootVector<GC::Ref<SVGElement>> invalidated_element_instances;

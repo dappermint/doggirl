@@ -803,6 +803,10 @@ public:
     void set_has_element_with_auto_directionality() { m_has_element_with_auto_directionality = true; }
     bool has_form_or_fieldset_element() const { return m_has_form_or_fieldset_element; }
     void set_has_form_or_fieldset_element() { m_has_form_or_fieldset_element = true; }
+    bool has_form_element() const { return m_has_form_element; }
+    void set_has_form_element() { m_has_form_element = true; }
+    bool has_inert_element() const { return m_has_inert_element; }
+    void set_has_inert_element() { m_has_inert_element = true; }
     bool has_svg_paint_resource_element() const { return m_has_svg_paint_resource_element; }
     void set_has_svg_paint_resource_element() { m_has_svg_paint_resource_element = true; }
 
@@ -1097,6 +1101,8 @@ public:
     void register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
     void unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
     SVG::SVGUseElement::DocumentUseElementList& svg_use_elements() { return m_svg_use_elements; }
+
+    bool has_node_iterators() const { return !m_node_iterators.is_empty(); }
 
     template<typename Callback>
     void for_each_node_iterator(Callback callback)
@@ -1759,7 +1765,7 @@ public:
     static constexpr size_t active_view_transition_offset() { return offsetof(Document, m_active_view_transition); }
     bool rendering_suppression_for_view_transitions() const { return m_rendering_suppression_for_view_transitions; }
     void set_rendering_suppression_for_view_transitions(bool);
-    CSS::StyleSheetState* dynamic_view_transition_style_sheet() const { return m_dynamic_view_transition_style_sheet.ptr(); }
+    CSS::StyleSheetState* dynamic_view_transition_style_sheet() const;
     void set_show_view_transition_tree(bool value) { m_show_view_transition_tree = value; }
     Vector<GC::Ptr<ViewTransition::ViewTransition>>& update_callback_queue() { return m_update_callback_queue; }
 
@@ -2098,6 +2104,8 @@ private:
     bool m_needs_mathml_and_svg_user_agent_style_sheets { false };
     bool m_has_element_with_auto_directionality { false };
     bool m_has_form_or_fieldset_element { false };
+    bool m_has_form_element { false };
+    bool m_has_inert_element { false };
     bool m_has_svg_paint_resource_element { false };
     SubtreeInsertionScope* m_subtree_insertion_scope { nullptr };
 
@@ -2645,7 +2653,7 @@ private:
     bool m_rendering_suppression_for_view_transitions { false };
 
     // https://drafts.csswg.org/css-view-transitions-1/#document-dynamic-view-transition-style-sheet
-    RefPtr<CSS::StyleSheetState> m_dynamic_view_transition_style_sheet;
+    mutable RefPtr<CSS::StyleSheetState> m_dynamic_view_transition_style_sheet;
 
     // https://drafts.csswg.org/css-view-transitions-1/#document-show-view-transition-tree
     bool m_show_view_transition_tree { false };

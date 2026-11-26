@@ -320,11 +320,45 @@ static void invalidate_content_blocker_style_if_needed(Element& element)
     element.document().page().invalidate_user_style();
 }
 
-static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<IterationDecision(Utf16View)> const& callback)
+static bool contains_ascii_whitespace(Utf16View input)
 {
+    if (input.has_latin1_storage()) {
+        for (u8 byte : input.latin1_span()) {
+            if (byte <= ' ' && Infra::is_ascii_whitespace(byte))
+                return true;
+        }
+        return false;
+    }
+    for (char16_t unit : input.utf16_span()) {
+        if (unit <= ' ' && Infra::is_ascii_whitespace(unit))
+            return true;
+    }
+    return false;
+}
+
+template<typename Callback>
+static void for_each_ascii_whitespace_separated_token(Utf16View input, Callback&& callback)
+{
+    size_t const length = input.length_in_code_units();
     size_t start = 0;
-    for (size_t i = 0; i <= input.length_in_code_units(); ++i) {
-        if (i != input.length_in_code_units() && !Infra::is_ascii_whitespace(input.code_unit_at(i)))
+    if (input.has_latin1_storage()) {
+        auto const span = input.latin1_span();
+        auto const* data = span.data();
+        for (size_t i = 0; i <= length; ++i) {
+            if (i != length && !Infra::is_ascii_whitespace(data[i]))
+                continue;
+
+            if (i > start && callback(input.substring_view(start, i - start)) == IterationDecision::Break)
+                return;
+            start = i + 1;
+        }
+        return;
+    }
+
+    auto const span = input.utf16_span();
+    auto const* data = span.data();
+    for (size_t i = 0; i <= length; ++i) {
+        if (i != length && !Infra::is_ascii_whitespace(data[i]))
             continue;
 
         if (i > start && callback(input.substring_view(start, i - start)) == IterationDecision::Break)
@@ -384,23 +418,21 @@ Element::Element(Document& document, DOM::QualifiedName qualified_name)
     : ParentNode(document, NodeType::ELEMENT_NODE)
     , m_qualified_name(move(qualified_name))
 {
+    set_wrappable_flag(WrappableFlag::IsElement);
 }
 
-Element::~Element() = default;
-
-void Element::finalize()
+Element::~Element()
 {
-    Base::finalize();
-    CSS::Parser::ValueParserFFI::rust_declaration_block_destroy(exchange(m_inline_declarations, nullptr));
-    finalize_animations();
+    if (m_inline_declarations) [[unlikely]]
+        CSS::Parser::ValueParserFFI::rust_declaration_block_destroy(exchange(m_inline_declarations, nullptr));
 }
 
 void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
 {
-    add_to_subtree_name_filter(name_filter_bit(name.local_name()));
+    add_to_subtree_filters(name_filter_bit(name.local_name()), attribute_filter_bits(name.local_name()));
     if (!m_attributes)
         m_attributes = AttributeList::create(1);
-    else
+    else if (m_attributes->size() == m_attributes->capacity())
         m_attributes = AttributeList::ensure_room_for_one_more(m_attributes.release_nonnull());
     m_attributes->unchecked_append(move(name), move(value));
 }
@@ -410,6 +442,16 @@ void Element::add_to_subtree_name_filter(u64 bits)
     // An element's filter holds those of its children, so the walk up ends at the first that has the bits.
     for (auto* element = this; element && (element->m_subtree_name_filter & bits) != bits; element = element->parent_element().ptr())
         element->m_subtree_name_filter |= bits;
+}
+
+void Element::add_to_subtree_filters(u64 name_bits, u32 attribute_bits)
+{
+    for (auto* element = this;
+        element && ((element->m_subtree_name_filter & name_bits) != name_bits || (element->m_subtree_attribute_filter & attribute_bits) != attribute_bits);
+        element = element->parent_element().ptr()) {
+        element->m_subtree_name_filter |= name_bits;
+        element->m_subtree_attribute_filter |= attribute_bits;
+    }
 }
 
 void Element::ensure_attribute_capacity(size_t capacity)
@@ -441,11 +483,41 @@ void Element::synchronize_all_attributes() const
 
 Optional<size_t> Element::find_attribute_index(Utf16FlyString const& qualified_name) const
 {
+    if (!m_attributes && !m_style_attribute_is_dirty)
+        return {};
+
     Utf16FlyString const* effective_name = &qualified_name;
     Utf16FlyString lowercase_name;
+    bool has_colon = false;
+    auto view = qualified_name.view();
     if (namespace_uri() == Namespace::HTML && document().is_html_document()) {
-        lowercase_name = qualified_name.to_ascii_lowercase();
-        effective_name = &lowercase_name;
+        bool has_upper = false;
+        if (view.has_latin1_storage()) {
+            for (u8 byte : view.latin1_span()) {
+                has_upper |= is_ascii_upper_alpha(byte);
+                has_colon |= byte == ':';
+            }
+        } else {
+            for (char16_t unit : view.utf16_span()) {
+                has_upper |= is_ascii_upper_alpha(unit);
+                has_colon |= unit == ':';
+            }
+        }
+        if (has_upper) {
+            lowercase_name = view.to_ascii_lowercase();
+            effective_name = &lowercase_name;
+        }
+    } else {
+        has_colon = view.has_latin1_storage()
+            ? any_of(view.latin1_span(), [](u8 byte) { return byte == ':'; })
+            : any_of(view.utf16_span(), [](char16_t unit) { return unit == ':'; });
+    }
+
+    // Qualified names without a colon have no prefix, so as_string() equals local_name(), whose bits are always in m_subtree_attribute_filter.
+    if (!has_colon) {
+        auto attr_bits = attribute_filter_bits(*effective_name);
+        if ((m_subtree_attribute_filter & attr_bits) != attr_bits)
+            return {};
     }
 
     synchronize_attribute(*effective_name);
@@ -462,6 +534,13 @@ Optional<size_t> Element::find_attribute_index(Utf16FlyString const& qualified_n
 
 Optional<size_t> Element::find_attribute_index_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name) const
 {
+    if (!m_attributes && !m_style_attribute_is_dirty)
+        return {};
+
+    auto attr_bits = attribute_filter_bits(local_name);
+    if ((m_subtree_attribute_filter & attr_bits) != attr_bits)
+        return {};
+
     Optional<Utf16FlyString> normalized_namespace;
     if (namespace_ != Utf16FlyString {})
         normalized_namespace = namespace_;
@@ -909,7 +988,11 @@ GC::Ptr<Attr> Element::get_attribute_node_ns(Optional<Utf16FlyString> const& nam
 
 void Element::set_attribute(FlyString qualified_name, Utf16String const& verified_value)
 {
-    auto utf16_qualified_name = Utf16FlyString::from_fly_string(qualified_name);
+    set_attribute(Utf16FlyString::from_fly_string(qualified_name), verified_value);
+}
+
+void Element::set_attribute(Utf16FlyString const& utf16_qualified_name, Utf16String const& verified_value)
+{
     // Let attribute be the first attribute in this’s attribute list whose qualified name is qualifiedName, and null otherwise.
     auto index = find_attribute_index(utf16_qualified_name);
 
@@ -933,16 +1016,46 @@ void Element::set_attribute(FlyString qualified_name, Utf16String const& verifie
 bool is_valid_namespace_prefix(Utf16View prefix)
 {
     // A string is a valid namespace prefix if its length is at least 1 and it does not contain ASCII whitespace, U+0000 NULL, U+002F (/), or U+003E (>).
-    constexpr Array<u32, 8> INVALID_NAMESPACE_PREFIX_CHARACTERS { '\t', '\n', '\f', '\r', ' ', '\0', '/', '>' };
-    return !prefix.is_empty() && !prefix.contains_any_of(INVALID_NAMESPACE_PREFIX_CHARACTERS);
+    if (prefix.is_empty())
+        return false;
+    auto is_invalid = [](u32 ch) {
+        return ch <= '>' && ((ch == ' ') || (ch == '\0') || (ch == '/') || (ch == '>') || (ch >= '\t' && ch <= '\r' && ch != '\v'));
+    };
+    if (prefix.has_latin1_storage()) {
+        for (u8 byte : prefix.latin1_span()) {
+            if (is_invalid(byte))
+                return false;
+        }
+        return true;
+    }
+    for (char16_t unit : prefix.utf16_span()) {
+        if (is_invalid(unit))
+            return false;
+    }
+    return true;
 }
 
 // https://dom.spec.whatwg.org/#valid-attribute-local-name
 bool is_valid_attribute_local_name(Utf16View local_name)
 {
     // A string is a valid attribute local name if its length is at least 1 and it does not contain ASCII whitespace, U+0000 NULL, U+002F (/), U+003D (=), or U+003E (>).
-    constexpr Array<u32, 9> INVALID_ATTRIBUTE_LOCAL_NAME_CHARACTERS { '\t', '\n', '\f', '\r', ' ', '\0', '/', '=', '>' };
-    return !local_name.is_empty() && !local_name.contains_any_of(INVALID_ATTRIBUTE_LOCAL_NAME_CHARACTERS);
+    if (local_name.is_empty())
+        return false;
+    auto is_invalid = [](u32 ch) {
+        return ch <= '>' && ((ch == ' ') || (ch == '\0') || (ch == '/') || (ch == '=') || (ch == '>') || (ch >= '\t' && ch <= '\r' && ch != '\v'));
+    };
+    if (local_name.has_latin1_storage()) {
+        for (u8 byte : local_name.latin1_span()) {
+            if (is_invalid(byte))
+                return false;
+        }
+        return true;
+    }
+    for (char16_t unit : local_name.utf16_span()) {
+        if (is_invalid(unit))
+            return false;
+    }
+    return true;
 }
 
 bool is_valid_element_local_name(Utf16View const& name)
@@ -1086,6 +1199,83 @@ void Element::append_attribute(QualifiedName name, Utf16String value)
     handle_attribute_changes(move(attribute_name), move(old_value), move(new_value));
 }
 
+void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16String value, bool skip_observer_checks)
+{
+    // Caller guarantees a brand-new, detached, uncustomized HTML element with no parent, observers, or classList.
+    VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
+        && (!rare_data() || (!rare_data()->registered_observer_list && !element_rare_data()->class_list)));
+    m_subtree_name_filter |= name_filter_bit(name.local_name());
+    m_subtree_attribute_filter |= attribute_filter_bits(name.local_name());
+    if (!m_attributes)
+        m_attributes = AttributeList::create(1);
+    else if (m_attributes->size() == m_attributes->capacity())
+        m_attributes = AttributeList::ensure_room_for_one_more(m_attributes.release_nonnull());
+    m_attributes->unchecked_append(move(name), move(value));
+    auto& attribute = m_attributes->last();
+    auto const& local_name = attribute.name.local_name();
+
+    bool const has_editing_history = !skip_observer_checks && document().editing_history_if_exists() != nullptr;
+    bool const needs_mutation_record = !skip_observer_checks
+        && (document().page().accessibility_interested()
+            || document().page().listen_for_dom_mutations()
+            || document().document_translator_if_exists());
+
+    if (!has_editing_history && !needs_mutation_record) {
+        if (local_name == HTML::AttributeNames::class_) {
+            auto value_view = attribute.value.utf16_view();
+            if (!value_view.is_empty()) {
+                if (!contains_ascii_whitespace(value_view)) {
+                    m_classes.append(Utf16FlyString { attribute.value });
+                    m_subtree_name_filter |= name_filter_bit(m_classes.last());
+                } else {
+                    for_each_ascii_whitespace_separated_token(value_view, [&](auto new_class) {
+                        m_classes.append(Utf16FlyString::from_utf16(new_class));
+                        m_subtree_name_filter |= name_filter_bit(m_classes.last());
+                        return IterationDecision::Continue;
+                    });
+                }
+            }
+            return;
+        }
+
+        if (local_name == HTML::AttributeNames::id
+            && !this->local_name().is_one_of(HTML::TagNames::datalist, HTML::TagNames::map, HTML::TagNames::track)) {
+            if (!attribute.value.is_empty())
+                m_id = Utf16FlyString { attribute.value };
+            return;
+        }
+
+        auto local_name_view = local_name.view();
+        if (local_name_view.length_in_code_units() >= 5
+            && local_name_view.code_unit_at(0) == 'd'
+            && local_name_view.code_unit_at(1) == 'a'
+            && local_name_view.code_unit_at(2) == 't'
+            && local_name_view.code_unit_at(3) == 'a'
+            && local_name_view.code_unit_at(4) == '-') {
+            return;
+        }
+    }
+
+    Optional<Utf16String> const old_value;
+    Optional<Utf16String> const new_value = attribute.value;
+    Optional<Utf16FlyString> const no_namespace;
+
+    if (has_editing_history)
+        document().editing_history_if_exists()->notify_dom_mutation();
+
+    if (needs_mutation_record)
+        queue_mutation_record(MutationType::attributes, local_name, no_namespace, old_value, {}, {}, nullptr, nullptr);
+
+    attribute_changed(local_name, old_value, new_value, no_namespace);
+
+    if (auto* controller = document().spell_check_controller_if_exists()) {
+        if (local_name.is_one_of(HTML::AttributeNames::spellcheck, HTML::AttributeNames::readonly, HTML::AttributeNames::disabled, HTML::AttributeNames::type, HTML::AttributeNames::contenteditable))
+            controller->did_change_checking_state(*this);
+    }
+    if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span))
+        Layout::publish_table_spans(*this);
+}
+
 void Element::change_attribute_value(GC::Ref<Attr> attribute_node, Utf16String value)
 {
     auto index = find_attribute_index_ns(attribute_node->namespace_uri(), attribute_node->local_name());
@@ -1106,7 +1296,10 @@ void Element::handle_attribute_changes(QualifiedName name, Optional<Utf16String>
         history->notify_dom_mutation();
 
     // 1. Queue a mutation record of "attributes" for element with attribute’s local name, attribute’s namespace, oldValue, « », « », null, and null.
-    queue_mutation_record(MutationType::attributes, name.local_name(), name.namespace_(), old_value, {}, {}, nullptr, nullptr);
+    // NB: A detached element with no parent and no rare data has no registered observers of its own or on any ancestor.
+    if (is_connected() || parent() || rare_data() || document().page().accessibility_interested()
+        || document().page().listen_for_dom_mutations() || document().document_translator_if_exists())
+        queue_mutation_record(MutationType::attributes, name.local_name(), name.namespace_(), old_value, {}, {}, nullptr, nullptr);
 
     // 2. If element is custom, then enqueue a custom element callback reaction with element, callback name "attributeChangedCallback",
     //    and « attribute’s local name, oldValue, newValue, attribute’s namespace ».
@@ -1450,50 +1643,54 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
 {
     attribute_changed(local_name, old_value, value, namespace_);
 
+    if (old_value == value)
+        return;
+
     // Published here rather than inside attribute_changed, because that function returns early for
     // the names whose change steps are specified elsewhere - and one of them is `style`, whose
     // early return is taken by exactly the CSSOM writes that change it. An attribute a selector
     // tests has to be heard about however it was written.
-    if (old_value != value)
+    if (is_connected())
         CSS::record_element_attribute_changed(*this, local_name, namespace_, old_value, value);
 
-    if (old_value != value
-        && local_name.is_one_of(HTML::AttributeNames::spellcheck, HTML::AttributeNames::readonly, HTML::AttributeNames::disabled, HTML::AttributeNames::type, HTML::AttributeNames::contenteditable)) {
-        if (auto* controller = document().spell_check_controller_if_exists())
+    if (auto* controller = document().spell_check_controller_if_exists()) {
+        if (local_name.is_one_of(HTML::AttributeNames::spellcheck, HTML::AttributeNames::readonly, HTML::AttributeNames::disabled, HTML::AttributeNames::type, HTML::AttributeNames::contenteditable))
             controller->did_change_checking_state(*this);
     }
 
-    if (old_value != value) {
-        // An SVG element's parsed attributes are layout input, published under its style node. Published here,
-        // after the change steps, rather than from SVGElement's: each SVG element runs its base class's steps before it
-        // parses the new value itself.
-        if (auto* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->attribute_affects_svg_attribute_facts(local_name))
-            svg_element->publish_svg_attribute_facts();
-        if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
-            Layout::publish_table_spans(*this);
-            Layout::ForcedReadScope read { document() };
-            if (auto* layout_node = unsafe_layout_node(read))
-                layout_node->synchronize_table_span_data();
-            // NB: The spans decide which cells of the table's grid are missing, which its boxes fill.
-            if (auto* cell = as_if<HTML::HTMLTableCellElement>(*this); cell && cell->take_table_span_change()) {
-                if (auto table = first_ancestor_of_type<HTML::HTMLTableElement>())
-                    table->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TableCellSpanAttribute);
-            }
+    // An SVG element's parsed attributes are layout input, published under its style node. Published here,
+    // after the change steps, rather than from SVGElement's: each SVG element runs its base class's steps before it
+    // parses the new value itself.
+    if (auto* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->attribute_affects_svg_attribute_facts(local_name))
+        svg_element->publish_svg_attribute_facts();
+    if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
+        Layout::publish_table_spans(*this);
+        Layout::ForcedReadScope read { document() };
+        if (auto* layout_node = unsafe_layout_node(read))
+            layout_node->synchronize_table_span_data();
+        // NB: The spans decide which cells of the table's grid are missing, which its boxes fill.
+        if (auto* cell = as_if<HTML::HTMLTableCellElement>(*this); cell && cell->take_table_span_change()) {
+            if (auto table = first_ancestor_of_type<HTML::HTMLTableElement>())
+                table->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TableCellSpanAttribute);
         }
-        if (!document().suppresses_attribute_style_invalidation()) {
+    }
+    if (!document().suppresses_attribute_style_invalidation()) {
+        if (style_node_id() != 0) {
             CSS::Invalidation::invalidate_style_after_attribute_change(
                 *this,
                 local_name,
                 old_value,
                 value);
-            if (local_name == HTML::AttributeNames::id || local_name == HTML::AttributeNames::class_)
-                invalidate_content_blocker_style_if_needed(*this);
         }
+        if (is_connected() && (local_name == HTML::AttributeNames::id || local_name == HTML::AttributeNames::class_))
+            invalidate_content_blocker_style_if_needed(*this);
+    }
+    if (parent() || rare_data()) {
         auto html_collection_invalidation_types = document().html_collection_attribute_invalidation_types_for_attribute(local_name, namespace_);
         if (html_collection_invalidation_types != 0)
             invalidate_html_collection_caches_in_ancestors_for_attribute_change(html_collection_invalidation_types);
-        bump_dom_tree_version_for_attribute_change();
     }
+    bump_dom_tree_version_for_attribute_change();
 }
 
 // https://drafts.csswg.org/css-overflow-3/#overflow-propagation
@@ -2607,7 +2804,7 @@ void Element::did_update_inline_style()
         document().mark_style_attribute_dirty(*this);
     m_style_attribute_is_dirty = true;
     // The style attribute is appended when it is next synchronized, but a selector query may skip this subtree before.
-    add_to_subtree_name_filter(name_filter_bit(HTML::AttributeNames::style));
+    add_to_subtree_filters(name_filter_bit(HTML::AttributeNames::style), attribute_filter_bits(HTML::AttributeNames::style));
     queue_mutation_record(MutationType::attributes, HTML::AttributeNames::style, {}, old_value, {}, {}, nullptr, nullptr);
 
     if (!document().suppresses_attribute_style_invalidation())
@@ -2722,11 +2919,12 @@ CSSPixelRect Element::bounding_client_rect_assuming_layout_clean() const
     Layout::ForcedReadScope read { document() };
     if (!document().navigable())
         return {};
-    auto viewport_mapping = Painting::viewport_mapping(document());
     auto const* layout_node = principal_layout_node(read);
     if (!layout_node)
         return {};
-    return Painting::bounding_client_rect(*layout_node, viewport_mapping);
+    if (document().can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node))
+        return Painting::bounding_client_rect(*layout_node, Layout::RustFFI::FfiViewportMapping {});
+    return Painting::bounding_client_rect(*layout_node, Painting::viewport_mapping(document()));
 }
 
 CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Layout::BegunRead const& read, MonotonicTime visual_animation_sample_time) const
@@ -2911,7 +3109,8 @@ void Element::inserted()
             invalidate_content_blocker_style_if_needed(*this);
     }
 
-    play_or_cancel_animations_after_display_property_change();
+    if (element_animations_if_created())
+        play_or_cancel_animations_after_display_property_change();
 
     // A shadow root's counter style names pass on to the scope its host is in, which a move of the host can change.
     if (m_shadow_root)
@@ -2935,28 +3134,37 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
             document().element_with_id_was_removed({}, *this);
         if (m_has_name)
             document().element_with_name_was_removed({}, *this);
-        // A shadow root leaves with its host, so an element in a shadow tree registered its names
-        // with the shadow root it still has, not with the root its host left.
-        auto& anchor_name_root = is<ShadowRoot>(root()) ? root() : old_root;
-        if (unregister_current_anchor_names(*this, anchor_name_root)) {
-            // Positioned boxes anywhere may hold geometry resolved against these names, which
-            // the partial relayout planner's subtree check can no longer see.
-            document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
+        if (has_style()) {
+            if (auto const* anchor_values = style_group<CSS::ComputedValues::AnchorValues>(); anchor_values && !anchor_values->anchor_names_span().is_empty()) {
+                // A shadow root leaves with its host, so an element in a shadow tree registered its names
+                // with the shadow root it still has, not with the root its host left.
+                auto& current_root = root();
+                auto& anchor_name_root = is<ShadowRoot>(current_root) ? current_root : old_root;
+                if (unregister_current_anchor_names(*this, anchor_name_root)) {
+                    // Positioned boxes anywhere may hold geometry resolved against these names, which
+                    // the partial relayout planner's subtree check can no longer see.
+                    document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
+                }
+            }
         }
     }
 
-    play_or_cancel_animations_after_display_property_change();
-    exit_fullscreen_on_element_removal();
+    if (element_animations_if_created())
+        play_or_cancel_animations_after_display_property_change();
+    if (document().fullscreen_element())
+        exit_fullscreen_on_element_removal();
 
     if (has_style()) {
         Layout::ForcedReadScope read { document() };
         replace_installed_style(read, {});
     }
-    for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-        note_subtree_style_moved();
-        pseudo_element.clear_computed_style();
-    });
-    clear_custom_highlight_styles();
+    if (rare_data()) {
+        for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
+            note_subtree_style_moved();
+            pseudo_element.clear_computed_style();
+        });
+        clear_custom_highlight_styles();
+    }
 
     // A shadow root's counter style names pass on to the scope its host is in, which a move of the host can change.
     if (m_shadow_root)
@@ -5307,7 +5515,7 @@ void Element::install_engine_pseudo_element_custom_property_data(Layout::BegunRe
     auto element_data = custom_property_data({});
     auto inherited = element_data ? element_data->inheritable(read, document()) : nullptr;
     auto data = inherited;
-    if (style_computer.style_engine().is_engine_custom_property_environment(read, environment) && environment != (inherited ? inherited->identity() : 0)) {
+    if (environment != (inherited ? inherited->identity() : 0) && style_computer.style_engine().is_engine_custom_property_environment(read, environment)) {
         data = style_computer.engine_custom_property_environment(read, environment, inherited);
         // NB: Where the engine resolved the environment over another one than the pseudo-element inherits now, as a
         //     store shared with an element under another parent names the one it was resolved over last, its
@@ -5907,13 +6115,21 @@ void Element::schedule_list_item_renumber_for_list_owner()
 
 bool Element::after_pseudo_element_style_depends_on_list_item_counter() const
 {
-    auto style_depends_on_list_item_counter = [](CSS::ComputedValues const& style) {
-        return style.display().is_list_item()
-            || (style.generated_content_facts() & (CSS::ComputedValuesFFI::GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER | CSS::ComputedValuesFFI::GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER));
-    };
+    auto const* groups = style_record_groups(CSS::PseudoElement::After);
+    if (!groups)
+        return false;
+    auto display = CSS::display_from_ffi_display(CSS::style_record_group<CSS::ComputedValues::BoxValues>(groups).display);
+    if (display.is_list_item())
+        return true;
+    auto const& content = CSS::style_record_group<CSS::ComputedValues::ContentValues>(groups);
+    auto facts = CSS::ComputedValuesFFI::rust_content_group_generated_content_facts(&content);
+    return (facts & (CSS::ComputedValuesFFI::GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER | CSS::ComputedValuesFFI::GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER)) != 0;
+}
 
-    auto style = computed_style(CSS::PseudoElement::After);
-    return style && style_depends_on_list_item_counter(*style);
+static bool style_groups_content_uses_list_item_counter(CSS::ComputedValuesFFI::StyleRecordGroups const* groups)
+{
+    auto const& content = CSS::style_record_group<CSS::ComputedValues::ContentValues>(groups);
+    return (CSS::ComputedValuesFFI::rust_content_group_generated_content_facts(&content) & CSS::ComputedValuesFFI::GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER) != 0;
 }
 
 static bool subtree_renders_list_item_counters(Element const& ancestor, bool items_renumber_with_walked_owner)
@@ -5922,25 +6138,29 @@ static bool subtree_renders_list_item_counters(Element const& ancestor, bool ite
         auto* element = as_if<Element>(*child);
         if (!element)
             continue;
-        auto style = element->computed_style();
-        if (!style || style->display().is_none())
+        auto const* groups = element->style_record_groups();
+        if (!groups)
             continue;
-        if (style->content_uses_list_item_counter())
+        auto display = CSS::display_from_ffi_display(CSS::style_record_group<CSS::ComputedValues::BoxValues>(groups).display);
+        if (display.is_none())
+            continue;
+        if (style_groups_content_uses_list_item_counter(groups))
             return true;
-        for (auto pseudo_element : { CSS::PseudoElement::Before, CSS::PseudoElement::After }) {
-            auto pseudo_style = element->computed_style(pseudo_element);
-            if (pseudo_style && pseudo_style->content_uses_list_item_counter())
+        if (auto const* before_groups = element->style_record_groups(CSS::PseudoElement::Before); before_groups && style_groups_content_uses_list_item_counter(before_groups))
+            return true;
+        if (auto const* after_groups = element->style_record_groups(CSS::PseudoElement::After); after_groups && style_groups_content_uses_list_item_counter(after_groups))
+            return true;
+        auto const* marker_groups = element->style_record_groups(CSS::PseudoElement::Marker);
+        if (marker_groups && style_groups_content_uses_list_item_counter(marker_groups))
+            return true;
+        if (items_renumber_with_walked_owner && display.is_list_item()) {
+            auto const& list_table = CSS::style_record_group<CSS::ComputedValues::InheritedListTableValues>(groups);
+            auto const* list_style_type = static_cast<CSS::StyleValueFFI::StyleValueData const*>(list_table.list_style_type.pointer);
+            if ((!marker_groups || CSS::style_record_group<CSS::ComputedValues::ContentValues>(marker_groups).content_is_normal())
+                && element->style_scope().list_style_type_depends_on_counter_value(list_style_type)
+                && !list_table.list_style_image_value())
                 return true;
         }
-        auto marker_style = element->computed_style(CSS::PseudoElement::Marker);
-        if (marker_style && marker_style->content_uses_list_item_counter())
-            return true;
-        if (items_renumber_with_walked_owner
-            && style->display().is_list_item()
-            && (!marker_style || marker_style->content_is_normal())
-            && !style->list_style_image()
-            && element->style_scope().list_style_type_depends_on_counter_value(style->list_style_type_data()))
-            return true;
         if (subtree_renders_list_item_counters(*element, items_renumber_with_walked_owner && !element->is_html_ol_ul_menu_element()))
             return true;
     }
@@ -6309,48 +6529,39 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         return;
     }
 
-    // https://html.spec.whatwg.org/multipage/dom.html#render-blocking-mechanism
-    // Whenever a render-blocking element el becomes browsing-context disconnected, or el's blocking attribute's
-    // value is changed so that el is no longer potentially render-blocking, then unblock rendering on el.
-    if (local_name == HTML::AttributeNames::blocking && document().is_render_blocking_element(*this) && !is_potentially_render_blocking())
-        unblock_rendering();
+    auto value_or_empty = value.has_value() ? value->utf16_view() : u""sv;
 
-    // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext①
-    // 1. If localName is slot and namespace is null, then:
-    if (local_name == HTML::AttributeNames::slot) {
-        // 1. If value is oldValue, then return.
-        if (value == old_value)
-            return;
+    if (local_name == HTML::AttributeNames::class_) {
+        // Elements without a StyleEngine identity have no feature state to update. Avoid moving
+        // their class list out just for record_element_class_list_changed() to reject the update.
+        Optional<Vector<Utf16FlyString, 1>> old_style_engine_classes;
+        if (style_node_id().value() != 0)
+            old_style_engine_classes = move(m_classes);
 
-        // 2. If value is null and oldValue is the empty string, then return.
-        if (!value.has_value() && old_value == Utf16String {})
-            return;
+        if (value_or_empty.is_empty()) {
+            m_classes.clear();
+        } else {
+            m_classes.clear();
+            if (!contains_ascii_whitespace(value_or_empty)) {
+                m_classes.append(Utf16FlyString { *value });
+                add_to_subtree_name_filter(name_filter_bit(m_classes.last()));
+            } else {
+                for_each_ascii_whitespace_separated_token(value_or_empty, [&](auto new_class) {
+                    m_classes.append(Utf16FlyString::from_utf16(new_class));
+                    add_to_subtree_name_filter(name_filter_bit(m_classes.last()));
+                    return IterationDecision::Continue;
+                });
+            }
+        }
+        if (auto* rare_data = element_rare_data(); rare_data && rare_data->class_list)
+            rare_data->class_list->associated_attribute_changed(value);
 
-        // 3. If value is the empty string and oldValue is null, then return.
-        if (value == Utf16String {} && !old_value.has_value())
-            return;
-
-        // AD-HOC: Assigned nodes are recomputed lazily.
-        if (auto assigned_slot = assigned_slot_internal())
-            assigned_slot->assign_slottables_if_needed();
-
-        // 4. If value is null or the empty string, then set element’s name to the empty string.
-        if (!value.has_value() || value->is_empty())
-            set_slottable_name({});
-        // 5. Otherwise, set element’s name to value.
-        else
-            set_slottable_name(*value);
-
-        // 6. If element is assigned, then run assign slottables for element’s assigned slot.
-        if (auto assigned_slot = assigned_slot_internal())
-            assign_slottables(*assigned_slot);
-
-        // 7. Run assign a slot for element.
-        assign_a_slot(GC::Ref { *this });
+        if (old_style_engine_classes.has_value())
+            CSS::record_element_class_list_changed(*this, *old_style_engine_classes, m_classes);
+        else if (is_connected())
+            CSS::record_waiting_element_classes_changed(*this);
         return;
     }
-
-    auto value_or_empty = value.has_value() ? value->utf16_view() : u""sv;
 
     if (local_name == HTML::AttributeNames::id) {
         // StyleEngine keys local features by interned atom, so capture the old side before the
@@ -6368,41 +6579,10 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
                 document().element_id_changed({}, *this, old_id);
             CSS::record_element_id_changed(*this, m_id);
         }
-    } else if (local_name == HTML::AttributeNames::name) {
-        m_has_name = !value_or_empty.is_empty();
-        if (m_has_name) {
-            ensure_element_rare_data().name = Utf16FlyString::from_utf16(value_or_empty);
-        } else if (auto* rare_data = element_rare_data()) {
-            rare_data->name = {};
-        }
+        return;
+    }
 
-        if (is_connected())
-            document().element_name_changed({}, *this);
-    } else if (local_name == HTML::AttributeNames::class_) {
-        // Elements without a StyleEngine identity have no feature state to update. Avoid moving
-        // their class list out just for record_element_class_list_changed() to reject the update.
-        Optional<Vector<Utf16FlyString, 1>> old_style_engine_classes;
-        if (style_node_id().value() != 0)
-            old_style_engine_classes = move(m_classes);
-
-        if (value_or_empty.is_empty()) {
-            m_classes.clear();
-        } else {
-            m_classes.clear();
-            for_each_ascii_whitespace_separated_token(value_or_empty, [&](auto new_class) {
-                m_classes.append(Utf16FlyString::from_utf16(new_class));
-                add_to_subtree_name_filter(name_filter_bit(m_classes.last()));
-                return IterationDecision::Continue;
-            });
-        }
-        if (auto* rare_data = element_rare_data(); rare_data && rare_data->class_list)
-            rare_data->class_list->associated_attribute_changed(value);
-
-        if (old_style_engine_classes.has_value())
-            CSS::record_element_class_list_changed(*this, *old_style_engine_classes, m_classes);
-        else if (is_connected())
-            CSS::record_waiting_element_classes_changed(*this);
-    } else if (local_name == HTML::AttributeNames::style) {
+    if (local_name == HTML::AttributeNames::style) {
         // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
         if (m_inline_style && m_inline_style->is_updating())
             return;
@@ -6451,7 +6631,67 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             return;
         }
         set_inline_style_declarations_from_text(style_attribute_is_blocked_by_content_security_policy(*this, *value) ? Utf16View {} : *value);
-    } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
+        return;
+    }
+
+    if (local_name == HTML::AttributeNames::name) {
+        m_has_name = !value_or_empty.is_empty();
+        if (m_has_name) {
+            ensure_element_rare_data().name = Utf16FlyString::from_utf16(value_or_empty);
+        } else if (auto* rare_data = element_rare_data()) {
+            rare_data->name = {};
+        }
+
+        if (is_connected())
+            document().element_name_changed({}, *this);
+        return;
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#render-blocking-mechanism
+    // Whenever a render-blocking element el becomes browsing-context disconnected, or el's blocking attribute's
+    // value is changed so that el is no longer potentially render-blocking, then unblock rendering on el.
+    if (local_name == HTML::AttributeNames::blocking) {
+        if (document().is_render_blocking_element(*this) && !is_potentially_render_blocking())
+            unblock_rendering();
+        return;
+    }
+
+    // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext①
+    // 1. If localName is slot and namespace is null, then:
+    if (local_name == HTML::AttributeNames::slot) {
+        // 1. If value is oldValue, then return.
+        if (value == old_value)
+            return;
+
+        // 2. If value is null and oldValue is the empty string, then return.
+        if (!value.has_value() && old_value == Utf16String {})
+            return;
+
+        // 3. If value is the empty string and oldValue is null, then return.
+        if (value == Utf16String {} && !old_value.has_value())
+            return;
+
+        // AD-HOC: Assigned nodes are recomputed lazily.
+        if (auto assigned_slot = assigned_slot_internal())
+            assigned_slot->assign_slottables_if_needed();
+
+        // 4. If value is null or the empty string, then set element’s name to the empty string.
+        if (!value.has_value() || value->is_empty())
+            set_slottable_name({});
+        // 5. Otherwise, set element’s name to value.
+        else
+            set_slottable_name(*value);
+
+        // 6. If element is assigned, then run assign slottables for element’s assigned slot.
+        if (auto assigned_slot = assigned_slot_internal())
+            assign_slottables(*assigned_slot);
+
+        // 7. Run assign a slot for element.
+        assign_a_slot(GC::Ref { *this });
+        return;
+    }
+
+    if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
         bool const is_dir = local_name == HTML::AttributeNames::dir;
         if (is_dir) {
             // https://html.spec.whatwg.org/multipage/dom.html#attr-dir
@@ -6474,7 +6714,10 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             CSS::Invalidation::invalidate_style_after_directionality_change(*this);
         else
             CSS::Invalidation::invalidate_style_after_language_change(*this);
-    } else if (local_name == HTML::AttributeNames::part) {
+        return;
+    }
+
+    if (local_name == HTML::AttributeNames::part) {
         if (auto* rare_data = element_rare_data())
             rare_data->parts.clear();
         if (!value_or_empty.is_empty()) {
@@ -6496,14 +6739,19 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         if (auto* rare_data = element_rare_data(); rare_data && rare_data->part_list)
             rare_data->part_list->associated_attribute_changed(value);
         CSS::record_element_parts_changed(*this);
-    } else if (local_name == HTML::AttributeNames::exportparts) {
+        return;
+    }
+
+    if (local_name == HTML::AttributeNames::exportparts) {
         CSS::Invalidation::invalidate_style_after_exportparts_attribute_change(*this);
+        return;
     }
 
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes:concept-element-attributes-change-ext
     // 1. If localName is not attr or namespace is not null, then return.
     // 2. Set element's explicitly set attr-element to null.
-    if (local_name.view().starts_with(u"aria-"sv)) {
+    auto local_name_view = local_name.view();
+    if (local_name_view.length_in_code_units() >= 5 && local_name_view.code_unit_at(0) == 'a' && local_name_view.starts_with(u"aria-"sv)) {
 #define __ENUMERATE_ARIA_ATTRIBUTE(attribute, referencing_attribute) \
     if (local_name == ARIA::AttributeNames::referencing_attribute) { \
         set_##attribute({});                                         \
@@ -7396,16 +7644,16 @@ WebIDL::ExceptionOr<void> insert_adjacent_html(DOM::Element& element, Utf16Strin
 
 WebIDL::ExceptionOr<void> set_attribute(DOM::Element& element, Utf16String const& qualified_name, Variant<GC::Ref<TrustedTypes::TrustedHTML>, GC::Ref<TrustedTypes::TrustedScript>, GC::Ref<TrustedTypes::TrustedScriptURL>, Utf16String> const& value)
 {
-    auto utf16_qualified_name = Utf16FlyString::from_utf16(qualified_name.utf16_view());
-    auto qualified_name_string = qualified_name;
-    if (!DOM::is_valid_attribute_local_name(qualified_name_string.utf16_view()))
+    auto qualified_name_view = qualified_name.utf16_view();
+    if (!DOM::is_valid_attribute_local_name(qualified_name_view))
         return WebIDL::InvalidCharacterError::create("Attribute name must not be empty or contain invalid characters"_utf16);
 
+    auto utf16_qualified_name = Utf16FlyString::from_utf16(qualified_name_view);
     if (element.namespace_uri() == Namespace::HTML && element.document().document_type() == DOM::Document::Type::HTML)
         utf16_qualified_name = utf16_qualified_name.to_ascii_lowercase();
 
     auto const verified_value = TRY(TrustedTypes::get_trusted_types_compliant_attribute_value(utf16_qualified_name, {}, element, value));
-    element.set_attribute(FlyString { utf16_qualified_name.to_utf16_string().to_utf8() }, verified_value);
+    element.set_attribute(utf16_qualified_name, verified_value);
     return {};
 }
 

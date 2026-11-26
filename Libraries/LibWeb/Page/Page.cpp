@@ -753,6 +753,14 @@ void Page::keyboard_scroll_event_path_changed(DOM::EventTarget const& target)
         invalidate_compositor_keyboard_scroll_state();
 }
 
+bool Page::keyboard_scroll_tracks_document(DOM::Document const& document) const
+{
+    if (!m_keyboard_scroll_state_is_current || !has_local_traversable())
+        return false;
+    auto active_document = local_traversable()->active_document();
+    return active_document && active_document.ptr() == &document;
+}
+
 void Page::keyboard_scroll_dom_tree_changed(DOM::Node const& subtree)
 {
     if (!m_keyboard_scroll_state_is_current || !has_local_traversable())

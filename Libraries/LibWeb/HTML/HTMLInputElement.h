@@ -76,7 +76,7 @@ public:
     virtual CSS::ElementBoxKind box_kind() const override;
     virtual void set_being_activated(bool) override;
 
-    enum class TypeAttributeState {
+    enum class TypeAttributeState : u8 {
 #define __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE(_, state) state,
         ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTES
 #undef __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE
@@ -182,7 +182,12 @@ public:
         int x { 0 };
         int y { 0 };
     };
-    SelectedCoordinate selected_coordinate() const { return m_selected_coordinate; }
+    SelectedCoordinate selected_coordinate() const
+    {
+        if (m_rare_input_data)
+            return m_rare_input_data->selected_coordinate;
+        return {};
+    }
 
     Optional<double> value_as_date() const;
     WebIDL::ExceptionOr<void> set_value_as_date(Optional<double>);
@@ -403,6 +408,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
     Utf16String value_sanitization_algorithm(Utf16View) const;
+    Utf16String value_sanitization_algorithm(Utf16String const&) const;
 
     enum class ColorSpaceState : u8 {
         LimitedSRGB,
@@ -421,9 +427,71 @@ private:
     static ValueAttributeMode value_attribute_mode_for_type_state(TypeAttributeState);
     ValueAttributeMode value_attribute_mode() const;
 
+    struct RareInputData {
+        AK_MAKE_NONCOPYABLE(RareInputData);
+        AK_MAKE_NONMOVABLE(RareInputData);
+        AK_ALLOC_WITH_KMALLOC;
+
+    public:
+        RareInputData() = default;
+
+        void visit_edges(Cell::Visitor&);
+
+        GC::Ptr<DOM::Element> search_clear_button;
+
+        GC::Ptr<DOM::Element> date_time_fields_container;
+        Vector<DateTimeField> date_time_fields;
+        Vector<Utf16String> day_period_names;
+        Optional<Utf16String> date_time_fields_value;
+        size_t active_date_time_field { 0 };
+        u8 date_time_field_typed_digits { 0 };
+        bool date_time_fields_show_seconds { false };
+
+        GC::Ptr<DOM::Text> image_button_alt_text_node;
+        GC::Ptr<DOM::Element> up_button_element;
+        GC::Ptr<DOM::Element> down_button_element;
+
+        GC::Ptr<DOM::Element> color_well_element;
+
+        GC::Ptr<DOM::Element> file_button;
+        GC::Ptr<DOM::Element> file_label;
+
+        GC::Ptr<DOM::Element> slider_runnable_track;
+        GC::Ptr<DOM::Element> slider_progress_element;
+        GC::Ptr<DOM::Element> slider_thumb_container;
+        GC::Ptr<DOM::Element> slider_thumb;
+        GC::Ptr<DOM::Element> slider_ticks_element;
+        Vector<double> slider_tick_positions;
+        GC::Ptr<DOM::IDLEventListener> slider_drag_mousemove_listener;
+        GC::Ptr<DOM::IDLEventListener> slider_drag_mouseup_listener;
+
+        GC::Ptr<SharedResourceRequest> resource_request;
+        SelectedCoordinate selected_coordinate;
+
+        Optional<DOM::DocumentLoadEventDelayer> load_event_delayer;
+
+        GC::Ptr<RadioButtonGroupRegistry> radio_button_group_registry;
+        Utf16FlyString radio_button_group_name;
+
+        GC::Ptr<HTMLInputElement> legacy_pre_activation_behavior_checked_element_in_group;
+
+        // https://html.spec.whatwg.org/multipage/input.html#concept-input-type-file-selected
+        GC::Ptr<FileAPI::FileList> selected_files;
+
+        Utf16String last_src_value;
+    };
+
+    RareInputData* rare_input_data() { return m_rare_input_data.ptr(); }
+    RareInputData const* rare_input_data() const { return m_rare_input_data.ptr(); }
+    RareInputData& ensure_rare_input_data()
+    {
+        if (!m_rare_input_data)
+            m_rare_input_data = make<RareInputData>();
+        return *m_rare_input_data;
+    }
+
     void update_text_input_decorations();
     GC::Ptr<DOM::Element> m_placeholder_element;
-    GC::Ptr<DOM::Element> m_search_clear_button;
     GC::Ptr<DOM::Text> m_placeholder_text_node;
 
     void update_button_input_shadow_tree();
@@ -444,82 +512,51 @@ private:
     i32 date_time_field_minimum(DateTimeField::Kind) const;
     i32 date_time_field_maximum(DateTimeField::Kind) const;
 
-    GC::Ptr<DOM::Element> m_date_time_fields_container;
-    Vector<DateTimeField> m_date_time_fields;
-    Vector<Utf16String> m_day_period_names;
-    Optional<Utf16String> m_date_time_fields_value;
-    size_t m_active_date_time_field { 0 };
-    u8 m_date_time_field_typed_digits { 0 };
-    bool m_date_time_fields_show_seconds { false };
-
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Text> m_text_node;
-    GC::Ptr<DOM::Text> m_image_button_alt_text_node;
-    bool m_checked { false };
-    GC::Ptr<DOM::Element> m_up_button_element;
-    GC::Ptr<DOM::Element> m_down_button_element;
 
     void update_color_well_element();
-    GC::Ptr<DOM::Element> m_color_well_element;
 
     void update_file_input_shadow_tree();
-    GC::Ptr<DOM::Element> m_file_button;
-    GC::Ptr<DOM::Element> m_file_label;
 
     void update_slider_shadow_tree_elements();
     void update_slider_ticks();
-    GC::Ptr<DOM::Element> m_slider_runnable_track;
-    GC::Ptr<DOM::Element> m_slider_progress_element;
-    GC::Ptr<DOM::Element> m_slider_thumb_container;
-    GC::Ptr<DOM::Element> m_slider_thumb;
-    GC::Ptr<DOM::Element> m_slider_ticks_element;
-    Vector<double> m_slider_tick_positions;
     void set_slider_value_from_position(CSSPixelPoint viewport_position);
     void end_slider_drag();
-    GC::Ptr<DOM::IDLEventListener> m_slider_drag_mousemove_listener;
-    GC::Ptr<DOM::IDLEventListener> m_slider_drag_mouseup_listener;
 
     GC::Ptr<DecodedImageData> image_data() const;
-    GC::Ptr<SharedResourceRequest> m_resource_request;
-    SelectedCoordinate m_selected_coordinate;
 
     Optional<regex::ECMAScriptRegex> compiled_pattern_regular_expression() const;
 
     Optional<GC::Ref<HTMLDataListElement const>> suggestions_source_element() const;
 
-    Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
+    OwnPtr<RareInputData> m_rare_input_data;
 
-    // https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate
-    bool m_indeterminateness { false };
-
-    // https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag
-    bool m_dirty_checkedness { false };
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty
-    bool m_dirty_value { false };
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
-    bool m_user_validity { false };
-
-    GC::Ptr<RadioButtonGroupRegistry> m_radio_button_group_registry;
-    Utf16FlyString m_radio_button_group_name;
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
-    bool m_before_legacy_pre_activation_behavior_checked { false };
-    bool m_before_legacy_pre_activation_behavior_indeterminate { false };
-    GC::Ptr<HTMLInputElement> m_legacy_pre_activation_behavior_checked_element_in_group;
-
-    // https://html.spec.whatwg.org/multipage/input.html#concept-input-type-file-selected
-    GC::Ptr<FileAPI::FileList> m_selected_files;
-
-    TypeAttributeState m_type { TypeAttributeState::Text };
     Utf16String m_value;
 
-    Utf16String m_last_src_value;
+    TypeAttributeState m_type { TypeAttributeState::Text };
 
-    bool m_has_uncommitted_changes { false };
+    bool m_checked : 1 { false };
 
-    bool m_is_open { false };
+    // https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate
+    bool m_indeterminateness : 1 { false };
+
+    // https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag
+    bool m_dirty_checkedness : 1 { false };
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty
+    bool m_dirty_value : 1 { false };
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
+    bool m_user_validity : 1 { false };
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
+    bool m_before_legacy_pre_activation_behavior_checked : 1 { false };
+    bool m_before_legacy_pre_activation_behavior_indeterminate : 1 { false };
+
+    bool m_has_uncommitted_changes : 1 { false };
+
+    bool m_is_open : 1 { false };
 
     void signal_a_type_change();
 

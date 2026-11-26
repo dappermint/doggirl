@@ -164,6 +164,7 @@ static Optional<Utf16View> optional_utf16_view(Optional<Utf16String> const& stri
 HTMLElement::HTMLElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : Element(document, move(qualified_name))
 {
+    set_wrappable_flag(WrappableFlag::IsHTMLElement);
 }
 
 HTMLElement::~HTMLElement() = default;
@@ -1124,16 +1125,36 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
 
         void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
+    Optional<GC::RootVector<PreviousReadWriteState>> previous_read_write_states;
     if (name == HTML::AttributeNames::contenteditable && old_value != value) {
+        previous_read_write_states.emplace();
         for_each_in_inclusive_subtree_of_type<DOM::Element>([&](DOM::Element& element) {
-            previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
+            previous_read_write_states->append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
             return TraversalDecision::Continue;
         });
     }
 
     Base::attribute_changed(name, old_value, value, namespace_);
-    HTMLOrSVGOrMathMLElement::attribute_changed(name, old_value, value, namespace_);
+
+    if (!namespace_.has_value()) {
+        if (name == HTML::AttributeNames::class_
+            || name == HTML::AttributeNames::id
+            || name == HTML::AttributeNames::style
+            || name == HTML::AttributeNames::href)
+            return;
+
+        if (name == HTML::AttributeNames::type
+            || name == HTML::AttributeNames::value
+            || name == HTML::AttributeNames::checked
+            || name == HTML::AttributeNames::name) {
+            if (is_form_associated_element())
+                form_associated_element_attribute_changed(name, old_value, value, namespace_);
+            return;
+        }
+    }
+
+    if (name == HTML::AttributeNames::nonce && !namespace_.has_value())
+        HTMLOrSVGOrMathMLElement::attribute_changed(name, old_value, value, namespace_);
 
     if (name == HTML::AttributeNames::contenteditable) {
         if (!value.has_value()) {
@@ -1153,25 +1174,32 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
             m_content_editable_state = ContentEditableState::Inherit;
         }
         recompute_editable_subtree_flags_and_repaint();
-        for (auto const& state : previous_read_write_states)
-            CSS::Invalidation::invalidate_style_after_read_write_state_change(*state.element, state.value);
+        if (previous_read_write_states.has_value()) {
+            for (auto const& state : *previous_read_write_states)
+                CSS::Invalidation::invalidate_style_after_read_write_state_change(*state.element, state.value);
+        }
     } else if (name == HTML::AttributeNames::inert) {
         // https://html.spec.whatwg.org/multipage/interaction.html#the-inert-attribute
         // The inert attribute is a boolean attribute that indicates, by its presence, that the element and all its flat tree descendants which don't otherwise escape inertness
         // (such as modal dialogs) are to be made inert by the user agent.
         auto is_inert = value.has_value();
+        if (is_inert)
+            document().set_has_inert_element();
         set_subtree_inertness(is_inert);
     }
 
     // 1. If namespace is not null, or localName is not the name of an event handler content attribute on element, then return.
-    if (!namespace_.has_value() && name.view().starts_with(u"on"sv)) {
+    if (!namespace_.has_value()) {
+        auto name_view = name.view();
+        if (name_view.length_in_code_units() >= 2 && name_view.code_unit_at(0) == 'o' && name_view.code_unit_at(1) == 'n') {
 #undef __ENUMERATE
 #define __ENUMERATE(attribute_name, event_name)               \
     if (name == HTML::AttributeNames::attribute_name) {       \
         element_event_handler_attribute_changed(name, value); \
     }
-        ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
+            ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
 #undef __ENUMERATE
+        }
     }
 
     [&]() {
@@ -1196,7 +1224,8 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
     }();
 
     if (!namespace_.has_value() && is_form_associated_element()) {
-        form_node_attribute_changed(name, value);
+        if (name == HTML::AttributeNames::form)
+            form_node_attribute_changed(name, value);
         form_associated_element_attribute_changed(name, old_value, value, namespace_);
         if (name == HTML::AttributeNames::disabled) {
             if (auto* input = as_if<HTMLInputElement>(*this))
@@ -1273,8 +1302,16 @@ void HTMLElement::inserted()
     Base::inserted();
     HTMLOrSVGOrMathMLElement::inserted();
 
-    if (nearest_html_element_is_inert(parent_or_shadow_host_node()) && !has_attribute(HTML::AttributeNames::inert))
-        set_subtree_inertness(true);
+    if (document().has_inert_element()) {
+        auto* parent_node = parent_or_shadow_host_node();
+        bool parent_is_inert = false;
+        if (auto const* parent_html = as_if<HTMLElement>(parent_node))
+            parent_is_inert = parent_html->is_inert();
+        else if (parent_node)
+            parent_is_inert = nearest_html_element_is_inert(parent_node);
+        if (parent_is_inert && !has_attribute(HTML::AttributeNames::inert))
+            set_subtree_inertness(true);
+    }
 
     if (is_form_associated_element()) {
         form_node_was_inserted();
@@ -2685,7 +2722,7 @@ void HTMLElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor
         MUST(hide_popover(FocusPreviousElement::No, FireEvents::No, ThrowExceptions::No, IgnoreDomState::Yes, nullptr));
 
     // AD-HOC: Update inertness
-    if (nearest_html_element_is_inert(old_ancestor) && !has_attribute(HTML::AttributeNames::inert))
+    if (document().has_inert_element() && nearest_html_element_is_inert(old_ancestor) && !has_attribute(HTML::AttributeNames::inert))
         set_subtree_inertness(false);
 }
 
@@ -2708,7 +2745,7 @@ void HTMLElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<DOM::Node> o
     }
 
     // AD-HOC: Update inertness
-    if (!has_attribute(HTML::AttributeNames::inert)) {
+    if (document().has_inert_element() && !has_attribute(HTML::AttributeNames::inert)) {
         bool parent_is_inert = nearest_html_element_is_inert(parent_or_shadow_host_node());
         if (is_inert() != parent_is_inert)
             set_subtree_inertness(parent_is_inert);

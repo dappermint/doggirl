@@ -822,9 +822,9 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
     , m_fonts(CSS::FontFaceSet::create(relevant_settings_object()))
     , m_temporary_document_for_fragment_parsing(temporary_document_for_fragment_parsing == TemporaryDocumentForFragmentParsing::Yes)
     , m_editing_host_manager(EditingHostManager::create(*this))
-    , m_dynamic_view_transition_style_sheet(parse_css_stylesheet(CSS::Parser::ParsingParams {}, ""sv, {}))
     , m_style_scope(*this)
 {
+    set_wrappable_flag(WrappableFlag::IsDocument);
     m_rust_custom_property_registry = CSS::ComputedValuesFFI::rust_custom_property_registry_create();
     m_animations = Animations::RustFFI::animations_document_animations_create();
 
@@ -2536,14 +2536,14 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
 bool Document::is_clean_for_layout_geometry_read(Layout::BegunRead const& read) const
 {
     return m_has_completed_style_update
-        && layout_is_up_to_date()
-        && m_elements_with_dirty_style_attributes.is_empty()
-        && m_elements_with_dirty_svg_presentation_attributes.is_empty()
-        && !style_computer().style_engine().has_pending_transaction(read)
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
-        && !has_size_containers_needing_evaluation_after_layout(read)
-        && m_elements_with_pending_top_layer_membership_change.is_empty();
+        && m_elements_with_dirty_style_attributes.is_empty()
+        && m_elements_with_dirty_svg_presentation_attributes.is_empty()
+        && m_elements_with_pending_top_layer_membership_change.is_empty()
+        && layout_is_up_to_date()
+        && !style_computer().style_engine().has_pending_transaction(read)
+        && !has_size_containers_needing_evaluation_after_layout(read);
 }
 
 void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutReason reason)
@@ -4104,6 +4104,10 @@ void Document::adopt_node_steps(Node& node)
         //     make the answer more conservative.
         if (old_document.may_have_blocking_wheel_event_listener())
             set_may_have_blocking_wheel_event_listener();
+        if (old_document.has_form_element())
+            set_has_form_element();
+        if (old_document.has_inert_element())
+            set_has_inert_element();
         if (old_document.has_svg_paint_resource_element())
             set_has_svg_paint_resource_element();
 
@@ -8592,6 +8596,9 @@ Animations::NamedTimelines& Document::named_timelines()
 
 int Document::compare_elements_in_tree_order_for_composite_order(Element& first, Element& second)
 {
+    if (&first == &second)
+        return 0;
+
     // NB: Comparisons cost less than a walk of the document until enough of them have gone by at one version of the
     //     tree, which is more of them the more elements the last walk found.
     static constexpr u32 minimum_compares_before_tree_positions = 256;
@@ -8603,16 +8610,18 @@ int Document::compare_elements_in_tree_order_for_composite_order(Element& first,
         //     with the order of elements within a tree. Elements of other trees than the document's, as of shadow trees
         //     and removed subtrees, sort after the document's instead, by their trees, so that the order is total.
         //     Elements of different documents sort by their documents, whichever document compares them.
-        auto& first_root = first.root();
-        auto& second_root = second.root();
-        if (&first_root != &second_root) {
-            if (&first.document() != &second.document())
-                return &first.document() < &second.document() ? -1 : 1;
-            if (&first_root == this)
-                return -1;
-            if (&second_root == this)
-                return 1;
-            return &first_root < &second_root ? -1 : 1;
+        if (!(first.in_a_document_tree() && second.in_a_document_tree() && &first.document() == &second.document())) {
+            auto& first_root = first.root();
+            auto& second_root = second.root();
+            if (&first_root != &second_root) {
+                if (&first.document() != &second.document())
+                    return &first.document() < &second.document() ? -1 : 1;
+                if (&first_root == this)
+                    return -1;
+                if (&second_root == this)
+                    return 1;
+                return &first_root < &second_root ? -1 : 1;
+            }
         }
         auto position = first.compare_document_position(second);
         if (position & Node::DOCUMENT_POSITION_FOLLOWING)
@@ -10154,6 +10163,13 @@ GC::Ref<WebIDL::ObservableArray> Document::adopted_style_sheets() const
     if (!m_adopted_style_sheets)
         m_adopted_style_sheets = create_adopted_style_sheets_list(const_cast<Document&>(*this));
     return *m_adopted_style_sheets;
+}
+
+CSS::StyleSheetState* Document::dynamic_view_transition_style_sheet() const
+{
+    if (!m_dynamic_view_transition_style_sheet)
+        m_dynamic_view_transition_style_sheet = parse_css_stylesheet(CSS::Parser::ParsingParams {}, ""sv, {});
+    return m_dynamic_view_transition_style_sheet.ptr();
 }
 
 void Document::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const

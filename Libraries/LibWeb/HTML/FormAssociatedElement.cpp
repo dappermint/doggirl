@@ -228,12 +228,15 @@ bool FormAssociatedElement::enabled() const
 
     // A form control is disabled if any of the following are true:
     // - The element is a button, input, select, textarea, or form-associated custom element, and the disabled attribute is specified on this element (regardless of its value); or
-    if ((is<HTMLButtonElement>(html_element) || is<HTMLInputElement>(html_element) || is<HTMLSelectElement>(html_element) || is<HTMLTextAreaElement>(html_element) || form_associated_element_to_html_element().is_form_associated_custom_element()) && html_element.has_attribute(HTML::AttributeNames::disabled))
+    auto const disabled_bit = DOM::Element::name_filter_bit(HTML::AttributeNames::disabled);
+    if ((html_element.subtree_name_filter() & disabled_bit) != 0
+        && (is<HTMLButtonElement>(html_element) || is<HTMLInputElement>(html_element) || is<HTMLSelectElement>(html_element) || is<HTMLTextAreaElement>(html_element) || form_associated_element_to_html_element().is_form_associated_custom_element())
+        && html_element.has_attribute(HTML::AttributeNames::disabled))
         return false;
 
     // - The element is a descendant of a fieldset element whose disabled attribute is specified, and is not a descendant of that fieldset element's first legend element child, if any.
     for (auto* fieldset_ancestor = html_element.first_ancestor_of_type<HTMLFieldSetElement>(); fieldset_ancestor; fieldset_ancestor = fieldset_ancestor->first_ancestor_of_type<HTMLFieldSetElement>()) {
-        if (fieldset_ancestor->has_attribute(HTML::AttributeNames::disabled)) {
+        if ((fieldset_ancestor->subtree_name_filter() & disabled_bit) != 0 && fieldset_ancestor->has_attribute(HTML::AttributeNames::disabled)) {
             auto* first_legend_element_child = fieldset_ancestor->first_child_of_type<HTMLLegendElement>();
             if (!first_legend_element_child || !html_element.is_descendant_of(*first_legend_element_child))
                 return false;
@@ -376,6 +379,10 @@ void FormAssociatedElement::reset_form_owner()
     // 1. Unset element's parser inserted flag.
     if (auto* rare_data = form_associated_rare_data())
         rare_data->parser_inserted = false;
+
+    // OPTIMIZATION: A document that has never held a form element cannot associate a control with one.
+    if (!old_form && !html_element.document().has_form_element())
+        return;
 
     // 2. If all of the following conditions are true
     //    - element's form owner is not null

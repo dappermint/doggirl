@@ -147,7 +147,6 @@ private:
     ShadowRoot(Document&, Element& host, ShadowRootMode);
 
     // ^Node
-    virtual bool is_shadow_root() const final { return true; }
     virtual void adopted_from(Document&) override;
 
     void calculate_part_element_map();
@@ -230,28 +229,121 @@ inline TraversalDecision Node::for_each_shadow_including_inclusive_descendant(Ca
     if (decision == TraversalDecision::SkipChildrenAndContinue)
         return TraversalDecision::Continue;
 
-    if (this->for_each_shadow_including_descendant(callback) == TraversalDecision::Break)
-        return TraversalDecision::Break;
+    ShadowRoot* root_shadow = is_element() ? static_cast<Element*>(this)->shadow_root().ptr() : nullptr;
+    Node* root_first_child = first_child();
+    if (!root_shadow && !root_first_child)
+        return TraversalDecision::Continue;
 
-    return TraversalDecision::Continue;
+    struct Frame {
+        Node* node;
+        bool resume_children;
+    };
+
+    Vector<Frame, 32> stack;
+    Node* current = nullptr;
+    if (root_shadow) {
+        if (root_first_child)
+            stack.append({ this, true });
+        current = root_shadow;
+    } else {
+        current = root_first_child;
+    }
+
+    for (;;) {
+        auto child_decision = callback(*current);
+        if (child_decision == TraversalDecision::Break)
+            return TraversalDecision::Break;
+        if (child_decision != TraversalDecision::SkipChildrenAndContinue) {
+            ShadowRoot* shadow_root = current->is_element() ? static_cast<Element*>(current)->shadow_root().ptr() : nullptr;
+            if (shadow_root) {
+                stack.append({ current, false });
+                stack.append({ current, true });
+                current = shadow_root;
+                continue;
+            }
+            if (auto* child = current->first_child()) {
+                stack.append({ current, false });
+                current = child;
+                continue;
+            }
+        }
+
+        if (auto* sibling = current->next_sibling()) {
+            current = sibling;
+            continue;
+        }
+
+        Node* next = nullptr;
+        while (!stack.is_empty()) {
+            auto frame = stack.take_last();
+            next = frame.resume_children ? frame.node->first_child() : frame.node->next_sibling();
+            if (next)
+                break;
+        }
+        if (!next)
+            return TraversalDecision::Continue;
+        current = next;
+    }
 }
 
 template<typename Callback>
 inline TraversalDecision Node::for_each_shadow_including_descendant(Callback callback)
 {
-    if (is_element()) {
-        if (auto shadow_root = static_cast<Element*>(this)->shadow_root()) {
-            if (shadow_root->for_each_shadow_including_inclusive_descendant(callback) == TraversalDecision::Break)
-                return TraversalDecision::Break;
-        }
+    ShadowRoot* root_shadow = is_element() ? static_cast<Element*>(this)->shadow_root().ptr() : nullptr;
+    Node* root_first_child = first_child();
+    if (!root_shadow && !root_first_child)
+        return TraversalDecision::Continue;
+
+    struct Frame {
+        Node* node;
+        bool resume_children;
+    };
+
+    Vector<Frame, 32> stack;
+    Node* current = nullptr;
+    if (root_shadow) {
+        if (root_first_child)
+            stack.append({ this, true });
+        current = root_shadow;
+    } else {
+        current = root_first_child;
     }
 
-    for (auto* child = first_child(); child; child = child->next_sibling()) {
-        if (child->for_each_shadow_including_inclusive_descendant(callback) == TraversalDecision::Break)
+    for (;;) {
+        auto decision = callback(*current);
+        if (decision == TraversalDecision::Break)
             return TraversalDecision::Break;
-    }
+        if (decision != TraversalDecision::SkipChildrenAndContinue) {
+            ShadowRoot* shadow_root = current->is_element() ? static_cast<Element*>(current)->shadow_root().ptr() : nullptr;
+            if (shadow_root) {
+                stack.append({ current, false });
+                stack.append({ current, true });
+                current = shadow_root;
+                continue;
+            }
+            if (auto* child = current->first_child()) {
+                stack.append({ current, false });
+                current = child;
+                continue;
+            }
+        }
 
-    return TraversalDecision::Continue;
+        if (auto* sibling = current->next_sibling()) {
+            current = sibling;
+            continue;
+        }
+
+        Node* next = nullptr;
+        while (!stack.is_empty()) {
+            auto frame = stack.take_last();
+            next = frame.resume_children ? frame.node->first_child() : frame.node->next_sibling();
+            if (next)
+                break;
+        }
+        if (!next)
+            return TraversalDecision::Continue;
+        current = next;
+    }
 }
 
 }
