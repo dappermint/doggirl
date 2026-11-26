@@ -114,6 +114,15 @@ pub enum RustFfiHtmlFragmentAttributeKind {
     OtherData,
 }
 
+/// Compact classification of supported `<input type="...">` values scanned by the fragment fast path.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiHtmlFragmentInputType {
+    None = 0,
+    Text,
+    Checkbox,
+}
+
 /// An attribute of an element to make. The name and the value are ranges of code units of the input.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +135,7 @@ pub struct RustFfiHtmlFragmentAttribute {
     pub value_length: u32,
     pub hot_kind: RustFfiHtmlFragmentAttributeKind,
     pub value_is_ascii: bool,
+    pub input_type: RustFfiHtmlFragmentInputType,
 }
 
 /// What the scanner made of a fragment. `tape` is null if the fragment is not for the fast path, and otherwise must
@@ -489,9 +499,14 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         let (hot_kind, known_name) = self.classify_attribute_name(name);
 
         // NB: Other input types have insertion steps or children the fast path doesn't cover.
+        let mut input_type = RustFfiHtmlFragmentInputType::None;
         if tag == tag_id!("input") && hot_kind == RustFfiHtmlFragmentAttributeKind::Type {
             let value_code_units = &input[value_start..value_start + value.length];
-            if !equals_ascii(value_code_units, b"text") && !equals_ascii(value_code_units, b"checkbox") {
+            if equals_ascii(value_code_units, b"text") {
+                input_type = RustFfiHtmlFragmentInputType::Text;
+            } else if equals_ascii(value_code_units, b"checkbox") {
+                input_type = RustFfiHtmlFragmentInputType::Checkbox;
+            } else {
                 return false;
             }
         }
@@ -504,6 +519,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             value_length: value.length as u32,
             hot_kind,
             value_is_ascii: value.is_ascii,
+            input_type,
         });
         true
     }

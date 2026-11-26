@@ -4110,6 +4110,8 @@ void Document::adopt_node_steps(Node& node)
             set_has_inert_element();
         if (old_document.has_svg_paint_resource_element())
             set_has_svg_paint_resource_element();
+        if (old_document.has_anchor_names())
+            set_has_anchor_names();
 
         GC::RootVector<GC::Ref<ShadowRoot>> shadow_roots_with_adopted_sheets;
 
@@ -10524,6 +10526,8 @@ HTML::HTMLParser::AllowDeclarativeShadowRoots Document::allow_declarative_shadow
 
 bool Document::is_render_blocking_element(GC::Ref<Element> element) const
 {
+    if (m_render_blocking_elements.is_empty())
+        return false;
     return m_render_blocking_elements.contains(element);
 }
 

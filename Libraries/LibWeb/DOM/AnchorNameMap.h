@@ -26,6 +26,7 @@ public:
     // of the map's root.
     void register_name(Utf16FlyString const& name, GC::Ref<Element>, Optional<CSS::StyleNodeID> scope_host);
     void unregister_name(Utf16FlyString const& name, GC::Ref<Element>, Optional<CSS::StyleNodeID> scope_host);
+    [[nodiscard]] bool is_empty() const { return m_map.is_empty(); }
 
     template<typename Visitor>
     void visit_edges(Visitor& visitor) { visitor.visit(m_map); }

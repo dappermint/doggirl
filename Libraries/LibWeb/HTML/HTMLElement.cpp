@@ -2714,8 +2714,14 @@ void HTMLElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor
 
         // The control took its constraints out of the form and fieldsets it was under, and they
         // answer for `:valid`/`:invalid` on behalf of what is left.
-        if (old_ancestor && document().has_form_or_fieldset_element())
-            CSS::Invalidation::invalidate_style_after_form_control_left(*old_ancestor);
+        if (old_ancestor && document().has_form_or_fieldset_element()) {
+            if (auto* removal_scope = document().subtree_removal_scope(); removal_scope && old_ancestor == &removal_scope->parent()) {
+                for (auto const& ancestor : removal_scope->inclusive_form_and_fieldset_ancestors_of_parent())
+                    CSS::Invalidation::record_validity_states(ancestor);
+            } else {
+                CSS::Invalidation::invalidate_style_after_form_control_left(*old_ancestor);
+            }
+        }
     }
 
     // 5. If removedNode's popover attribute is not in the No Popover state, then run the hide popover algorithm given
@@ -2726,8 +2732,14 @@ void HTMLElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor
         MUST(hide_popover(FocusPreviousElement::No, FireEvents::No, ThrowExceptions::No, IgnoreDomState::Yes, nullptr));
 
     // AD-HOC: Update inertness
-    if (document().has_inert_element() && nearest_html_element_is_inert(old_ancestor) && !has_attribute(HTML::AttributeNames::inert))
-        set_subtree_inertness(false);
+    if (document().has_inert_element()) {
+        auto* removal_scope = document().subtree_removal_scope();
+        bool const old_ancestor_is_inert = (removal_scope && old_ancestor == &removal_scope->parent())
+            ? removal_scope->parent_is_inert([&] { return nearest_html_element_is_inert(old_ancestor); })
+            : nearest_html_element_is_inert(old_ancestor);
+        if (old_ancestor_is_inert && !has_attribute(HTML::AttributeNames::inert))
+            set_subtree_inertness(false);
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/infrastructure.html#dom-trees:concept-node-move-ext

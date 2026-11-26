@@ -7,6 +7,7 @@
 #include <AK/HashTable.h>
 #include <AK/QuickSort.h>
 #include <AK/SetUnion.h>
+#include <LibGC/DeferGC.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Animations/AnimationEffect.h>
@@ -454,6 +455,17 @@ static DOM::Element* element_whose_waiting_children_hold(DOM::Node& node)
     return holder;
 }
 
+bool node_has_waiting_style_arrival_holder(DOM::Node& parent)
+{
+    if (auto* element = as_if<DOM::Element>(parent)) {
+        if (element->style_node_id() != no_style_node)
+            return element->child_style_arrivals_wait();
+    } else if (!is<DOM::ShadowRoot>(parent)) {
+        return false;
+    }
+    return element_whose_waiting_children_hold(parent) != nullptr;
+}
+
 // Whether a name answers to one of the keys. Tag and attribute names are keyed folded, as are IDs and classes in quirks
 // mode, and folding a name that is folded already allocates nothing.
 static bool name_answers_to_keys(Utf16FlyString const& name, bool folds, StyleEngine::RelationalArrivalKeys const& keys)
@@ -649,6 +661,24 @@ void record_subtree_connecting(DOM::Node& root)
         return;
     if (auto* style_engine = style_engine_for(*root.parent()))
         mark_style_arrival_pending(root, *style_engine);
+}
+
+void record_subtree_connecting_under_parent(DOM::Node& parent, DOM::Node& root, bool& parent_ancestors_marked)
+{
+    auto* style_engine = style_engine_for(parent);
+    if (!style_engine)
+        return;
+    style_engine->note_pending_arrivals(1);
+    style_engine->list_arrival(root);
+    root.set_style_arrival_pending(true);
+    if (!parent_ancestors_marked) {
+        parent_ancestors_marked = true;
+        for (auto* ancestor = &parent; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+            if (ancestor->style_arrival_pending())
+                break;
+            ancestor->set_descendant_style_arrival_pending(true);
+        }
+    }
 }
 
 // A node that is no element hovers the element it is inside of.
@@ -2808,13 +2838,14 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
             style_engine->record_hover({});
     }
 
+    GC::DeferGC defer_gc(parent.heap());
     Vector<u32, 64> layout_style_nodes;
     Vector<StyleNodeID, 64> unlinked_top_level;
     Vector<u32, 64> departing_element_ids;
-    GC::RootVector<GC::Ref<DOM::Element>> departing_elements;
+    Vector<DOM::Element*, 64> departing_elements;
     Vector<StyleNodeID, 64> departing_text_ids;
-    GC::RootVector<GC::Ref<DOM::Text>> departing_texts;
-    GC::RootVector<GC::Ref<DOM::ShadowRoot>> shadow_roots;
+    Vector<DOM::Text*, 64> departing_texts;
+    Vector<DOM::ShadowRoot*, 4> shadow_roots;
     bool had_non_empty_direct_text_child = false;
 
     for (auto* child = parent.first_child(); child; child = child->next_sibling()) {
@@ -2846,15 +2877,16 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
                             record_element_relinked(*style_engine, (*assigned_element)->style_node_id(), old_relations, new_relations);
                         }
                     }
-                    style_engine->cancel_deferred_element_initial_features(*element);
+                    element->set_initial_style_features_pending(false);
+                    style_engine->cancel_deferred_element_initial_features_for_style_node(id);
                     departing_element_ids.append(id.value());
-                    departing_elements.append(*element);
+                    departing_elements.append(element);
                 }
             } else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node)) {
-                shadow_roots.append(*shadow_root);
+                shadow_roots.append(shadow_root);
             } else if (auto* text = as_if<DOM::Text>(node); text && text->style_node_id() != no_style_node) {
                 departing_text_ids.append(text->style_node_id());
-                departing_texts.append(*text);
+                departing_texts.append(text);
             }
             return TraversalDecision::Continue;
         });
@@ -2886,8 +2918,8 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
         StyleEngineFFI::style_engine_retire_text_style_nodes(style_engine->host(), departing_text_ids.span());
     }
 
-    for (auto const& shadow_root : shadow_roots)
-        record_shadow_root_disconnecting(shadow_root);
+    for (auto* shadow_root : shadow_roots)
+        record_shadow_root_disconnecting(*shadow_root);
 
     if (had_non_empty_direct_text_child) {
         if (auto* parent_element = as_if<DOM::Element>(parent); parent_element && parent_element->style_node_id() != no_style_node)

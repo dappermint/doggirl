@@ -12,7 +12,11 @@
 #include <AK/Debug.h>
 #include <AK/FFIHelpers.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/Platform.h>
 #include <AK/UnicodeUtils.h>
+#if ARCH(AARCH64)
+#    include <arm_neon.h>
+#endif
 #include <LibCore/StatsLog.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
@@ -130,7 +134,17 @@ static Utf16String utf16_string_from_ascii_code_units(ReadonlySpan<CodeUnit> cod
             if (!code_units.is_empty())
                 __builtin_memcpy(buffer.data(), code_units.data(), code_units.size());
         } else {
-            for (size_t i = 0; i < code_units.size(); ++i)
+            size_t i = 0;
+#if ARCH(AARCH64)
+            while (i + 16 <= code_units.size()) {
+                uint16x8_t lo = vld1q_u16(reinterpret_cast<u16 const*>(code_units.data() + i));
+                uint16x8_t hi = vld1q_u16(reinterpret_cast<u16 const*>(code_units.data() + i + 8));
+                uint8x16_t packed = vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+                vst1q_u8(buffer.data() + i, packed);
+                i += 16;
+            }
+#endif
+            for (; i < code_units.size(); ++i)
                 buffer[i] = static_cast<u8>(code_units[i]);
         }
     });
@@ -140,12 +154,14 @@ struct CachedAsciiAttributeValueEntry {
     u32 hash { 0 };
     Utf16String value;
     Optional<Utf16FlyString> single_class_token;
+    u64 single_class_filter_bit { 0 };
     bool checked_for_single_class { false };
 };
 
 static constexpr size_t ascii_value_cache_size = 512;
 static constexpr size_t ascii_value_cache_mask = ascii_value_cache_size - 1;
 static constexpr size_t ascii_value_cache_max_length = 64;
+static constexpr size_t text_value_cache_max_length = 128;
 
 static Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& ascii_attribute_value_cache()
 {
@@ -159,6 +175,12 @@ struct CachedAsciiTextEntry {
 };
 
 static Array<CachedAsciiTextEntry, ascii_value_cache_size>& ascii_text_value_cache()
+{
+    static thread_local NeverDestroyed<Array<CachedAsciiTextEntry, ascii_value_cache_size>> s_cache;
+    return *s_cache;
+}
+
+static Array<CachedAsciiTextEntry, ascii_value_cache_size>& utf16_text_value_cache()
 {
     static thread_local NeverDestroyed<Array<CachedAsciiTextEntry, ascii_value_cache_size>> s_cache;
     return *s_cache;
@@ -181,6 +203,12 @@ static u32 hash_ascii_code_units(ReadonlySpan<CodeUnit> code_units)
             ++i;
         }
     } else {
+        while (i + 4 <= code_units.size()) {
+            u64 word = 0;
+            __builtin_memcpy(&word, code_units.data() + i, 8);
+            hash = (hash ^ word) * 0x100000001b3ull;
+            i += 4;
+        }
         while (i < code_units.size()) {
             hash = (hash ^ static_cast<u64>(code_units[i])) * 0x100000001b3ull;
             ++i;
@@ -196,7 +224,21 @@ static bool ascii_span_equals_latin1(ReadonlySpan<CodeUnit> code_units, Readonly
     if constexpr (sizeof(CodeUnit) == 1) {
         return __builtin_memcmp(cached_bytes.data(), code_units.data(), code_units.size()) == 0;
     } else {
-        for (size_t i = 0; i < code_units.size(); ++i) {
+        size_t i = 0;
+#if ARCH(AARCH64)
+        while (i + 16 <= code_units.size()) {
+            uint8x16_t cached = vld1q_u8(cached_bytes.data() + i);
+            uint16x8_t lo = vmovl_u8(vget_low_u8(cached));
+            uint16x8_t hi = vmovl_u8(vget_high_u8(cached));
+            uint16x8_t in_lo = vld1q_u16(reinterpret_cast<u16 const*>(code_units.data() + i));
+            uint16x8_t in_hi = vld1q_u16(reinterpret_cast<u16 const*>(code_units.data() + i + 8));
+            uint16x8_t diff = vorrq_u16(veorq_u16(lo, in_lo), veorq_u16(hi, in_hi));
+            if (vmaxvq_u16(diff) != 0)
+                return false;
+            i += 16;
+        }
+#endif
+        for (; i < code_units.size(); ++i) {
             if (static_cast<u16>(cached_bytes[i]) != static_cast<u16>(code_units[i]))
                 return false;
         }
@@ -217,9 +259,10 @@ static bool ascii_bytes_contain_whitespace(ReadonlyBytes bytes)
 //               list markup) share a single immutable string buffer and, for single-token class values, a pre-interned
 //               Utf16FlyString so detached element parsing skips both whitespace scanning and fly-string table lookups.
 template<typename CodeUnit>
-static Utf16String cached_ascii_attribute_value(Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& cache, ReadonlySpan<CodeUnit> code_units, bool prefer_fly_string, Utf16FlyString const*& out_single_class_token)
+static Utf16String cached_ascii_attribute_value(Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& cache, ReadonlySpan<CodeUnit> code_units, bool prefer_fly_string, Utf16FlyString const*& out_single_class_token, u64& out_single_class_filter_bit)
 {
     out_single_class_token = nullptr;
+    out_single_class_filter_bit = 0;
     auto const length = code_units.size();
     size_t const min_length = prefer_fly_string ? 1 : 8;
     if (length < min_length || length > ascii_value_cache_max_length)
@@ -236,11 +279,14 @@ static Utf16String cached_ascii_attribute_value(Array<CachedAsciiAttributeValueE
                     if (!ascii_bytes_contain_whitespace(cached_bytes)) {
                         Utf16FlyString fly { entry.value };
                         entry.value = fly.to_utf16_string();
+                        entry.single_class_filter_bit = DOM::Element::name_filter_bit(fly);
                         entry.single_class_token = move(fly);
                     }
                 }
-                if (entry.single_class_token.has_value())
+                if (entry.single_class_token.has_value()) {
                     out_single_class_token = &entry.single_class_token.value();
+                    out_single_class_filter_bit = entry.single_class_filter_bit;
+                }
             }
             return entry.value;
         }
@@ -248,18 +294,22 @@ static Utf16String cached_ascii_attribute_value(Array<CachedAsciiAttributeValueE
 
     auto value = utf16_string_from_ascii_code_units(code_units);
     Optional<Utf16FlyString> single_class_token;
+    u64 single_class_filter_bit = 0;
     bool checked_for_single_class = false;
     if (prefer_fly_string) {
         checked_for_single_class = true;
         if (!ascii_bytes_contain_whitespace(value.utf16_view().latin1_span())) {
             Utf16FlyString fly { value };
             value = fly.to_utf16_string();
+            single_class_filter_bit = DOM::Element::name_filter_bit(fly);
             single_class_token = move(fly);
         }
     }
-    entry = { hash, value, move(single_class_token), checked_for_single_class };
-    if (entry.single_class_token.has_value())
+    entry = { hash, value, move(single_class_token), single_class_filter_bit, checked_for_single_class };
+    if (entry.single_class_token.has_value()) {
         out_single_class_token = &entry.single_class_token.value();
+        out_single_class_filter_bit = entry.single_class_filter_bit;
+    }
     return value;
 }
 
@@ -267,7 +317,7 @@ template<typename CodeUnit>
 static Utf16String cached_ascii_text_value(Array<CachedAsciiTextEntry, ascii_value_cache_size>& cache, ReadonlySpan<CodeUnit> code_units)
 {
     auto const length = code_units.size();
-    if (length < 8 || length > ascii_value_cache_max_length)
+    if (length < 8 || length > text_value_cache_max_length)
         return utf16_string_from_ascii_code_units(code_units);
 
     u32 const hash = hash_ascii_code_units(code_units);
@@ -278,6 +328,25 @@ static Utf16String cached_ascii_text_value(Array<CachedAsciiTextEntry, ascii_val
     }
 
     auto value = utf16_string_from_ascii_code_units(code_units);
+    entry = { hash, value };
+    return value;
+}
+
+static Utf16String cached_non_ascii_utf16_text_value(Array<CachedAsciiTextEntry, ascii_value_cache_size>& cache, ReadonlySpan<char16_t> code_units)
+{
+    auto const length = code_units.size();
+    u32 const hash = hash_ascii_code_units(code_units);
+    auto& entry = cache[(hash ^ (hash >> 16)) & ascii_value_cache_mask];
+    if (entry.hash == hash && entry.value.length_in_code_units() == length) {
+        auto cached_view = entry.value.utf16_view();
+        bool matches = cached_view.has_latin1_storage()
+            ? ascii_span_equals_latin1(code_units, cached_view.latin1_span())
+            : __builtin_memcmp(cached_view.utf16_span().data(), code_units.data(), length * sizeof(char16_t)) == 0;
+        if (matches)
+            return entry.value;
+    }
+
+    auto value = utf16_string_from_span(code_units);
     entry = { hash, value };
     return value;
 }
@@ -341,6 +410,7 @@ static Utf16String const& newline_then_tabs_string(Array<Optional<Utf16String>, 
 struct DetachedFragmentCaches {
     Array<CachedAsciiAttributeValueEntry, ascii_value_cache_size>& attribute_values;
     Array<CachedAsciiTextEntry, ascii_value_cache_size>& text_values;
+    Array<CachedAsciiTextEntry, ascii_value_cache_size>& utf16_text_values;
     Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_spaces;
     Array<Optional<Utf16String>, newline_then_spaces_table_size>& newline_tabs;
 };
@@ -358,7 +428,7 @@ static Utf16String text_node_data_from_span(ReadonlySpan<CharT> text, IsKnownToB
             return newline_then_tabs_string(newline_then_tabs_table(), text.size());
     }
     if constexpr (sizeof...(IsKnownToBeASCIIOrNothing) == 1) {
-        if ((is_known_to_be_ascii, ...) == IsKnownToBeASCII::Yes && text.size() >= 8 && text.size() <= ascii_value_cache_max_length)
+        if ((is_known_to_be_ascii, ...) == IsKnownToBeASCII::Yes && text.size() >= 8 && text.size() <= text_value_cache_max_length)
             return cached_ascii_text_value(ascii_text_value_cache(), text);
     }
     return utf16_string_from_span(text, is_known_to_be_ascii...);
@@ -374,8 +444,15 @@ static Utf16String detached_text_node_data_from_span(DetachedFragmentCaches& cac
         if (second == '\t' && all_of(text.slice(2), [](CharT ch) { return ch == '\t'; }))
             return newline_then_tabs_string(caches.newline_tabs, text.size());
     }
-    if (is_known_to_be_ascii == IsKnownToBeASCII::Yes && text.size() >= 8 && text.size() <= ascii_value_cache_max_length)
-        return cached_ascii_text_value(caches.text_values, text);
+    if (is_known_to_be_ascii == IsKnownToBeASCII::Yes) {
+        if (text.size() >= 8 && text.size() <= text_value_cache_max_length)
+            return cached_ascii_text_value(caches.text_values, text);
+        return utf16_string_from_ascii_code_units(text);
+    }
+    if constexpr (sizeof(CharT) == 2) {
+        if (text.size() >= 4 && text.size() <= text_value_cache_max_length)
+            return cached_non_ascii_utf16_text_value(caches.utf16_text_values, text);
+    }
     return utf16_string_from_span(text, is_known_to_be_ascii);
 }
 
@@ -1770,7 +1847,18 @@ public:
     // Builds the nodes for parsing in context, and appends the ones without a parent to top_level_nodes.
     void build_into_detached_nodes(DOM::Element& context, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes) const
     {
+        if (m_input.has_latin1_storage())
+            build_into_detached_nodes_impl(context, top_level_nodes, m_input.latin1_span());
+        else
+            build_into_detached_nodes_impl(context, top_level_nodes, m_input.utf16_span());
+    }
+
+private:
+    template<typename CodeUnit>
+    void build_into_detached_nodes_impl(DOM::Element& context, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes, ReadonlySpan<CodeUnit> input_span) const
+    {
         auto& document = context.document();
+        auto& heap = document.heap();
         auto registry = look_up_a_custom_element_registry(context);
         bool const uses_document_global_registry = is_a_global_custom_element_registry(registry)
             && registry == document.custom_element_registry();
@@ -1781,6 +1869,7 @@ public:
         DetachedFragmentCaches caches {
             .attribute_values = ascii_attribute_value_cache(),
             .text_values = ascii_text_value_cache(),
+            .utf16_text_values = utf16_text_value_cache(),
             .newline_spaces = newline_then_spaces_table(),
             .newline_tabs = newline_then_tabs_table(),
         };
@@ -1799,7 +1888,7 @@ public:
             switch (operation.kind) {
             case RustFfiHtmlFragmentOperationKind::OpenElement:
             case RustFfiHtmlFragmentOperationKind::AppendVoidElement: {
-                auto element = DOM::create_builtin_html_element_for_fragment(document, to_underlying(operation.tag_kind), uses_document_global_registry, registry);
+                auto element = DOM::create_builtin_html_element_for_fragment(document, heap, to_underlying(operation.tag_kind), uses_document_global_registry, registry);
                 if (operation.length > 2)
                     element->ensure_attribute_capacity(operation.length);
                 bool const is_input = operation.tag_kind == RustFfiHtmlFragmentTag::Input;
@@ -1809,36 +1898,39 @@ public:
                     auto const hot_kind = attribute.hot_kind;
                     bool const is_class = hot_kind == RustFfiHtmlFragmentAttributeKind::Class;
                     Utf16FlyString const* preinterned_single_class = nullptr;
-                    auto value = with_code_units(attribute.value_start, attribute.value_length, [&](auto code_units) {
-                        if (attribute.value_is_ascii)
-                            return cached_ascii_attribute_value(caches.attribute_values, code_units, is_class, preinterned_single_class);
-                        return utf16_string_from_span(code_units, IsKnownToBeASCII::No);
-                    });
+                    u64 single_class_filter_bit = 0;
+                    auto value_code_units = input_span.slice(attribute.value_start, attribute.value_length);
+                    auto value = attribute.value_is_ascii
+                        ? cached_ascii_attribute_value(caches.attribute_values, value_code_units, is_class, preinterned_single_class, single_class_filter_bit)
+                        : utf16_string_from_span(value_code_units, IsKnownToBeASCII::No);
                     if (skip_observer_checks) {
+                        if (is_class && preinterned_single_class) {
+                            element->append_single_class_attribute_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value), *preinterned_single_class, single_class_filter_bit);
+                            continue;
+                        }
                         if (hot_kind == RustFfiHtmlFragmentAttributeKind::DataId || hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData) {
-                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
                             continue;
                         }
                         if (is_input) {
                             if (hot_kind == RustFfiHtmlFragmentAttributeKind::Type) {
-                                auto value_view = value.utf16_view();
-                                if (value_view.equals_ignoring_ascii_case("checkbox"sv)) {
-                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                if (attribute.input_type == RustFfiHtmlFragmentInputType::Checkbox) {
+                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
                                     as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
                                     continue;
                                 }
-                                if (value_view.equals_ignoring_ascii_case("text"sv)) {
-                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                if (attribute.input_type == RustFfiHtmlFragmentInputType::Text) {
+                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
                                     as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
                                     continue;
                                 }
                             } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Checked) {
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
                                 as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
                                 continue;
                             } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Value) {
                                 detached_input_value_attr_index = element->attribute_list_size();
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value));
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
                                 continue;
                             }
                         }
@@ -1848,7 +1940,7 @@ public:
                             || hot_kind == RustFfiHtmlFragmentAttributeKind::Checked)) {
                         input_needs_reset = true;
                     }
-                    element->append_attribute_from_detached_parser(attribute_qualified_name(hot_attr_names, attribute), move(value), skip_observer_checks, preinterned_single_class);
+                    element->append_attribute_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value), skip_observer_checks, preinterned_single_class);
                 }
                 // NB: Among the built-in HTML tags accepted by the fragment scanner, only <input> is resettable,
                 //     and fragment.rs restricts <input> to type="text" or type="checkbox" (or default text). For a
@@ -1880,29 +1972,18 @@ public:
             }
             case RustFfiHtmlFragmentOperationKind::AppendText: {
                 auto is_ascii = operation.is_ascii ? IsKnownToBeASCII::Yes : IsKnownToBeASCII::No;
-                auto data = with_code_units(operation.start, operation.length, [&](auto code_units) {
-                    return detached_text_node_data_from_span(caches, code_units, is_ascii);
-                });
-                append(DOM::Text::create(document, move(data)));
+                auto data = detached_text_node_data_from_span(caches, input_span.slice(operation.start, operation.length), is_ascii);
+                append(DOM::Text::create(document, heap, move(data)));
                 break;
             }
             }
         }
     }
 
-private:
     ScannedFragment(Utf16View input, RustFfiHtmlFragmentScan scan)
         : m_input(input)
         , m_scan(scan)
     {
-    }
-
-    template<typename Callback>
-    Utf16String with_code_units(size_t start, size_t length, Callback&& callback) const
-    {
-        if (m_input.has_latin1_storage())
-            return callback(m_input.latin1_span().slice(start, length));
-        return callback(m_input.utf16_span().slice(start, length));
     }
 
     static constexpr size_t hot_attribute_table_size = to_underlying(RustFfiHtmlFragmentAttributeKind::DataId) + 1;
@@ -1938,7 +2019,8 @@ private:
         return *s_table;
     }
 
-    DOM::QualifiedName attribute_qualified_name(HotAttributeTable const& hot_names, RustFfiHtmlFragmentAttribute const& attribute) const
+    template<typename CodeUnit>
+    static DOM::QualifiedName attribute_qualified_name(HotAttributeTable const& hot_names, ReadonlySpan<CodeUnit> input_span, RustFfiHtmlFragmentAttribute const& attribute)
     {
         auto kind_index = to_underlying(attribute.hot_kind);
         if (kind_index > 0 && kind_index < hot_attribute_table_size)
@@ -1952,9 +2034,7 @@ private:
             cache.set(raw, qualified_name);
             return qualified_name;
         }
-        if (m_input.has_latin1_storage())
-            return cached_custom_attribute_qualified_name(m_input.latin1_span().slice(attribute.name_start, attribute.name_length));
-        return cached_custom_attribute_qualified_name(m_input.utf16_span().slice(attribute.name_start, attribute.name_length));
+        return cached_custom_attribute_qualified_name(input_span.slice(attribute.name_start, attribute.name_length));
     }
 
     struct CachedCustomName {

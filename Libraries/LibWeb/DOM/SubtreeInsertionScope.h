@@ -59,4 +59,34 @@ private:
     bool m_saw_shadow_root { false };
 };
 
+class SubtreeRemovalScope {
+    AK_MAKE_NONCOPYABLE(SubtreeRemovalScope);
+    AK_MAKE_NONMOVABLE(SubtreeRemovalScope);
+
+public:
+    explicit SubtreeRemovalScope(Node& parent);
+    ~SubtreeRemovalScope();
+
+    Node& parent() const { return m_parent; }
+    Layout::RenderDocument const& render_document();
+    ReadonlySpan<GC::Ref<Element>> inclusive_form_and_fieldset_ancestors_of_parent();
+
+    template<typename ComputeFn>
+    bool parent_is_inert(ComputeFn&& compute)
+    {
+        if (!m_parent_is_inert.has_value())
+            m_parent_is_inert = compute();
+        return *m_parent_is_inert;
+    }
+
+private:
+    GC::Ref<Node> m_parent;
+    GC::Ref<Document> m_document;
+    SubtreeRemovalScope* m_enclosing_scope { nullptr };
+    Layout::RenderDocument const* m_render_document { nullptr };
+    Optional<GC::RootVector<GC::Ref<Element>>> m_inclusive_form_and_fieldset_ancestors_of_parent;
+    Optional<bool> m_parent_is_inert;
+    bool m_has_collected_form_and_fieldset_ancestors { false };
+};
+
 }

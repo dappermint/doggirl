@@ -476,7 +476,7 @@ void FormAssociatedElement::form_associated_element_attribute_changed(Utf16FlySt
 void FormAssociatedElement::update_face_disabled_state()
 {
     auto& html_element = form_associated_element_to_html_element();
-    if (!html_element.is_form_associated_custom_element())
+    if (!html_element.is_custom() || !html_element.is_form_associated_custom_element())
         return;
 
     bool is_disabled = !enabled();

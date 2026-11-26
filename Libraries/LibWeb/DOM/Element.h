@@ -250,6 +250,7 @@ public:
 
     void set_attribute(FlyString qualified_name, Utf16String const& verified_value);
     void set_attribute(Utf16FlyString const& qualified_name, Utf16String const& verified_value);
+    void set_attribute_normalized(Utf16FlyString const& normalized_qualified_name, Utf16String const& verified_value, bool has_colon);
     void set_attribute_ns(QualifiedName const&, Utf16String const& verified_value);
     void set_attribute_value(FlyString const& local_name, String const& value, Optional<FlyString> const& prefix = {}, Optional<FlyString> const& namespace_ = {});
     void set_attribute_value(Utf16FlyString const& local_name, Utf16View value, Optional<Utf16FlyString> const& prefix = {}, Optional<Utf16FlyString> const& namespace_ = {});
@@ -260,6 +261,7 @@ public:
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
     void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false, Utf16FlyString const* preinterned_single_class = nullptr);
+    void append_single_class_attribute_from_detached_parser(QualifiedName, Utf16String value, Utf16FlyString const& single_class, u64 single_class_filter_bit);
     void append_attribute_without_callbacks_from_detached_parser(QualifiedName, Utf16String value);
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
@@ -1102,6 +1104,7 @@ private:
     void synchronize_attribute_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
     void synchronize_style_attribute() const;
     Optional<size_t> find_attribute_index(Utf16FlyString const& qualified_name) const;
+    Optional<size_t> find_attribute_index_normalized(Utf16FlyString const& normalized_qualified_name, bool has_colon) const;
     Optional<size_t> find_attribute_index_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
     void change_attribute_value(GC::Ref<Attr>, Utf16String value);
     void handle_attribute_changes(QualifiedName, Optional<Utf16String> old_value, Optional<Utf16String> new_value);

@@ -70,6 +70,11 @@ GC::Ref<Text> Text::create(Document& document, Utf16String data)
     return GC::Heap::the().allocate<Text>(document, move(data));
 }
 
+GC::Ref<Text> Text::create(Document& document, GC::Heap& heap, Utf16String data)
+{
+    return heap.allocate<Text>(document, move(data));
+}
+
 GC::Ref<Text> Text::create_for_constructor(JS::Object& relevant_global_object, Utf16String data)
 {
     return create(HTML::relevant_window(relevant_global_object).associated_document(), move(data));
