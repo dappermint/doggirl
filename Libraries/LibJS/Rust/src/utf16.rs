@@ -17,6 +17,38 @@ pub const MAX_SHORT_STRING_BYTE_COUNT: usize = size_of::<usize>() - 1;
 /// Mirrors AK::Detail::Utf16StringData::Flag::IsFlyString.
 const IS_FLY_STRING_FLAG: u32 = 1 << 2;
 
+/// Finds the first index of `target` in `haystack`, using NEON on aarch64.
+#[inline]
+fn find_u16_code_unit(haystack: &[u16], target: u16) -> Option<usize> {
+    let mut offset = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let len = haystack.len();
+        let ptr = haystack.as_ptr();
+        // SAFETY: NEON is always available on aarch64 and every 8-lane load stays within `haystack`.
+        unsafe {
+            let needle = vdupq_n_u16(target);
+            while offset + 8 <= len {
+                let chunk = vld1q_u16(ptr.add(offset));
+                let eq = vceqq_u16(chunk, needle);
+                let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(eq, 4)), 0);
+                if mask != 0 {
+                    return Some(offset + (mask.trailing_zeros() / 8) as usize);
+                }
+                offset += 8;
+            }
+        }
+    }
+    while offset < haystack.len() {
+        if haystack[offset] == target {
+            return Some(offset);
+        }
+        offset += 1;
+    }
+    None
+}
+
 /// Mirrors AK::Span::index_of(): finds where `needle` first occurs in `haystack` at or after `start_offset`, comparing
 /// the whole needle only where `find_first` finds its first element. The needle must be non-empty and fit in the
 /// haystack after `start_offset`.
@@ -268,23 +300,29 @@ impl<'a> Utf16View<'a> {
         let last_possible_offset = self.length_in_code_units() - needle_length;
         match (self, needle) {
             (Self::Ascii(haystack) | Self::Latin1(haystack), Utf16View::Ascii(needle) | Utf16View::Latin1(needle)) => {
+                if needle.len() == 1 {
+                    return memchr::memchr(needle[0], &haystack[start_offset..]).map(|offset| start_offset + offset);
+                }
                 find_subslice(haystack, needle, start_offset, |candidates, first_byte| {
                     memchr::memchr(first_byte, candidates)
                 })
             }
             (Self::Utf16(haystack), Utf16View::Utf16(needle)) => {
-                find_subslice(haystack, needle, start_offset, |candidates, first_code_unit| {
-                    candidates.iter().position(|&code_unit| code_unit == first_code_unit)
-                })
+                if needle.len() == 1 {
+                    return find_u16_code_unit(&haystack[start_offset..], needle[0])
+                        .map(|offset| start_offset + offset);
+                }
+                find_subslice(haystack, needle, start_offset, find_u16_code_unit)
             }
             (Self::Utf16(haystack), Utf16View::Ascii(needle) | Utf16View::Latin1(needle)) => {
                 let (&first_byte, rest) = needle.split_first().expect("the needle is not empty");
                 let first = u16::from(first_byte);
+                if rest.is_empty() {
+                    return find_u16_code_unit(&haystack[start_offset..], first).map(|offset| start_offset + offset);
+                }
                 let mut offset = start_offset;
                 while offset <= last_possible_offset {
-                    offset += haystack[offset..=last_possible_offset]
-                        .iter()
-                        .position(|&code_unit| code_unit == first)?;
+                    offset += find_u16_code_unit(&haystack[offset..=last_possible_offset], first)?;
                     if haystack[offset + 1..offset + needle_length]
                         .iter()
                         .zip(rest)
@@ -301,6 +339,9 @@ impl<'a> Utf16View<'a> {
                 let Ok(first) = u8::try_from(first_unit) else {
                     return None;
                 };
+                if rest.is_empty() {
+                    return memchr::memchr(first, &haystack[start_offset..]).map(|offset| start_offset + offset);
+                }
                 let mut offset = start_offset;
                 while offset <= last_possible_offset {
                     offset += memchr::memchr(first, &haystack[offset..=last_possible_offset])?;
@@ -423,17 +464,43 @@ pub fn json_special_code_unit_lanes(word: u64, lowest_bits: u64) -> u64 {
 
 /// The position of the first code unit of Latin-1 (or ASCII) text that a JSON string cannot hold as it is, if it has one.
 fn latin1_json_special_code_unit_position(bytes: &[u8]) -> Option<usize> {
-    let (chunks, remainder) = bytes.as_chunks::<8>();
-    for (index, chunk) in chunks.iter().enumerate() {
+    let mut index = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let len = bytes.len();
+        let ptr = bytes.as_ptr();
+        // SAFETY: NEON is always available on aarch64 and every 16-byte load stays within `bytes`.
+        unsafe {
+            let quote = vdupq_n_u8(b'"');
+            let backslash = vdupq_n_u8(b'\\');
+            let space = vdupq_n_u8(0x20);
+            while index + 16 <= len {
+                let chunk = vld1q_u8(ptr.add(index));
+                let special = vorrq_u8(
+                    vorrq_u8(vceqq_u8(chunk, quote), vceqq_u8(chunk, backslash)),
+                    vcltq_u8(chunk, space),
+                );
+                let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(special), 4)), 0);
+                if mask != 0 {
+                    return Some(index + (mask.trailing_zeros() / 4) as usize);
+                }
+                index += 16;
+            }
+        }
+    }
+    let rest = &bytes[index..];
+    let (chunks, remainder) = rest.as_chunks::<8>();
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let lanes = json_special_code_unit_lanes(u64::from_le_bytes(*chunk), 0x0101_0101_0101_0101);
         if lanes != 0 {
-            return Some(index * 8 + lanes.trailing_zeros() as usize / 8);
+            return Some(index + chunk_idx * 8 + lanes.trailing_zeros() as usize / 8);
         }
     }
     remainder
         .iter()
         .position(|byte| is_json_special_code_unit(u32::from(*byte)))
-        .map(|position| chunks.len() * 8 + position)
+        .map(|position| index + chunks.len() * 8 + position)
 }
 
 pub fn is_unicode_surrogate(code_unit: u16) -> bool {
@@ -557,6 +624,12 @@ impl Utf16StringBuilder {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             storage: BuilderStorage::Latin1(Vec::with_capacity(capacity)),
+        }
+    }
+
+    pub fn with_utf16_capacity(capacity: usize) -> Self {
+        Self {
+            storage: BuilderStorage::Utf16(Vec::with_capacity(capacity)),
         }
     }
 

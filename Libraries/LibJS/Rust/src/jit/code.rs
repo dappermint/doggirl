@@ -496,59 +496,53 @@ fn split_function_cells(
     mut embedded_cells: Vec<Gc<CellHeader>>,
     _defer_gc: &DeferGc<'_>,
 ) -> (Vec<Gc<CellHeader>>, FunctionCells) {
-    if !embedded_cells
-        .iter()
-        .any(|cell| cell.downcast::<EcmascriptFunctionObject>().is_some())
-    {
-        return (embedded_cells, Vec::new());
+    let mut function_cells = Vec::new();
+    let mut candidate_owned: Vec<(Gc<CellHeader>, Gc<CellHeader>)> = Vec::new();
+    for &cell in &embedded_cells {
+        let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
+            continue;
+        };
+        let function_cell = function.upcast::<CellHeader>();
+        // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
+        //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
+        if let Some(environment) = function.environment().map(Gc::upcast::<CellHeader>) {
+            function_cells.push((function_cell, environment));
+        }
+        let shared_data = function.shared_data();
+        candidate_owned.push((function_cell, shared_data.upcast::<CellHeader>()));
+        if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>) {
+            candidate_owned.push((function_cell, exec_cell));
+        }
     }
-    if embedded_cells.len() <= 32 {
-        let mut function_cells = Vec::new();
-        for &cell in &embedded_cells {
-            let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
-                continue;
-            };
-            // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
-            //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
-            if let Some(environment) = function.environment().map(Gc::upcast) {
-                function_cells.push((function.upcast(), environment));
+    if function_cells.is_empty() && candidate_owned.is_empty() {
+        return (embedded_cells, function_cells);
+    }
+    if candidate_owned.len() <= 16 && function_cells.len() <= 16 {
+        // Common case: scan `embedded_cells` once without allocating or sorting address tables.
+        let mut matched_candidates = 0u16;
+        embedded_cells.retain(|cell| {
+            let ptr = cell.as_ptr();
+            let mut owned = function_cells.iter().any(|&(_, env)| env.as_ptr() == ptr);
+            for (index, &(function_cell, candidate)) in candidate_owned.iter().enumerate() {
+                if candidate.as_ptr() == ptr {
+                    owned = true;
+                    let bit = 1u16 << index;
+                    if matched_candidates & bit == 0 {
+                        matched_candidates |= bit;
+                        function_cells.push((function_cell, candidate));
+                    }
+                }
             }
-            let shared_data = function.shared_data();
-            let shared_cell = shared_data.upcast::<CellHeader>();
-            if embedded_cells.iter().any(|c| c.as_ptr() == shared_cell.as_ptr()) {
-                function_cells.push((function.upcast(), shared_cell));
-            }
-            if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>)
-                && embedded_cells.iter().any(|c| c.as_ptr() == exec_cell.as_ptr())
-            {
-                function_cells.push((function.upcast(), exec_cell));
-            }
-        }
-        if !function_cells.is_empty() {
-            embedded_cells.retain(|cell| !function_cells.iter().any(|&(_, owned)| owned.as_ptr() == cell.as_ptr()));
-        }
+            !owned
+        });
         return (embedded_cells, function_cells);
     }
     let mut embedded_addrs: Vec<usize> = embedded_cells.iter().map(|cell| cell.as_ptr().addr()).collect();
     embedded_addrs.sort_unstable();
     embedded_addrs.dedup();
-    let mut function_cells = Vec::new();
-    for &cell in &embedded_cells {
-        let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
-            continue;
-        };
-        if let Some(environment) = function.environment().map(Gc::upcast::<CellHeader>) {
-            function_cells.push((function.upcast(), environment));
-        }
-        let shared_data = function.shared_data();
-        let shared_cell = shared_data.upcast::<CellHeader>();
-        if embedded_addrs.binary_search(&shared_cell.as_ptr().addr()).is_ok() {
-            function_cells.push((function.upcast(), shared_cell));
-        }
-        if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>)
-            && embedded_addrs.binary_search(&exec_cell.as_ptr().addr()).is_ok()
-        {
-            function_cells.push((function.upcast(), exec_cell));
+    for (function_cell, candidate) in candidate_owned {
+        if embedded_addrs.binary_search(&candidate.as_ptr().addr()).is_ok() {
+            function_cells.push((function_cell, candidate));
         }
     }
     if !function_cells.is_empty() {
