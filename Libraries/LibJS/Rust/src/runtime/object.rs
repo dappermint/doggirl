@@ -714,6 +714,90 @@ impl Object {
         Self::create_in_size_class(vm, shape, property_count)
     }
 
+    /// Creates a plain object of `shape` initialized with `values[first_value..]` in a single write pass, avoiding
+    /// filling slots with `undefined` only to overwrite them immediately. Borrows `values` only while GC is deferred
+    /// (or while allocating GC-free storage) so moving GC can safely trace `values`.
+    pub fn create_with_premade_shape_from_values(
+        vm: &Vm,
+        shape: Gc<Shape>,
+        values: &core::cell::RefCell<Vec<Value>>,
+        first_value: usize,
+    ) -> Gc<Object> {
+        let property_count = shape.property_count();
+        debug_assert_eq!(values.borrow().len() - first_value, property_count as usize);
+        let size_class = if property_count <= u32::from(EMPTY_PLAIN_OBJECT_INLINE_CAPACITY) {
+            0
+        } else {
+            plain_object_size_class(property_count)
+        };
+        let inline_capacity = usize::from(PLAIN_OBJECT_INLINE_CAPACITIES[size_class]);
+        let object = Self::new_with_shape(Self::CLASS, shape, MayInterfereWithIndexedPropertyAccess::No);
+        object.inline_named_capacity.set(inline_capacity as u8);
+        let size_class_allocator = plain_object_size_classes(vm.heap())[size_class];
+
+        if property_count as usize <= inline_capacity {
+            let tail_slots = inline_capacity - 1;
+            // Defer GC until `cell.named_properties` points at the inline slots so a moving GC traces and updates
+            // every value just copied into `cell`.
+            let defer_gc = crate::gc::defer_gc::DeferGc::of_heap(vm.heap());
+            // SAFETY: Every slot in the inline tail `[0..tail_slots)` is written once while GC is deferred.
+            let cell = unsafe {
+                vm.heap().allocate_with_size_class_init_tail(
+                    size_class_allocator,
+                    |_| {
+                        let borrowed = values.borrow();
+                        let slice = &borrowed[first_value..];
+                        let first = slice.first().copied().unwrap_or(Value::UNDEFINED);
+                        object
+                            .indexed_elements
+                            .set(core::ptr::without_provenance_mut(first.to_raw() as usize));
+                        object
+                    },
+                    |tail_start, tail_size| {
+                        debug_assert_eq!(tail_size, tail_slots * size_of::<Value>());
+                        let borrowed = values.borrow();
+                        let tail_values = borrowed[first_value..].get(1..).unwrap_or(&[]);
+                        let dst = tail_start.cast::<Value>();
+                        if !tail_values.is_empty() {
+                            core::ptr::copy_nonoverlapping(tail_values.as_ptr(), dst, tail_values.len());
+                        }
+                        if tail_values.len() < tail_slots {
+                            ak::slice_from_raw_parts_mut(
+                                dst.add(tail_values.len()).cast::<core::mem::MaybeUninit<Value>>(),
+                                tail_slots - tail_values.len(),
+                            )
+                            .fill(core::mem::MaybeUninit::new(Value::UNDEFINED));
+                        }
+                    },
+                )
+            };
+            cell.named_properties.set(cell.indexed_elements.as_ptr().cast());
+            drop(defer_gc);
+            return cell;
+        }
+
+        // Out-of-line named storage: allocate the cell first (which may trigger GC while `values` is unborrowed),
+        // then allocate GC-free ValueStorage initialized directly from `values[first_value..]`.
+        let cell = vm
+            .heap()
+            .allocate_with_size_class(size_class_allocator, |_| object, Value::UNDEFINED);
+        let new_storage = {
+            let borrowed = values.borrow();
+            value_storage::allocate_from_slice_with_capacity(
+                vm.heap(),
+                &borrowed[first_value..],
+                property_count,
+                Value::UNDEFINED,
+            )
+        };
+        cell.replace_storage(
+            &cell.named_properties,
+            object_flag::HAS_MALLOC_NAMED_STORAGE,
+            new_storage,
+        );
+        cell
+    }
+
     /// OrdinaryObjectCreate(prototype) for the `this` of a construction of the function with `shared_data`, with
     /// room for the properties earlier constructions gave their objects (see
     /// SharedFunctionInstanceData::construct_reserve()).
@@ -830,7 +914,7 @@ impl Object {
         unsafe { class_at(core::ptr::from_ref(self).cast()) }
     }
 
-    fn methods(&self) -> &'static ObjectMethods {
+    pub(crate) fn methods(&self) -> &'static ObjectMethods {
         self.class()
             .object_methods
             .expect("an object class has internal methods")
@@ -1507,14 +1591,53 @@ impl Object {
             return false;
         };
 
+        if let Some(assign_copy) = from_shape.cached_assign_copy()
+            && assign_copy.prototype_validity == prototype_validity
+            && prototype_validity.is_valid()
+            && assign_copy.copy_shape.prototype() == Some(prototype)
+            && assign_copy.identical_layout
+        {
+            let count = from_shape.property_count() as usize;
+            if count > 0 {
+                assert!(count <= from.named_storage_capacity() as usize);
+                // SAFETY: `count` is within `from`'s named property storage.
+                let source_values = unsafe { ak::slice_from_raw_parts(from.named_properties.get(), count) };
+                if source_values.iter().any(|value| value.is_accessor()) {
+                    return false;
+                }
+            }
+            // NB: The object leaves its shape without a transition away from it.
+            self.shape().mark_unstable(vm);
+            self.unsafe_set_shape(assign_copy.copy_shape);
+            if count > 0 {
+                assert!(count <= self.named_storage_capacity() as usize);
+                // SAFETY: Both pointers are valid for `count` `Value`s and non-overlapping (`self != from` is checked by caller,
+                //         and `from` has non-zero properties while `self` had `new_object_shape` with 0 properties).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(from.named_properties.get(), self.named_properties.get(), count);
+                }
+            }
+            return true;
+        }
+
         // Only data properties are read without running code.
         let mut has_accessors_or_symbols = false;
+        let mut identical_layout = true;
+        let mut expected_offset = 0u32;
         from_shape.for_each_property_in_insertion_order(|property_key, metadata| {
             if !property_key.is_string()
                 || (metadata.attributes.is_enumerable() && from.get_direct(metadata.offset).is_accessor())
             {
                 has_accessors_or_symbols = true;
                 return ControlFlow::Break(());
+            }
+            if metadata.attributes.is_enumerable() {
+                if metadata.offset != expected_offset {
+                    identical_layout = false;
+                }
+                expected_offset += 1;
+            } else {
+                identical_layout = false;
             }
             ControlFlow::Continue(())
         });
@@ -1552,11 +1675,13 @@ impl Object {
                 for property_key in &enumerable_keys {
                     copy_shape = copy_shape.create_put_transition(vm, property_key, DEFAULT_ATTRIBUTES);
                 }
+                let identical_layout = identical_layout && copy_shape.property_count() == from_shape.property_count();
                 from_shape.set_cached_assign_copy(
                     vm,
                     AssignCopy {
                         prototype_validity,
                         copy_shape,
+                        identical_layout,
                     },
                 );
                 copy_shape
@@ -2352,6 +2477,33 @@ impl Object {
     // 10.1.7 [[HasProperty]] ( P ), https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-hasproperty-p
     // 10.1.7.1 OrdinaryHasProperty ( O, P ), https://tc39.es/ecma262/#sec-ordinaryhasproperty
     pub fn ordinary_has_property(&self, vm: &Vm, property_key: &PropertyKey) -> ThrowCompletionOr<bool> {
+        if !property_key.is_number() {
+            let mut current = self.as_gc();
+            loop {
+                if !current.has_ordinary_get_own_property_for(vm, property_key)
+                    || current.methods().internal_get_prototype_of.is_some()
+                {
+                    if current == self.as_gc() {
+                        break;
+                    }
+                    return current.internal_has_property(vm, property_key);
+                }
+                if current.shape().lookup(property_key).is_some() {
+                    return Ok(true);
+                }
+                let Some(parent) = current.shape().prototype() else {
+                    return Ok(false);
+                };
+                if !core::ptr::fn_addr_eq(
+                    parent.methods().internal_has_property,
+                    ORDINARY_OBJECT_METHODS.internal_has_property,
+                ) {
+                    return parent.internal_has_property(vm, property_key);
+                }
+                current = parent;
+            }
+        }
+
         // 1. Let hasOwn be ? O.[[GetOwnProperty]](P).
         let has_own = self.internal_get_own_property(vm, property_key)?;
 
@@ -2385,6 +2537,113 @@ impl Object {
     ) -> ThrowCompletionOr<Value> {
         assert!(!receiver.is_empty());
 
+        // OPTIMIZATION: Walk ordinary objects and prototypes iteratively via Shape::lookup without constructing
+        //               PropertyDescriptors or recursing through [[Get]] for non-indexed named/symbol keys.
+        if !property_key.is_number() {
+            let mut current = self.as_gc();
+            let mut current_phase = phase;
+            loop {
+                if !current.has_ordinary_get_own_property_for(vm, property_key)
+                    || current.methods().internal_get_prototype_of.is_some()
+                {
+                    if current == self.as_gc() {
+                        break;
+                    }
+                    return current.ordinary_get_slow(vm, property_key, receiver, cacheable_metadata, current_phase);
+                }
+                if let Some(metadata) = current.shape().lookup(property_key) {
+                    let mut value = current.get_direct(metadata.offset);
+                    if current.has_intrinsic_accessors()
+                        && value.is_undefined()
+                        && let Some(accessor) = find_intrinsic_accessor(vm, &current, property_key)
+                    {
+                        value = accessor.compute_value(vm, current.shape().realm());
+                        current.initialize_direct(metadata.offset, value);
+                    }
+                    if !value.is_accessor() {
+                        if let Some(cacheable_metadata) = cacheable_metadata {
+                            match current_phase {
+                                PropertyLookupPhase::OwnProperty => {
+                                    *cacheable_metadata = CacheableGetPropertyMetadata {
+                                        r#type: CacheableGetPropertyMetadataType::GetOwnProperty,
+                                        property_offset: Some(metadata.offset),
+                                        prototype: None,
+                                        ..Default::default()
+                                    };
+                                }
+                                PropertyLookupPhase::PrototypeChain => {
+                                    assert!(current.shape().is_prototype_shape());
+                                    assert!(
+                                        current
+                                            .shape()
+                                            .prototype_chain_validity()
+                                            .expect("a prototype shape has a validity")
+                                            .is_valid()
+                                    );
+                                    *cacheable_metadata = CacheableGetPropertyMetadata {
+                                        r#type: CacheableGetPropertyMetadataType::GetPropertyInPrototypeChain,
+                                        property_offset: Some(metadata.offset),
+                                        prototype: Some(current),
+                                        ..Default::default()
+                                    };
+                                }
+                            }
+                        }
+                        return Ok(value);
+                    }
+                    // Accessor property: fall through to full ordinary_get logic on `current`.
+                    if current == self.as_gc() {
+                        break;
+                    }
+                    return current.ordinary_get_slow(vm, property_key, receiver, cacheable_metadata, current_phase);
+                }
+
+                let Some(parent) = current.shape().prototype() else {
+                    if let Some(cacheable_metadata) = cacheable_metadata
+                        && cacheable_metadata.property_absence_is_cacheable
+                    {
+                        cacheable_metadata.r#type = CacheableGetPropertyMetadataType::GetMissingProperty;
+                    }
+                    return Ok(Value::UNDEFINED);
+                };
+
+                if let Some(cacheable_metadata) = cacheable_metadata.as_deref_mut()
+                    && !parent.is_cacheable_for_absence_of(vm, property_key)
+                {
+                    cacheable_metadata.property_absence_is_cacheable = false;
+                }
+                if cacheable_metadata.is_some() && !current.is_cacheable_for_inherited_property() {
+                    cacheable_metadata = None;
+                }
+
+                if !is_ordinary_method!(parent.methods(), internal_get) {
+                    if vm.did_reach_stack_space_limit() {
+                        return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+                    }
+                    return parent.internal_get(
+                        vm,
+                        property_key,
+                        receiver,
+                        cacheable_metadata,
+                        PropertyLookupPhase::PrototypeChain,
+                    );
+                }
+                current = parent;
+                current_phase = PropertyLookupPhase::PrototypeChain;
+            }
+        }
+
+        self.ordinary_get_slow(vm, property_key, receiver, cacheable_metadata, phase)
+    }
+
+    fn ordinary_get_slow(
+        &self,
+        vm: &Vm,
+        property_key: &PropertyKey,
+        receiver: Value,
+        mut cacheable_metadata: Option<&mut CacheableGetPropertyMetadata>,
+        phase: PropertyLookupPhase,
+    ) -> ThrowCompletionOr<Value> {
         // 1. Let desc be ? O.[[GetOwnProperty]](P).
         let descriptor = self.internal_get_own_property(vm, property_key)?;
 
@@ -3921,11 +4180,14 @@ impl Object {
         // NB: Callers may have given the object a shape with more properties than its storage has room for already, so
         //     nothing may visit it before the new storage is in place, and cached property additions read their cache
         //     entry after this. Storage allocation never collects garbage.
-        let new_storage = value_storage::allocate(self.vm().heap(), new_capacity, Value::UNDEFINED);
-        // SAFETY: Both storages hold at least old_capacity values, and they do not overlap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.named_properties.get(), new_storage, old_capacity as usize);
-        }
+        // SAFETY: The existing named storage holds `old_capacity` valid values.
+        let old_values = unsafe { ak::slice_from_raw_parts(self.named_properties.get(), old_capacity as usize) };
+        let new_storage = value_storage::allocate_from_slice_with_capacity(
+            self.vm().heap(),
+            old_values,
+            new_capacity,
+            Value::UNDEFINED,
+        );
         self.replace_storage(
             &self.named_properties,
             object_flag::HAS_MALLOC_NAMED_STORAGE,
@@ -4656,12 +4918,10 @@ impl Object {
         }
 
         let size = u32::try_from(values.len()).expect("an array-like size fits in u32");
+        let elements = value_storage::allocate_from_slice_with_capacity(self.vm().heap(), values, size, Value::EMPTY);
         self.indexed_storage_kind.set(IndexedStorageKind::Packed);
         self.indexed_array_like_size.set(size);
-        self.adopt_indexed_elements(self.allocate_indexed_elements(size));
-        for (index, value) in values.iter().enumerate() {
-            self.set_indexed_element(index as u32, *value);
-        }
+        self.adopt_indexed_elements(elements);
     }
 
     /// Replaces the indexed storage with `size` packed undefined elements, which the caller overwrites with
@@ -4673,11 +4933,7 @@ impl Object {
             return;
         }
 
-        let elements = self.allocate_indexed_elements(size);
-        for index in 0..size as usize {
-            // SAFETY: The index is within the new buffer.
-            unsafe { elements.add(index).write(Value::UNDEFINED) };
-        }
+        let elements = value_storage::allocate_with_prefix_fill(self.vm().heap(), size, Value::UNDEFINED, Value::EMPTY);
 
         self.indexed_storage_kind.set(IndexedStorageKind::Packed);
         self.indexed_array_like_size.set(size);
@@ -4686,12 +4942,34 @@ impl Object {
 
     // For FunctionPrototype.apply fast path
     pub fn indexed_packed_elements<'vm>(&self, vm: &'vm Vm) -> MarkedVec<'vm, Value> {
-        let count = self.indexed_packed_elements_span_size();
+        self.indexed_packed_elements_prefix(vm, self.indexed_packed_elements_span_size())
+    }
+
+    /// Copies the first `count` elements of packed indexed storage into a new `MarkedVec` in bulk.
+    pub fn indexed_packed_elements_prefix<'vm>(&self, vm: &'vm Vm, count: u32) -> MarkedVec<'vm, Value> {
+        assert!(self.indexed_storage_kind() == IndexedStorageKind::Packed);
+        assert!(count <= self.indexed_packed_elements_span_size());
         let elements = MarkedVec::with_capacity(vm, count as usize);
-        for index in 0..count {
-            elements.push(self.indexed_element(index));
+        if count > 0 {
+            // SAFETY: `count` is within the initialized packed elements span, and copying values cannot trigger GC.
+            let slice = unsafe { ak::slice_from_raw_parts(self.indexed_elements.get(), count as usize) };
+            elements.extend_from_slice(slice);
         }
         elements
+    }
+
+    /// Overwrites the first `values.len()` elements of packed indexed storage in bulk.
+    /// Every element of `values` must be a non-empty `Value`.
+    pub fn overwrite_packed_elements_prefix(&self, values: &[Value]) {
+        assert!(self.indexed_storage_kind() == IndexedStorageKind::Packed);
+        assert!(values.len() <= self.indexed_packed_elements_span_size() as usize);
+        if values.is_empty() {
+            return;
+        }
+        debug_assert!(values.iter().all(|value| !value.is_empty()));
+        // SAFETY: `values.len()` lies within existing packed storage, which holds writable own data properties.
+        let destination = unsafe { ak::slice_from_raw_parts_mut(self.indexed_elements.get(), values.len()) };
+        destination.copy_from_slice(values);
     }
 
     /// The number of elements in the span of packed storage, which only packed storage has.

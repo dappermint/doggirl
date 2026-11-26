@@ -10,6 +10,7 @@
 //! the root class of its kind for a table without a parent of its kind, so that Class::is_subclass_of() follows the
 //! chain of tables. Its name is the table's, and its internal methods come from the table's hooks.
 
+use core::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -31,6 +32,74 @@ pub struct RegisteredHostClass {
     /// The allocator of the table's cells, which the first of them creates. A table that only ever is the parent of
     /// others has none.
     allocator: Option<RuntimeClassAllocator>,
+}
+
+const HOST_CLASS_CACHE_SIZE: usize = 256;
+
+#[derive(Clone, Copy)]
+struct HostClassCacheEntry {
+    table_identity: usize,
+    class: *const Class,
+    allocator: Option<RuntimeClassAllocator>,
+}
+
+impl HostClassCacheEntry {
+    const EMPTY: Self = Self {
+        table_identity: 0,
+        class: core::ptr::null(),
+        allocator: None,
+    };
+}
+
+/// Direct-mapped fast cache in front of `HostClassRegistry` to avoid hashing and RefCell borrows on hot wrapper creation.
+pub struct HostClassFastCache {
+    entries: Box<[Cell<HostClassCacheEntry>; HOST_CLASS_CACHE_SIZE]>,
+}
+
+impl Default for HostClassFastCache {
+    fn default() -> Self {
+        Self {
+            entries: Box::new([const { Cell::new(HostClassCacheEntry::EMPTY) }; HOST_CLASS_CACHE_SIZE]),
+        }
+    }
+}
+
+impl HostClassFastCache {
+    #[inline(always)]
+    fn slot(identity: usize) -> usize {
+        (((identity as u64 >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize) & (HOST_CLASS_CACHE_SIZE - 1)
+    }
+
+    #[inline(always)]
+    fn get(&self, identity: usize) -> Option<(&'static Class, RuntimeClassAllocator)> {
+        let entry = self.entries[Self::slot(identity)].get();
+        if entry.table_identity == identity
+            && let Some(allocator) = entry.allocator
+        {
+            // SAFETY: `class` was stored from a `&'static Class` when inserting into this cache.
+            return Some((unsafe { &*entry.class }, allocator));
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn get_class(&self, identity: usize) -> Option<&'static Class> {
+        let entry = self.entries[Self::slot(identity)].get();
+        if entry.table_identity == identity && !entry.class.is_null() {
+            // SAFETY: `class` was stored from a `&'static Class` when inserting into this cache.
+            return Some(unsafe { &*entry.class });
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn set(&self, identity: usize, class: &'static Class, allocator: Option<RuntimeClassAllocator>) {
+        self.entries[Self::slot(identity)].set(HostClassCacheEntry {
+            table_identity: identity,
+            class,
+            allocator,
+        });
+    }
 }
 
 /// The classes of a VM, by the address of their JSHostClass.
@@ -63,8 +132,14 @@ fn derive_class_of_kind(table: &'static JSHostClass, parent: &'static Class) -> 
 
 /// The runtime class of `table`.
 pub fn runtime_class_of_host_class(vm: &Vm, table: &'static JSHostClass) -> &'static Class {
-    let registered = vm.host_classes().borrow().get(&table.identity()).copied();
+    let identity = table.identity();
+    if let Some(class) = vm.host_class_fast_cache().get_class(identity) {
+        return class;
+    }
+    let registered = vm.host_classes().borrow().get(&identity).copied();
     if let Some(registered) = registered {
+        vm.host_class_fast_cache()
+            .set(identity, registered.class, registered.allocator);
         return registered.class;
     }
 
@@ -76,11 +151,12 @@ pub fn runtime_class_of_host_class(vm: &Vm, table: &'static JSHostClass) -> &'st
     let class = *DERIVED_CLASSES
         .lock()
         .expect("deriving a class does not panic")
-        .entry(table.identity())
+        .entry(identity)
         .or_insert_with(|| derive_class_of_kind(table, parent));
     vm.host_classes()
         .borrow_mut()
-        .insert(table.identity(), RegisteredHostClass { class, allocator: None });
+        .insert(identity, RegisteredHostClass { class, allocator: None });
+    vm.host_class_fast_cache().set(identity, class, None);
     class
 }
 
@@ -98,12 +174,17 @@ pub fn runtime_class_and_allocator_of_host_class(
         table.class_name(),
         table.kind
     );
-    let registered = vm.host_classes().borrow().get(&table.identity()).copied();
+    let identity = table.identity();
+    if let Some(hit) = vm.host_class_fast_cache().get(identity) {
+        return hit;
+    }
+    let registered = vm.host_classes().borrow().get(&identity).copied();
     if let Some(RegisteredHostClass {
         class,
         allocator: Some(allocator),
     }) = registered
     {
+        vm.host_class_fast_cache().set(identity, class, Some(allocator));
         return (class, allocator);
     }
 
@@ -112,13 +193,18 @@ pub fn runtime_class_and_allocator_of_host_class(
     let allocator = if core::ptr::eq(allocating_class, table) {
         vm.heap().runtime_class_allocator(class)
     } else {
-        vm.heap()
-            .shared_runtime_class_allocator(runtime_class_of_host_class(vm, allocating_class), class)
+        let shared_class = runtime_class_of_host_class(vm, allocating_class);
+        if class.type_info.finalize.is_some() && shared_class.type_info.finalize.is_none() {
+            vm.heap().runtime_class_allocator(class)
+        } else {
+            vm.heap().shared_runtime_class_allocator(shared_class, class)
+        }
     };
     vm.host_classes()
         .borrow_mut()
-        .get_mut(&table.identity())
+        .get_mut(&identity)
         .expect("the class was registered above")
         .allocator = Some(allocator);
+    vm.host_class_fast_cache().set(identity, class, Some(allocator));
     (class, allocator)
 }

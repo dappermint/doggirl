@@ -827,13 +827,19 @@ pub fn init_object_literal_property(
     let property_slot = instruction.property_slot as usize;
 
     let cached_shape = cache.shape.get();
-    let cached_property_offset = cache.property_offsets.borrow().get(property_slot).copied();
     if let Some(cached_shape) = cached_shape
         && object.shape() == cached_shape
-        && let Some(property_offset) = cached_property_offset
     {
-        object.initialize_direct(property_offset, value);
-        return SlowPathControl::continue_at(pc + op::InitObjectLiteralProperty::LENGTH);
+        let cached_property_offset = if property_slot < crate::bytecode::executable::INLINE_OBJECT_SHAPE_CACHE_OFFSETS {
+            let offset = cache.inline_property_offsets[property_slot].get();
+            (offset != u32::MAX).then_some(offset)
+        } else {
+            cache.property_offsets.borrow().get(property_slot).copied()
+        };
+        if let Some(property_offset) = cached_property_offset {
+            object.initialize_direct(property_offset, value);
+            return SlowPathControl::continue_at(pc + op::InitObjectLiteralProperty::LENGTH);
+        }
     }
 
     let property_key = executable.get_property_key(&instruction.property);
@@ -847,6 +853,9 @@ pub fn init_object_literal_property(
     if !object.shape().is_dictionary()
         && let Some(metadata) = object.shape().lookup(property_key)
     {
+        if property_slot < crate::bytecode::executable::INLINE_OBJECT_SHAPE_CACHE_OFFSETS {
+            cache.inline_property_offsets[property_slot].set(metadata.offset);
+        }
         let mut property_offsets = cache.property_offsets.borrow_mut();
         if property_slot >= property_offsets.len() {
             property_offsets.resize(property_slot + 1, 0);

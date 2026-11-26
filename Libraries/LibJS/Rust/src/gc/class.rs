@@ -234,11 +234,20 @@ impl Class {
         name: &'static str,
         object_methods: &'static ObjectMethods,
     ) -> &'static Class {
+        Self::derive_runtime_with_finalize(parent, name, object_methods, parent.type_info.finalize)
+    }
+
+    pub fn derive_runtime_with_finalize(
+        parent: &'static Class,
+        name: &'static str,
+        object_methods: &'static ObjectMethods,
+        finalize: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> &'static Class {
         assert!(
             parent.object_methods.is_some(),
             "only object classes are derived at run time"
         );
-        Self::leak_class_derived_at_run_time(parent, name, Some(object_methods))
+        Self::leak_class_derived_at_run_time(parent, name, Some(object_methods), finalize)
     }
 
     /// Creates a class of cells that are not objects, such as the module records of a host class, that extends
@@ -248,16 +257,19 @@ impl Class {
             parent.object_methods.is_none(),
             "the classes of objects have internal methods"
         );
-        Self::leak_class_derived_at_run_time(parent, name, None)
+        Self::leak_class_derived_at_run_time(parent, name, None, parent.type_info.finalize)
     }
 
     fn leak_class_derived_at_run_time(
         parent: &'static Class,
         name: &'static str,
         object_methods: Option<&'static ObjectMethods>,
+        finalize: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> &'static Class {
+        let mut type_info = parent.type_info;
+        type_info.finalize = finalize;
         let class = Box::leak(Box::new(Class {
-            type_info: parent.type_info,
+            type_info,
             name,
             id: parent.id,
             parent: Some(parent),

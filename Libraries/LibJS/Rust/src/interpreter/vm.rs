@@ -30,7 +30,7 @@ use crate::bytecode::flushing::{CodeFlushing, CodeFlushingOptions};
 use crate::bytecode::property_access::Strict;
 use crate::debugger::Debugger;
 use crate::embedding::hooks::Embedder;
-use crate::embedding::host::registry::HostClassRegistry;
+use crate::embedding::host::registry::{HostClassFastCache, HostClassRegistry};
 use crate::gc::capi::{self, GCVisitor};
 use crate::gc::class::{GcCell, define_cell};
 use crate::gc::foreign::ForeignCellSlot;
@@ -467,7 +467,7 @@ pub(crate) fn default_host_enqueue_finalization_registry_cleanup_job(
 pub const STRING_TO_ATOM_CACHE_SIZE: usize = 256;
 pub const CHARACTERS_TO_ATOM_CACHE_SIZE: usize = 256;
 pub const KEY_CONCATENATION_CACHE_SIZE: usize = 256;
-pub const FLY_STRING_CACHE_SIZE: usize = 1024;
+pub const FLY_STRING_CACHE_SIZE: usize = 4096;
 pub const NUMERIC_STRING_CACHE_SIZE: usize = 1000;
 pub const LARGE_NUMERIC_STRING_CACHE_SIZE: usize = 1024;
 const SINGLE_ASCII_CHARACTER_STRING_COUNT: usize = 128;
@@ -652,6 +652,7 @@ pub struct Vm {
     /// How many run_executable() calls are running: the outermost one runs the promise jobs its code queued.
     run_executable_depth: Cell<u32>,
     running_promise_jobs: Cell<bool>,
+    pub(crate) proxy_recursion_depth: Cell<u32>,
     /// The cells that hold others weakly, LibGC's list of weak containers. The list is weak: the sweep callback drops
     /// the containers that die, and has the others forget the cells that died.
     weak_containers: RefCell<Vec<WeakContainer>>,
@@ -693,6 +694,7 @@ pub struct Vm {
     /// the embedder's choice, since scripts read both to tell engines apart.
     saved_execution_context_stacks: RefCell<Vec<SavedExecutionContextStack>>,
     host_classes: RefCell<HostClassRegistry>,
+    host_class_fast_cache: HostClassFastCache,
     pub jit: JitState,
     pub code_flushing: CodeFlushing,
 }
@@ -839,6 +841,7 @@ impl Vm {
             job_queues: OnceCell::new(),
             run_executable_depth: Cell::new(0),
             running_promise_jobs: Cell::new(false),
+            proxy_recursion_depth: Cell::new(0),
             weak_containers: RefCell::new(Vec::new()),
             finalization_registries_with_dead_cells: GcRefCell::new(Vec::new()),
             host_resize_array_buffer: Cell::new(default_host_resize_array_buffer),
@@ -862,6 +865,7 @@ impl Vm {
             agent: Cell::new(AgentRecord::default()),
             saved_execution_context_stacks: RefCell::new(Vec::new()),
             host_classes: RefCell::new(HashMap::default()),
+            host_class_fast_cache: HostClassFastCache::default(),
             jit: JitState::new(JitOptions::from_environment()),
             code_flushing: CodeFlushing::new(CodeFlushingOptions::from_environment()),
         };
@@ -1547,6 +1551,11 @@ impl Vm {
         &self.host_classes
     }
 
+    #[inline(always)]
+    pub fn host_class_fast_cache(&self) -> &HostClassFastCache {
+        &self.host_class_fast_cache
+    }
+
     /// The realm vm.throw_completion() creates a TypeError in.
     pub(crate) fn type_error_realm(&self) -> Option<Gc<Realm>> {
         if let Some(realm) = self.head.type_error_realm_override.get()
@@ -1762,9 +1771,10 @@ impl Vm {
                 executable.free_jit_entry_slot(self, sweep);
                 return false;
             }
-            executable.remove_dead_cells(sweep);
-            executable.drop_jit_code_that_lost_embedded_cells(self, sweep);
             let idle_collection_count = &executable.head.idle_collection_count;
+            let ran_since_last_gc = idle_collection_count.get() == 0;
+            executable.remove_dead_cells(sweep, ran_since_last_gc);
+            executable.drop_jit_code_that_lost_embedded_cells(self, sweep);
             idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true
         });
@@ -1786,7 +1796,7 @@ impl Vm {
     }
 
     pub fn register_executable(&self, executable: Gc<Executable>) {
-        let (tier, tier_up_budget) = tier_up::initial_tier(&self.jit);
+        let (tier, tier_up_budget) = tier_up::initial_tier(&self.jit, &executable);
         executable.set_interpreter_tier(tier);
         executable.head.tier_up_budget.set(tier_up_budget);
         executable.allocate_jit_entry_slot(self);
@@ -2573,6 +2583,9 @@ unsafe extern "C" fn sweep(context: *mut c_void) {
     vm.remove_dead_async_waits(&sweep);
     vm.remove_dead_cells_from_weak_containers(&sweep);
     vm.remove_dead_strings_from_weak_caches(&sweep);
+    // Clear idle counts of running executables before cache pruning so `ran_since_last_gc` still folds their
+    // value feedback, and clear them again after pruning increments idle counts so code flushing does not age them.
+    vm.clear_idle_collection_counts_of_running_executables();
     vm.remove_dead_cells_from_property_lookup_caches(&sweep);
     vm.clear_idle_collection_counts_of_running_executables();
     vm.remove_dead_objects_from_intrinsic_accessors_and_unimplemented_properties(&sweep);

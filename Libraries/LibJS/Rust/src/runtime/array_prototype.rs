@@ -1112,6 +1112,17 @@ impl ArrayPrototype {
         // 6. Let itemCount be the number of elements in sortedList.
         let item_count = sorted_list.len() as u64;
 
+        // OPTIMIZATION: Re-verify after user comparator execution that `object` is still a plain packed array of
+        //               at least `length` elements; if so, overwrite its packed elements in bulk.
+        if item_count == length
+            && !object.may_interfere_with_indexed_property_access()
+            && object.indexed_storage_kind() == IndexedStorageKind::Packed
+            && u64::from(object.indexed_packed_elements_span_size()) >= item_count
+        {
+            object.overwrite_packed_elements_prefix(&sorted_list.values());
+            return Ok(Value::from_object(object));
+        }
+
         // 7. Let j be 0.
         let mut j: u64 = 0;
 
@@ -1998,72 +2009,111 @@ fn flatten_into_array(
     Ok(target_index)
 }
 
+/// Stable in-place insertion sort over `arr[start..end]`, preserving the `(later, earlier)` comparator
+/// argument order so inconsistent comparators like `() => 1` leave the order unchanged.
+fn insertion_sort_range(
+    arr: &MarkedVec<'_, Value>,
+    start: usize,
+    end: usize,
+    compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
+) -> ThrowCompletionOr<()> {
+    for i in (start + 1)..end {
+        let key = arr.get(i).expect("i is below end");
+        let mut j = i;
+        while j > start {
+            let prev = arr.get(j - 1).expect("j - 1 is within range");
+            // INTEROP: Pass the later element first and keep the earlier element first unless `key < prev`.
+            if compare_func(key, prev)? < 0.0 {
+                arr.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        if j != i {
+            arr.set(j, key);
+        }
+    }
+    Ok(())
+}
+
+fn merge_sort_range(
+    arr: &MarkedVec<'_, Value>,
+    scratch: &MarkedVec<'_, Value>,
+    start: usize,
+    end: usize,
+    compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
+) -> ThrowCompletionOr<()> {
+    const INSERTION_SORT_THRESHOLD: usize = 16;
+    let len = end - start;
+    if len <= INSERTION_SORT_THRESHOLD {
+        return insertion_sort_range(arr, start, end, compare_func);
+    }
+
+    let mid = start + len / 2;
+    merge_sort_range(arr, scratch, start, mid, compare_func)?;
+    merge_sort_range(arr, scratch, mid, end, compare_func)?;
+
+    // Fast path for already-ordered runs: if `right[0]` does not compare below `left[last]`, no merge is needed.
+    let left_last = arr.get(mid - 1).expect("mid - 1 is within range");
+    let right_first = arr.get(mid).expect("mid is within range");
+    if compare_func(right_first, left_last)? >= 0.0 {
+        return Ok(());
+    }
+
+    // Copy only the left half into the reusable GC-rooted scratch buffer; the right half stays in place in `arr`.
+    let left_len = mid - start;
+    {
+        let src = arr.values();
+        let mut dst = scratch.values_mut();
+        dst[..left_len].copy_from_slice(&src[start..mid]);
+    }
+
+    let mut left_index = 0;
+    let mut right_index = mid;
+    let mut out = start;
+    while left_index < left_len && right_index < end {
+        let x = scratch.get(left_index).expect("left_index is below left_len");
+        let y = arr.get(right_index).expect("right_index is below end");
+
+        // INTEROP: The later element is passed as the first argument, and the earlier one stays first unless it compares
+        //          below it. Most other engines do the same, and server rendered pages depend on it when they sort with
+        //          an inconsistent comparator such as `() => 1`, which then has to leave the order unchanged.
+        if compare_func(y, x)? < 0.0 {
+            arr.set(out, y);
+            right_index += 1;
+        } else {
+            arr.set(out, x);
+            left_index += 1;
+        }
+        out += 1;
+    }
+
+    if left_index < left_len {
+        let src = scratch.values();
+        let mut dst = arr.values_mut();
+        dst[out..out + (left_len - left_index)].copy_from_slice(&src[left_index..left_len]);
+    }
+
+    Ok(())
+}
+
 /// Sorts `arr_to_sort` in place with a stable merge sort, stopping at the first comparison that throws.
 pub fn array_merge_sort(
     vm: &Vm,
     compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
     arr_to_sort: &MarkedVec<'_, Value>,
 ) -> ThrowCompletionOr<()> {
-    // FIXME: it would probably be better to switch to insertion sort for small arrays for
-    // better performance
     let size = arr_to_sort.len();
     if size <= 1 {
         return Ok(());
     }
-
-    let left = MarkedVec::with_capacity(vm, size / 2);
-    let right = MarkedVec::with_capacity(vm, size / 2 + (size & 1));
-
-    for i in 0..size {
-        let value = arr_to_sort.get(i).expect("i is below the size");
-        if i < size / 2 {
-            left.push(value);
-        } else {
-            right.push(value);
-        }
+    if size <= 16 {
+        return insertion_sort_range(arr_to_sort, 0, size, compare_func);
     }
 
-    array_merge_sort(vm, compare_func, &left)?;
-    array_merge_sort(vm, compare_func, &right)?;
-
-    // NB: Every element is written back in order, so this overwrites arr_to_sort in place; a throwing comparison leaves
-    //     it half merged.
-    let mut sorted_count = 0;
-    let mut append = |value: Value| {
-        arr_to_sort.set(sorted_count, value);
-        sorted_count += 1;
-    };
-
-    let mut left_index = 0;
-    let mut right_index = 0;
-
-    while left_index < left.len() && right_index < right.len() {
-        let x = left.get(left_index).expect("the index is below the size");
-        let y = right.get(right_index).expect("the index is below the size");
-
-        // INTEROP: The later element is passed as the first argument, and the earlier one stays first unless it compares
-        //          below it. Most other engines do the same, and server rendered pages depend on it when they sort with
-        //          an inconsistent comparator such as `() => 1`, which then has to leave the order unchanged.
-        let comparison_result = compare_func(y, x)?;
-
-        if comparison_result < 0.0 {
-            append(y);
-            right_index += 1;
-        } else {
-            append(x);
-            left_index += 1;
-        }
-    }
-
-    while left_index < left.len() {
-        append(left.get(left_index).expect("the index is below the size"));
-        left_index += 1;
-    }
-
-    while right_index < right.len() {
-        append(right.get(right_index).expect("the index is below the size"));
-        right_index += 1;
-    }
-
-    Ok(())
+    // Allocate one reusable GC-rooted scratch buffer of half the input size for all merge levels.
+    let scratch = MarkedVec::with_capacity(vm, size / 2);
+    scratch.resize(size / 2, Value::UNDEFINED);
+    merge_sort_range(arr_to_sort, &scratch, 0, size, compare_func)
 }

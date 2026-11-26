@@ -242,6 +242,9 @@ void initialize_agent(HTML::AgentType type)
     if (type == HTML::AgentType::SimilarOriginWindow) {
         VERIFY(!main_thread_vm_ptr());
         main_thread_vm_ptr() = new_vm;
+        // Every window document exposes document.all (an [[IsHTMLDDA]] object), so avoid compiling
+        // hundreds of functions assuming none exist only to invalidate them all on first access.
+        vm.note_htmldda_objects_may_exist();
     } else {
         ++s_worker_agent_count;
         ladybird_did_start_short_lived_thread();

@@ -127,6 +127,11 @@ impl PropertyKey {
         self.0.get() & Self::FLAG_MASK
     }
 
+    #[inline(always)]
+    pub(crate) fn raw_bits(&self) -> usize {
+        self.0.get()
+    }
+
     pub fn as_number(&self) -> u32 {
         assert!(self.is_number());
         (self.0.get() >> 2) as u32

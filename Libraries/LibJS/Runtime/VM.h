@@ -371,6 +371,8 @@ public:
     // Ends the synchronous run of code during which the targets of the WeakRefs it dereferenced stay alive.
     void finish_execution_generation();
 
+    void note_htmldda_objects_may_exist();
+
     // 9.4.2 ResolveBinding ( name [ , env ] ), https://tc39.es/ecma262/#sec-resolvebinding
     // Returns the base of the Reference Record, or null if the reference is unresolvable.
     ThrowCompletionOr<GC::Ptr<Environment>> resolve_binding(Utf16FlyString const&, Strict, GC::Ptr<Environment> = nullptr);
