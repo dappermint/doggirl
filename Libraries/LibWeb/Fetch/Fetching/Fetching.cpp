@@ -252,7 +252,7 @@ public:
     }
 
 private:
-    static constexpr size_t bytes_in_memory_limit = 16 * MiB;
+    static constexpr size_t bytes_in_memory_limit = 64 * MiB;
     static constexpr size_t largest_body_in_memory = bytes_in_memory_limit / 4;
     static constexpr size_t mapped_body_limit = 1024;
 

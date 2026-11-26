@@ -84,7 +84,7 @@ private:
     static bool is_linked(Entry&);
 
     // An entry that is about to be linked, which no record holds the source code of yet, counts as linked.
-    void evict_until_within_limit(Optional<CompiledScriptCacheKey const&> about_to_be_linked = {});
+    void evict_until_within_limit(Optional<CompiledScriptCacheKey const&> about_to_be_linked);
 
     HashMap<CompiledScriptCacheKey, Entry> m_entries;
     u64 m_next_touch_serial { 0 };
