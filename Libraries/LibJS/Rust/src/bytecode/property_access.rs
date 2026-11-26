@@ -569,74 +569,83 @@ pub fn put_by_property_key(
             };
             let from_shape = ShapeKey::of(from_shape);
             if let Some(caches) = caches {
-                for cache in caches.entries_for_shape(object.shape(), cache_key).as_slice() {
+                let object_shape = object.shape();
+                let object_shape_key = ShapeKey::of(object_shape);
+                let mut setter_to_call = None;
+                for slot in caches.entry_slots_for_shape(object_shape, cache_key) {
                     // NB: Only the caches of keyed accesses have keys, and named accesses pass a constant 0.
-                    if cache_key != 0 && cache.key != cache_key {
+                    if cache_key != 0 && slot.key.get() != cache_key {
                         continue;
                     }
-                    match cache.entry_type {
+                    match slot.entry_type.get() {
                         PropertyLookupCacheEntryType::Empty => {}
                         PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain => {
-                            let Some(cached_prototype) = cache.prototype else {
+                            if slot.shape_key() != Some(object_shape_key) {
+                                continue;
+                            }
+                            let Some(cached_prototype) = slot.prototype.get() else {
                                 continue;
                             };
                             // OPTIMIZATION: If the prototype chain hasn't been mutated in a way that would invalidate the cache, we can use it.
-                            let can_use_cache = cache.shape == Some(ShapeKey::of(object.shape()))
-                                && cache
-                                    .prototype_chain_validity
-                                    .is_some_and(|validity| validity.is_valid());
-                            if can_use_cache {
-                                let value_in_prototype = cached_prototype.get_direct(cache.property_offset);
+                            if slot
+                                .prototype_chain_validity
+                                .get()
+                                .is_some_and(|validity| validity.is_valid())
+                            {
+                                let value_in_prototype = cached_prototype.get_direct(slot.property_offset.get());
                                 if value_in_prototype.is_accessor() {
                                     let Some(setter) = value_in_prototype.as_accessor().setter() else {
                                         continue;
                                     };
-                                    call_function_object(vm, setter, this_value, &[value])?;
-                                    return Ok(());
+                                    setter_to_call = Some(setter);
+                                    break;
                                 }
                             }
                         }
                         PropertyLookupCacheEntryType::ChangeOwnProperty => {
-                            if cache.shape != Some(ShapeKey::of(object.shape())) {
+                            if slot.shape_key() != Some(object_shape_key) {
                                 continue;
                             }
 
-                            let value_in_object = object.get_direct(cache.property_offset);
+                            let property_offset = slot.property_offset.get();
+                            let value_in_object = object.get_direct(property_offset);
                             if value_in_object.is_accessor() {
                                 let Some(setter) = value_in_object.as_accessor().setter() else {
                                     continue;
                                 };
-                                call_function_object(vm, setter, this_value, &[value])?;
-                                return Ok(());
+                                setter_to_call = Some(setter);
+                                break;
                             }
-                            if !cache.writes_data_property {
+                            if !slot.writes_data_property.get() {
                                 continue;
                             }
-                            object.put_direct_from_cache(cache.property_offset, value);
+                            object.put_direct_from_cache(property_offset, value);
                             return Ok(());
                         }
                         PropertyLookupCacheEntryType::AddOwnProperty => {
                             // OPTIMIZATION: If the object's shape is the same as the one cached before adding the new property, we can
                             //               reuse the resulting shape from the cache.
-                            if cache.shape != Some(ShapeKey::of(object.shape())) {
+                            if slot.shape_key() != Some(object_shape_key) {
                                 continue;
                             }
                             if !property_addition_is_cacheable(vm, &object, name) {
                                 continue;
                             }
-                            let Some(new_shape) = cache.new_shape else {
+                            let Some(new_shape) = slot.new_shape.get() else {
                                 continue;
                             };
 
                             // The cache is invalid if the prototype chain has been mutated, since such a mutation could have added a setter for the property.
-                            if cache
+                            if slot
                                 .prototype_chain_validity
+                                .get()
                                 .is_some_and(|validity| !validity.is_valid())
                             {
                                 continue;
                             }
+                            let property_offset = slot.property_offset.get();
                             object.unsafe_set_shape(new_shape);
-                            object.initialize_direct(cache.property_offset, value);
+                            object.initialize_direct(property_offset, value);
                             return Ok(());
                         }
                         PropertyLookupCacheEntryType::GetOwnProperty
@@ -644,6 +653,10 @@ pub fn put_by_property_key(
                         | PropertyLookupCacheEntryType::GetMissingProperty
                         | PropertyLookupCacheEntryType::MissingOwnProperty => {}
                     }
+                }
+                if let Some(setter) = setter_to_call {
+                    call_function_object(vm, setter, this_value, &[value])?;
+                    return Ok(());
                 }
             }
 
@@ -739,27 +752,30 @@ pub fn put_by_property_key(
         }
         PutKind::Own => {
             if let Some(caches) = caches {
-                for cache in caches.entries_for_shape(object.shape(), cache_key).as_slice() {
+                let object_shape = object.shape();
+                let object_shape_key = ShapeKey::of(object_shape);
+                for slot in caches.entry_slots_for_shape(object_shape, cache_key) {
                     // NB: Only the caches of keyed accesses have keys, and named accesses pass a constant 0.
-                    if cache_key != 0 && cache.key != cache_key {
+                    if cache_key != 0 && slot.key.get() != cache_key {
                         continue;
                     }
-                    if cache.entry_type == PropertyLookupCacheEntryType::AddOwnProperty {
+                    if slot.entry_type.get() == PropertyLookupCacheEntryType::AddOwnProperty {
                         // PutKind::Own is not currently emitted for platform
                         // objects, but keep this aligned with the normal PutById
                         // AddOwnProperty cache hit so a future bytecode path cannot
                         // bypass subclass hooks for objects that require them.
-                        if cache.shape != Some(ShapeKey::of(object.shape())) {
+                        if slot.shape_key() != Some(object_shape_key) {
                             continue;
                         }
                         if !property_addition_is_cacheable(vm, &object, name) {
                             continue;
                         }
-                        let Some(new_shape) = cache.new_shape else {
+                        let Some(new_shape) = slot.new_shape.get() else {
                             continue;
                         };
+                        let property_offset = slot.property_offset.get();
                         object.unsafe_set_shape(new_shape);
-                        object.initialize_direct(cache.property_offset, value);
+                        object.initialize_direct(property_offset, value);
                         return Ok(());
                     }
                 }

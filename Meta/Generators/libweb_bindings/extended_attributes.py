@@ -67,7 +67,7 @@ def wrap_with_ce_reactions(includes: GeneratedIncludes, expression: str, this_ob
         // 3. Let queue be the result of popping from this object's relevant agent's custom element reactions stack.
         // 4. Invoke custom element reactions in queue.
         if (reactions_stack.element_queue_stack.last().is_empty()) {{
-            reactions_stack.element_queue_stack.shrink(reactions_stack.element_queue_stack.size() - 1);
+            reactions_stack.element_queue_stack.shrink(reactions_stack.element_queue_stack.size() - 1, true);
         }} else {{
             auto queue = reactions_stack.element_queue_stack.take_last();
             HTML::invoke_custom_element_reactions(queue);
