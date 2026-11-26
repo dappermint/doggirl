@@ -97,8 +97,6 @@ impl Region {
                     Some(chunk) => chunk,
                     None => self.commit_next_chunk(&mut chunks),
                 };
-                // SAFETY: The chunk was just committed, and nothing uses it yet.
-                unsafe { os::mark_reusable(block_pointer(chunk), CHUNK_SIZE) };
                 sanitizer::poison(chunk, CHUNK_SIZE);
                 chunks.next_unused_block = chunk;
                 chunks.unused_blocks_end = chunk + CHUNK_SIZE;
@@ -149,6 +147,11 @@ pub struct BlockPool {
     state: Mutex<PoolState>,
 }
 
+/// On macOS, reusing a discarded block requires a synchronous madvise(MADV_FREE_REUSE) call on the allocating thread,
+/// so freshly freed blocks stay warm for 1-2 generation intervals (5-10s) before the decommit worker discards them.
+#[cfg(target_os = "macos")]
+const MACOS_WARM_GENERATION_AGE: Duration = Duration::from_millis(5000);
+
 #[derive(Default)]
 struct PoolState {
     /// Blocks whose pages were discarded, which the system may have taken back.
@@ -158,6 +161,12 @@ struct PoolState {
     returned_blocks: Vec<usize>,
     /// Blocks that were freed but not discarded yet. They are the first ones to reuse, with no system call at all.
     freshly_freed: Vec<usize>,
+    /// On macOS, freed blocks that survived one warm generation and will be discarded on the next unless reused first.
+    #[cfg(target_os = "macos")]
+    aging_freed: Vec<usize>,
+    /// When this pool last aged its warm freed blocks on macOS.
+    #[cfg(target_os = "macos")]
+    last_aged_at: Option<Instant>,
     /// Whether the pool is on the decommit worker's list.
     in_decommit_registry: bool,
 }
@@ -168,17 +177,32 @@ impl BlockPool {
             let mut state = lock(&self.state);
             if let Some(block) = state.freshly_freed.pop() {
                 (Some(block), false)
-            } else if let Some(block) = state.blocks.pop() {
-                (Some(block), true)
             } else {
-                (state.returned_blocks.pop(), true)
+                #[cfg(target_os = "macos")]
+                if let Some(block) = state.aging_freed.pop() {
+                    (Some(block), false)
+                } else if let Some(block) = state.blocks.pop() {
+                    (Some(block), true)
+                } else if let Some(block) = state.returned_blocks.pop() {
+                    (Some(block), true)
+                } else {
+                    (None, false)
+                }
+                #[cfg(not(target_os = "macos"))]
+                if let Some(block) = state.blocks.pop() {
+                    (Some(block), true)
+                } else if let Some(block) = state.returned_blocks.pop() {
+                    (Some(block), true)
+                } else {
+                    (None, false)
+                }
             }
         };
         let block = block.unwrap_or_else(|| region().take_unused_block());
         sanitizer::unpoison(block, BLOCK_SIZE);
         sanitizer::register_root_region(block, BLOCK_SIZE);
         if needs_reuse {
-            // SAFETY: The block is committed, and was discarded or is part of a chunk that was marked reusable.
+            // SAFETY: The block is committed and was discarded via os::discard() or os::return_to_system().
             unsafe { os::reuse(block_pointer(block), BLOCK_SIZE) };
         }
         block
@@ -189,6 +213,10 @@ impl BlockPool {
         sanitizer::unregister_root_region(block, BLOCK_SIZE);
         let needs_registering = {
             let mut state = lock(&self.state);
+            #[cfg(target_os = "macos")]
+            if state.freshly_freed.is_empty() && state.aging_freed.is_empty() {
+                state.last_aged_at = Some(Instant::now());
+            }
             state.freshly_freed.push(block);
             defer_decommit && !core::mem::replace(&mut state.in_decommit_registry, true)
         };
@@ -201,6 +229,11 @@ impl BlockPool {
         let blocks = {
             let mut state = lock(&self.state);
             let mut blocks = core::mem::take(&mut state.freshly_freed);
+            #[cfg(target_os = "macos")]
+            {
+                blocks.append(&mut state.aging_freed);
+                state.last_aged_at = None;
+            }
             // NB: Discarded pages stay in the process until the system runs short of memory.
             if cfg!(any(target_os = "linux", target_os = "android")) {
                 blocks.append(&mut state.blocks);
@@ -288,9 +321,13 @@ impl DecommitWorker {
                             .wait(state)
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                     } else {
+                        #[cfg(target_os = "macos")]
+                        let wait_duration = MACOS_WARM_GENERATION_AGE.min(cold_block_age());
+                        #[cfg(not(target_os = "macos"))]
+                        let wait_duration = cold_block_age();
                         let (next_state, timeout) = self
                             .condition
-                            .wait_timeout(state, cold_block_age())
+                            .wait_timeout(state, wait_duration)
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         state = next_state;
                         if timeout.timed_out() {
@@ -332,10 +369,36 @@ impl DecommitWorker {
     }
 
     fn process_one(&self, pool: Arc<BlockPool>, return_cold_blocks: bool) {
-        let (to_process, cold_blocks) = {
+        let (to_process, cold_blocks, keep_warm_pending) = {
             let mut state = lock(&pool.state);
             state.in_decommit_registry = false;
-            let to_process = core::mem::take(&mut state.freshly_freed);
+            let to_process = {
+                #[cfg(target_os = "macos")]
+                {
+                    let now = Instant::now();
+                    let age = MACOS_WARM_GENERATION_AGE.min(cold_block_age());
+                    let last_aged = *state.last_aged_at.get_or_insert(now);
+                    if now.duration_since(last_aged) >= age {
+                        state.last_aged_at = Some(now);
+                        let expired = core::mem::take(&mut state.aging_freed);
+                        state.aging_freed = core::mem::take(&mut state.freshly_freed);
+                        if state.aging_freed.is_empty() {
+                            state.last_aged_at = None;
+                        }
+                        expired
+                    } else {
+                        Vec::new()
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    core::mem::take(&mut state.freshly_freed)
+                }
+            };
+            #[cfg(target_os = "macos")]
+            let keep_warm_pending = !state.freshly_freed.is_empty() || !state.aging_freed.is_empty();
+            #[cfg(not(target_os = "macos"))]
+            let keep_warm_pending = false;
             // NB: Blocks whose pages were discarded stay in the process until the system runs short of memory, and
             //     only their own type can reuse them. What that type did not reuse since the last time will likely
             //     stay unused.
@@ -344,7 +407,7 @@ impl DecommitWorker {
             } else {
                 Vec::new()
             };
-            (to_process, cold_blocks)
+            (to_process, cold_blocks, keep_warm_pending)
         };
 
         // NB: The system calls happen outside the pool's lock, so that its heaps can go on allocating and freeing, and
@@ -370,8 +433,7 @@ impl DecommitWorker {
             state.blocks.extend(to_process);
             state.returned_blocks.extend(cold_blocks);
             // NB: So a pool is only on the list while it has blocks to look at, however many pools there are.
-            cfg!(any(target_os = "linux", target_os = "android"))
-                && !state.blocks.is_empty()
+            (keep_warm_pending || (cfg!(any(target_os = "linux", target_os = "android")) && !state.blocks.is_empty()))
                 && !core::mem::replace(&mut state.in_decommit_registry, true)
         };
         if needs_registering {

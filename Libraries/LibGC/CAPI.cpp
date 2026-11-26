@@ -413,6 +413,16 @@ bool gc_cell_is_marked(GCCell const* cell)
     return GC::is_marked(cell);
 }
 
+void const* gc_block_descriptors()
+{
+    static_assert(sizeof(FFI::BlockDescriptor) == 256);
+    static_assert(FFI::BLOCK_SIZE == 16 * 1024);
+    static_assert(FFI::CELL_BITMAP_WORDS == 11);
+    static_assert(offsetof(FFI::BlockDescriptor, cell_index_magic) == 20);
+    static_assert(offsetof(FFI::BlockDescriptor, marked) == 40);
+    return GC::g_block_descriptors;
+}
+
 bool gc_cell_will_move(GCCell const* cell)
 {
     return CAPI::will_move(*reinterpret_cast<Cell const*>(cell));

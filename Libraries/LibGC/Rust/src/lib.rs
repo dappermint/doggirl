@@ -30,10 +30,11 @@ mod sanitizer;
 pub use allocator::{
     Allocator, AllocatorConfig, LocalFreeCells, SweepStats, rust_gc_allocator_allocate,
     rust_gc_allocator_allocate_destination, rust_gc_allocator_block_at, rust_gc_allocator_block_count,
-    rust_gc_allocator_create, rust_gc_allocator_destroy, rust_gc_allocator_give_back_local_free_cells,
-    rust_gc_allocator_has_blocks_pending_sweep, rust_gc_allocator_keep_cells_pinned, rust_gc_allocator_local_block,
-    rust_gc_allocator_release_moved_cell, rust_gc_allocator_start_sweep, rust_gc_allocator_sweep_next_block,
-    rust_gc_allocator_sweep_pending_block,
+    rust_gc_allocator_create, rust_gc_allocator_destroy, rust_gc_allocator_finalize_unmarked,
+    rust_gc_allocator_give_back_local_free_cells, rust_gc_allocator_has_blocks_pending_sweep,
+    rust_gc_allocator_keep_cells_pinned, rust_gc_allocator_local_block, rust_gc_allocator_release_moved_cell,
+    rust_gc_allocator_start_sweep, rust_gc_allocator_sweep_blocks, rust_gc_allocator_sweep_next_block,
+    rust_gc_allocator_sweep_pending_block, rust_gc_allocator_will_sweep_on_allocate,
 };
 pub use block::{BlockDescriptor, rust_gc_block_descriptor_table};
 pub use block_pool::{

@@ -186,6 +186,26 @@ pub unsafe extern "C" fn rust_gc_cell_identity_hash(heap_region_base: usize, cel
     unsafe { identity_hash(heap_region_base, cell) }.0
 }
 
+/// Whether `heap` currently has any moved cells with identity hashes recorded in its side table.
+///
+/// # Safety
+///
+/// `heap` must be a live LibGC heap, used on this thread.
+#[inline]
+pub unsafe fn heap_has_moved_identity_hashes(heap: *mut c_void) -> bool {
+    #[cfg(test)]
+    {
+        let _ = heap;
+        false
+    }
+    #[cfg(not(test))]
+    // SAFETY: The caller passes a live heap, whose table only its thread uses.
+    unsafe {
+        let table = *gc_heap_identity_hashes(heap).cast::<*const IdentityHashes>();
+        !table.is_null() && !(*table).hashes.is_empty()
+    }
+}
+
 /// Whether the cell at `cell` moved since it was hashed, so that the side table of its heap has an entry for it.
 ///
 /// # Safety
