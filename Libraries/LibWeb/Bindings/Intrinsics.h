@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Forward.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
@@ -15,6 +16,7 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/FunctionObject.h>
+#include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Bindings/Wrappable.h>
@@ -104,6 +106,19 @@ public:
     }
 
     template<typename PrototypeType>
+    GC::Ref<JS::Shape> ensure_web_wrapper_shape(InterfaceName interface_name, Utf16FlyString const& class_name)
+    {
+        auto index = to_underlying(interface_name);
+        if (auto shape = m_wrapper_shapes[index])
+            return *shape;
+
+        auto& prototype = ensure_web_prototype<PrototypeType>(class_name);
+        auto shape = JS::HostObject::initial_shape_for_prototype(*m_realm, prototype);
+        m_wrapper_shapes[index] = shape;
+        return shape;
+    }
+
+    template<typename PrototypeType>
     JS::NativeFunction& ensure_web_constructor(Utf16FlyString const& class_name)
     {
         if (auto it = m_constructors.find(class_name); it != m_constructors.end())
@@ -135,6 +150,7 @@ private:
     HashMap<Utf16FlyString, GC::Ref<JS::Object>> m_prototypes;
     HashMap<Utf16FlyString, GC::Ptr<JS::NativeFunction>> m_constructors;
     HashMap<UnforgeableKey, GC::Ref<JS::NativeFunction>> m_unforgeable_functions;
+    Array<GC::Ptr<JS::Shape>, to_underlying(InterfaceName::Count)> m_wrapper_shapes {};
     GC::Ref<JS::Realm> m_realm;
 };
 
@@ -150,6 +166,12 @@ template<typename T>
 [[nodiscard]] JS::Object& ensure_web_prototype(JS::Realm& realm, Utf16FlyString const& class_name)
 {
     return host_defined_intrinsics(realm).ensure_web_prototype<T>(class_name);
+}
+
+template<typename T>
+[[nodiscard]] GC::Ref<JS::Shape> ensure_web_wrapper_shape(JS::Realm& realm, InterfaceName interface_name, Utf16FlyString const& class_name)
+{
+    return host_defined_intrinsics(realm).ensure_web_wrapper_shape<T>(interface_name, class_name);
 }
 
 // https://webidl.spec.whatwg.org/#internally-create-a-new-object-implementing-the-interface

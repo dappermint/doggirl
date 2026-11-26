@@ -555,6 +555,20 @@ pub extern "C" fn style_engine_stage_tree_delta(host: &DocumentHost, delta: &Ffi
         .record_ffi_tree_delta(delta);
 }
 
+/// Stages the departure of every identified element under `parent` when all children of `parent` are removed at once.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_stage_all_children_departures(
+    host: &DocumentHost,
+    parent: u32,
+    departing_elements: ak::Span<'_, u32>,
+) {
+    host.engine_memo()
+        .projection
+        .borrow_mut()
+        .writes()
+        .record_all_children_departures(StyleNodeID::from_raw(parent), departing_elements.as_slice());
+}
+
 /// An element's facts arriving, with how it stands in the tree where it arrives there with them. Elements that took
 /// their place in the tree earlier arrive with `has_relations` false.
 #[repr(C)]

@@ -27,6 +27,7 @@
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/SubtreeInsertionScope.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/CloseWatcher.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
@@ -1302,7 +1303,8 @@ void HTMLElement::inserted()
     Base::inserted();
     HTMLOrSVGOrMathMLElement::inserted();
 
-    if (document().has_inert_element()) {
+    auto* subtree_insertion_scope = document().subtree_insertion_scope();
+    if (subtree_insertion_scope ? subtree_insertion_scope->document_has_inert_element() : document().has_inert_element()) {
         auto* parent_node = parent_or_shadow_host_node();
         bool parent_is_inert = false;
         if (auto const* parent_html = as_if<HTMLElement>(parent_node))
@@ -1321,12 +1323,14 @@ void HTMLElement::inserted()
         // `:invalid` on either of those is a statement about the controls under it. Published here
         // rather than in form_associated_element_was_inserted(), which subclasses override without
         // calling up.
-        CSS::Invalidation::invalidate_style_after_validity_change(*this);
+        if (style_node_id() != 0 || document().has_form_or_fieldset_element())
+            CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
         // Whether the placeholder shows is decided by the control's value, which a text control
         // keeps in the shadow tree that form_associated_element_was_inserted() has just built. The
         // state published as the element connected was read before that existed.
-        CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
+        if (style_node_id() != 0)
+            CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
     }
 }
 

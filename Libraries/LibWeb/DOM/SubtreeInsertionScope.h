@@ -27,6 +27,11 @@ public:
     GC::Ptr<HTML::HTMLFormElement> nearest_inclusive_form_ancestor_of_parent();
     ReadonlySpan<GC::Ref<Element>> inclusive_fieldset_ancestors_of_parent();
     bool keyboard_scroll_tracks_document() const { return m_keyboard_scroll_tracks_document; }
+    bool document_may_have_blocking_wheel_event_listener() const { return m_document_may_have_blocking_wheel_event_listener; }
+    bool document_has_auto_directionality() const { return m_document_has_auto_directionality; }
+    void note_auto_directionality() { m_document_has_auto_directionality = true; }
+    bool document_has_inert_element() const { return m_document_has_inert_element; }
+    bool content_blocker_has_cosmetic_rules() const { return m_content_blocker_has_cosmetic_rules; }
     bool descendants_covered_by_subtree_arrival() const { return m_descendants_covered_by_subtree_arrival; }
     void set_descendants_covered_by_subtree_arrival(bool value) { m_descendants_covered_by_subtree_arrival = value; }
     bool may_be_in_shadow_tree() const { return m_parent_is_in_shadow_tree || m_saw_shadow_root; }
@@ -45,6 +50,10 @@ private:
     Optional<GC::RootVector<GC::Ref<Element>>> m_inclusive_fieldset_ancestors_of_parent;
     bool m_has_collected_inclusive_fieldset_ancestors_of_parent { false };
     bool m_keyboard_scroll_tracks_document { false };
+    bool m_document_may_have_blocking_wheel_event_listener { false };
+    bool m_document_has_auto_directionality { false };
+    bool m_document_has_inert_element { false };
+    bool m_content_blocker_has_cosmetic_rules { false };
     bool m_descendants_covered_by_subtree_arrival { false };
     bool m_parent_is_in_shadow_tree { false };
     bool m_saw_shadow_root { false };

@@ -79,7 +79,7 @@ impl AsciiNibbleLut {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(never)]
+#[inline]
 fn find_ascii_nibble_lut_bytes_neon(slice: &[u8], lo: &[u8; 16], negated: bool) -> Option<usize> {
     use core::arch::aarch64::*;
     const HI_LUT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -382,6 +382,52 @@ pub trait Input: Copy {
     }
 
     #[inline(always)]
+    fn find_byte_in_bitset(self, start: usize, end: usize, bits: &[u64; 4]) -> Option<usize> {
+        let mut pos = start;
+        while pos < end {
+            let cu = self.code_unit(pos);
+            if cu < 256 && (bits[(cu >> 6) as usize] & (1u64 << (cu & 63))) != 0 {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn find_ascii_lut_bitset(self, start: usize, end: usize, _lut: &AsciiNibbleLut, bits: &[u64; 4]) -> Option<usize> {
+        self.find_byte_in_bitset(start, end, bits)
+    }
+
+    #[inline(always)]
+    fn matches_latin1_at(self, pos: usize, needle: &[u8]) -> bool {
+        if pos + needle.len() > self.len() {
+            return false;
+        }
+        for (offset, &expected) in needle.iter().enumerate() {
+            if self.code_unit(pos + offset) != u16::from(expected) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn matches_ascii_ignore_case_latin1_at(self, pos: usize, lower_needle: &[u8]) -> bool {
+        if pos + lower_needle.len() > self.len() {
+            return false;
+        }
+        for (offset, &expected) in lower_needle.iter().enumerate() {
+            let actual = self.code_unit(pos + offset);
+            if actual > 0xFF || (actual as u8).to_ascii_lowercase() != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
     fn find_builtin_class_non_unicode(self, start: usize, class: BuiltinCharacterClass) -> Option<usize> {
         let len = self.len();
         (start..len).find(|&pos| match_builtin_class(u32::from(self.code_unit(pos)), class, false))
@@ -558,17 +604,56 @@ impl Input for &[u8] {
     #[inline(always)]
     fn find_ascii_lut(self, start: usize, end: usize, lut: &AsciiNibbleLut, table: &[bool; 256]) -> Option<usize> {
         let slice = self.get(start..end)?;
-        if slice.len() >= 32 {
+        if slice.len() >= 16 {
             return find_ascii_nibble_lut_bytes_neon(slice, lut.lo(), false).map(|offset| start + offset);
         }
         self.find_byte_in_table(start, end, table)
     }
 
     #[inline(always)]
+    fn find_byte_in_bitset(self, start: usize, end: usize, bits: &[u64; 4]) -> Option<usize> {
+        let slice = self.get(start..end)?;
+        for (offset, &byte) in slice.iter().enumerate() {
+            if (bits[(byte >> 6) as usize] & (1u64 << (byte & 63))) != 0 {
+                return Some(start + offset);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn find_ascii_lut_bitset(self, start: usize, end: usize, lut: &AsciiNibbleLut, bits: &[u64; 4]) -> Option<usize> {
+        let slice = self.get(start..end)?;
+        if slice.len() >= 16 {
+            return find_ascii_nibble_lut_bytes_neon(slice, lut.lo(), false).map(|offset| start + offset);
+        }
+        self.find_byte_in_bitset(start, end, bits)
+    }
+
+    #[inline(always)]
+    fn matches_latin1_at(self, pos: usize, needle: &[u8]) -> bool {
+        self.get(pos..pos + needle.len()) == Some(needle)
+    }
+
+    #[inline(always)]
+    fn matches_ascii_ignore_case_latin1_at(self, pos: usize, lower_needle: &[u8]) -> bool {
+        let Some(slice) = self.get(pos..pos + lower_needle.len()) else {
+            return false;
+        };
+        for (&actual, &expected) in slice.iter().zip(lower_needle.iter()) {
+            if actual.to_ascii_lowercase() != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
     fn find_builtin_class_non_unicode(self, start: usize, class: BuiltinCharacterClass) -> Option<usize> {
         let slice = self.get(start..)?;
         #[cfg(target_arch = "aarch64")]
-        if slice.len() >= 32 {
+        if slice.len() >= 16 {
             return find_builtin_class_bytes_neon(slice, class).map(|offset| start + offset);
         }
         for (offset, &byte) in slice.iter().enumerate() {
@@ -583,7 +668,7 @@ impl Input for &[u8] {
     fn find_char_class_non_unicode(self, start: usize, ranges: &CharRanges, negated: bool) -> Option<usize> {
         let slice = self.get(start..)?;
         #[cfg(target_arch = "aarch64")]
-        if slice.len() >= 32 && ranges.is_ascii_only() {
+        if slice.len() >= 16 && ranges.is_ascii_only() {
             return find_ascii_nibble_lut_bytes_neon(slice, ranges.ascii_nibble_lo(), negated)
                 .map(|offset| start + offset);
         }

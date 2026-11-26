@@ -47,6 +47,7 @@ void style_engine_set_html_element_namespace(DocumentHost const*, StyleAtomID na
 void style_engine_mark_relation_only_style_node(DocumentHost const*, StyleNodeID node);
 void style_engine_link_style_nodes_in_dom_order(DocumentHost const*, ReadonlySpan<u32> links);
 void style_engine_unlink_style_node_from_dom_order(DocumentHost const*, StyleNodeID node, StyleNodeID parent);
+void style_engine_unlink_style_nodes_from_dom_order(DocumentHost const*, ReadonlySpan<StyleNodeID> nodes, StyleNodeID parent);
 void style_engine_retire_text_style_nodes(DocumentHost const*, ReadonlySpan<StyleNodeID> nodes);
 void style_engine_set_slot_assigned_nodes(DocumentHost const*, StyleNodeID slot, ReadonlySpan<StyleNodeID> assigned);
 void style_engine_set_top_layer_elements(DocumentHost const*, ReadonlySpan<StyleNodeID> members);
@@ -303,6 +304,7 @@ public:
     // The document host stages deltas, which cross to the engine in one batch per style flush, never one write per
     // element.
     void record_tree_delta(StyleEngineFFI::FfiTreeDelta const&);
+    void record_all_children_departures(StyleNodeID parent, ReadonlySpan<u32> departing_elements);
     // Everything an element's selectors test arrives with it, as one row, and the rows of many elements in one write.
     // The atoms hold each row's custom states, classes, and attributes as name and value atom pairs in turn.
     void record_element_arrivals(ReadonlySpan<StyleEngineFFI::FfiArrivingElement>);

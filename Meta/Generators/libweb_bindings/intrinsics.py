@@ -219,8 +219,11 @@ enum class InterfaceName : u16 {
 """
     )
 
-    for name, value in interface_name_values(interface_sets.intrinsics).items():
+    values = interface_name_values(interface_sets.intrinsics)
+    for name, value in values.items():
         out.write(f"    {name} = {value},\n")
+    count = (max(values.values()) + 1) if values else 1
+    out.write(f"    Count = {count},\n")
 
     out.write(
         """};
