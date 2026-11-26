@@ -571,7 +571,15 @@ impl Regex {
                         continue;
                     }
                     let alt_start = entry.start as usize;
-                    if alt_len == 1 || input.matches_latin1_at(pos + 1, &latin1[alt_start + 1..alt_start + alt_len]) {
+                    let matched = match alt_len {
+                        1 => true,
+                        2 => input.code_unit(pos + 1) == u16::from(latin1[alt_start + 1]),
+                        _ => {
+                            input.code_unit(pos + alt_len - 1) == u16::from(latin1[alt_start + alt_len - 1])
+                                && input.matches_latin1_at(pos + 1, &latin1[alt_start + 1..alt_start + alt_len - 1])
+                        }
+                    };
+                    if matched {
                         if out.len() >= 2 {
                             out[0] = pos as i32;
                             out[1] = (pos + alt_len) as i32;
@@ -647,10 +655,19 @@ impl Regex {
                         continue;
                     }
                     let alt_start = entry.start as usize;
-                    if alt_len == 1
-                        || input
-                            .matches_ascii_ignore_case_latin1_at(pos + 1, &latin1[alt_start + 1..alt_start + alt_len])
-                    {
+                    let matched = match alt_len {
+                        1 => true,
+                        2 => fold_ascii_for_compare(input.code_unit(pos + 1)) == u16::from(latin1[alt_start + 1]),
+                        _ => {
+                            fold_ascii_for_compare(input.code_unit(pos + alt_len - 1))
+                                == u16::from(latin1[alt_start + alt_len - 1])
+                                && input.matches_ascii_ignore_case_latin1_at(
+                                    pos + 1,
+                                    &latin1[alt_start + 1..alt_start + alt_len - 1],
+                                )
+                        }
+                    };
+                    if matched {
                         if out.len() >= 2 {
                             out[0] = pos as i32;
                             out[1] = (pos + alt_len) as i32;
@@ -744,6 +761,23 @@ impl Regex {
         let capacity = result_buf.len();
         let mut count = 0i32;
         let mut pos = start;
+        if matcher.all_single_unit && !matches!(matcher.first_scan, FirstUnitScan::General) {
+            let end = input.len();
+            while pos < end {
+                let Some(found) = matcher.find_next_candidate(input, pos, end) else {
+                    break;
+                };
+                let idx = count as usize * 2;
+                if idx + 1 >= capacity {
+                    return -1;
+                }
+                result_buf[idx] = found as i32;
+                result_buf[idx + 1] = (found + 1) as i32;
+                count += 1;
+                pos = found + 1;
+            }
+            return count;
+        }
         let mut out = [-1i32; 2];
         loop {
             if pos > input.len() {

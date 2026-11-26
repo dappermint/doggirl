@@ -203,8 +203,22 @@ impl CodeUnit for u16 {
                 const MAX_INLINE_ASCII: usize = crate::layout::primitive_string::INLINE_STRING_CAPACITY;
                 if units.len() <= MAX_INLINE_ASCII {
                     let mut ascii = [0u8; MAX_INLINE_ASCII];
-                    for (dst, &unit) in ascii.iter_mut().zip(units) {
-                        *dst = unit as u8;
+                    let mut index = 0usize;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use core::arch::aarch64::*;
+                        // SAFETY: NEON is always available on aarch64 and every load/store stays within `units` and `ascii`.
+                        unsafe {
+                            while index + 8 <= units.len() {
+                                let wide = vld1q_u16(units.as_ptr().add(index));
+                                vst1_u8(ascii.as_mut_ptr().add(index), vmovn_u16(wide));
+                                index += 8;
+                            }
+                        }
+                    }
+                    while index < units.len() {
+                        ascii[index] = units[index] as u8;
+                        index += 1;
                     }
                     return PrimitiveString::create_from_ascii(vm, &ascii[..units.len()]);
                 }
@@ -280,6 +294,16 @@ impl CodeUnit for u16 {
         #[cfg(target_arch = "aarch64")]
         {
             use core::arch::aarch64::*;
+            const TAIL_MASKS: [[u16; 8]; 8] = [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [0xFFFF, 0, 0, 0, 0, 0, 0, 0],
+                [0xFFFF, 0xFFFF, 0, 0, 0, 0, 0, 0],
+                [0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0, 0],
+                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0],
+                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0],
+                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0],
+                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0],
+            ];
             // SAFETY: NEON is always available on aarch64 and every load stays within `units`.
             unsafe {
                 let quote = vdupq_n_u16(0x22);
@@ -295,11 +319,9 @@ impl CodeUnit for u16 {
                     let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(special, 4)), 0);
                     if mask != 0 {
                         let offset = (mask.trailing_zeros() / 8) as usize;
-                        let mut tail_or = 0u16;
-                        for &unit in &units[position..position + offset] {
-                            tail_or |= unit;
-                        }
-                        record_bits(width, tail_or | vmaxvq_u16(or_vec));
+                        let tail_mask = vld1q_u16(TAIL_MASKS[offset].as_ptr());
+                        let combined = vorrq_u16(or_vec, vandq_u16(chunk, tail_mask));
+                        record_bits(width, vmaxvq_u16(combined));
                         return position + offset;
                     }
                     or_vec = vorrq_u16(or_vec, chunk);
@@ -466,6 +488,11 @@ struct ShapeCache {
     next_generation: u64,
 }
 
+struct SimpleByteKeys {
+    bytes: Box<[u8]>,
+    ranges: Box<[(u32, u32)]>,
+}
+
 struct ShapeCacheEntry {
     keys: Box<[NonSymbolPropertyKey]>,
     shape: GcWeak<Shape>,
@@ -473,6 +500,41 @@ struct ShapeCacheEntry {
     /// True when none of `keys` contains a quote, backslash, or control character, so a raw slice match
     /// directly validates the JSON string token without running `scan_string`.
     all_keys_simple: bool,
+    /// Flat ASCII bytes and `(start, end)` ranges of each key when `all_keys_simple` and every key has ASCII/Latin-1
+    /// storage, avoiding per-key `Utf16View::of_fly_string` lookups during predicted-shape object parsing.
+    simple_byte_keys: Option<SimpleByteKeys>,
+}
+
+fn build_simple_byte_keys(keys: &[NonSymbolPropertyKey]) -> Option<SimpleByteKeys> {
+    let mut total_len = 0usize;
+    for key in keys {
+        match Utf16View::of_fly_string(key.as_string()) {
+            Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+                if bytes.iter().any(|&b| is_json_special_code_unit(u32::from(b))) {
+                    return None;
+                }
+                total_len = total_len.checked_add(bytes.len())?;
+            }
+            Utf16View::Utf16(_) => return None,
+        }
+    }
+    if total_len > u32::MAX as usize {
+        return None;
+    }
+    let mut flat = Vec::with_capacity(total_len);
+    let mut ranges = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes)) = Utf16View::of_fly_string(key.as_string()) else {
+            unreachable!("verified one-byte storage above");
+        };
+        let start = flat.len() as u32;
+        flat.extend_from_slice(bytes);
+        ranges.push((start, flat.len() as u32));
+    }
+    Some(SimpleByteKeys {
+        bytes: flat.into_boxed_slice(),
+        ranges: ranges.into_boxed_slice(),
+    })
 }
 
 fn is_simple_json_key(key: &PropertyKey) -> bool {
@@ -543,12 +605,14 @@ impl ShapeCache {
         if self.pin_counts[slot] == 0 {
             let generation = self.next_generation;
             self.next_generation = self.next_generation.wrapping_add(1);
-            let all_keys_simple = keys.iter().all(|key| is_simple_json_key(key));
+            let simple_byte_keys = build_simple_byte_keys(keys);
+            let all_keys_simple = simple_byte_keys.is_some() || keys.iter().all(|key| is_simple_json_key(key));
             self.entries[slot] = Some(ShapeCacheEntry {
                 keys: keys.into(),
                 shape: GcWeak::new(vm.heap(), shape),
                 generation,
                 all_keys_simple,
+                simple_byte_keys,
             });
             self.last_slot = Some(slot);
         }
@@ -727,16 +791,29 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 && let Some(entry) = &self.tables.shapes.entries[slot]
                 && entry.generation == generation
             {
-                let expected = &entry.keys[predicted_matched];
-                let key_len = Utf16View::of_fly_string(expected.as_string()).length_in_code_units();
                 let start = self.position + 1;
-                let end = start + key_len;
-                if let Some(slice) = self.units.get(start..end)
-                    && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
-                    && are_code_units_of(slice, expected)
-                {
-                    self.position = end + 1;
-                    matched_predicted = true;
+                if let Some(ref simple_keys) = entry.simple_byte_keys {
+                    let (key_start, key_end) = simple_keys.ranges[predicted_matched];
+                    let expected_bytes = &simple_keys.bytes[key_start as usize..key_end as usize];
+                    let end = start + expected_bytes.len();
+                    if let Some(slice) = self.units.get(start..end)
+                        && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
+                        && C::equals_byte_slice(slice, expected_bytes)
+                    {
+                        self.position = end + 1;
+                        matched_predicted = true;
+                    }
+                } else {
+                    let expected = &entry.keys[predicted_matched];
+                    let key_len = Utf16View::of_fly_string(expected.as_string()).length_in_code_units();
+                    let end = start + key_len;
+                    if let Some(slice) = self.units.get(start..end)
+                        && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
+                        && are_code_units_of(slice, expected)
+                    {
+                        self.position = end + 1;
+                        matched_predicted = true;
+                    }
                 }
             }
 
