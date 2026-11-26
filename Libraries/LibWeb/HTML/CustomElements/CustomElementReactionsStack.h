@@ -21,7 +21,8 @@ struct CustomElementReactionsStack {
     // https://html.spec.whatwg.org/multipage/custom-elements.html#element-queue
     // Each item in the stack is an element queue, which is initially empty as well. Each item in an element queue is an element.
     // (The elements are not necessarily custom yet, since this queue is used for upgrades as well.)
-    Vector<Vector<GC::Root<DOM::Element>>> element_queue_stack;
+    // Inline capacity avoids heap allocation/deallocation churn on every [CEReactions] DOM call.
+    Vector<Vector<GC::Root<DOM::Element>>, 8> element_queue_stack;
 
     // https://html.spec.whatwg.org/multipage/custom-elements.html#backup-element-queue
     // Each custom element reactions stack has an associated backup element queue, which an initially-empty element queue.

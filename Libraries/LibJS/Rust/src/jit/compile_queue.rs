@@ -39,11 +39,18 @@ const SPARE_SNAPSHOTS: usize = 16;
 const SPARE_CODE_BYTES: usize = 64 * 1024;
 const SPARE_TABLE_WORDS: usize = 8 * 1024;
 
+/// A reusable snapshot together with the vector that holds strong `Arc<ExecutableData>` owners during compilation,
+/// keeping the vector's backing allocation out of cross-thread allocator churn.
+pub struct SpareSnapshot {
+    pub snapshot: Box<Snapshot>,
+    pub bytecode_owners: Vec<Arc<ExecutableData>>,
+}
+
 /// The snapshots and the results that nothing uses now. The thread of a VM writes the input of a compile into a
 /// snapshot, and the compile thread that read it brings it back. A compile thread writes the code and the tables of
 /// a compile into a result, and the thread of the VM that asked for the compile brings it back.
 struct Spare {
-    snapshots: [Option<Box<Snapshot>>; SPARE_SNAPSHOTS],
+    snapshots: [Option<SpareSnapshot>; SPARE_SNAPSHOTS],
     results: [Option<CompiledCode>; SPARE_RESULTS],
     /// How many compile threads had a task since they last were idle. The last of them to go idle gives the memory
     /// of the snapshots and of the results back to the system.
@@ -116,22 +123,36 @@ fn note_thread_is_idle() {
     drop(results);
 }
 
-/// A snapshot of nothing, to capture into. It has the memory of an earlier snapshot if one is spare.
-pub fn spare_snapshot() -> Box<Snapshot> {
-    let snapshot = spare().snapshots.iter_mut().find_map(Option::take);
-    snapshot.unwrap_or_default()
+/// A snapshot of nothing, to capture into, paired with a cleared reusable `bytecode_owners` vector. It has the memory
+/// of an earlier snapshot if one is spare.
+pub fn spare_snapshot() -> SpareSnapshot {
+    spare()
+        .snapshots
+        .iter_mut()
+        .find_map(Option::take)
+        .unwrap_or_else(|| SpareSnapshot {
+            snapshot: Box::default(),
+            bytecode_owners: Vec::with_capacity(8),
+        })
 }
 
-/// Takes back a snapshot that nothing reads anymore, for a later capture.
-pub fn give_back_snapshot(mut snapshot: Box<Snapshot>) {
+/// Takes back a snapshot and its `bytecode_owners` vector that nothing reads anymore, for a later capture.
+pub fn give_back_snapshot(mut snapshot: Box<Snapshot>, mut bytecode_owners: Vec<Arc<ExecutableData>>) {
     snapshot.clear();
     snapshot.trim();
+    bytecode_owners.clear();
+    if bytecode_owners.capacity() > 64 {
+        bytecode_owners.shrink_to(16);
+    }
     let mut spare = spare();
     // NB: With no place left, the memory of the snapshot goes back to the system here.
     let Some(place) = spare.snapshots.iter_mut().find(|place| place.is_none()) else {
         return;
     };
-    *place = Some(snapshot);
+    *place = Some(SpareSnapshot {
+        snapshot,
+        bytecode_owners,
+    });
     release_spare_memory_later(spare);
 }
 
@@ -253,11 +274,10 @@ impl CompileQueue {
             note_thread_is_active();
             let OwnedSnapshot {
                 snapshot,
-                _bytecode_owners,
+                _bytecode_owners: bytecode_owners,
             } = owned;
             let result = compile(&snapshot);
-            give_back_snapshot(snapshot);
-            drop(_bytecode_owners);
+            give_back_snapshot(snapshot, bytecode_owners);
             // NB: A VM that went away has no use for the result, and the thread goes on with other VMs' jobs.
             if result_sender.send((id, result)).is_ok() {
                 finished_count.fetch_add(1, Ordering::Release);

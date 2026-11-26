@@ -227,25 +227,34 @@ impl ExecutableFeedback {
             for (bucket, value) in self.value_buckets().iter().zip(self.value()) {
                 let bits = bucket.get();
                 if bits != value_feedback::EMPTY_VALUE_BUCKET {
-                    value.set(value.get() | value_feedback::for_bits(bits));
+                    let old = value.get();
+                    let updated = old | value_feedback::for_bits(bits);
+                    if updated != old {
+                        value.set(updated);
+                    }
                 }
             }
             let cache_buckets = self.cache_value_buckets();
             let cache_values = self.cache_value();
-            let count = cache_buckets.len();
-            for index in 0..count {
-                let bits = cache_buckets[count - 1 - index].get();
+            for (bucket, value) in cache_buckets.iter().rev().zip(cache_values) {
+                let bits = bucket.get();
                 if bits != value_feedback::EMPTY_VALUE_BUCKET {
-                    let value = &cache_values[index];
-                    value.set(value.get() | value_feedback::for_bits(bits));
+                    let old = value.get();
+                    let updated = old | value_feedback::for_bits(bits);
+                    if updated != old {
+                        value.set(updated);
+                    }
                 }
             }
         }
         for call in self.call() {
             let tag = call.value_bucket.get();
             if tag != value_feedback::EMPTY_VALUE_BUCKET_TAG {
-                call.value
-                    .set(call.value.get() | value_feedback::for_bits(u64::from(tag) << 48));
+                let old = call.value.get();
+                let updated = old | value_feedback::for_bits(u64::from(tag) << 48);
+                if updated != old {
+                    call.value.set(updated);
+                }
             }
         }
     }

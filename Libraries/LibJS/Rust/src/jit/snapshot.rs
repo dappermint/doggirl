@@ -30,7 +30,9 @@ use super::allocation::{
     SampleSlots, allocation_infos, closure_template_snapshots, closure_templates, function_environment_template,
     lexical_environment_templates,
 };
-use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, speculated_cache_size};
+use super::code::{
+    CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, SnapshotExecutables, speculated_cache_size,
+};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::executable_data::ExecutableData;
@@ -90,9 +92,31 @@ pub struct CapturedSnapshot<'d> {
     /// Strong handles to every `ExecutableData` whose bytecode is borrowed zero-copy by `snapshot`.
     pub bytecode_owners: Vec<Arc<ExecutableData>>,
     pub cells: Deferred<'d, Vec<Gc<CellHeader>>>,
-    pub snapshot_executables: Deferred<'d, Vec<SnapshotExecutable>>,
+    pub snapshot_executables: Deferred<'d, SnapshotExecutables>,
     /// The slots of the samples of the closure templates, whose samples are among the cells.
     pub sample_slots: Deferred<'d, SampleSlots>,
+}
+
+/// Reusable non-GC scratch vectors kept on `JitState` across snapshot captures on the VM thread.
+#[derive(Default)]
+pub(crate) struct SnapshotScratch {
+    environment_templates: Vec<EnvironmentTemplateSnapshot>,
+    bound_arguments: Vec<u64>,
+    super_constructors: Vec<(u32, SuperConstructTarget)>,
+    literal_instance_fields: Vec<(u32, LiteralFieldValues)>,
+    derived_instance_fields: Vec<(u32, DerivedInstanceFields)>,
+    property_cache_ranges: Vec<(u32, u32)>,
+}
+
+impl SnapshotScratch {
+    pub(crate) fn clear(&mut self) {
+        self.environment_templates.clear();
+        self.bound_arguments.clear();
+        self.super_constructors.clear();
+        self.literal_instance_fields.clear();
+        self.derived_instance_fields.clear();
+        self.property_cache_ranges.clear();
+    }
 }
 
 /// An executable of the snapshot.
@@ -115,6 +139,10 @@ struct SnapshotBuilder<'vm> {
     cells: Vec<Gc<CellHeader>>,
     entries: Vec<Entry>,
     indices: Vec<(InlinedFunction, u32)>,
+    /// Flat buffer accumulating speculated property lookup cache sizes across every entry in `entries`.
+    property_cache_sizes: Vec<u8>,
+    /// Reusable non-GC scratch vectors owned by `JitState`.
+    scratch: &'vm mut SnapshotScratch,
     /// The realm of the compiled executable and its inlined callees, along with its pre-noted prototype/shape cells.
     compiled_realm: Gc<Realm>,
     realm_new_object_shape: ShapeSnapshot,
@@ -134,22 +162,9 @@ struct SnapshotBuilder<'vm> {
     sample_slots: SampleSlots,
     /// The lexical environment templates of the compiled executable.
     lexical_environment_templates: List<Option<LexicalEnvironmentTemplateSnapshot>>,
-    /// The environment templates of the direct calls of the executable whose snapshot is being made.
-    environment_templates: Vec<EnvironmentTemplateSnapshot>,
-    /// The bound arguments of the call feedback of the executable whose snapshot is being made.
-    bound_arguments: Vec<u64>,
     /// For the constructors among the inlining candidates, by index: the shape of the `this` value their inlined
     /// constructs create, whose entries their megamorphic caches describe.
     construct_this_shapes: Vec<(u32, Gc<Shape>)>,
-    /// For the derived constructors among the inlining candidates, by index: what their super() constructs with in
-    /// inlined constructs of them (see `ExecutableSnapshot::super_constructor`).
-    super_constructors: Vec<(u32, SuperConstructTarget)>,
-    /// For the base constructors with fields among the inlining candidates, by index: the values of their fields (see
-    /// `ExecutableSnapshot::literal_instance_fields`).
-    literal_instance_fields: Vec<(u32, LiteralFieldValues)>,
-    /// For the derived constructors with fields among the inlining candidates, by index: how they add their fields
-    /// (see `ExecutableSnapshot::derived_instance_fields`).
-    derived_instance_fields: Vec<(u32, DerivedInstanceFields)>,
 }
 
 #[inline]
@@ -982,11 +997,11 @@ impl SnapshotBuilder<'_> {
             //     alive. The snapshot notes their cells, which keeps them in place until the code is installed.
             let bound_arguments = bound.bound_arguments();
             snapshot.bound_this = self.value_bits(bound.bound_this());
-            snapshot.bound_arguments_start = u32::try_from(self.bound_arguments.len()).ok()?;
+            snapshot.bound_arguments_start = u32::try_from(self.scratch.bound_arguments.len()).ok()?;
             snapshot.bound_argument_count = u32::try_from(bound_arguments.len()).ok()?;
             for &value in bound_arguments {
                 let bits = self.value_bits(value);
-                self.bound_arguments.push(bits);
+                self.scratch.bound_arguments.push(bits);
             }
         }
         Some(snapshot)
@@ -1086,7 +1101,7 @@ impl SnapshotBuilder<'_> {
         }
         if let Some(fields) = literal_fields {
             vec_map_insert(
-                &mut self.literal_instance_fields,
+                &mut self.scratch.literal_instance_fields,
                 *indices.last().expect("the chain ends with a base constructor"),
                 fields,
             );
@@ -1094,7 +1109,7 @@ impl SnapshotBuilder<'_> {
         for (level, index) in indices.iter().enumerate().take(chain.len() - 1) {
             let constructor = chain.get(level).expect("the level is in the chain");
             if let Some(fields) = self.derived_instance_fields(constructor) {
-                vec_map_insert(&mut self.derived_instance_fields, *index, fields);
+                vec_map_insert(&mut self.scratch.derived_instance_fields, *index, fields);
             }
         }
         if chain.len() == 1 {
@@ -1108,7 +1123,7 @@ impl SnapshotBuilder<'_> {
                 function_shape: self.cell(chain.get(level).expect("the level is in the chain").shape()),
                 derived: level + 2 < chain.len(),
             };
-            vec_map_insert(&mut self.super_constructors, indices[level], target);
+            vec_map_insert(&mut self.scratch.super_constructors, indices[level], target);
             super_constructor = Some(target);
         }
         Some(ConstructTarget {
@@ -1216,8 +1231,8 @@ impl SnapshotBuilder<'_> {
         let cells = &mut self.cells;
         let template =
             function_environment_template(self.vm, function, &mut self.snapshot, |cell| note_cell(cells, cell))?;
-        let index = u32::try_from(self.environment_templates.len()).ok()?;
-        self.environment_templates.push(template);
+        let index = u32::try_from(self.scratch.environment_templates.len()).ok()?;
+        self.scratch.environment_templates.push(template);
         Some(Some(index))
     }
 
@@ -1402,9 +1417,9 @@ impl SnapshotBuilder<'_> {
                 cache_value: self.snapshot.add(cell_slice_as_values(feedback.cache_value())),
                 call,
                 keyed,
-                bound_arguments: self.snapshot.add(&self.bound_arguments),
+                bound_arguments: self.snapshot.add(&self.scratch.bound_arguments),
             };
-            self.bound_arguments.clear();
+            self.scratch.bound_arguments.clear();
             (false, snapshot)
         } else {
             (true, FeedbackSnapshot::default())
@@ -1414,9 +1429,11 @@ impl SnapshotBuilder<'_> {
             .function
             .and_then(|function| vec_map_get(&self.indices, &function));
         let construct_this_shape = index.and_then(|index| vec_map_get(&self.construct_this_shapes, &index));
-        let super_constructor = index.and_then(|index| vec_map_get(&self.super_constructors, &index));
-        let literal_instance_fields = index.and_then(|index| vec_map_get(&self.literal_instance_fields, &index));
-        let derived_instance_fields = index.and_then(|index| vec_map_get(&self.derived_instance_fields, &index));
+        let super_constructor = index.and_then(|index| vec_map_get(&self.scratch.super_constructors, &index));
+        let literal_instance_fields =
+            index.and_then(|index| vec_map_get(&self.scratch.literal_instance_fields, &index));
+        let derived_instance_fields =
+            index.and_then(|index| vec_map_get(&self.scratch.derived_instance_fields, &index));
         let has_instance_elements =
             matches!(entry.function, Some(InlinedFunction::Ecmascript(function)) if function.has_class_data());
         let primitive_prototype_shapes = if realm == self.compiled_realm {
@@ -1428,12 +1445,21 @@ impl SnapshotBuilder<'_> {
                 realm.boolean_prototype(vm).shape(),
             ]
         };
+        let caches_slice = executable.property_lookup_caches();
+        let cache_sizes_start =
+            u32::try_from(self.property_cache_sizes.len()).expect("property cache sizes count fits in u32");
+        self.property_cache_sizes.reserve(caches_slice.len());
         let property_caches = self.snapshot.begin();
-        for cache in executable.property_lookup_caches() {
+        for cache in caches_slice {
+            self.property_cache_sizes.push(speculated_cache_size(cache));
             let row = self.property_cache(cache, entry, construct_this_shape, &primitive_prototype_shapes);
             self.snapshot.push(row);
         }
         let property_caches = self.snapshot.end(property_caches);
+        self.scratch.property_cache_ranges.push((
+            cache_sizes_start,
+            u32::try_from(caches_slice.len()).expect("property cache count fits in u32"),
+        ));
         let object_shape_caches = self.snapshot.begin();
         for cache in executable.object_shape_caches() {
             let row = cache.shape.get().map(|shape| ObjectShapeCacheSnapshot {
@@ -1443,8 +1469,8 @@ impl SnapshotBuilder<'_> {
             self.snapshot.push(row);
         }
         let object_shape_caches = self.snapshot.end(object_shape_caches);
-        let environment_templates = self.snapshot.add(&self.environment_templates);
-        self.environment_templates.clear();
+        let environment_templates = self.snapshot.add(&self.scratch.environment_templates);
+        self.scratch.environment_templates.clear();
 
         // NB: The same rules as ExecutionContext::keeps_private_environment() and keeps_variable_environment().
         let frame_function = match entry.function {
@@ -1792,151 +1818,171 @@ pub fn capture_snapshot<'d>(
             ..FunctionFrameFields::default()
         },
     };
-    let mut spare_snapshot = super::compile_queue::spare_snapshot();
-    let (runtime, bytecode_owners, cells, entries, sample_slots) = vm.jit.with_snapshot_open_lists(|open_lists| {
-        let mut snapshot = SnapshotWriter::new(&mut spare_snapshot, open_lists);
-        // NB: These allocate (and so may collect garbage), which they do before anything is captured.
-        let allocation = allocation_infos(vm, realm, defer_gc, &mut snapshot);
-        // NB: Closures that top-level code creates have its environments, which the code does not know.
-        let closure_templates = match function {
-            Some(function) => closure_templates(vm, executable, function, defer_gc, &mut snapshot),
-            None => defer_gc.cover((0..executable.shared_function_data_count()).map(|_| None).collect()),
-        };
-        let closure_samples = closure_templates
-            .iter()
-            .map(|template| template.as_ref().map(|(sample, _)| *sample))
-            .collect::<Vec<_>>();
-        let mut cells = Vec::with_capacity(allocation.cells.len() + 256);
-        cells.extend_from_slice(&allocation.cells);
-        let realm_new_object_shape_gc = realm.intrinsics().new_object_shape();
-        let realm_new_object_shape = ShapeSnapshot {
-            shape: note_cell(&mut cells, realm_new_object_shape_gc),
-            property_count: realm_new_object_shape_gc.property_count(),
-        };
-        let realm_string_prototype_gc = realm.string_prototype(vm);
-        let realm_number_prototype_gc = realm.number_prototype(vm);
-        let realm_boolean_prototype_gc = realm.boolean_prototype(vm);
-        let realm_string_prototype = note_cell(&mut cells, realm_string_prototype_gc);
-        let realm_number_prototype = note_cell(&mut cells, realm_number_prototype_gc);
-        let realm_boolean_prototype = note_cell(&mut cells, realm_boolean_prototype_gc);
-        let realm_primitive_prototype_shapes = [
-            realm_string_prototype_gc.shape(),
-            realm_number_prototype_gc.shape(),
-            realm_boolean_prototype_gc.shape(),
-        ];
-        let mut entries = Vec::with_capacity(16);
-        entries.push(Entry {
-            executable,
-            function: None,
-            realm,
-            depth: 0,
-        });
-        let mut builder = SnapshotBuilder {
-            vm,
-            defer_gc,
-            snapshot,
-            bytecode_owners: Vec::with_capacity(8),
-            cells,
-            entries,
-            indices: Vec::with_capacity(16),
-            compiled_realm: realm,
-            realm_new_object_shape,
-            realm_string_prototype,
-            realm_number_prototype,
-            realm_boolean_prototype,
-            realm_primitive_prototype_shapes,
-            compiled_function: function,
-            compiled_function_fields,
-            closure_templates: List::empty(),
-            closure_samples: Vec::new(),
-            sample_slots: Vec::new(),
-            environment_templates: Vec::new(),
-            bound_arguments: Vec::new(),
-            lexical_environment_templates: List::empty(),
-            construct_this_shapes: Vec::new(),
-            super_constructors: Vec::new(),
-            literal_instance_fields: Vec::new(),
-            derived_instance_fields: Vec::new(),
-        };
-        if let Some(function) = function {
-            note_frame_field_cells(&mut builder.cells, function);
-        }
-        let cells = &mut builder.cells;
-        builder.closure_templates = closure_template_snapshots(
-            closure_templates.into_inner(),
-            |cell| note_cell(cells, cell),
-            &mut builder.sample_slots,
-            defer_gc,
-            &mut builder.snapshot,
-        );
-        builder.lexical_environment_templates =
-            lexical_environment_templates(vm, executable, realm, &mut builder.snapshot, |cell| {
-                note_cell(cells, cell)
+    let super::compile_queue::SpareSnapshot {
+        snapshot: mut spare_snapshot,
+        bytecode_owners: spare_bytecode_owners,
+    } = super::compile_queue::spare_snapshot();
+    let (runtime, bytecode_owners, cells, snapshot_executables, sample_slots) =
+        vm.jit.with_snapshot_buffers(|open_lists, scratch| {
+            let mut snapshot = SnapshotWriter::new(&mut spare_snapshot, open_lists);
+            // NB: These allocate (and so may collect garbage), which they do before anything is captured.
+            let allocation = allocation_infos(vm, realm, defer_gc, &mut snapshot);
+            // NB: Closures that top-level code creates have its environments, which the code does not know.
+            let closure_templates = match function {
+                Some(function) => closure_templates(vm, executable, function, defer_gc, &mut snapshot),
+                None => defer_gc.cover((0..executable.shared_function_data_count()).map(|_| None).collect()),
+            };
+            let closure_samples = closure_templates
+                .iter()
+                .map(|template| template.as_ref().map(|(sample, _)| *sample))
+                .collect::<Vec<_>>();
+            let mut cells = Vec::with_capacity(allocation.cells.len() + 256);
+            cells.extend_from_slice(&allocation.cells);
+            let realm_new_object_shape_gc = realm.intrinsics().new_object_shape();
+            let realm_new_object_shape = ShapeSnapshot {
+                shape: note_cell(&mut cells, realm_new_object_shape_gc),
+                property_count: realm_new_object_shape_gc.property_count(),
+            };
+            let realm_string_prototype_gc = realm.string_prototype(vm);
+            let realm_number_prototype_gc = realm.number_prototype(vm);
+            let realm_boolean_prototype_gc = realm.boolean_prototype(vm);
+            let realm_string_prototype = note_cell(&mut cells, realm_string_prototype_gc);
+            let realm_number_prototype = note_cell(&mut cells, realm_number_prototype_gc);
+            let realm_boolean_prototype = note_cell(&mut cells, realm_boolean_prototype_gc);
+            let realm_primitive_prototype_shapes = [
+                realm_string_prototype_gc.shape(),
+                realm_number_prototype_gc.shape(),
+                realm_boolean_prototype_gc.shape(),
+            ];
+            let mut entries = Vec::with_capacity(16);
+            entries.push(Entry {
+                executable,
+                function: None,
+                realm,
+                depth: 0,
             });
-        // NB: executable_snapshot() appends the inlining candidates it finds.
-        let mut index = 0;
-        while index < builder.entries.len() {
-            let entry = builder.entries[index];
-            let row = builder.executable_snapshot(&entry);
-            builder.snapshot.add_executable(row);
-            index += 1;
-        }
-        // NB: Calls of closures the code creates can be inlined without feedback, as calls of the function its closure
-        //     templates are samples of. These come last, so that they take what is left of the inlining budget. Their
-        //     snapshots may have closure templates in turn.
-        let mut samples = closure_samples
-            .into_iter()
-            .enumerate()
-            .filter_map(|(template_index, sample)| Some((0, template_index, sample?)))
-            .collect::<Vec<_>>();
-        samples.append(&mut builder.closure_samples);
-        while !samples.is_empty() {
-            for (executable_index, template_index, sample) in samples {
-                let creator = builder.entries[executable_index as usize];
-                let inline_executable = builder.inline_executable_index(Some(sample.upcast::<CellHeader>()), &creator);
-                // NB: A snapshot that had no room for an executable has no row for it (see `Snapshot::is_complete()`).
-                let Some(executable) = builder.snapshot.executables.get(executable_index as usize) else {
-                    continue;
-                };
-                let templates = executable.closure_templates;
-                if let Some(Some(template)) = builder.snapshot[templates].get_mut(template_index) {
-                    template.inline_executable = inline_executable;
-                }
+            let mut builder = SnapshotBuilder {
+                vm,
+                defer_gc,
+                snapshot,
+                bytecode_owners: spare_bytecode_owners,
+                cells,
+                entries,
+                indices: Vec::with_capacity(16),
+                property_cache_sizes: Vec::new(),
+                scratch,
+                compiled_realm: realm,
+                realm_new_object_shape,
+                realm_string_prototype,
+                realm_number_prototype,
+                realm_boolean_prototype,
+                realm_primitive_prototype_shapes,
+                compiled_function: function,
+                compiled_function_fields,
+                closure_templates: List::empty(),
+                closure_samples: Vec::new(),
+                sample_slots: Vec::new(),
+                lexical_environment_templates: List::empty(),
+                construct_this_shapes: Vec::new(),
+            };
+            if let Some(function) = function {
+                note_frame_field_cells(&mut builder.cells, function);
             }
+            let cells = &mut builder.cells;
+            builder.closure_templates = closure_template_snapshots(
+                closure_templates.into_inner(),
+                |cell| note_cell(cells, cell),
+                &mut builder.sample_slots,
+                defer_gc,
+                &mut builder.snapshot,
+            );
+            builder.lexical_environment_templates =
+                lexical_environment_templates(vm, executable, realm, &mut builder.snapshot, |cell| {
+                    note_cell(cells, cell)
+                });
+            // NB: executable_snapshot() appends the inlining candidates it finds.
+            let mut index = 0;
             while index < builder.entries.len() {
                 let entry = builder.entries[index];
                 let row = builder.executable_snapshot(&entry);
                 builder.snapshot.add_executable(row);
                 index += 1;
             }
-            samples = core::mem::take(&mut builder.closure_samples);
-        }
-        let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
-        // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.
-        builder.cell(realm.array_prototype());
-        builder.cell(realm.object_prototype());
-        runtime.array_iterator_next = builder.optional_cell(array_iterator_next(vm, realm));
-        runtime.array_iterator_return_watchpoint_set = builder.optional_cell(
-            realm
-                .array_iterator_return_watchpoint_set
-                .get()
-                .filter(|set| set.is_valid()),
-        );
-        // NB: Code that reads the cells of the realm embeds the realm.
-        builder.cell(realm);
-        runtime.array_iterator_next_watchpoint_set_address =
-            realm_watchpoints::array_iterator_next_watchpoint_set_address(realm);
-        runtime.array_iterator_method_watchpoint_set_address =
-            realm_watchpoints::array_iterator_method_watchpoint_set_address(realm);
-        let SnapshotBuilder {
-            bytecode_owners,
-            cells,
-            entries,
-            sample_slots,
-            ..
-        } = builder;
-        (runtime, bytecode_owners, cells, entries, sample_slots)
-    });
+            // NB: Calls of closures the code creates can be inlined without feedback, as calls of the function its closure
+            //     templates are samples of. These come last, so that they take what is left of the inlining budget. Their
+            //     snapshots may have closure templates in turn.
+            let mut samples = closure_samples
+                .into_iter()
+                .enumerate()
+                .filter_map(|(template_index, sample)| Some((0, template_index, sample?)))
+                .collect::<Vec<_>>();
+            samples.append(&mut builder.closure_samples);
+            while !samples.is_empty() {
+                for (executable_index, template_index, sample) in samples {
+                    let creator = builder.entries[executable_index as usize];
+                    let inline_executable =
+                        builder.inline_executable_index(Some(sample.upcast::<CellHeader>()), &creator);
+                    // NB: A snapshot that had no room for an executable has no row for it (see `Snapshot::is_complete()`).
+                    let Some(executable) = builder.snapshot.executables.get(executable_index as usize) else {
+                        continue;
+                    };
+                    let templates = executable.closure_templates;
+                    if let Some(Some(template)) = builder.snapshot[templates].get_mut(template_index) {
+                        template.inline_executable = inline_executable;
+                    }
+                }
+                while index < builder.entries.len() {
+                    let entry = builder.entries[index];
+                    let row = builder.executable_snapshot(&entry);
+                    builder.snapshot.add_executable(row);
+                    index += 1;
+                }
+                samples = core::mem::take(&mut builder.closure_samples);
+            }
+            let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
+            // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.
+            builder.cell(realm.array_prototype());
+            builder.cell(realm.object_prototype());
+            runtime.array_iterator_next = builder.optional_cell(array_iterator_next(vm, realm));
+            runtime.array_iterator_return_watchpoint_set = builder.optional_cell(
+                realm
+                    .array_iterator_return_watchpoint_set
+                    .get()
+                    .filter(|set| set.is_valid()),
+            );
+            // NB: Code that reads the cells of the realm embeds the realm.
+            builder.cell(realm);
+            runtime.array_iterator_next_watchpoint_set_address =
+                realm_watchpoints::array_iterator_next_watchpoint_set_address(realm);
+            runtime.array_iterator_method_watchpoint_set_address =
+                realm_watchpoints::array_iterator_method_watchpoint_set_address(realm);
+            let SnapshotBuilder {
+                bytecode_owners,
+                cells,
+                entries,
+                property_cache_sizes,
+                scratch,
+                sample_slots,
+                ..
+            } = builder;
+            debug_assert_eq!(entries.len(), scratch.property_cache_ranges.len());
+            let snapshot_executables = SnapshotExecutables {
+                entries: entries
+                    .iter()
+                    .zip(scratch.property_cache_ranges.iter())
+                    .map(|(entry, &(start, len))| SnapshotExecutable {
+                        executable: entry.executable,
+                        function: entry.function,
+                        known_exit_sites: entry.executable.jit_exit_site_count(),
+                        known_builtin_exit_sites: entry.executable.jit_builtin_exit_site_count(),
+                        property_cache_sizes_start: start,
+                        property_cache_sizes_len: len,
+                    })
+                    .collect(),
+                property_cache_sizes: property_cache_sizes.into_boxed_slice(),
+            };
+            (runtime, bytecode_owners, cells, snapshot_executables, sample_slots)
+        });
     let options = &vm.jit.options;
     let mut snapshot = spare_snapshot;
     snapshot.runtime = runtime;
@@ -1968,22 +2014,6 @@ pub fn capture_snapshot<'d>(
         bytecode_owners,
         cells: defer_gc.cover(cells),
         sample_slots: defer_gc.cover(sample_slots),
-        snapshot_executables: defer_gc.cover(
-            entries
-                .iter()
-                .map(|entry| SnapshotExecutable {
-                    executable: entry.executable,
-                    function: entry.function,
-                    known_exit_sites: entry.executable.jit_exit_site_count(),
-                    known_builtin_exit_sites: entry.executable.jit_builtin_exit_site_count(),
-                    property_cache_sizes: entry
-                        .executable
-                        .property_lookup_caches()
-                        .iter()
-                        .map(speculated_cache_size)
-                        .collect(),
-                })
-                .collect(),
-        ),
+        snapshot_executables: defer_gc.cover(snapshot_executables),
     }
 }

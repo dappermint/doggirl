@@ -10,7 +10,7 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
 use super::allocation::SampleSlots;
-use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutable};
+use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutables};
 use super::compile_queue::{CompileResult, Compiled};
 use super::data_memory::DataMemory;
 use super::executable_memory::ExecutableMemory;
@@ -428,8 +428,6 @@ fn install(
     executable.install_jit_code(vm, code, compile_wait_budget(&vm.jit.options), defer_gc);
 }
 
-type SnapshotExecutables = Vec<SnapshotExecutable>;
-
 /// Finishes a compile whose code, if it should be installed, is in `memory`.
 fn finish_compile(
     vm: &Vm,
@@ -519,8 +517,7 @@ fn compile(
     if sync {
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
         let result = super::compile_queue::compile(&snapshot);
-        super::compile_queue::give_back_snapshot(snapshot);
-        drop(bytecode_owners);
+        super::compile_queue::give_back_snapshot(snapshot, bytecode_owners);
         let memory = should_install(vm, &result).then(|| {
             let code = &result.as_ref().expect("the compile succeeded").code;
             let perf_map = vm.jit.options.perf_map;

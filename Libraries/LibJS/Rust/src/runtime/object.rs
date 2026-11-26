@@ -4910,6 +4910,17 @@ impl Object {
         }
     }
 
+    /// Returns the first `count` slots of this object's named property storage.
+    #[inline]
+    pub fn named_properties_prefix(&self, count: usize) -> &[Value] {
+        assert!(count <= self.named_storage_capacity() as usize);
+        if count == 0 {
+            return &[];
+        }
+        // SAFETY: `count` lies within this object's initialized named property storage.
+        unsafe { ak::slice_from_raw_parts(self.named_properties.get(), count) }
+    }
+
     pub fn set_indexed_property_elements(&self, values: &[Value]) {
         self.free_indexed_elements();
 
@@ -4919,6 +4930,24 @@ impl Object {
 
         let size = u32::try_from(values.len()).expect("an array-like size fits in u32");
         let elements = value_storage::allocate_from_slice_with_capacity(self.vm().heap(), values, size, Value::EMPTY);
+        self.indexed_storage_kind.set(IndexedStorageKind::Packed);
+        self.indexed_array_like_size.set(size);
+        self.adopt_indexed_elements(elements);
+    }
+
+    /// Replaces the indexed storage with `size` packed elements initialized in place by `init`. Never collects garbage.
+    pub fn set_indexed_property_elements_with(
+        &self,
+        size: u32,
+        init: impl FnOnce(&mut [core::mem::MaybeUninit<Value>]),
+    ) {
+        self.free_indexed_elements();
+
+        if size == 0 {
+            return;
+        }
+
+        let elements = value_storage::allocate_initialized_with(self.vm().heap(), size, Value::EMPTY, init);
         self.indexed_storage_kind.set(IndexedStorageKind::Packed);
         self.indexed_array_like_size.set(size);
         self.adopt_indexed_elements(elements);

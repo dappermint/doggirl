@@ -226,6 +226,48 @@ pub fn allocate_from_slice_with_capacity(heap: &Heap, values: &[Value], capacity
         .cast::<Value>()
 }
 
+/// Allocates storage for at least `prefix_len` values, initializes `[0..prefix_len)` via `init`, and sets any
+/// remaining size-class capacity to `tail_fill` in a single pass. Never collects garbage.
+pub fn allocate_initialized_with(
+    heap: &Heap,
+    prefix_len: u32,
+    tail_fill: Value,
+    init: impl FnOnce(&mut [core::mem::MaybeUninit<Value>]),
+) -> *mut Value {
+    let prefix = prefix_len as usize;
+    let Some(index) = size_class_index(prefix_len) else {
+        return malloc::allocate_initialized_with(prefix_len, init);
+    };
+    let cell_capacity = SIZE_CLASS_CAPACITIES[index] as usize;
+    // SAFETY: `init` initializes `[0..prefix)` and the tail fill initializes `[prefix..cell_capacity)`.
+    let storage = unsafe {
+        heap.allocate_storage_with_size_class_init_tail(
+            size_classes(heap)[index],
+            |_| ValueStorage {
+                header: CellHeader::for_class(ValueStorage::CLASS),
+                _padding: [0; 5],
+                capacity: SIZE_CLASS_CAPACITIES[index],
+                kind: ValueStorageKind::Cell,
+                values: [],
+            },
+            |tail_start, tail_size| {
+                debug_assert_eq!(tail_size, cell_capacity * size_of::<Value>());
+                let dst = tail_start.cast::<core::mem::MaybeUninit<Value>>();
+                init(ak::slice_from_raw_parts_mut(dst, prefix));
+                if prefix < cell_capacity {
+                    ak::slice_from_raw_parts_mut(dst.add(prefix), cell_capacity - prefix)
+                        .fill(core::mem::MaybeUninit::new(tail_fill));
+                }
+            },
+        )
+    };
+    storage
+        .as_ptr()
+        .cast::<u8>()
+        .wrapping_add(VALUES_OFFSET)
+        .cast::<Value>()
+}
+
 /// Allocates storage for at least `prefix_len` values, setting `[0..prefix_len)` to `prefix_fill` and any remaining
 /// size-class capacity to `tail_fill` in a single pass. Never collects garbage.
 pub fn allocate_with_prefix_fill(heap: &Heap, prefix_len: u32, prefix_fill: Value, tail_fill: Value) -> *mut Value {
@@ -374,6 +416,29 @@ mod malloc {
 
     pub fn allocation_size(capacity: u32) -> usize {
         INDEXED_ELEMENTS_HEADER_SIZE + capacity as usize * size_of::<Value>()
+    }
+
+    pub fn allocate_initialized_with(
+        capacity: u32,
+        init: impl FnOnce(&mut [core::mem::MaybeUninit<Value>]),
+    ) -> *mut Value {
+        let layout = layout(capacity);
+        // SAFETY: The layout has room for the header and `capacity` values.
+        let raw = unsafe { raw::allocate(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: The allocation starts with the header, followed by `capacity` uninitialized `Value`s.
+        unsafe {
+            raw.cast::<u32>().write(capacity);
+            raw.add(size_of::<u32>())
+                .cast::<ValueStorageKind>()
+                .write(ValueStorageKind::Malloc);
+            let values = raw.add(INDEXED_ELEMENTS_HEADER_SIZE).cast::<Value>();
+            let slice = ak::slice_from_raw_parts_mut(values.cast::<core::mem::MaybeUninit<Value>>(), capacity as usize);
+            init(slice);
+            values
+        }
     }
 
     pub fn allocate(capacity: u32, fill: Value) -> *mut Value {

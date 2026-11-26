@@ -115,8 +115,19 @@ pub struct SnapshotExecutable {
     /// For the compiled executable, how many sites in inlined builtins it had recorded then.
     #[gc(untraced)]
     pub known_builtin_exit_sites: usize,
-    /// The size of each property lookup cache of the executable when the code was compiled (see
-    /// `speculated_cache_size()`): how many shapes the code speculated on there.
+    /// Start offset and length within `JitCode::property_cache_sizes` for this executable's property lookup cache
+    /// sizes at snapshot capture time (see `speculated_cache_size()`).
+    #[gc(untraced)]
+    pub property_cache_sizes_start: u32,
+    #[gc(untraced)]
+    pub property_cache_sizes_len: u32,
+}
+
+/// The executables captured in one snapshot together with one flat buffer of their speculated property lookup cache
+/// sizes, avoiding per-executable heap allocations.
+#[derive(Trace)]
+pub struct SnapshotExecutables {
+    pub entries: Vec<SnapshotExecutable>,
     #[gc(untraced)]
     pub property_cache_sizes: Box<[u8]>,
 }
@@ -202,7 +213,7 @@ pub struct JitCode {
     /// cell alive only while the function is alive, as these cells may reach the function's realm, but have no realm
     /// of their own (see `split_function_cells()`).
     function_cells: FunctionCells,
-    snapshot_executables: Vec<SnapshotExecutable>,
+    snapshot_executables: SnapshotExecutables,
     /// The slots of the samples the code copies closures of, whose addresses the code holds rather than those of the
     /// samples. A collection rewrites them where they are when a sample moves.
     sample_slots: SampleSlots,
@@ -246,7 +257,7 @@ impl JitCode {
         tables: DataMemory,
         layout: Layout,
         embedded_cells: Vec<Gc<CellHeader>>,
-        snapshot_executables: Vec<SnapshotExecutable>,
+        snapshot_executables: SnapshotExecutables,
         defer_gc: &DeferGc<'_>,
     ) -> Self {
         let entry = entry_at(&memory, entry_offset);
@@ -350,6 +361,7 @@ impl JitCode {
     fn cells_held_by_realm(&self) -> impl Iterator<Item = Gc<CellHeader>> {
         let functions = self
             .snapshot_executables
+            .entries
             .iter()
             .filter_map(|snapshot| snapshot.function)
             .map(|function| match function {
@@ -375,6 +387,7 @@ impl JitCode {
             || self.function_cells.iter().any(|&(_, cell)| sweep.is_dead(cell))
             || self
                 .snapshot_executables
+                .entries
                 .iter()
                 .any(|snapshot| sweep.is_dead(snapshot.executable))
     }
@@ -425,7 +438,14 @@ impl JitCode {
     }
 
     pub fn snapshot_executable(&self, index: u32) -> &SnapshotExecutable {
-        &self.snapshot_executables[index as usize]
+        &self.snapshot_executables.entries[index as usize]
+    }
+
+    pub fn snapshot_executable_property_cache_sizes(&self, index: u32) -> &[u8] {
+        let snapshot = &self.snapshot_executables.entries[index as usize];
+        let start = snapshot.property_cache_sizes_start as usize;
+        let end = start + snapshot.property_cache_sizes_len as usize;
+        &self.snapshot_executables.property_cache_sizes[start..end]
     }
 
     /// How often the code exited.
@@ -490,6 +510,12 @@ impl JitCode {
 /// Cells that belong to ECMAScript functions, each with its function (see `JitCode::function_cells`).
 type FunctionCells = Vec<(Gc<CellHeader>, Gc<CellHeader>)>;
 
+#[inline(always)]
+fn cell_addr_bloom_mask(addr: usize) -> u64 {
+    let h = (addr as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (1u64 << (h >> 58)) | (1u64 << ((h >> 52) & 63))
+}
+
 /// Splits the cells that belong to an ECMAScript function among `embedded_cells` off them (see
 /// `JitCode::function_cells`), returning the other embedded cells and those cells, with their functions.
 fn split_function_cells(
@@ -498,6 +524,7 @@ fn split_function_cells(
 ) -> (Vec<Gc<CellHeader>>, FunctionCells) {
     let mut function_cells = Vec::new();
     let mut candidate_owned: Vec<(Gc<CellHeader>, Gc<CellHeader>)> = Vec::new();
+    let mut bloom = 0u64;
     for &cell in &embedded_cells {
         let Some(function) = cell.downcast::<EcmascriptFunctionObject>() else {
             continue;
@@ -506,11 +533,15 @@ fn split_function_cells(
         // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
         //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
         if let Some(environment) = function.environment().map(Gc::upcast::<CellHeader>) {
+            bloom |= cell_addr_bloom_mask(environment.as_ptr().addr());
             function_cells.push((function_cell, environment));
         }
         let shared_data = function.shared_data();
-        candidate_owned.push((function_cell, shared_data.upcast::<CellHeader>()));
+        let shared_cell = shared_data.upcast::<CellHeader>();
+        bloom |= cell_addr_bloom_mask(shared_cell.as_ptr().addr());
+        candidate_owned.push((function_cell, shared_cell));
         if let Some(exec_cell) = shared_data.executable().map(Gc::upcast::<CellHeader>) {
+            bloom |= cell_addr_bloom_mask(exec_cell.as_ptr().addr());
             candidate_owned.push((function_cell, exec_cell));
         }
     }
@@ -518,11 +549,19 @@ fn split_function_cells(
         return (embedded_cells, function_cells);
     }
     if candidate_owned.len() <= 16 && function_cells.len() <= 16 {
-        // Common case: scan `embedded_cells` once without allocating or sorting address tables.
+        // Common case: bloom-filtered single pass over `embedded_cells` without sorting or extra allocations.
         let mut matched_candidates = 0u16;
+        let initial_env_count = function_cells.len();
         embedded_cells.retain(|cell| {
+            let addr = cell.as_ptr().addr();
+            let mask = cell_addr_bloom_mask(addr);
+            if (bloom & mask) != mask {
+                return true;
+            }
             let ptr = cell.as_ptr();
-            let mut owned = function_cells.iter().any(|&(_, env)| env.as_ptr() == ptr);
+            let mut owned = function_cells[..initial_env_count]
+                .iter()
+                .any(|&(_, env)| env.as_ptr() == ptr);
             for (index, &(function_cell, candidate)) in candidate_owned.iter().enumerate() {
                 if candidate.as_ptr() == ptr {
                     owned = true;
@@ -537,20 +576,33 @@ fn split_function_cells(
         });
         return (embedded_cells, function_cells);
     }
-    let mut embedded_addrs: Vec<usize> = embedded_cells.iter().map(|cell| cell.as_ptr().addr()).collect();
-    embedded_addrs.sort_unstable();
-    embedded_addrs.dedup();
-    for (function_cell, candidate) in candidate_owned {
-        if embedded_addrs.binary_search(&candidate.as_ptr().addr()).is_ok() {
-            function_cells.push((function_cell, candidate));
+    // Larger case: sort only the small candidate and environment lists (not all `embedded_cells`) and guard lookups
+    // with the 64-bit bloom filter.
+    candidate_owned.sort_unstable_by_key(|&(_, candidate)| candidate.as_ptr().addr());
+    let mut env_addrs: Vec<usize> = function_cells.iter().map(|&(_, env)| env.as_ptr().addr()).collect();
+    env_addrs.sort_unstable();
+    env_addrs.dedup();
+    let mut matched = vec![false; candidate_owned.len()];
+    embedded_cells.retain(|cell| {
+        let addr = cell.as_ptr().addr();
+        let mask = cell_addr_bloom_mask(addr);
+        if (bloom & mask) != mask {
+            return true;
         }
-    }
-    if !function_cells.is_empty() {
-        let mut owned_addrs: Vec<usize> = function_cells.iter().map(|&(_, cell)| cell.as_ptr().addr()).collect();
-        owned_addrs.sort_unstable();
-        owned_addrs.dedup();
-        embedded_cells.retain(|cell| owned_addrs.binary_search(&cell.as_ptr().addr()).is_err());
-    }
+        let mut owned = env_addrs.binary_search(&addr).is_ok();
+        let start = candidate_owned.partition_point(|&(_, candidate)| candidate.as_ptr().addr() < addr);
+        let mut index = start;
+        while index < candidate_owned.len() && candidate_owned[index].1.as_ptr().addr() == addr {
+            owned = true;
+            if !matched[index] {
+                matched[index] = true;
+                let (function_cell, candidate) = candidate_owned[index];
+                function_cells.push((function_cell, candidate));
+            }
+            index += 1;
+        }
+        !owned
+    });
     (embedded_cells, function_cells)
 }
 
@@ -585,7 +637,7 @@ unsafe impl Trace for JitCode {
             visitor.visit(materialized.object);
         }
         // NB: The executables of inlined calls are held like the cells of their functions.
-        for snapshot in &self.snapshot_executables {
+        for snapshot in &self.snapshot_executables.entries {
             match snapshot.function {
                 Some(InlinedFunction::Ecmascript(function)) => {
                     visitor.visit_ephemeron_cell(function, snapshot.executable);
