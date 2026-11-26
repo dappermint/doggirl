@@ -67,8 +67,15 @@ unsafe impl SweptAfterCollection for Dependents {}
 
 impl Dependents {
     /// Records that the code with `id` installed for `executable` depends on `dependencies`.
-    pub fn register(&self, vm: &Vm, executable: Gc<Executable>, id: u64, dependencies: &[Dependency]) {
-        if dependencies.is_empty() {
+    pub fn register(
+        &self,
+        vm: &Vm,
+        executable: Gc<Executable>,
+        id: u64,
+        dependencies: impl IntoIterator<Item = Dependency>,
+    ) {
+        let mut dependencies = dependencies.into_iter().peekable();
+        if dependencies.peek().is_none() {
             return;
         }
         let mut code = self.code.borrow_mut();
@@ -77,14 +84,14 @@ impl Dependents {
             match dependency {
                 Dependency::GlobalDeclarations { environment, .. }
                 | Dependency::GlobalBindingUnassigned { environment, .. } => {
-                    declarative_environment(*environment).set_has_dependent_code();
+                    declarative_environment(environment).set_has_dependent_code();
                 }
-                Dependency::StableShape(shape) => shape_of(*shape).set_has_dependent_code(),
+                Dependency::StableShape(shape) => shape_of(shape).set_has_dependent_code(),
                 Dependency::WatchpointSetValid(_)
                 | Dependency::GlobalPropertyUnassigned { .. }
                 | Dependency::NoHtmlDdaObjects => {}
             }
-            code.entry(*dependency).or_default().push(DependentCode {
+            code.entry(dependency).or_default().push(DependentCode {
                 executable: weak_executable.clone(),
                 id,
             });

@@ -10,19 +10,19 @@
 use ak::Zone;
 use core::num::NonZeroU64;
 use libjs_abi::Builtin;
-use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use libjs_jit::bytecode::{
-    EnvironmentCoordinate, ExceptionHandler, FrameLayout, Instruction, OpCode, decode_instruction,
+    EnvironmentCoordinate, ExceptionHandler, FrameLayout, Instruction, OpCode, decode_instruction, opcode_and_length,
 };
 use libjs_jit::code::ExitKind;
 use libjs_jit::snapshot::{
-    AccessorFunctionSnapshot, CallFeedbackSnapshot, CellId, ClosureTemplateSnapshot, CompileOptions, ConstructTarget,
-    DerivedInstanceFields, DirectCallTarget, DirectGetterFields, EnvironmentTemplateSnapshot, ExecutableSnapshot,
-    FeedbackSnapshot, ForwardedCallSnapshot, Forwarding, FunctionFrameFields, GlobalCacheSnapshot, GlobalValueSnapshot,
-    GlobalsSnapshot, InlinedFunctionSnapshot, InliningLimits, Intrinsic, KeyedFeedbackSnapshot,
+    AccessorFunctionSnapshot, BytecodeSlice, CallFeedbackSnapshot, CellId, ClosureTemplateSnapshot, CompileOptions,
+    ConstructTarget, DerivedInstanceFields, DirectCallTarget, DirectGetterFields, EnvironmentTemplateSnapshot,
+    ExecutableSnapshot, FeedbackSnapshot, ForwardedCallSnapshot, Forwarding, FunctionFrameFields, GlobalCacheSnapshot,
+    GlobalValueSnapshot, GlobalsSnapshot, InlinedFunctionSnapshot, InliningLimits, Intrinsic, KeyedFeedbackSnapshot,
     LexicalEnvironmentTemplateSnapshot, List, NativeCallTarget, ObjectShapeCacheSnapshot, OrdinaryHasInstanceSnapshot,
-    PropertyCacheEntrySnapshot, PropertyCacheEntryType, PropertyCacheKind, PropertyCacheSnapshot, Row, ShapeSnapshot,
+    PropertyCacheEntrySnapshot, PropertyCacheEntryType, PropertyCacheKind, PropertyCacheSnapshot, ShapeSnapshot,
     Snapshot, SnapshotWriter, StressOptions, SuperBaseSnapshot, SuperConstructTarget, TypedArraySnapshot,
 };
 
@@ -33,6 +33,7 @@ use super::allocation::{
 use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, speculated_cache_size};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
+use crate::bytecode::executable_data::ExecutableData;
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
 use crate::bytecode::instruction::instruction_length_from_bytes;
 use crate::gc::class::Extends;
@@ -86,6 +87,8 @@ const MAX_INLINED_CONSTRUCT_INSTRUCTION_COUNT: u32 = 50;
 /// the job is abandoned.
 pub struct CapturedSnapshot<'d> {
     pub snapshot: Box<Snapshot>,
+    /// Strong handles to every `ExecutableData` whose bytecode is borrowed zero-copy by `snapshot`.
+    pub bytecode_owners: Vec<Arc<ExecutableData>>,
     pub cells: Deferred<'d, Vec<Gc<CellHeader>>>,
     pub snapshot_executables: Deferred<'d, Vec<SnapshotExecutable>>,
     /// The slots of the samples of the closure templates, whose samples are among the cells.
@@ -107,9 +110,18 @@ struct SnapshotBuilder<'vm> {
     defer_gc: &'vm DeferGc<'vm>,
     /// The snapshot that is being captured.
     snapshot: SnapshotWriter<'vm>,
+    /// Strong handles to every `ExecutableData` whose bytecode is borrowed zero-copy by `snapshot`.
+    bytecode_owners: Vec<Arc<ExecutableData>>,
     cells: Vec<Gc<CellHeader>>,
     entries: Vec<Entry>,
-    indices: HashMap<InlinedFunction, u32>,
+    indices: Vec<(InlinedFunction, u32)>,
+    /// The realm of the compiled executable and its inlined callees, along with its pre-noted prototype/shape cells.
+    compiled_realm: Gc<Realm>,
+    realm_new_object_shape: ShapeSnapshot,
+    realm_string_prototype: CellId,
+    realm_number_prototype: CellId,
+    realm_boolean_prototype: CellId,
+    realm_primitive_prototype_shapes: [Gc<Shape>; 3],
     /// The function the compiled executable runs, or `None` for the top-level code of a script or of a module.
     compiled_function: Option<Gc<EcmascriptFunctionObject>>,
     /// The words the compiled executable's frames start with (see `FunctionFrameFields`).
@@ -128,16 +140,43 @@ struct SnapshotBuilder<'vm> {
     bound_arguments: Vec<u64>,
     /// For the constructors among the inlining candidates, by index: the shape of the `this` value their inlined
     /// constructs create, whose entries their megamorphic caches describe.
-    construct_this_shapes: HashMap<u32, Gc<Shape>>,
+    construct_this_shapes: Vec<(u32, Gc<Shape>)>,
     /// For the derived constructors among the inlining candidates, by index: what their super() constructs with in
     /// inlined constructs of them (see `ExecutableSnapshot::super_constructor`).
-    super_constructors: HashMap<u32, SuperConstructTarget>,
+    super_constructors: Vec<(u32, SuperConstructTarget)>,
     /// For the base constructors with fields among the inlining candidates, by index: the values of their fields (see
     /// `ExecutableSnapshot::literal_instance_fields`).
-    literal_instance_fields: HashMap<u32, LiteralFieldValues>,
+    literal_instance_fields: Vec<(u32, LiteralFieldValues)>,
     /// For the derived constructors with fields among the inlining candidates, by index: how they add their fields
     /// (see `ExecutableSnapshot::derived_instance_fields`).
-    derived_instance_fields: HashMap<u32, DerivedInstanceFields>,
+    derived_instance_fields: Vec<(u32, DerivedInstanceFields)>,
+}
+
+#[inline]
+fn cell_slice_as_values<T: Copy>(slice: &[core::cell::Cell<T>]) -> &[T] {
+    // SAFETY: `Cell<T>` is `#[repr(transparent)]` over `T`, `T: Copy`, and no mutation occurs while this slice is live.
+    unsafe { ak::slice_from_raw_parts(slice.as_ptr().cast::<T>(), slice.len()) }
+}
+
+#[inline]
+fn vec_map_get<K: PartialEq, V: Copy>(entries: &[(K, V)], key: &K) -> Option<V> {
+    for (entry_key, value) in entries {
+        if entry_key == key {
+            return Some(*value);
+        }
+    }
+    None
+}
+
+#[inline]
+fn vec_map_insert<K: PartialEq, V>(entries: &mut Vec<(K, V)>, key: K, value: V) {
+    for (entry_key, entry_value) in &mut *entries {
+        if *entry_key == key {
+            *entry_value = value;
+            return;
+        }
+    }
+    entries.push((key, value));
 }
 
 /// The property offset of a literal field, its value, and the shape its definition gives the object if it adds the
@@ -149,6 +188,11 @@ type LiteralFieldValues = List<(u32, u64)>;
 
 /// The number of bytecode instructions of an executable, counted up to one past `limit`.
 fn instruction_count(executable: &Executable, limit: u32) -> u32 {
+    let code = executable.code();
+    let (cached_count, is_exact) = code.cached_instruction_count();
+    if is_exact || cached_count > limit {
+        return cached_count;
+    }
     let bytecode = executable.bytecode();
     let mut count = 0;
     let mut offset = 0;
@@ -158,6 +202,10 @@ fn instruction_count(executable: &Executable, limit: u32) -> u32 {
         };
         offset += length;
         count += 1;
+    }
+    let exact = offset >= bytecode.len();
+    if exact || count > cached_count {
+        code.update_cached_instruction_count(count, exact);
     }
     count
 }
@@ -184,6 +232,18 @@ fn builtin_inlining_candidate(
 /// The intrinsic the compiler knows an object as, if it is one.
 fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
     let cell = cell?;
+    if let Some(function) = cell.downcast::<RawNativeFunction>() {
+        match function.builtin() {
+            Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
+            Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
+            _ => {}
+        }
+        let address = function.native_function(vm)? as usize;
+        return lookup_native_intrinsic(address);
+    }
+    if cell.downcast::<EcmascriptFunctionObject>().is_some() {
+        return None;
+    }
     if cell.downcast::<StringConstructor>().is_some() {
         return Some(Intrinsic::StringConstructor);
     }
@@ -196,17 +256,7 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
     if cell.downcast::<BooleanConstructor>().is_some() {
         return Some(Intrinsic::BooleanConstructor);
     }
-    let function = cell.downcast::<RawNativeFunction>()?;
-    match function.builtin() {
-        Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
-        Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
-        _ => {}
-    }
-    let address = function.native_function(vm)? as usize;
-    NATIVE_INTRINSICS
-        .iter()
-        .find(|(native_function, _)| native_function.is_some_and(|native_function| native_function as usize == address))
-        .map(|(_, intrinsic)| *intrinsic)
+    None
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
@@ -264,6 +314,45 @@ static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 24] = [
     (&map_prototype::HAS_FUNCTION, Intrinsic::MapPrototypeHas),
 ];
 
+const NATIVE_INTRINSIC_TABLE_SIZE: usize = 64;
+const _: () = assert!(NATIVE_INTRINSICS.len() < NATIVE_INTRINSIC_TABLE_SIZE);
+
+#[inline(always)]
+fn native_intrinsic_slot(address: usize) -> usize {
+    ((address as u64 >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+}
+
+#[inline]
+fn lookup_native_intrinsic(address: usize) -> Option<Intrinsic> {
+    static TABLE: OnceLock<[(usize, Option<Intrinsic>); NATIVE_INTRINSIC_TABLE_SIZE]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut entries = [(0usize, None); NATIVE_INTRINSIC_TABLE_SIZE];
+        for &(native_function, intrinsic) in &NATIVE_INTRINSICS {
+            let Some(pointer) = *native_function else {
+                continue;
+            };
+            let key = pointer as usize;
+            let mut slot = native_intrinsic_slot(key);
+            while entries[slot].0 != 0 {
+                slot = (slot + 1) & (NATIVE_INTRINSIC_TABLE_SIZE - 1);
+            }
+            entries[slot] = (key, Some(intrinsic));
+        }
+        entries
+    });
+    let mut slot = native_intrinsic_slot(address);
+    loop {
+        let (key, intrinsic) = table[slot];
+        if key == address {
+            return intrinsic;
+        }
+        if key == 0 {
+            return None;
+        }
+        slot = (slot + 1) & (NATIVE_INTRINSIC_TABLE_SIZE - 1);
+    }
+}
+
 /// The builtin `%ArrayIteratorPrototype%.next` of the realm, if `%ArrayIteratorPrototype%` holds it.
 fn array_iterator_next(vm: &Vm, realm: Gc<Realm>) -> Option<Gc<FunctionObject>> {
     let next = realm
@@ -274,16 +363,6 @@ fn array_iterator_next(vm: &Vm, realm: Gc<Realm>) -> Option<Gc<FunctionObject>> 
     }
     let next = next.as_function();
     (next.as_native_function().is_some() && next.is_array_prototype_next_builtin()).then_some(next)
-}
-
-/// The object the holder of a prototype chain lookup cache entry has in the property the entry describes, if the entry
-/// is still valid and the property holds an object (such as a method).
-fn prototype_property_object(entry: &PropertyLookupCacheEntryData) -> Option<Gc<Object>> {
-    if entry.entry_type != PropertyLookupCacheEntryType::GetPropertyInPrototypeChain {
-        return None;
-    }
-    let value = prototype_property_value(entry)?;
-    value.is_object().then(|| value.as_object())
 }
 
 /// Whether the own property an entry reads or writes is writable in the shape of the object, which makes it a data
@@ -299,15 +378,9 @@ fn property_holds_data(entry: &PropertyLookupCacheEntryData) -> bool {
     let Some(ShapeKey { shape, .. }) = entry.shape else {
         return false;
     };
-    let mut writable = false;
-    shape.for_each_property_in_insertion_order(|_, metadata| {
-        if metadata.offset != entry.property_offset {
-            return core::ops::ControlFlow::Continue(());
-        }
-        writable = metadata.attributes.is_writable();
-        core::ops::ControlFlow::Break(())
-    });
-    writable
+    shape
+        .property_metadata_at_offset(entry.property_offset)
+        .is_some_and(|metadata| metadata.attributes.is_writable())
 }
 
 /// The value the prototype of a GetPropertyInPrototypeChain or ChangePropertyInPrototypeChain entry holds in the
@@ -333,11 +406,14 @@ fn prototype_property_value(entry: &PropertyLookupCacheEntryData) -> Option<Valu
 /// The function of the accessor an entry calls: for a GetPropertyInPrototypeChain
 /// entry, the getter of the accessor its prototype holds in the property, for a ChangePropertyInPrototypeChain entry
 /// its setter, and for a GetOwnProperty entry the getter the interpreter last called.
-fn entry_accessor_function(entry: &PropertyLookupCacheEntryData) -> Option<Gc<FunctionObject>> {
+fn entry_accessor_function_with_proto_value(
+    entry: &PropertyLookupCacheEntryData,
+    proto_value: Option<Value>,
+) -> Option<Gc<FunctionObject>> {
     let (accessor, setter) = match entry.entry_type {
         PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => return entry.getter,
         entry_type => {
-            let value = prototype_property_value(entry)?;
+            let value = proto_value?;
             if !value.is_accessor() {
                 return None;
             }
@@ -352,10 +428,10 @@ fn entry_accessor_function(entry: &PropertyLookupCacheEntryData) -> Option<Gc<Fu
 
 /// Whether the property of an entry held an accessor: the accessor the interpreter last called the getter of for a
 /// GetOwnProperty entry, or the value its prototype holds in the property for entries of a prototype.
-fn entry_holds_accessor(entry: &PropertyLookupCacheEntryData) -> bool {
+fn entry_holds_accessor_with_proto_value(entry: &PropertyLookupCacheEntryData, proto_value: Option<Value>) -> bool {
     match entry.entry_type {
         PropertyLookupCacheEntryType::GetOwnProperty if entry.key == 0 => entry.getter.is_some(),
-        _ => prototype_property_value(entry).is_some_and(|value| value.is_accessor()),
+        _ => proto_value.is_some_and(|value| value.is_accessor()),
     }
 }
 
@@ -438,15 +514,6 @@ impl SnapshotBuilder<'_> {
         function_frame_fields(function)
     }
 
-    /// Adds `rows` to the snapshot as a list.
-    fn list<T: Row>(&mut self, rows: impl IntoIterator<Item = T>) -> List<T> {
-        let list = self.snapshot.begin();
-        for row in rows {
-            self.snapshot.push(row);
-        }
-        self.snapshot.end(list)
-    }
-
     fn optional_cell<T: Extends<CellHeader>>(&mut self, cell: Option<Gc<T>>) -> Option<CellId> {
         cell.map(|cell| self.cell(cell))
     }
@@ -458,6 +525,108 @@ impl SnapshotBuilder<'_> {
         }
     }
 
+    fn property_cache_entry(
+        &mut self,
+        entry: PropertyLookupCacheEntryData,
+        caller: &Entry,
+        primitive_prototype_shapes: &[Gc<Shape>; 3],
+        sees_primitives: &mut bool,
+    ) -> Option<PropertyCacheEntrySnapshot> {
+        let shape = entry.shape.map(|key| key.shape);
+        if shape.is_some_and(|shape| primitive_prototype_shapes.contains(&shape)) {
+            *sees_primitives = true;
+            return None;
+        }
+        let entry_type = match entry.entry_type {
+            // NB: Only the VM's keyed property lookup cache has entries for missing own properties.
+            PropertyLookupCacheEntryType::Empty | PropertyLookupCacheEntryType::MissingOwnProperty => return None,
+            PropertyLookupCacheEntryType::AddOwnProperty => PropertyCacheEntryType::AddOwnProperty,
+            PropertyLookupCacheEntryType::ChangeOwnProperty => PropertyCacheEntryType::ChangeOwnProperty,
+            PropertyLookupCacheEntryType::GetOwnProperty => PropertyCacheEntryType::GetOwnProperty,
+            PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain => {
+                PropertyCacheEntryType::ChangePropertyInPrototypeChain
+            }
+            PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
+                PropertyCacheEntryType::GetPropertyInPrototypeChain
+            }
+            // NB: Like the interpreter, compiled code relies on an entry for a missing property only where the
+            //     property is also missing from an unchanged prototype chain, which an entry without a prototype
+            //     chain validity can only tell for shapes without a prototype.
+            PropertyLookupCacheEntryType::GetMissingProperty
+                if entry.prototype_chain_validity.is_none()
+                    && shape.is_some_and(|shape| shape.prototype().is_some()) =>
+            {
+                return None;
+            }
+            PropertyLookupCacheEntryType::GetMissingProperty => PropertyCacheEntryType::GetMissingProperty,
+        };
+        let proto_value = prototype_property_value(&entry);
+        let prototype_property = if entry.entry_type == PropertyLookupCacheEntryType::GetPropertyInPrototypeChain {
+            proto_value
+                .filter(|value| value.is_object())
+                .map(|value| value.as_object())
+        } else {
+            None
+        };
+        let cached_value_offset = proto_value
+            .filter(|value| value.is_accessor() && value.as_accessor().cache_on_receiver())
+            .and_then(|value| value.as_accessor().cached_value_key())
+            .and_then(|key| shape?.lookup(&PropertyKey::from_symbol(key)))
+            .map(|metadata| metadata.offset);
+        let accessor_function = entry_accessor_function_with_proto_value(&entry, proto_value).map(|function| {
+            let cell = self.cell(function);
+            AccessorFunctionSnapshot {
+                cached_value_offset,
+                function: cell,
+                intrinsic: intrinsic_of(self.vm, Some(Value::from_object(function.upcast::<Object>()).as_cell())),
+                inline_executable: self
+                    .inline_executable_index(Some(Value::from_object(function.upcast::<Object>()).as_cell()), caller),
+                native: self.native_accessor_target(function, cell, entry.getter == Some(function)),
+            }
+        });
+        Some(PropertyCacheEntrySnapshot {
+            entry_type,
+            property_offset: entry.property_offset,
+            shape_dictionary_generation: entry.shape.map_or(0, |key| key.dictionary_generation),
+            shape_is_dictionary: shape.is_some_and(|shape| shape.is_dictionary()),
+            shape_is_stable: shape.is_some_and(|shape| shape.is_stable()),
+            writes_data_property: entry.writes_data_property,
+            new_shape: self.optional_cell(entry.new_shape),
+            shape: self.optional_cell(shape),
+            prototype: self.optional_cell(entry.prototype),
+            prototype_chain_validity: self.optional_cell(entry.prototype_chain_validity),
+            prototype_chain_valid: entry
+                .prototype_chain_validity
+                .is_some_and(|validity| validity.is_valid()),
+            key: (entry.key != 0).then(|| self.cell(Value::from_bits(entry.key).as_cell())),
+            key_value: entry.key,
+            prototype_property: self.optional_cell(prototype_property),
+            prototype_property_intrinsic: intrinsic_of(
+                self.vm,
+                prototype_property.map(|object| Value::from_object(object).as_cell()),
+            ),
+            prototype_property_inline_executable: prototype_property
+                .and_then(|object| self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)),
+            prototype_property_direct_call: prototype_property
+                .and_then(|object| self.prototype_method_direct_call(object)),
+            // NB: Watching a slot allocates, which collects no garbage while the snapshot is taken. Slots
+            //     replaced while watched are checked instead, as invalidated code learns nothing, while the
+            //     check learns from its exit.
+            prototype_property_watchpoint: prototype_property
+                .and(entry.prototype)
+                .filter(|holder| !holder.shape().was_slot_replaced(entry.property_offset))
+                .and_then(|holder| {
+                    holder
+                        .shape()
+                        .watch_slot_for_replacements(self.vm, entry.property_offset)
+                })
+                .map(|set| self.cell(set)),
+            accessor_function,
+            property_holds_data: property_holds_data(&entry),
+            holds_accessor: entry_holds_accessor_with_proto_value(&entry, proto_value),
+        })
+    }
+
     /// What property lookup cache `cache` of `caller` knows. Of a megamorphic cache, that is the entry for
     /// `known_shape` if it has one: JIT code only uses megamorphic entries for objects whose shape it knows.
     fn property_cache(
@@ -465,9 +634,15 @@ impl SnapshotBuilder<'_> {
         cache: &PropertyLookupCache,
         caller: &Entry,
         known_shape: Option<Gc<Shape>>,
+        primitive_prototype_shapes: &[Gc<Shape>; 3],
     ) -> PropertyCacheSnapshot {
         let kind = match cache.tier() {
-            PropertyLookupCacheTier::Empty => PropertyCacheKind::Empty,
+            PropertyLookupCacheTier::Empty => {
+                return PropertyCacheSnapshot {
+                    kind: PropertyCacheKind::Empty,
+                    entries: List::empty(),
+                };
+            }
             PropertyLookupCacheTier::Monomorphic => PropertyCacheKind::Monomorphic,
             PropertyLookupCacheTier::Polymorphic => PropertyCacheKind::Polymorphic,
             PropertyLookupCacheTier::Megamorphic => PropertyCacheKind::Megamorphic,
@@ -475,111 +650,32 @@ impl SnapshotBuilder<'_> {
         // NB: The interpreter caches the properties strings, numbers and booleans get from their prototypes as
         //     properties of those prototypes. JIT code speculating on such entries would check for an object and exit
         //     for every primitive, so caches with them are left to the fast paths, which look these up themselves.
-        let realm = caller.realm;
-        let primitive_prototype_shapes = [
-            realm.string_prototype(self.vm).shape(),
-            realm.number_prototype(self.vm).shape(),
-            realm.boolean_prototype(self.vm).shape(),
-        ];
-        let mut sees_primitives = false;
-        let entries = self.snapshot.begin();
         let known_shape_slot = known_shape.and_then(|shape| cache.megamorphic_entry_for_shape(shape, 0));
         let slots = match known_shape_slot {
             Some(slot) => core::slice::from_ref(slot),
             None => cache.entries(),
         };
+        if slots.len() == 1 {
+            let mut sees_primitives = false;
+            let entries = match self.property_cache_entry(
+                slots[0].get(),
+                caller,
+                primitive_prototype_shapes,
+                &mut sees_primitives,
+            ) {
+                Some(row) if !sees_primitives => self.snapshot.add(core::slice::from_ref(&row)),
+                _ => List::empty(),
+            };
+            return PropertyCacheSnapshot { kind, entries };
+        }
+        let mut sees_primitives = false;
+        let entries = self.snapshot.begin();
         for slot in slots {
-            let entry = slot.get();
-            let shape = entry.shape.map(|key| key.shape);
-            if shape.is_some_and(|shape| primitive_prototype_shapes.contains(&shape)) {
-                sees_primitives = true;
-                continue;
+            if let Some(row) =
+                self.property_cache_entry(slot.get(), caller, primitive_prototype_shapes, &mut sees_primitives)
+            {
+                self.snapshot.push(row);
             }
-            let entry_type = match entry.entry_type {
-                // NB: Only the VM's keyed property lookup cache has entries for missing own properties.
-                PropertyLookupCacheEntryType::Empty | PropertyLookupCacheEntryType::MissingOwnProperty => continue,
-                PropertyLookupCacheEntryType::AddOwnProperty => PropertyCacheEntryType::AddOwnProperty,
-                PropertyLookupCacheEntryType::ChangeOwnProperty => PropertyCacheEntryType::ChangeOwnProperty,
-                PropertyLookupCacheEntryType::GetOwnProperty => PropertyCacheEntryType::GetOwnProperty,
-                PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain => {
-                    PropertyCacheEntryType::ChangePropertyInPrototypeChain
-                }
-                PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
-                    PropertyCacheEntryType::GetPropertyInPrototypeChain
-                }
-                // NB: Like the interpreter, compiled code relies on an entry for a missing property only where the
-                //     property is also missing from an unchanged prototype chain, which an entry without a prototype
-                //     chain validity can only tell for shapes without a prototype.
-                PropertyLookupCacheEntryType::GetMissingProperty
-                    if entry.prototype_chain_validity.is_none()
-                        && shape.is_some_and(|shape| shape.prototype().is_some()) =>
-                {
-                    continue;
-                }
-                PropertyLookupCacheEntryType::GetMissingProperty => PropertyCacheEntryType::GetMissingProperty,
-            };
-            let prototype_property = prototype_property_object(&entry);
-            let cached_value_offset = prototype_property_value(&entry)
-                .filter(|value| value.is_accessor() && value.as_accessor().cache_on_receiver())
-                .and_then(|value| value.as_accessor().cached_value_key())
-                .and_then(|key| shape?.lookup(&PropertyKey::from_symbol(key)))
-                .map(|metadata| metadata.offset);
-            let accessor_function = entry_accessor_function(&entry).map(|function| {
-                let cell = self.cell(function);
-                AccessorFunctionSnapshot {
-                    cached_value_offset,
-                    function: cell,
-                    intrinsic: intrinsic_of(self.vm, Some(Value::from_object(function.upcast::<Object>()).as_cell())),
-                    inline_executable: self.inline_executable_index(
-                        Some(Value::from_object(function.upcast::<Object>()).as_cell()),
-                        caller,
-                    ),
-                    native: self.native_accessor_target(function, cell, entry.getter == Some(function)),
-                }
-            });
-            let row = PropertyCacheEntrySnapshot {
-                entry_type,
-                property_offset: entry.property_offset,
-                shape_dictionary_generation: entry.shape.map_or(0, |key| key.dictionary_generation),
-                shape_is_dictionary: shape.is_some_and(|shape| shape.is_dictionary()),
-                shape_is_stable: shape.is_some_and(|shape| shape.is_stable()),
-                writes_data_property: entry.writes_data_property,
-                new_shape: self.optional_cell(entry.new_shape),
-                shape: self.optional_cell(shape),
-                prototype: self.optional_cell(entry.prototype),
-                prototype_chain_validity: self.optional_cell(entry.prototype_chain_validity),
-                prototype_chain_valid: entry
-                    .prototype_chain_validity
-                    .is_some_and(|validity| validity.is_valid()),
-                key: (entry.key != 0).then(|| self.cell(Value::from_bits(entry.key).as_cell())),
-                key_value: entry.key,
-                prototype_property: self.optional_cell(prototype_property),
-                prototype_property_intrinsic: intrinsic_of(
-                    self.vm,
-                    prototype_property.map(|object| Value::from_object(object).as_cell()),
-                ),
-                prototype_property_inline_executable: prototype_property.and_then(|object| {
-                    self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)
-                }),
-                prototype_property_direct_call: prototype_property
-                    .and_then(|object| self.prototype_method_direct_call(object)),
-                // NB: Watching a slot allocates, which collects no garbage while the snapshot is taken. Slots
-                //     replaced while watched are checked instead, as invalidated code learns nothing, while the
-                //     check learns from its exit.
-                prototype_property_watchpoint: prototype_property
-                    .and(entry.prototype)
-                    .filter(|holder| !holder.shape().was_slot_replaced(entry.property_offset))
-                    .and_then(|holder| {
-                        holder
-                            .shape()
-                            .watch_slot_for_replacements(self.vm, entry.property_offset)
-                    })
-                    .map(|set| self.cell(set)),
-                accessor_function,
-                property_holds_data: property_holds_data(&entry),
-                holds_accessor: entry_holds_accessor(&entry),
-            };
-            self.snapshot.push(row);
         }
         if sees_primitives {
             self.snapshot.drop_rows(&entries);
@@ -808,8 +904,8 @@ impl SnapshotBuilder<'_> {
     /// inlining budget: their calls are what the code would otherwise spend the most on.
     fn inlined_builtin_index(&mut self, builtin: Gc<NativeJavaScriptBackedFunction>, caller: &Entry) -> Option<u32> {
         let function = InlinedFunction::Builtin(builtin);
-        if let Some(index) = self.indices.get(&function) {
-            return Some(*index);
+        if let Some(index) = vec_map_get(&self.indices, &function) {
+            return Some(index);
         }
         if caller.depth + 1 > self.vm.jit.options.inline_depth {
             return None;
@@ -822,7 +918,7 @@ impl SnapshotBuilder<'_> {
             realm: builtin.realm(),
             depth: caller.depth + 1,
         });
-        self.indices.insert(function, index);
+        self.indices.push((function, index));
         Some(index)
     }
 
@@ -830,8 +926,9 @@ impl SnapshotBuilder<'_> {
     /// it captures by their size and depth; the graph builder decides which it inlines, within the budget of
     /// `InliningLimits`.
     fn inlined_function_index(&mut self, function: Gc<EcmascriptFunctionObject>, caller: &Entry) -> Option<u32> {
-        if let Some(index) = self.indices.get(&InlinedFunction::Ecmascript(function)) {
-            return Some(*index);
+        let key = InlinedFunction::Ecmascript(function);
+        if let Some(index) = vec_map_get(&self.indices, &key) {
+            return Some(index);
         }
         let executable = function.bytecode_executable()?;
         if caller.depth + 1 > self.vm.jit.options.inline_depth {
@@ -840,11 +937,11 @@ impl SnapshotBuilder<'_> {
         let index = u32::try_from(self.entries.len()).expect("the executable count fits in u32");
         self.entries.push(Entry {
             executable,
-            function: Some(InlinedFunction::Ecmascript(function)),
+            function: Some(key),
             realm: function.realm().expect("an ECMAScript function has a realm"),
             depth: caller.depth + 1,
         });
-        self.indices.insert(InlinedFunction::Ecmascript(function), index);
+        self.indices.push((key, index));
         Some(index)
     }
 
@@ -988,17 +1085,20 @@ impl SnapshotBuilder<'_> {
             indices.push(self.inlined_function_index(parent, &entry)?);
         }
         if let Some(fields) = literal_fields {
-            self.literal_instance_fields
-                .insert(*indices.last().expect("the chain ends with a base constructor"), fields);
+            vec_map_insert(
+                &mut self.literal_instance_fields,
+                *indices.last().expect("the chain ends with a base constructor"),
+                fields,
+            );
         }
         for (level, index) in indices.iter().enumerate().take(chain.len() - 1) {
             let constructor = chain.get(level).expect("the level is in the chain");
             if let Some(fields) = self.derived_instance_fields(constructor) {
-                self.derived_instance_fields.insert(*index, fields);
+                vec_map_insert(&mut self.derived_instance_fields, *index, fields);
             }
         }
         if chain.len() == 1 {
-            self.construct_this_shapes.insert(index, this_shape);
+            vec_map_insert(&mut self.construct_this_shapes, index, this_shape);
         }
         let mut super_constructor = None;
         for level in (0..chain.len() - 1).rev() {
@@ -1008,7 +1108,7 @@ impl SnapshotBuilder<'_> {
                 function_shape: self.cell(chain.get(level).expect("the level is in the chain").shape()),
                 derived: level + 2 < chain.len(),
             };
-            self.super_constructors.insert(indices[level], target);
+            vec_map_insert(&mut self.super_constructors, indices[level], target);
             super_constructor = Some(target);
         }
         Some(ConstructTarget {
@@ -1031,7 +1131,9 @@ impl SnapshotBuilder<'_> {
         shape: Gc<Shape>,
     ) -> Option<(Gc<Shape>, LiteralFieldValues)> {
         let (shape, fields) = self.literal_field_definitions(constructor, shape, false)?;
-        let values = self.list(fields.into_iter().map(|(offset, value, _)| (offset, value)));
+        let values = self
+            .snapshot
+            .add_exact_iter(fields.into_iter().map(|(offset, value, _)| (offset, value)));
         Some((shape, values))
     }
 
@@ -1241,7 +1343,8 @@ impl SnapshotBuilder<'_> {
         if function.private_environment().is_some() {
             return List::empty();
         }
-        let index = self.indices[&InlinedFunction::Ecmascript(function)];
+        let index = vec_map_get(&self.indices, &InlinedFunction::Ecmascript(function))
+            .expect("an inlined function has an index");
         let defer_gc = self.defer_gc;
         let templates = closure_templates(self.vm, entry.executable, function, defer_gc, &mut self.snapshot);
         for (template_index, template) in templates.iter().enumerate() {
@@ -1269,45 +1372,65 @@ impl SnapshotBuilder<'_> {
             Some(InlinedFunction::Ecmascript(function)) => Some(function),
             Some(InlinedFunction::Builtin(_)) => None,
         };
-        let bytecode = executable.bytecode();
+        let code = executable.code();
+        let bytecode = &*code.bytecode;
+        self.bytecode_owners.push(Arc::clone(code));
+        // SAFETY: `self.bytecode_owners` retains an `Arc<ExecutableData>` keeping `code.bytecode` alive and immutable
+        //         until the snapshot is cleared or dropped.
+        let bytecode_slice = unsafe { BytecodeSlice::borrowed(bytecode) };
 
         // NB: Value feedback is only up to date once the values the interpreter recorded since the last update are
-        //     folded in.
-        // NB: Executables that never left the plain tier have no feedback arrays yet, and an inlined callee may be one.
-        let feedback = executable.ensure_feedback();
-        feedback.update_value_feedback();
-        let call = self.snapshot.begin();
-        for call in feedback.call() {
-            let row = self.call_feedback(call, entry);
-            self.snapshot.push(row);
-        }
-        let call = self.snapshot.end(call);
-        let keyed = self.list(
-            feedback
-                .keyed()
-                .iter()
-                .map(|keyed| KeyedFeedbackSnapshot { bits: keyed.bits.get() }),
-        );
-        let feedback = FeedbackSnapshot {
-            arith: self.list(feedback.arith().iter().map(core::cell::Cell::get)),
-            value: self.list(feedback.value().iter().map(core::cell::Cell::get)),
-            cache_value: self.list(feedback.cache_value().iter().map(core::cell::Cell::get)),
-            call,
-            keyed,
-            bound_arguments: self.snapshot.add(&self.bound_arguments),
+        //     folded in. Unprofiled inlined callees set `unprofiled = true` instead of allocating a zero-filled
+        //     `ExecutableFeedback`, so `builder::has_run()` still reports unexecuted instructions as not having run.
+        let (unprofiled, feedback) = if let Some(feedback) = executable.feedback() {
+            feedback.update_value_feedback();
+            let call = self.snapshot.begin();
+            for call in feedback.call() {
+                let row = self.call_feedback(call, entry);
+                self.snapshot.push(row);
+            }
+            let call = self.snapshot.end(call);
+            let keyed = self.snapshot.add_exact_iter(
+                feedback
+                    .keyed()
+                    .iter()
+                    .map(|keyed| KeyedFeedbackSnapshot { bits: keyed.bits.get() }),
+            );
+            let snapshot = FeedbackSnapshot {
+                arith: self.snapshot.add(cell_slice_as_values(feedback.arith())),
+                value: self.snapshot.add(cell_slice_as_values(feedback.value())),
+                cache_value: self.snapshot.add(cell_slice_as_values(feedback.cache_value())),
+                call,
+                keyed,
+                bound_arguments: self.snapshot.add(&self.bound_arguments),
+            };
+            self.bound_arguments.clear();
+            (false, snapshot)
+        } else {
+            (true, FeedbackSnapshot::default())
         };
-        self.bound_arguments.clear();
 
-        let index = entry.function.and_then(|function| self.indices.get(&function));
-        let construct_this_shape = index.and_then(|index| self.construct_this_shapes.get(index)).copied();
-        let super_constructor = index.and_then(|index| self.super_constructors.get(index)).copied();
-        let literal_instance_fields = index.and_then(|index| self.literal_instance_fields.get(index)).copied();
-        let derived_instance_fields = index.and_then(|index| self.derived_instance_fields.get(index)).copied();
+        let index = entry
+            .function
+            .and_then(|function| vec_map_get(&self.indices, &function));
+        let construct_this_shape = index.and_then(|index| vec_map_get(&self.construct_this_shapes, &index));
+        let super_constructor = index.and_then(|index| vec_map_get(&self.super_constructors, &index));
+        let literal_instance_fields = index.and_then(|index| vec_map_get(&self.literal_instance_fields, &index));
+        let derived_instance_fields = index.and_then(|index| vec_map_get(&self.derived_instance_fields, &index));
         let has_instance_elements =
             matches!(entry.function, Some(InlinedFunction::Ecmascript(function)) if function.has_class_data());
+        let primitive_prototype_shapes = if realm == self.compiled_realm {
+            self.realm_primitive_prototype_shapes
+        } else {
+            [
+                realm.string_prototype(vm).shape(),
+                realm.number_prototype(vm).shape(),
+                realm.boolean_prototype(vm).shape(),
+            ]
+        };
         let property_caches = self.snapshot.begin();
         for cache in executable.property_lookup_caches() {
-            let row = self.property_cache(cache, entry, construct_this_shape);
+            let row = self.property_cache(cache, entry, construct_this_shape, &primitive_prototype_shapes);
             self.snapshot.push(row);
         }
         let property_caches = self.snapshot.end(property_caches);
@@ -1323,7 +1446,6 @@ impl SnapshotBuilder<'_> {
         let environment_templates = self.snapshot.add(&self.environment_templates);
         self.environment_templates.clear();
 
-        let intrinsics = realm.intrinsics();
         // NB: The same rules as ExecutionContext::keeps_private_environment() and keeps_variable_environment().
         let frame_function = match entry.function {
             Some(InlinedFunction::Ecmascript(function)) => Some(function),
@@ -1339,10 +1461,28 @@ impl SnapshotBuilder<'_> {
                 ),
                 None => (false, false),
             };
+        let (new_object_shape, string_prototype, number_prototype, boolean_prototype) = if realm == self.compiled_realm
+        {
+            (
+                self.realm_new_object_shape,
+                self.realm_string_prototype,
+                self.realm_number_prototype,
+                self.realm_boolean_prototype,
+            )
+        } else {
+            let intrinsics = realm.intrinsics();
+            (
+                self.shape(intrinsics.new_object_shape()),
+                self.cell(realm.string_prototype(vm)),
+                self.cell(realm.number_prototype(vm)),
+                self.cell(realm.boolean_prototype(vm)),
+            )
+        };
         ExecutableSnapshot {
             frames_read_private_environment_from_function,
             frames_read_variable_environment_from_function,
-            bytecode: self.snapshot.add(bytecode),
+            unprofiled,
+            bytecode: bytecode_slice,
             bytecode_address: bytecode.as_ptr() as u64,
             layout: FrameLayout {
                 number_of_registers: executable.number_of_registers(),
@@ -1352,19 +1492,26 @@ impl SnapshotBuilder<'_> {
                 number_of_arguments: executable.number_of_arguments(),
             },
             constants: {
-                for &constant in executable.constants() {
+                let constants = executable.constants();
+                for &constant in constants {
                     self.value_bits(constant);
                 }
-                self.list(executable.constants().iter().map(|constant| constant.0))
+                const _: () =
+                    assert!(size_of::<Value>() == size_of::<u64>() && align_of::<Value>() == align_of::<u64>());
+                // SAFETY: `Value` is `#[repr(transparent)]` over `u64`.
+                let bits = unsafe { ak::slice_from_raw_parts(constants.as_ptr().cast::<u64>(), constants.len()) };
+                self.snapshot.add(bits)
             },
-            exception_handlers: self.list(executable.exception_handlers().iter().map(|handler| ExceptionHandler {
-                start_offset: handler.start_offset,
-                end_offset: handler.end_offset,
-                handler_offset: handler.handler_offset,
-            })),
+            exception_handlers: self
+                .snapshot
+                .add_exact_iter(executable.exception_handlers().iter().map(|handler| ExceptionHandler {
+                    start_offset: handler.start_offset,
+                    end_offset: handler.end_offset,
+                    handler_offset: handler.handler_offset,
+                })),
             exit_sites: self.snapshot.add(&executable.jit_exit_sites_for_recompile()),
             builtin_exit_sites: if entry.function.is_none() {
-                self.list(
+                self.snapshot.add_exact_iter(
                     executable
                         .jit_builtin_exit_sites()
                         .into_iter()
@@ -1404,10 +1551,10 @@ impl SnapshotBuilder<'_> {
                 .is_some_and(|function| !function.mapped_argument_names().is_empty()),
             supports_legacy_arguments: arguments_function
                 .is_some_and(|function| function.supports_legacy_caller_or_arguments()),
-            new_object_shape: Some(self.shape(intrinsics.new_object_shape())),
-            string_prototype: Some(self.cell(realm.string_prototype(vm))),
-            number_prototype: Some(self.cell(realm.number_prototype(vm))),
-            boolean_prototype: Some(self.cell(realm.boolean_prototype(vm))),
+            new_object_shape: Some(new_object_shape),
+            string_prototype: Some(string_prototype),
+            number_prototype: Some(number_prototype),
+            boolean_prototype: Some(boolean_prototype),
             object_shape_caches,
             closure_templates: match entry.function {
                 None => self.closure_templates,
@@ -1429,7 +1576,7 @@ impl SnapshotBuilder<'_> {
             derived_instance_fields,
             // NB: Only the compiled function's own code creates bindings by name.
             identifiers: if entry.function.is_none() {
-                self.list(
+                self.snapshot.add_exact_iter(
                     executable
                         .identifier_table()
                         .iter()
@@ -1438,13 +1585,15 @@ impl SnapshotBuilder<'_> {
             } else {
                 List::empty()
             },
-            property_key_names: self.list(executable.property_keys().iter().map(|key| {
-                if key.is_string() {
-                    key.as_string().raw_identity() as u64
-                } else {
-                    0
-                }
-            })),
+            property_key_names: self
+                .snapshot
+                .add_exact_iter(executable.property_keys().iter().map(|key| {
+                    if key.is_string() {
+                        key.as_string().raw_identity() as u64
+                    } else {
+                        0
+                    }
+                })),
         }
     }
 
@@ -1458,20 +1607,33 @@ impl SnapshotBuilder<'_> {
         executable: Gc<Executable>,
         realm: Gc<Realm>,
     ) -> List<(EnvironmentCoordinate, GlobalValueSnapshot)> {
-        if function.allocates_function_environment() || function.shared_data().closure_count() != ClosureCount::One {
+        if function.allocates_function_environment()
+            || function.shared_data().closure_count() != ClosureCount::One
+            || executable.code().captured_bindings_known_empty()
+        {
             return List::empty();
         }
-        let loads = &executable
-            .jit_state()
-            .captured_binding_accesses
-            .get_or_init(|| captured_binding_accesses(&executable, self.snapshot.scratch()))
-            .loads;
+        let accesses = executable.jit_state().captured_binding_accesses.get_or_init(|| {
+            let accesses = captured_binding_accesses(&executable, self.snapshot.scratch());
+            if accesses.loads.is_empty() && accesses.stores.is_empty() {
+                executable.code().mark_captured_bindings_empty();
+            }
+            accesses
+        });
+        let loads = &accesses.loads;
+        if loads.is_empty() {
+            return List::empty();
+        }
         let exit_sites = executable.jit_exit_sites();
-        let changed: Vec<EnvironmentCoordinate> = loads
-            .iter()
-            .filter(|&&(_, pc)| exit_sites.contains(&(pc, ExitKind::UnexpectedValue)))
-            .map(|&(coordinate, _)| coordinate)
-            .collect();
+        let changed: Vec<EnvironmentCoordinate> = if exit_sites.is_empty() {
+            Vec::new()
+        } else {
+            loads
+                .iter()
+                .filter(|&&(_, pc)| exit_sites.contains(&(pc, ExitKind::UnexpectedValue)))
+                .map(|&(coordinate, _)| coordinate)
+                .collect()
+        };
         let bindings = self.snapshot.begin::<(EnvironmentCoordinate, GlobalValueSnapshot)>();
         for &(coordinate, _) in loads {
             let is_captured = self
@@ -1516,14 +1678,23 @@ fn mutable_bindings(
     function: Gc<EcmascriptFunctionObject>,
     executable: Gc<Executable>,
 ) -> List<EnvironmentCoordinate> {
-    if function.allocates_function_environment() || function.shared_data().closure_count() != ClosureCount::One {
+    if function.allocates_function_environment()
+        || function.shared_data().closure_count() != ClosureCount::One
+        || executable.code().captured_bindings_known_empty()
+    {
         return List::empty();
     }
-    let stores = &executable
-        .jit_state()
-        .captured_binding_accesses
-        .get_or_init(|| captured_binding_accesses(&executable, snapshot.scratch()))
-        .stores;
+    let accesses = executable.jit_state().captured_binding_accesses.get_or_init(|| {
+        let accesses = captured_binding_accesses(&executable, snapshot.scratch());
+        if accesses.loads.is_empty() && accesses.stores.is_empty() {
+            executable.code().mark_captured_bindings_empty();
+        }
+        accesses
+    });
+    let stores = &accesses.stores;
+    if stores.is_empty() {
+        return List::empty();
+    }
     let bindings = snapshot.begin();
     for &coordinate in stores {
         if snapshot.rows_of(&bindings).contains(&coordinate) {
@@ -1556,41 +1727,46 @@ fn captured_binding_accesses(executable: &Executable, zone: &mut Zone) -> Captur
     let mut loads = Vec::new();
     let mut stores = Vec::new();
     let mut pc = 0;
-    // NB: This reads the instructions one at a time: a list of all of them would be a large block of the heap. The
-    //     arrays of the instructions go in the zone, which drops each one when the next instruction is read. The
-    //     zone is one that captures share: a zone of its own would take memory from the system for each walk.
+    // NB: Scan opcodes and lengths directly without decoding fields for instructions that neither alter lexical
+    //     environments nor access captured bindings. Only the four binding-access opcodes enter `zone.scope`.
     while pc < end {
-        let next_pc = zone.scope(|zone| {
-            let decoded = decode_instruction(bytecode, pc, zone).ok()?;
-            let changes_environment = matches!(
-                decoded.instruction.opcode(),
-                OpCode::SetLexicalEnvironment
-                    | OpCode::CreateLexicalEnvironment
-                    | OpCode::CreateVariableEnvironment
-                    | OpCode::EnterObjectEnvironment
-                    | OpCode::NewClass
-                    | OpCode::CallDirectEval
-                    | OpCode::CallDirectEvalWithArgumentArray
-                    | OpCode::Debugger
-            );
-            if changes_environment {
-                return None;
-            }
-            match decoded.instruction {
-                Instruction::GetBinding { cache: coordinate, .. }
-                | Instruction::GetInitializedBinding { cache: coordinate, .. }
-                | Instruction::GetCalleeAndThisFromEnvironment { cache: coordinate, .. } => {
-                    loads.push((coordinate, decoded.pc));
-                }
-                Instruction::SetLexicalBinding { cache: coordinate, .. } => stores.push(coordinate),
-                _ => {}
-            }
-            Some(decoded.next_pc())
-        });
-        let Some(next_pc) = next_pc else {
+        let Ok((opcode, length)) = opcode_and_length(bytecode, pc) else {
             return CapturedBindingAccesses::default();
         };
-        pc = next_pc;
+        if opcode == OpCode::SetLexicalEnvironment as u8
+            || opcode == OpCode::CreateLexicalEnvironment as u8
+            || opcode == OpCode::CreateVariableEnvironment as u8
+            || opcode == OpCode::EnterObjectEnvironment as u8
+            || opcode == OpCode::NewClass as u8
+            || opcode == OpCode::CallDirectEval as u8
+            || opcode == OpCode::CallDirectEvalWithArgumentArray as u8
+            || opcode == OpCode::Debugger as u8
+        {
+            return CapturedBindingAccesses::default();
+        }
+        if opcode == OpCode::GetBinding as u8
+            || opcode == OpCode::GetInitializedBinding as u8
+            || opcode == OpCode::GetCalleeAndThisFromEnvironment as u8
+            || opcode == OpCode::SetLexicalBinding as u8
+        {
+            let ok = zone.scope(|zone| {
+                let decoded = decode_instruction(bytecode, pc, zone).ok()?;
+                match decoded.instruction {
+                    Instruction::GetBinding { cache: coordinate, .. }
+                    | Instruction::GetInitializedBinding { cache: coordinate, .. }
+                    | Instruction::GetCalleeAndThisFromEnvironment { cache: coordinate, .. } => {
+                        loads.push((coordinate, decoded.pc));
+                    }
+                    Instruction::SetLexicalBinding { cache: coordinate, .. } => stores.push(coordinate),
+                    _ => {}
+                }
+                Some(())
+            });
+            if ok.is_none() {
+                return CapturedBindingAccesses::default();
+            }
+        }
+        pc += length as u32;
     }
     CapturedBindingAccesses {
         loads: loads.into_boxed_slice(),
@@ -1617,122 +1793,151 @@ pub fn capture_snapshot<'d>(
         },
     };
     let mut spare_snapshot = super::compile_queue::spare_snapshot();
-    let mut snapshot = SnapshotWriter::new(&mut spare_snapshot, super::compile_queue::spare_open_lists());
-    // NB: These allocate (and so may collect garbage), which they do before anything is captured.
-    let allocation = allocation_infos(vm, realm, defer_gc, &mut snapshot);
-    // NB: Closures that top-level code creates have its environments, which the code does not know.
-    let closure_templates = match function {
-        Some(function) => closure_templates(vm, executable, function, defer_gc, &mut snapshot),
-        None => defer_gc.cover((0..executable.shared_function_data_count()).map(|_| None).collect()),
-    };
-    let closure_samples = closure_templates
-        .iter()
-        .map(|template| template.as_ref().map(|(sample, _)| *sample))
-        .collect::<Vec<_>>();
-    let mut builder = SnapshotBuilder {
-        vm,
-        defer_gc,
-        snapshot,
-        cells: (*allocation.cells).clone(),
-        entries: vec![Entry {
+    let (runtime, bytecode_owners, cells, entries, sample_slots) = vm.jit.with_snapshot_open_lists(|open_lists| {
+        let mut snapshot = SnapshotWriter::new(&mut spare_snapshot, open_lists);
+        // NB: These allocate (and so may collect garbage), which they do before anything is captured.
+        let allocation = allocation_infos(vm, realm, defer_gc, &mut snapshot);
+        // NB: Closures that top-level code creates have its environments, which the code does not know.
+        let closure_templates = match function {
+            Some(function) => closure_templates(vm, executable, function, defer_gc, &mut snapshot),
+            None => defer_gc.cover((0..executable.shared_function_data_count()).map(|_| None).collect()),
+        };
+        let closure_samples = closure_templates
+            .iter()
+            .map(|template| template.as_ref().map(|(sample, _)| *sample))
+            .collect::<Vec<_>>();
+        let mut cells = Vec::with_capacity(allocation.cells.len() + 256);
+        cells.extend_from_slice(&allocation.cells);
+        let realm_new_object_shape_gc = realm.intrinsics().new_object_shape();
+        let realm_new_object_shape = ShapeSnapshot {
+            shape: note_cell(&mut cells, realm_new_object_shape_gc),
+            property_count: realm_new_object_shape_gc.property_count(),
+        };
+        let realm_string_prototype_gc = realm.string_prototype(vm);
+        let realm_number_prototype_gc = realm.number_prototype(vm);
+        let realm_boolean_prototype_gc = realm.boolean_prototype(vm);
+        let realm_string_prototype = note_cell(&mut cells, realm_string_prototype_gc);
+        let realm_number_prototype = note_cell(&mut cells, realm_number_prototype_gc);
+        let realm_boolean_prototype = note_cell(&mut cells, realm_boolean_prototype_gc);
+        let realm_primitive_prototype_shapes = [
+            realm_string_prototype_gc.shape(),
+            realm_number_prototype_gc.shape(),
+            realm_boolean_prototype_gc.shape(),
+        ];
+        let mut entries = Vec::with_capacity(16);
+        entries.push(Entry {
             executable,
             function: None,
             realm,
             depth: 0,
-        }],
-        indices: HashMap::new(),
-        compiled_function: function,
-        compiled_function_fields,
-        closure_templates: List::empty(),
-        closure_samples: Vec::new(),
-        sample_slots: Vec::new(),
-        environment_templates: Vec::new(),
-        bound_arguments: Vec::new(),
-        lexical_environment_templates: List::empty(),
-        construct_this_shapes: HashMap::new(),
-        super_constructors: HashMap::new(),
-        literal_instance_fields: HashMap::new(),
-        derived_instance_fields: HashMap::new(),
-    };
-    if let Some(function) = function {
-        note_frame_field_cells(&mut builder.cells, function);
-    }
-    let cells = &mut builder.cells;
-    builder.closure_templates = closure_template_snapshots(
-        closure_templates.into_inner(),
-        |cell| note_cell(cells, cell),
-        &mut builder.sample_slots,
-        defer_gc,
-        &mut builder.snapshot,
-    );
-    builder.lexical_environment_templates =
-        lexical_environment_templates(vm, executable, realm, &mut builder.snapshot, |cell| {
-            note_cell(cells, cell)
         });
-    // NB: executable_snapshot() appends the inlining candidates it finds.
-    let mut index = 0;
-    while index < builder.entries.len() {
-        let entry = builder.entries[index];
-        let row = builder.executable_snapshot(&entry);
-        builder.snapshot.add_executable(row);
-        index += 1;
-    }
-    // NB: Calls of closures the code creates can be inlined without feedback, as calls of the function its closure
-    //     templates are samples of. These come last, so that they take what is left of the inlining budget. Their
-    //     snapshots may have closure templates in turn.
-    let mut samples = closure_samples
-        .into_iter()
-        .enumerate()
-        .filter_map(|(template_index, sample)| Some((0, template_index, sample?)))
-        .collect::<Vec<_>>();
-    samples.append(&mut builder.closure_samples);
-    while !samples.is_empty() {
-        for (executable_index, template_index, sample) in samples {
-            let creator = builder.entries[executable_index as usize];
-            let inline_executable = builder.inline_executable_index(Some(sample.upcast::<CellHeader>()), &creator);
-            // NB: A snapshot that had no room for an executable has no row for it (see `Snapshot::is_complete()`).
-            let Some(executable) = builder.snapshot.executables.get(executable_index as usize) else {
-                continue;
-            };
-            let templates = executable.closure_templates;
-            if let Some(Some(template)) = builder.snapshot[templates].get_mut(template_index) {
-                template.inline_executable = inline_executable;
-            }
+        let mut builder = SnapshotBuilder {
+            vm,
+            defer_gc,
+            snapshot,
+            bytecode_owners: Vec::with_capacity(8),
+            cells,
+            entries,
+            indices: Vec::with_capacity(16),
+            compiled_realm: realm,
+            realm_new_object_shape,
+            realm_string_prototype,
+            realm_number_prototype,
+            realm_boolean_prototype,
+            realm_primitive_prototype_shapes,
+            compiled_function: function,
+            compiled_function_fields,
+            closure_templates: List::empty(),
+            closure_samples: Vec::new(),
+            sample_slots: Vec::new(),
+            environment_templates: Vec::new(),
+            bound_arguments: Vec::new(),
+            lexical_environment_templates: List::empty(),
+            construct_this_shapes: Vec::new(),
+            super_constructors: Vec::new(),
+            literal_instance_fields: Vec::new(),
+            derived_instance_fields: Vec::new(),
+        };
+        if let Some(function) = function {
+            note_frame_field_cells(&mut builder.cells, function);
         }
+        let cells = &mut builder.cells;
+        builder.closure_templates = closure_template_snapshots(
+            closure_templates.into_inner(),
+            |cell| note_cell(cells, cell),
+            &mut builder.sample_slots,
+            defer_gc,
+            &mut builder.snapshot,
+        );
+        builder.lexical_environment_templates =
+            lexical_environment_templates(vm, executable, realm, &mut builder.snapshot, |cell| {
+                note_cell(cells, cell)
+            });
+        // NB: executable_snapshot() appends the inlining candidates it finds.
+        let mut index = 0;
         while index < builder.entries.len() {
             let entry = builder.entries[index];
             let row = builder.executable_snapshot(&entry);
             builder.snapshot.add_executable(row);
             index += 1;
         }
-        samples = core::mem::take(&mut builder.closure_samples);
-    }
-    let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
-    // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.
-    builder.cell(realm.array_prototype());
-    builder.cell(realm.object_prototype());
-    runtime.array_iterator_next = builder.optional_cell(array_iterator_next(vm, realm));
-    runtime.array_iterator_return_watchpoint_set = builder.optional_cell(
-        realm
-            .array_iterator_return_watchpoint_set
-            .get()
-            .filter(|set| set.is_valid()),
-    );
-    // NB: Code that reads the cells of the realm embeds the realm.
-    builder.cell(realm);
-    runtime.array_iterator_next_watchpoint_set_address =
-        realm_watchpoints::array_iterator_next_watchpoint_set_address(realm);
-    runtime.array_iterator_method_watchpoint_set_address =
-        realm_watchpoints::array_iterator_method_watchpoint_set_address(realm);
+        // NB: Calls of closures the code creates can be inlined without feedback, as calls of the function its closure
+        //     templates are samples of. These come last, so that they take what is left of the inlining budget. Their
+        //     snapshots may have closure templates in turn.
+        let mut samples = closure_samples
+            .into_iter()
+            .enumerate()
+            .filter_map(|(template_index, sample)| Some((0, template_index, sample?)))
+            .collect::<Vec<_>>();
+        samples.append(&mut builder.closure_samples);
+        while !samples.is_empty() {
+            for (executable_index, template_index, sample) in samples {
+                let creator = builder.entries[executable_index as usize];
+                let inline_executable = builder.inline_executable_index(Some(sample.upcast::<CellHeader>()), &creator);
+                // NB: A snapshot that had no room for an executable has no row for it (see `Snapshot::is_complete()`).
+                let Some(executable) = builder.snapshot.executables.get(executable_index as usize) else {
+                    continue;
+                };
+                let templates = executable.closure_templates;
+                if let Some(Some(template)) = builder.snapshot[templates].get_mut(template_index) {
+                    template.inline_executable = inline_executable;
+                }
+            }
+            while index < builder.entries.len() {
+                let entry = builder.entries[index];
+                let row = builder.executable_snapshot(&entry);
+                builder.snapshot.add_executable(row);
+                index += 1;
+            }
+            samples = core::mem::take(&mut builder.closure_samples);
+        }
+        let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
+        // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.
+        builder.cell(realm.array_prototype());
+        builder.cell(realm.object_prototype());
+        runtime.array_iterator_next = builder.optional_cell(array_iterator_next(vm, realm));
+        runtime.array_iterator_return_watchpoint_set = builder.optional_cell(
+            realm
+                .array_iterator_return_watchpoint_set
+                .get()
+                .filter(|set| set.is_valid()),
+        );
+        // NB: Code that reads the cells of the realm embeds the realm.
+        builder.cell(realm);
+        runtime.array_iterator_next_watchpoint_set_address =
+            realm_watchpoints::array_iterator_next_watchpoint_set_address(realm);
+        runtime.array_iterator_method_watchpoint_set_address =
+            realm_watchpoints::array_iterator_method_watchpoint_set_address(realm);
+        let SnapshotBuilder {
+            bytecode_owners,
+            cells,
+            entries,
+            sample_slots,
+            ..
+        } = builder;
+        (runtime, bytecode_owners, cells, entries, sample_slots)
+    });
     let options = &vm.jit.options;
-    let SnapshotBuilder {
-        snapshot,
-        cells,
-        entries,
-        sample_slots,
-        ..
-    } = builder;
-    super::compile_queue::give_back_open_lists(snapshot.finish());
     let mut snapshot = spare_snapshot;
     snapshot.runtime = runtime;
     snapshot.options = {
@@ -1760,6 +1965,7 @@ pub fn capture_snapshot<'d>(
     };
     CapturedSnapshot {
         snapshot,
+        bytecode_owners,
         cells: defer_gc.cover(cells),
         sample_slots: defer_gc.cover(sample_slots),
         snapshot_executables: defer_gc.cover(

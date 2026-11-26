@@ -131,7 +131,10 @@ pub mod tier_up {
     use super::{InterpreterTier, JitState, Vm};
 
     /// The interpreter tier and the tier-up budget a new executable starts with: it never tiers up.
-    pub fn initial_tier(_jit: &JitState) -> (InterpreterTier, i32) {
+    pub fn initial_tier(
+        _jit: &JitState,
+        _executable: &crate::bytecode::executable::Executable,
+    ) -> (InterpreterTier, i32) {
         (InterpreterTier::Plain, i32::MAX)
     }
 

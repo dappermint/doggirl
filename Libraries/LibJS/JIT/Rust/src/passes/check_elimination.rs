@@ -130,12 +130,12 @@ struct Store<'f> {
 }
 
 impl<'f> Store<'f> {
-    fn new_in(zone: &'f Zone) -> Self {
+    fn new_in(zone: &'f Zone, block_count: usize) -> Self {
         Self {
             zone,
-            facts: ZoneVec::new_in(zone),
-            incoming: ZoneVec::new_in(zone),
-            outgoing: ZoneVec::new_in(zone),
+            facts: ZoneVec::with_capacity_in(block_count.saturating_mul(2), zone),
+            incoming: ZoneVec::with_capacity_in(4, zone),
+            outgoing: ZoneVec::with_capacity_in(4, zone),
         }
     }
 
@@ -189,7 +189,12 @@ fn move_limit(kept: usize) -> usize {
     (2 * kept).max(1 << 20)
 }
 
+#[cfg(test)]
 pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
+    run_checked(graph, work, steps);
+}
+
+pub fn run_checked(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) -> bool {
     let mut constants = Constants::new(graph, work);
     // NB: The visits add no nodes to blocks, only constants.
     let mut decisions = Decisions {
@@ -206,7 +211,7 @@ pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
     //     the visits stop when the store of the facts holds much more than after the last move, the facts in use
     //     move to the other step zone, and the zone they leave is reset.
     let [zone, other] = steps;
-    let mut store = Store::new_in(zone);
+    let mut store = Store::new_in(zone, round.graph.blocks.len());
     let mut kept = 0;
     loop {
         if round.run(&mut store, move_limit(kept)) {
@@ -223,6 +228,11 @@ pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
         other.reset();
     }
 
+    let changed_control_flow = !decisions.controls.is_empty();
+    let changed = changed_control_flow
+        || !decisions.replacements.is_empty()
+        || !decisions.removed.is_empty()
+        || !decisions.assumptions.is_empty();
     decisions.replacements.apply(graph);
     edit::remove_nodes(graph, &decisions.removed);
     for node in decisions.assumptions.drain_all() {
@@ -233,7 +243,6 @@ pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
     for shape in decisions.stable_shapes.drain_all() {
         graph.depend_on(Dependency::StableShape(shape));
     }
-    let changed_control_flow = !decisions.controls.is_empty();
     for (node, control) in decisions.controls.drain_all() {
         match control {
             NewControl::Jump { target } => edit::make_jump(graph, node, target),
@@ -249,6 +258,7 @@ pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
     if changed_control_flow {
         edit::clean_up_control_flow(graph, work);
     }
+    changed
 }
 
 /// The rounds of visits of the blocks, until the facts stop changing, with what lasts from one visit to the next
@@ -301,7 +311,7 @@ impl<'a, 'g, 'w> Round<'a, 'g, 'w> {
             skipped: ZoneVec::new_in(work),
             edges: ZoneVec::from_iter_in((0..block_count).map(|_| ZoneVec::new_in(work)), work),
             entry_facts: ZoneVec::from_elem_in(None, block_count, work),
-            free: ZoneVec::new_in(work),
+            free: ZoneVec::with_capacity_in(block_count, work),
             changed: false,
             next: 0,
         };
@@ -446,7 +456,7 @@ fn facts_at_entry<'f>(
         let mut index = 0;
         while index < edges.len() {
             if edges[index].0 == block {
-                let (_, slot) = edges.remove(index);
+                let (_, slot) = edges.swap_remove(index);
                 incoming.push((*predecessor, store.take(slot, free)));
             } else {
                 index += 1;

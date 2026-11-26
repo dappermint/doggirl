@@ -62,7 +62,7 @@ fn count_uses<'w>(graph: &Graph, work: &'w Zone) -> ZoneVec<'w, u32> {
 /// booleans, which nothing else uses, branch on their input of the phi
 /// themselves (through a new block on each edge, which jumps on), or jump
 /// to the target of a constant one.
-fn thread_boolean_phis(graph: &mut Graph, uses: &[u32], work: &Zone) {
+fn thread_boolean_phis(graph: &mut Graph, uses: &[u32], work: &Zone) -> bool {
     let block_count = graph.blocks.len();
     // NB: A block whose jump becomes a branch gets the two blocks of its edges. It then jumps nowhere, so it gets
     //     no more.
@@ -144,7 +144,7 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32], work: &Zone) {
         threaded.insert(block);
     }
     if threaded.is_empty() {
-        return;
+        return false;
     }
     // NB: The new blocks follow their predecessor, before their targets.
     let order = ZoneVec::from_iter_in(
@@ -156,6 +156,7 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32], work: &Zone) {
         work,
     );
     graph.reorder_blocks(&order, work);
+    true
 }
 
 /// Removes `predecessor` from the predecessors of `target`, and its inputs
@@ -189,10 +190,25 @@ fn add_predecessor(graph: &mut Graph, target: BlockId, predecessor: BlockId, lik
     }
 }
 
-pub fn run(graph: &mut Graph, work: &Zone) {
+/// Returns whether control flow changed (boolean phis were threaded into new edge blocks).
+pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
+    let has_bool_branch = graph.blocks.iter().any(|block| {
+        block.control.is_some_and(|control| {
+            matches!(
+                graph.node(control).op,
+                Op::Branch {
+                    condition: BranchCondition::Bool,
+                    ..
+                }
+            )
+        })
+    });
+    if !has_bool_branch {
+        return false;
+    }
     // NB: Threading moves the uses of each phi's inputs to the branches.
     let uses = count_uses(graph, work);
-    thread_boolean_phis(graph, &uses, work);
+    let changed_cfg = thread_boolean_phis(graph, &uses, work);
     let count = graph.nodes.len();
     let mut removed = ZoneBitSet::new_in(count, work);
     let mut inputs = ZoneVec::new_in(work);
@@ -241,4 +257,5 @@ pub fn run(graph: &mut Graph, work: &Zone) {
         removed.insert(comparison.index());
     }
     edit::remove_nodes(graph, &removed);
+    changed_cfg
 }

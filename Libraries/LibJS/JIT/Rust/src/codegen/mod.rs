@@ -1065,7 +1065,9 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
         if let Some(decoded) = self.decoded_instructions.get(&(executable, pc)) {
             return Ok(*decoded);
         }
-        let bytecode = &self.snapshot[self.snapshot.executables[executable as usize].bytecode];
+        let bytecode = self
+            .snapshot
+            .bytecode(self.snapshot.executables[executable as usize].bytecode);
         let decoded = decode_instruction(bytecode, pc, self.work).map_err(|_| CompileFailure::InvalidBytecode {
             pc,
             reason: "undecodable instruction",
@@ -1087,7 +1089,9 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
     /// The byte at `offset` in the instruction at `pc` of executable `executable`.
     fn read_u8(&self, executable: u32, pc: u32, offset: u32) -> Result<u8, CompileFailure> {
         let at = (pc + offset) as usize;
-        let byte = self.snapshot[self.snapshot.executables[executable as usize].bytecode]
+        let byte = self
+            .snapshot
+            .bytecode(self.snapshot.executables[executable as usize].bytecode)
             .get(at)
             .ok_or(CompileFailure::InvalidBytecode {
                 pc,
@@ -1762,8 +1766,14 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
             Op::Generic { opcode, executable, pc } => {
                 self.emit_generic(*opcode, *executable, *pc)?;
             }
-            Op::CallNativeAccessor { pc, part, target } => {
-                self.emit_call_native_accessor(node_id, *pc, *part, *target)?;
+            Op::CallNativeAccessor {
+                executable,
+                pc,
+                part,
+                target,
+                ..
+            } => {
+                self.emit_call_native_accessor(node_id, *executable, *pc, *part, *target)?;
             }
             Op::CallDirect { executable, pc, .. } | Op::CallNative { executable, pc, .. } => {
                 let (executable, pc) = (*executable, *pc);

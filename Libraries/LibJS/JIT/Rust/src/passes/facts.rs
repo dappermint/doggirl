@@ -239,12 +239,26 @@ impl<'w, K: Ord + Copy, V: Copy> FactMap<'w, K, V> {
         }
     }
 
-    fn keys(&self) -> impl Iterator<Item = &K> {
-        self.as_slice().iter().map(|(key, _)| key)
-    }
-
-    fn retain(&mut self, zone: &'w Zone, mut keep: impl FnMut(&K, &mut V) -> bool) {
-        self.0.make_mut(zone).retain_mut(|(key, value)| keep(key, value));
+    fn retain(&mut self, zone: &'w Zone, mut keep: impl FnMut(&K, &V) -> bool) {
+        match &mut self.0 {
+            Part::Frozen(slice) => {
+                if let Some(first_dropped) = slice.iter().position(|(key, value)| !keep(key, value)) {
+                    let mut kept = ZoneVec::with_capacity_in(slice.len() - 1, zone);
+                    kept.extend_from_slice(&slice[..first_dropped]);
+                    for entry in &slice[first_dropped + 1..] {
+                        if keep(&entry.0, &entry.1) {
+                            kept.push(*entry);
+                        }
+                    }
+                    self.0 = Part::Owned(kept);
+                }
+            }
+            Part::Owned(values) => {
+                if !values.is_empty() {
+                    values.retain(|(key, value)| keep(key, value));
+                }
+            }
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -284,14 +298,22 @@ impl<'w, K: Ord + Copy> FactSet<'w, K> {
     }
 
     fn insert(&mut self, zone: &'w Zone, key: K) {
-        if let Err(index) = self.as_slice().binary_search(&key) {
+        let slice = self.as_slice();
+        if slice.last().is_none_or(|last| *last < key) {
+            self.0.make_mut(zone).push(key);
+            return;
+        }
+        if let Err(index) = slice.binary_search(&key) {
             self.0.make_mut(zone).insert(index, key);
         }
     }
 
-    fn remove(&mut self, zone: &'w Zone, key: &K) {
+    fn remove(&mut self, zone: &'w Zone, key: &K) -> bool {
         if let Ok(index) = self.as_slice().binary_search(key) {
             self.0.make_mut(zone).remove(index);
+            true
+        } else {
+            false
         }
     }
 
@@ -300,8 +322,26 @@ impl<'w, K: Ord + Copy> FactSet<'w, K> {
         self.as_slice().iter()
     }
 
-    fn retain(&mut self, zone: &'w Zone, keep: impl FnMut(&K) -> bool) {
-        self.0.make_mut(zone).retain(keep);
+    fn retain(&mut self, zone: &'w Zone, mut keep: impl FnMut(&K) -> bool) {
+        match &mut self.0 {
+            Part::Frozen(slice) => {
+                if let Some(first_dropped) = slice.iter().position(|key| !keep(key)) {
+                    let mut kept = ZoneVec::with_capacity_in(slice.len() - 1, zone);
+                    kept.extend_from_slice(&slice[..first_dropped]);
+                    for entry in &slice[first_dropped + 1..] {
+                        if keep(entry) {
+                            kept.push(*entry);
+                        }
+                    }
+                    self.0 = Part::Owned(kept);
+                }
+            }
+            Part::Owned(values) => {
+                if !values.is_empty() {
+                    values.retain(keep);
+                }
+            }
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -858,14 +898,12 @@ impl<'w> Facts<'w> {
     /// Records that `value` has one of `shapes`, narrowing what was known
     /// (unless that holds only if the code is still valid).
     pub fn set_shapes(&mut self, value: NodeId, shapes: &[ShapeCheck]) {
-        let unvalidated = self.unvalidated.contains(&value);
-        if unvalidated {
-            self.unvalidated.remove(self.zone, &value);
-        }
-        if self.shapes(value) == Some(shapes) {
+        let unvalidated = self.unvalidated.remove(self.zone, &value);
+        let existing = self.shapes(value);
+        if existing == Some(shapes) {
             return;
         }
-        let narrowed: &'w [ShapeCheck] = match self.shapes(value) {
+        let narrowed: &'w [ShapeCheck] = match existing {
             Some(known) if !unvalidated => self
                 .zone
                 .alloc_slice_from_iter(shapes.iter().filter(|shape| known.contains(shape)).copied()),
@@ -909,11 +947,7 @@ impl<'w> Facts<'w> {
 
     /// A store to `offset` of some object, which may alias any object.
     pub fn forget_named_properties_at(&mut self, offset: u32) {
-        if !self
-            .contents
-            .keys()
-            .any(|location| matches!(location, Location::Named { offset: known, .. } if *known == offset))
-        {
+        if self.contents.is_empty() {
             return;
         }
         self.contents.retain(
@@ -925,7 +959,7 @@ impl<'w> Facts<'w> {
     /// A store to binding `index` of some environment, which may be any
     /// environment with such a binding, a global one too.
     pub fn forget_bindings_at(&mut self, index: u32) {
-        if !self.contents.keys().any(|location| matches!(location, Location::GlobalBinding { index: known, .. } | Location::Binding { index: known, .. } if *known == index)) {
+        if self.contents.is_empty() {
             return;
         }
         self.contents.retain(self.zone, |location, _| match location {
@@ -989,7 +1023,7 @@ impl<'w> Facts<'w> {
             location.locations().intersects(writes)
                 && !location.object().is_some_and(|object| unexposed.contains(&object))
         };
-        if self.contents.keys().any(killed) {
+        if !self.contents.is_empty() {
             self.contents.retain(zone, |location, _| !killed(location));
         }
         if writes.intersects(Locations::ELEMENT_COUNTS) && !self.elements.is_empty() {
@@ -1018,11 +1052,9 @@ impl<'w> Facts<'w> {
                     .retain(zone, |value, shapes| unexposed.contains(value) || is_stable(shapes));
             }
         }
-        if writes.intersects(Locations::SHAPES) {
+        if writes.intersects(Locations::SHAPES) && !self.unvalidated.is_empty() {
             let shapes = &self.shapes;
-            if self.unvalidated.iter().any(|value| !shapes.contains_key(value)) {
-                self.unvalidated.retain(zone, |value| shapes.contains_key(value));
-            }
+            self.unvalidated.retain(zone, |value| shapes.contains_key(value));
         }
         if writes.intersects(Locations::SHAPES) && !self.valid_prototype_chains.is_empty() {
             self.valid_prototype_chains.clear();
@@ -1038,57 +1070,31 @@ impl<'w> Facts<'w> {
         let mut merged = first;
         let zone = merged.zone;
         for other in facts {
-            narrow_unless_shared(&mut merged.kinds.0, &other.kinds.0, zone, |kinds| {
-                kinds.retain_mut(|(value, kinds)| {
-                    let Some(other) = other.kinds.get(value) else {
-                        return false;
-                    };
-                    *kinds = kinds.union(*other);
-                    true
-                });
-            });
-            narrow_unless_shared(&mut merged.checked_values.0, &other.checked_values.0, zone, |values| {
-                values.retain(|value| other.checked_values.contains(value));
-            });
-            narrow_unless_shared(&mut merged.elements.0, &other.elements.0, zone, |elements| {
-                elements.retain(|(value, kind)| other.elements.get(value) == Some(kind));
-            });
-            narrow_unless_shared(
+            merge_sorted_map(
+                &mut merged.kinds.0,
+                &other.kinds.0,
+                zone,
+                |a, b| a.union(*b),
+                |a, b| a.union(*b) == *a,
+            );
+            intersect_sorted_set(&mut merged.checked_values.0, &other.checked_values.0, zone);
+            intersect_sorted_map_eq(&mut merged.elements.0, &other.elements.0, zone);
+            intersect_sorted_set(
                 &mut merged.valid_prototype_chains.0,
                 &other.valid_prototype_chains.0,
                 zone,
-                |chains| {
-                    chains.retain(|cell| other.valid_prototype_chains.contains(cell));
-                },
             );
-            narrow_unless_shared(&mut merged.contents.0, &other.contents.0, zone, |contents| {
-                contents.retain(|(location, value)| other.contents.get(location) == Some(value));
-            });
-            narrow_unless_shared(&mut merged.unexposed.0, &other.unexposed.0, zone, |unexposed| {
-                unexposed.retain(|object| other.unexposed.contains(object));
-            });
-            if !merged.unvalidated.0.is_same(&other.unvalidated.0) {
-                for value in other.unvalidated.iter() {
-                    merged.unvalidated.insert(zone, *value);
-                }
-            }
+            intersect_sorted_map_eq(&mut merged.contents.0, &other.contents.0, zone);
+            intersect_sorted_set(&mut merged.unexposed.0, &other.unexposed.0, zone);
+            union_sorted_set(&mut merged.unvalidated.0, &other.unvalidated.0, zone);
             merged.code_valid &= other.code_valid;
-            narrow_unless_shared(
-                &mut merged.branch_outcomes.0,
-                &other.branch_outcomes.0,
+            intersect_sorted_map_eq(&mut merged.branch_outcomes.0, &other.branch_outcomes.0, zone);
+            intersect_sorted_map_eq(&mut merged.refinements.0, &other.refinements.0, zone);
+            merge_sorted_map(
+                &mut merged.shapes.0,
+                &other.shapes.0,
                 zone,
-                |outcomes| {
-                    outcomes.retain(|(key, holds)| other.branch_outcomes.get(key) == Some(holds));
-                },
-            );
-            narrow_unless_shared(&mut merged.refinements.0, &other.refinements.0, zone, |refinements| {
-                refinements.retain(|(key, value)| other.refinements.get(key) == Some(value));
-            });
-            narrow_unless_shared(&mut merged.shapes.0, &other.shapes.0, zone, |shapes| {
-                shapes.retain_mut(|(value, shapes)| {
-                    let Some(other_shapes) = other.shapes.get(value) else {
-                        return false;
-                    };
+                |shapes, other_shapes| {
                     if other_shapes.iter().any(|shape| !shapes.contains(shape)) {
                         let mut united = ZoneVec::from_slice_in(shapes, zone);
                         for shape in *other_shapes {
@@ -1096,31 +1102,292 @@ impl<'w> Facts<'w> {
                                 united.push(*shape);
                             }
                         }
-                        *shapes = united.into_slice();
+                        united.into_slice()
+                    } else {
+                        *shapes
                     }
-                    true
-                });
-            });
+                },
+                |shapes, other_shapes| !other_shapes.iter().any(|shape| !shapes.contains(shape)),
+            );
         }
         let shapes = &merged.shapes;
-        if merged.unvalidated.iter().any(|value| !shapes.contains_key(value)) {
+        if !merged.unvalidated.is_empty() {
             merged.unvalidated.retain(zone, |value| shapes.contains_key(value));
         }
         merged
     }
 }
 
-/// Merges `other` into the facts `merged` with `merge`, unless both are the
-/// same facts, which then hold on both paths as they are.
-fn narrow_unless_shared<'w, T: Copy>(
-    merged: &mut Part<'w, T>,
-    other: &Part<'w, T>,
+/// Two-pointer sorted intersection of key-value maps keeping entries present with equal values in both.
+fn intersect_sorted_map_eq<'w, K: Ord + Copy, V: PartialEq + Copy>(
+    merged: &mut Part<'w, (K, V)>,
+    other: &Part<'w, (K, V)>,
     zone: &'w Zone,
-    merge: impl FnOnce(&mut ZoneVec<'w, T>),
 ) {
-    if !merged.is_same(other) {
-        merge(merged.make_mut(zone));
+    if merged.is_same(other) || merged.as_slice().is_empty() {
+        return;
     }
+    let b = other.as_slice();
+    if b.is_empty() {
+        merged.clear();
+        return;
+    }
+    match merged {
+        Part::Frozen(a) => {
+            // Check whether every entry in `a` already matches `b` so shared storage stays zero-copy.
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        if a[ai].1 != b[bi].1 {
+                            break;
+                        }
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Greater => bi += 1,
+                    core::cmp::Ordering::Less => break,
+                }
+            }
+            if ai == a.len() {
+                return;
+            }
+            let mut kept = ZoneVec::with_capacity_in(a.len().min(b.len()), zone);
+            kept.extend_from_slice(&a[..ai]);
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        if a[ai].1 == b[bi].1 {
+                            kept.push(a[ai]);
+                        }
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            *merged = Part::Owned(kept);
+        }
+        Part::Owned(a) => {
+            let mut write = 0usize;
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        if a[ai].1 == b[bi].1 {
+                            if write != ai {
+                                a[write] = a[ai];
+                            }
+                            write += 1;
+                        }
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            a.truncate(write);
+        }
+    }
+}
+
+/// Two-pointer sorted intersection of key-value maps combining matching values with `combine`.
+fn merge_sorted_map<'w, K: Ord + Copy, V: Copy>(
+    merged: &mut Part<'w, (K, V)>,
+    other: &Part<'w, (K, V)>,
+    zone: &'w Zone,
+    mut combine: impl FnMut(&V, &V) -> V,
+    mut is_unchanged: impl FnMut(&V, &V) -> bool,
+) {
+    if merged.is_same(other) || merged.as_slice().is_empty() {
+        return;
+    }
+    let b = other.as_slice();
+    if b.is_empty() {
+        merged.clear();
+        return;
+    }
+    match merged {
+        Part::Frozen(a) => {
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        if !is_unchanged(&a[ai].1, &b[bi].1) {
+                            break;
+                        }
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Greater => bi += 1,
+                    core::cmp::Ordering::Less => break,
+                }
+            }
+            if ai == a.len() {
+                return;
+            }
+            let mut kept = ZoneVec::with_capacity_in(a.len().min(b.len()), zone);
+            kept.extend_from_slice(&a[..ai]);
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        let combined = combine(&a[ai].1, &b[bi].1);
+                        kept.push((a[ai].0, combined));
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            *merged = Part::Owned(kept);
+        }
+        Part::Owned(a) => {
+            let mut write = 0usize;
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].0.cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        let combined = combine(&a[ai].1, &b[bi].1);
+                        a[write] = (a[ai].0, combined);
+                        write += 1;
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            a.truncate(write);
+        }
+    }
+}
+
+/// Two-pointer sorted intersection of sets.
+fn intersect_sorted_set<'w, K: Ord + Copy>(merged: &mut Part<'w, K>, other: &Part<'w, K>, zone: &'w Zone) {
+    if merged.is_same(other) || merged.as_slice().is_empty() {
+        return;
+    }
+    let b = other.as_slice();
+    if b.is_empty() {
+        merged.clear();
+        return;
+    }
+    match merged {
+        Part::Frozen(a) => {
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi]) {
+                    core::cmp::Ordering::Equal => {
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Greater => bi += 1,
+                    core::cmp::Ordering::Less => break,
+                }
+            }
+            if ai == a.len() {
+                return;
+            }
+            let mut kept = ZoneVec::with_capacity_in(a.len().min(b.len()), zone);
+            kept.extend_from_slice(&a[..ai]);
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi]) {
+                    core::cmp::Ordering::Equal => {
+                        kept.push(a[ai]);
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            *merged = Part::Owned(kept);
+        }
+        Part::Owned(a) => {
+            let mut write = 0usize;
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi]) {
+                    core::cmp::Ordering::Equal => {
+                        if write != ai {
+                            a[write] = a[ai];
+                        }
+                        write += 1;
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            a.truncate(write);
+        }
+    }
+}
+
+/// Two-pointer sorted union of sets.
+fn union_sorted_set<'w, K: Ord + Copy>(merged: &mut Part<'w, K>, other: &Part<'w, K>, zone: &'w Zone) {
+    if merged.is_same(other) || other.as_slice().is_empty() {
+        return;
+    }
+    let a = merged.as_slice();
+    let b = other.as_slice();
+    if a.is_empty() {
+        *merged = match *other {
+            Part::Frozen(slice) => Part::Frozen(slice),
+            Part::Owned(_) => Part::Owned(ZoneVec::from_slice_in(b, zone)),
+        };
+        return;
+    }
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    let mut all_present = true;
+    while bi < b.len() {
+        while ai < a.len() && a[ai] < b[bi] {
+            ai += 1;
+        }
+        if ai >= a.len() || a[ai] != b[bi] {
+            all_present = false;
+            break;
+        }
+        ai += 1;
+        bi += 1;
+    }
+    if all_present {
+        return;
+    }
+    let mut out = ZoneVec::with_capacity_in(a.len() + b.len(), zone);
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    while ai < a.len() && bi < b.len() {
+        match a[ai].cmp(&b[bi]) {
+            core::cmp::Ordering::Less => {
+                out.push(a[ai]);
+                ai += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                out.push(b[bi]);
+                bi += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                out.push(a[ai]);
+                ai += 1;
+                bi += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[ai..]);
+    out.extend_from_slice(&b[bi..]);
+    *merged = Part::Owned(out);
 }
 
 /// Whether an object whose elements are known to be of kind `known` has
@@ -1194,14 +1461,14 @@ mod tests {
         assert_eq!(facts.as_slice(), [(1, 10), (2, 20), (3, 31), (4, 40)]);
         facts.remove(zone, &2);
         facts.remove(zone, &9);
-        facts.retain(zone, |key, value| {
-            *value += 1;
-            *key != 3
-        });
-        assert_eq!(facts.as_slice(), [(1, 11), (4, 41)]);
-        assert_eq!(facts.get(&4), Some(&41));
+        facts.retain(zone, |key, value| *key != 3 && *value > 0);
+        assert_eq!(facts.as_slice(), [(1, 10), (4, 40)]);
+        assert_eq!(facts.get(&4), Some(&40));
         assert_eq!(facts.get(&2), None);
-        assert_eq!(facts.share(), facts);
+        let shared = facts.share();
+        facts.retain(zone, |key, _| *key != 99);
+        assert!(facts.0.is_same(&shared.0));
+        assert_eq!(shared, facts);
     }
 
     #[test]

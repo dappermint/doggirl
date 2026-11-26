@@ -268,9 +268,35 @@ fn write_codes_in_chunk(chunk: &Chunk, writes: &[CodeWrite<'_>]) {
         copy_all();
         // SAFETY: As above.
         unsafe { pthread_jit_write_protect_np(1) };
+        // Writes are sorted by destination within one chunk, so coalescing adjacent/nearby ranges
+        // avoids repeated dsb/isb barriers across contiguous code allocations.
+        debug_assert!(
+            writes
+                .windows(2)
+                .all(|pair| (pair[0].destination as usize) <= (pair[1].destination as usize)),
+            "writes must be sorted by destination before coalescing icache invalidation"
+        );
+        const MAX_COALESCE_GAP: usize = 4096;
+        let mut range_start = 0usize;
+        let mut range_end = 0usize;
         for write in writes {
-            // SAFETY: The destination holds the code that was just written.
-            unsafe { sys_icache_invalidate(write.destination.cast(), write.code.len()) };
+            let start = write.destination as usize;
+            let end = start + write.code.len();
+            if range_end == 0 {
+                range_start = start;
+                range_end = end;
+            } else if start >= range_start && start <= range_end.saturating_add(MAX_COALESCE_GAP) {
+                range_end = range_end.max(end);
+            } else {
+                // SAFETY: The range lies within this mapped chunk and covers the written code.
+                unsafe { sys_icache_invalidate(range_start as *mut libc::c_void, range_end - range_start) };
+                range_start = start;
+                range_end = end;
+            }
+        }
+        if range_end > range_start {
+            // SAFETY: As above.
+            unsafe { sys_icache_invalidate(range_start as *mut libc::c_void, range_end - range_start) };
         }
     }
     // NB: Making a page writable commits it, so pages between the writes stay as they are.
@@ -387,6 +413,31 @@ impl CodeAllocator {
         start
     }
 
+    /// Allocates a single contiguous region of `total_size` bytes inside one chunk for batched installs, so all
+    /// copied code blocks share a single page-protection toggle and a single instruction-cache invalidation.
+    /// Returns `None` when existing chunks have ample fragmented free space so we do not map extra chunks.
+    fn allocate_contiguous(&mut self, total_size: usize) -> Option<(*mut u8, usize)> {
+        let total_size = align_up(total_size, ALLOCATION_ALIGNMENT);
+        if let Some(index) = self.free_blocks.iter().position(|block| block.size >= total_size) {
+            let block = &mut self.free_blocks[index];
+            let address = block.start;
+            let chunk = block.chunk;
+            block.start = block.start.wrapping_add(total_size);
+            block.size -= total_size;
+            if block.size == 0 {
+                self.free_blocks.remove(index);
+            }
+            return Some((address, chunk));
+        }
+        let total_free: usize = self.free_blocks.iter().map(|block| block.size).sum();
+        if self.chunks.is_empty() || total_free < total_size.saturating_mul(2) {
+            let address = self.allocate(total_size);
+            let chunk = self.chunk_index_of(address);
+            return Some((address, chunk));
+        }
+        None
+    }
+
     fn free(&mut self, start: *mut u8, size: usize) {
         let size = align_up(size, ALLOCATION_ALIGNMENT);
         let chunk = self.chunk_index_of(start);
@@ -429,7 +480,69 @@ impl ExecutableMemory {
         names: &[&str],
         perf_map: bool,
     ) -> Vec<ExecutableMemory> {
-        assert_eq!(codes.len(), names.len());
+        if perf_map {
+            assert_eq!(codes.len(), names.len());
+        }
+        if codes.is_empty() {
+            return Vec::new();
+        }
+        if codes.len() == 1 {
+            let code = codes[0];
+            assert!(!code.is_empty());
+            let (address, chunk) = {
+                let mut alloc = allocator.borrow_mut();
+                let address = alloc.allocate(code.len());
+                let chunk = alloc.chunk_index_of(address);
+                (address, chunk)
+            };
+            let memory = ExecutableMemory {
+                address,
+                size: code.len(),
+                allocator: Rc::clone(allocator),
+            };
+            let write = CodeWrite {
+                destination: address,
+                code,
+            };
+            write_codes_in_chunk(&allocator.borrow().chunks[chunk], core::slice::from_ref(&write));
+            if perf_map {
+                write_perf_map_entry(memory.address, memory.size, names[0]);
+            }
+            return vec![memory];
+        }
+        let total_aligned_size: usize = codes
+            .iter()
+            .map(|code| {
+                assert!(!code.is_empty());
+                align_up(code.len(), ALLOCATION_ALIGNMENT)
+            })
+            .sum();
+        let contiguous = allocator.borrow_mut().allocate_contiguous(total_aligned_size);
+        if let Some((base, chunk)) = contiguous {
+            let mut memories = Vec::with_capacity(codes.len());
+            let mut chunk_writes = Vec::with_capacity(codes.len());
+            let mut offset = 0usize;
+            for &code in codes {
+                let address = base.wrapping_add(offset);
+                offset += align_up(code.len(), ALLOCATION_ALIGNMENT);
+                memories.push(ExecutableMemory {
+                    address,
+                    size: code.len(),
+                    allocator: Rc::clone(allocator),
+                });
+                chunk_writes.push(CodeWrite {
+                    destination: address,
+                    code,
+                });
+            }
+            write_codes_in_chunk(&allocator.borrow().chunks[chunk], &chunk_writes);
+            if perf_map {
+                for (memory, name) in memories.iter().zip(names) {
+                    write_perf_map_entry(memory.address, memory.size, name);
+                }
+            }
+            return memories;
+        }
         let memories: Vec<ExecutableMemory> = codes
             .iter()
             .map(|code| {
@@ -491,7 +604,7 @@ impl ExecutableMemory {
         if patches.is_empty() {
             return;
         }
-        let writes: Vec<CodeWrite<'_>> = patches
+        let mut writes: Vec<CodeWrite<'_>> = patches
             .iter()
             .map(|patch| {
                 assert!(patch.offset as usize + patch.bytes().len() <= self.size);
@@ -502,6 +615,7 @@ impl ExecutableMemory {
                 }
             })
             .collect();
+        writes.sort_unstable_by_key(|write| write.destination as usize);
         let allocator = self.allocator.borrow();
         let chunk = allocator.chunk_index_of(self.address);
         write_codes_in_chunk(&allocator.chunks[chunk], &writes);

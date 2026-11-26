@@ -18,46 +18,55 @@ use ak::ZoneBitSet;
 use ak::ZoneVec;
 
 /// Whether a node can be dropped when its value is unused.
+#[inline]
 fn is_removable(op: &Op) -> bool {
-    if matches!(op, Op::Phi | Op::Int32Binary { .. }) {
-        return true;
-    }
-    let properties = op.properties();
-    !op.is_control()
-        && !op.can_eager_exit()
-        && !properties.can_lazy_exit
-        && !properties.allocates
-        && properties.writes.is_empty()
-        && !properties.runs_code
+    matches!(op, Op::Phi | Op::Int32Binary { .. }) || op.meta().is_dce_removable()
 }
 
 pub fn run(graph: &mut Graph, work: &Zone) {
+    run_checked(graph, work);
+}
+
+/// Returns whether control flow changed (branches folded to one target).
+pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
     remove_dead_nodes(graph, work);
     // NB: Branches whose edges did the same are left jumping where they go,
     //     which leaves what only they used dead.
     if edit::fold_branches_to_one_target(graph, work) {
         remove_dead_nodes(graph, work);
+        return true;
     }
+    false
 }
 
 fn remove_dead_nodes(graph: &mut Graph, work: &Zone) {
     let count = graph.nodes.len();
     let mut live = ZoneBitSet::new_in(count, work);
     let mut live_frames = ZoneBitSet::new_in(graph.frame_states.len(), work);
-    let mut pending = ZoneVec::new_in(work);
+    let mut pending = ZoneVec::with_capacity_in(count, work);
+    let mut block_node_count = 0usize;
     for block in &graph.blocks {
-        pending.extend(block.nodes().filter(|node| {
-            let data = graph.node(*node);
-            data.repr.is_none() || !is_removable(&data.op)
-        }));
-    }
-    while let Some(node) = pending.pop() {
-        if live.contains(node.index()) {
-            continue;
+        block_node_count += block.phis.len() + block.body.len() + usize::from(block.control.is_some());
+        for node in block.nodes() {
+            let data = graph.node(node);
+            if (data.repr.is_none() || !is_removable(&data.op)) && !live.contains(node.index()) {
+                live.insert(node.index());
+                pending.push(node);
+            }
         }
-        live.insert(node.index());
+    }
+    let mut live_block_nodes = 0usize;
+    while let Some(node) = pending.pop() {
         let data = graph.node(node);
-        pending.extend(data.inputs.iter().copied());
+        if !matches!(data.op, Op::Constant(_) | Op::VirtualObject { .. }) {
+            live_block_nodes += 1;
+        }
+        for &input in &data.inputs {
+            if !live.contains(input.index()) {
+                live.insert(input.index());
+                pending.push(input);
+            }
+        }
         let mut frame = data.frame_state;
         while let Some(id) = frame {
             if live_frames.contains(id.index()) {
@@ -65,8 +74,27 @@ fn remove_dead_nodes(graph: &mut Graph, work: &Zone) {
             }
             live_frames.insert(id.index());
             let state = graph.frame_state(id);
-            pending.extend(state.values.iter().map(|(_, value)| *value));
+            for &(_, value) in &state.values {
+                if !live.contains(value.index()) {
+                    live.insert(value.index());
+                    pending.push(value);
+                }
+            }
             frame = state.parent;
+        }
+    }
+    if live_block_nodes >= block_node_count {
+        let mut any_dead = false;
+        'scan: for block in &graph.blocks {
+            for node in block.nodes() {
+                if !live.contains(node.index()) {
+                    any_dead = true;
+                    break 'scan;
+                }
+            }
+        }
+        if !any_dead {
+            return;
         }
     }
     let mut removed = ZoneBitSet::new_in(count, work);

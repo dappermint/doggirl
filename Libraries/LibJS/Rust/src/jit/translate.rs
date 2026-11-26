@@ -355,6 +355,10 @@ fn call_instruction_shape(executable: &Executable, pc: u32) -> (u32, u32, CallKi
         let get = instruction_at::<op::GetById>(executable, pc);
         return (0, get.length(), CallKind::Call);
     }
+    if opcode == OpCode::GetLength as u8 {
+        let get = instruction_at::<op::GetLength>(executable, pc);
+        return (0, get.length(), CallKind::Call);
+    }
     if opcode == OpCode::PutById as u8 {
         let put = instruction_at::<op::PutById>(executable, pc);
         return (1, put.length(), CallKind::Call);

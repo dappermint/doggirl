@@ -460,7 +460,25 @@ macro_rules! define_ops {
             ),*
         }
 
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum OpKind {
+            $($variant,)*
+        }
+
+        impl OpKind {
+            pub(super) const COUNT: usize = [$(OpKind::$variant),*].len();
+            pub(super) const ALL: [Self; Self::COUNT] = [$(Self::$variant),*];
+        }
+
         impl Op<'_> {
+            #[inline(always)]
+            pub(super) fn kind(&self) -> OpKind {
+                match self {
+                    $(Op::$variant { .. } => OpKind::$variant),*
+                }
+            }
+
             pub fn name(&self) -> &'static str {
                 match self {
                     $(Op::$variant { .. } => stringify!($variant)),*
@@ -639,14 +657,15 @@ define_ops! {
             stores_operands: bool,
         },
         /// The `GetById` or `GetLength` (for the getter) or `PutById` (for the
-        /// setter) at `pc` of the compiled function (never of an inlined call),
-        /// whose checks established that the property is an accessor whose
-        /// `part` is the raw native function `target`: calls it like
-        /// `CallNative` calls its target, with input 0 as the `this` value and
-        /// input 1 (for the setter) as the argument. The value is the getter's
-        /// result (for the setter, its result too).
+        /// setter) at `pc` of `executable`, whose checks established that the
+        /// property is an accessor whose `part` is the raw native function
+        /// `target`: calls it like `CallNative` calls its target, with input 0
+        /// as the `this` value and input 1 (for the setter) as the argument.
+        /// The value is the getter's result (for the setter, its result too).
         CallNativeAccessor {
+            executable: u32,
             pc: u32,
+            inlined_frame_bytes: u32,
             part: AccessorPart,
             target: NativeCallTarget,
         },
@@ -1406,6 +1425,7 @@ impl Float64Function {
 
 impl<'z> Op<'z> {
     /// The blocks a control node can continue at.
+    #[inline]
     pub fn successors(&self) -> Successors<'z> {
         let inline = |blocks: &[BlockId]| {
             let mut inline = [BlockId(0); 3];
@@ -1431,6 +1451,7 @@ impl<'z> Op<'z> {
     }
 
     /// Calls `visit` with each block a control node can continue at, in the order of `successors()`.
+    #[inline(always)]
     pub fn for_each_successor(&self, mut visit: impl FnMut(BlockId)) {
         match self {
             Op::Jump { target } => visit(*target),
@@ -1873,7 +1894,7 @@ impl<'z> Graph<'z> {
                     seen.push(node);
                     pending.extend(data.inputs.iter().copied());
                 }
-                op if op.info().never_empty => {}
+                op if op.never_empty() => {}
                 _ => return false,
             }
         }
@@ -2088,6 +2109,7 @@ impl<'z> Graph<'z> {
     }
 
     /// The bits of `id` if it is a constant, or a refinement of one.
+    #[inline]
     pub fn constant_value(&self, id: NodeId) -> Option<u64> {
         match self.node(self.unrefined(id)).op {
             Op::Constant(bits) => Some(bits),
@@ -2096,6 +2118,7 @@ impl<'z> Graph<'z> {
     }
 
     /// The value of `id`, if it is a `Repr::Int32` constant.
+    #[inline]
     pub fn int32_constant(&self, id: NodeId) -> Option<i32> {
         let node = self.node(self.unrefined(id));
         match (&node.op, node.repr) {
@@ -2106,21 +2129,23 @@ impl<'z> Graph<'z> {
 
     /// The value `id` refines, through any number of refinements (see
     /// `Op::refined_input()`), or `id` itself.
+    #[inline]
     pub fn unrefined(&self, mut id: NodeId) -> NodeId {
-        while let Some(index) = self.node(id).op.refined_input() {
-            id = self.node(id).inputs[index];
+        while self.node(id).op.refines_input_0() {
+            id = self.node(id).inputs[0];
         }
         id
     }
 
     /// Whether `id` is `value`, or refines it through any number of
     /// refinements.
+    #[inline]
     pub fn refines(&self, mut id: NodeId, value: NodeId) -> bool {
         while id != value {
-            let Some(index) = self.node(id).op.refined_input() else {
+            if !self.node(id).op.refines_input_0() {
                 return false;
-            };
-            id = self.node(id).inputs[index];
+            }
+            id = self.node(id).inputs[0];
         }
         true
     }

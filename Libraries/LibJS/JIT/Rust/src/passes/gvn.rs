@@ -15,7 +15,7 @@
 use ak::Zone;
 use ak::ZoneVec;
 
-use super::dominators::Dominators;
+use super::dominators::CachedDominators;
 use super::edit;
 use super::edit::Replacements;
 use crate::ir::BlockId;
@@ -30,30 +30,32 @@ use core::hash::Hash;
 use core::hash::Hasher;
 use core::mem::discriminant;
 
+#[inline]
 fn is_numbered(op: &Op) -> bool {
-    let properties = op.properties();
-    properties.reads.is_empty()
-        && properties.writes.is_empty()
-        && !properties.allocates
-        && !properties.runs_code
-        && !properties.can_lazy_exit
-        && !matches!(op, Op::Constant(_) | Op::Phi)
-        && !op.is_control()
+    !matches!(op, Op::Constant(_) | Op::Phi) && op.meta().is_gvn_pure()
 }
 
-pub fn run(graph: &mut Graph, work: &Zone) {
-    run_with_hash(graph, work, |node, replacements| {
-        let mut hash = FastHasher::default();
-        discriminant(&node.op).hash(&mut hash);
-        node.inputs.len().hash(&mut hash);
-        for input in &node.inputs {
-            replacements.resolve(*input).hash(&mut hash);
-        }
-        hash.finish()
-    });
+#[inline]
+fn node_hash(node: &Node, replacements: &Replacements) -> u64 {
+    let mut hash = FastHasher::default();
+    discriminant(&node.op).hash(&mut hash);
+    node.inputs.len().hash(&mut hash);
+    for input in &node.inputs {
+        replacements.resolve(*input).hash(&mut hash);
+    }
+    hash.finish()
 }
 
-fn run_with_hash(graph: &mut Graph, work: &Zone, hash: impl Fn(&Node, &Replacements) -> u64) {
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
+    run_with_hash(graph, work, dominators, node_hash);
+}
+
+fn run_with_hash(
+    graph: &mut Graph,
+    work: &Zone,
+    dominators: &mut CachedDominators,
+    hash: impl Fn(&Node, &Replacements) -> u64,
+) {
     if graph
         .blocks
         .iter()
@@ -65,7 +67,7 @@ fn run_with_hash(graph: &mut Graph, work: &Zone, hash: impl Fn(&Node, &Replaceme
     {
         return;
     }
-    let dominators = Dominators::of(graph, work);
+    let dominators = dominators.get_or_compute(graph);
     let mut replacements = Replacements::new(graph, work);
     let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
     // NB: Hash borrowed inputs instead of allocating keys. Candidates with
@@ -144,8 +146,10 @@ fn run_with_hash(graph: &mut Graph, work: &Zone, hash: impl Fn(&Node, &Replaceme
             steps.push(Step::Enter(*child));
         }
     }
-    replacements.apply(graph);
-    edit::remove_nodes(graph, &removed);
+    if !removed.is_empty() {
+        replacements.apply(graph);
+        edit::remove_nodes(graph, &removed);
+    }
 }
 
 #[cfg(test)]
@@ -169,7 +173,8 @@ mod tests {
             .body
             .assign(&[first, different_input, different_operation, duplicate]);
         graph.blocks[0].control = Some(returned);
-        run_with_hash(&mut graph, crate::test_zone(), |_, _| 0);
+        let mut dominators = CachedDominators::new_in(crate::test_zone());
+        run_with_hash(&mut graph, crate::test_zone(), &mut dominators, |_, _| 0);
         assert_eq!(graph.blocks[0].body, [first, different_input, different_operation]);
         assert_eq!(graph.node(returned).inputs, [first]);
     }
