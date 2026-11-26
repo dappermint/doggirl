@@ -564,6 +564,7 @@ public:
         verify_icu_success(status);
 
         utext_close(&utext);
+        m_can_step_forward = true;
     }
 
     virtual void set_segmented_text(Utf16View const& text) override
@@ -579,6 +580,7 @@ public:
         else
             m_segmented_text = icu::UnicodeString { text.utf16_span().data(), static_cast<i32>(text.length_in_code_units()) };
         m_segmenter->setText(m_segmented_text.get<icu::UnicodeString>());
+        m_can_step_forward = true;
     }
 
     virtual size_t current_boundary() override
@@ -588,6 +590,7 @@ public:
 
     virtual Optional<size_t> previous_boundary(size_t boundary, Inclusive inclusive) override
     {
+        m_can_step_forward = false;
         auto icu_boundary = align_boundary(boundary);
 
         if (inclusive == Inclusive::Yes) {
@@ -605,13 +608,45 @@ public:
     {
         auto icu_boundary = align_boundary(boundary);
 
-        if (inclusive == Inclusive::Yes) {
-            if (static_cast<bool>(m_segmenter->isBoundary(icu_boundary)))
-                return static_cast<size_t>(icu_boundary);
+        // When scanning forward from a known-valid forward cursor, stepping with next() stays inside ICU's forward
+        // BreakCache instead of calling isBoundary()/following() which re-seek and can trigger handleSafePrevious().
+        // NB: preceding(0) leaves current() at 0 with ICU's internal fDone flag set, so only step forward while
+        //     m_can_step_forward guarantees the iterator is not in that done state.
+        if (m_can_step_forward) {
+            auto current = m_segmenter->current();
+            constexpr i32 max_forward_step = 64;
+            if (current != icu::BreakIterator::DONE && current <= icu_boundary && icu_boundary - current <= max_forward_step) {
+                if (inclusive == Inclusive::Yes && current == icu_boundary)
+                    return static_cast<size_t>(current);
+                while (true) {
+                    auto next = m_segmenter->next();
+                    if (next == icu::BreakIterator::DONE) {
+                        m_can_step_forward = false;
+                        return {};
+                    }
+                    if (inclusive == Inclusive::Yes ? next >= icu_boundary : next > icu_boundary)
+                        return static_cast<size_t>(next);
+                }
+            }
         }
 
-        if (auto index = m_segmenter->following(icu_boundary); index != icu::BreakIterator::DONE)
+        m_can_step_forward = false;
+        if (inclusive == Inclusive::Yes) {
+            if (static_cast<bool>(m_segmenter->isBoundary(icu_boundary))) {
+                m_can_step_forward = true;
+                return static_cast<size_t>(icu_boundary);
+            }
+            // ICU's isBoundary leaves the iterator at the first boundary at or after icu_boundary.
+            if (auto after = m_segmenter->current(); after != icu::BreakIterator::DONE && after > icu_boundary) {
+                m_can_step_forward = true;
+                return static_cast<size_t>(after);
+            }
+        }
+
+        if (auto index = m_segmenter->following(icu_boundary); index != icu::BreakIterator::DONE) {
+            m_can_step_forward = true;
             return static_cast<size_t>(index);
+        }
 
         return {};
     }
@@ -674,6 +709,7 @@ private:
 
     void for_each_boundary(SegmentationCallback callback)
     {
+        m_can_step_forward = false;
         if (callback(static_cast<size_t>(m_segmenter->first())) == IterationDecision::Break)
             return;
 
@@ -689,6 +725,7 @@ private:
 
     NonnullOwnPtr<icu::BreakIterator> m_segmenter;
     Variant<Empty, String, icu::UnicodeString> m_segmented_text;
+    bool m_can_step_forward { false };
 };
 
 NonnullOwnPtr<Segmenter> Segmenter::create(SegmenterGranularity segmenter_granularity)
