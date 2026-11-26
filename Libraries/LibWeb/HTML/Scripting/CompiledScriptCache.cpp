@@ -11,7 +11,7 @@
 
 namespace Web::HTML {
 
-static constexpr size_t compiled_script_cache_size_limit = 16 * MiB;
+static constexpr size_t compiled_script_cache_size_limit = 128 * MiB;
 
 CompiledScriptFingerprint CompiledScriptFingerprint::of(Utf16String const& source_text)
 {
@@ -81,7 +81,6 @@ void CompiledScriptCache::note_linked(CompiledScriptCacheKey const& key, JS::Sou
         return;
     entry->linked_source_codes.remove_all_matching([](auto const& linked) { return !linked.is_alive(); });
     entry->linked_source_codes.append(JS::WeakSourceCode { source_code });
-    evict_until_within_limit();
 }
 
 void CompiledScriptCache::clear()
