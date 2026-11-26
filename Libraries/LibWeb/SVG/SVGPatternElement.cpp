@@ -25,6 +25,7 @@ GC_DEFINE_ALLOCATOR(SVGPatternElement);
 SVGPatternElement::SVGPatternElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGElement(document, move(qualified_name))
 {
+    document.set_has_svg_paint_resource_element();
 }
 
 void SVGPatternElement::initialize_element()

@@ -457,6 +457,7 @@ Optional<StyleUpdateInputs> begin_style_update_inputs(Layout::BegunRead const& r
 {
     auto submission_started_at = MonotonicTime::now();
     document.synchronize_dirty_style_attributes();
+    document.synchronize_dirty_svg_presentation_attributes();
 
     // Fetch the viewport rect once, instead of repeatedly, during style computation.
     document.update_style_computer_viewport_rect();
@@ -717,6 +718,7 @@ static bool document_has_style_work_a_read_waits_for(Layout::BegunRead const& re
         || subtree_arrivals_may_be_due(read, document)
         || document.has_assigned_slot_change_notes()
         || document.has_dirty_style_attributes()
+        || document.has_dirty_svg_presentation_attributes()
         || document.has_unreported_style_attributes_to_report()
         || document.needs_highlight_style_update()
         || document.needs_media_rule_evaluation()

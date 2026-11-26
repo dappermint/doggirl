@@ -803,6 +803,8 @@ public:
     void set_has_element_with_auto_directionality() { m_has_element_with_auto_directionality = true; }
     bool has_form_or_fieldset_element() const { return m_has_form_or_fieldset_element; }
     void set_has_form_or_fieldset_element() { m_has_form_or_fieldset_element = true; }
+    bool has_svg_paint_resource_element() const { return m_has_svg_paint_resource_element; }
+    void set_has_svg_paint_resource_element() { m_has_svg_paint_resource_element = true; }
 
     SubtreeInsertionScope* subtree_insertion_scope() const { return m_subtree_insertion_scope; }
     void set_subtree_insertion_scope(Badge<SubtreeInsertionScope>, SubtreeInsertionScope* scope) { m_subtree_insertion_scope = scope; }
@@ -1105,6 +1107,7 @@ public:
 
     bool has_completed_style_update() const { return m_has_completed_style_update; }
     bool has_dirty_style_attributes() const { return !m_elements_with_dirty_style_attributes.is_empty(); }
+    bool has_dirty_svg_presentation_attributes() const { return !m_elements_with_dirty_svg_presentation_attributes.is_empty(); }
     // Whether a style update would report the style attributes it left out while nothing read them.
     bool has_unreported_style_attributes_to_report() const;
     // Whether a tree scope's counter styles may have moved since a style update last settled every scope's.
@@ -1128,6 +1131,8 @@ public:
     void set_has_completed_style_update() { m_has_completed_style_update = true; }
     void mark_style_attribute_dirty(Element&);
     void synchronize_dirty_style_attributes();
+    void mark_svg_presentation_attributes_dirty(SVG::SVGElement&);
+    void synchronize_dirty_svg_presentation_attributes();
     void flush_deferred_style_change_event();
     // Once the registrations changed, name again to the style engine what every environment an
     // element holds hands down, before the transaction that derives records under them.
@@ -2093,6 +2098,7 @@ private:
     bool m_needs_mathml_and_svg_user_agent_style_sheets { false };
     bool m_has_element_with_auto_directionality { false };
     bool m_has_form_or_fieldset_element { false };
+    bool m_has_svg_paint_resource_element { false };
     SubtreeInsertionScope* m_subtree_insertion_scope { nullptr };
 
     bool m_parser_cannot_change_the_mode { false };
@@ -2232,6 +2238,7 @@ private:
     bool m_style_engine_tracks_tree { false };
     CSS::StyleNodeID m_style_node_id;
     GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
+    GC::WeakHashSet<SVG::SVGElement> m_elements_with_dirty_svg_presentation_attributes;
     // Elements whose style attribute a style update left out of sync with their inline style, as nothing of the style
     // engine read it then.
     GC::WeakHashSet<Element> m_elements_with_unreported_style_attributes;

@@ -1033,11 +1033,15 @@ impl ParsedPath {
     }
 }
 
-#[cfg(test)]
-fn parse_ascii_path(input: &[u8], allow_error_recovery: bool) -> Option<ParsedPath> {
+pub(crate) fn parse_latin1_path(input: &[u8], allow_error_recovery: bool) -> Option<ParsedPath> {
     Parser::new(Input::Latin1(input))
         .parse(allow_error_recovery)
         .map(|instructions| ParsedPath { instructions })
+}
+
+#[cfg(test)]
+fn parse_ascii_path(input: &[u8], allow_error_recovery: bool) -> Option<ParsedPath> {
+    parse_latin1_path(input, allow_error_recovery)
 }
 
 pub(crate) fn parse_utf16_path(input: &[u16], allow_error_recovery: bool) -> Option<ParsedPath> {

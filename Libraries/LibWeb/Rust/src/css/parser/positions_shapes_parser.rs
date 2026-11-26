@@ -987,6 +987,13 @@ fn parse_polygon(context: &ParseContext, property: u16, arguments: &[ComponentVa
     Some(basic_shape(5, vec![], fill_rule, points, CssPath::none()))
 }
 
+pub(super) fn svg_presentation_path_value(path: crate::svg::ParsedPath) -> Option<StyleValueData> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(basic_shape(6, vec![], 0, vec![], CssPath::new(path)))
+}
+
 fn parse_path(context: &ParseContext, property: u16, arguments: &[ComponentValue]) -> Option<StyleValueData> {
     let arguments = arguments.split(ComponentValue::is_comma).collect::<Vec<_>>();
     // NB: Like other engines, offset-path does not accept a <fill-rule> in path(), which does not affect a path the

@@ -9,6 +9,7 @@
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
@@ -46,6 +47,7 @@ GC_DEFINE_ALLOCATOR(SVGFilterElement);
 SVGFilterElement::SVGFilterElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGElement(document, qualified_name)
 {
+    document.set_has_svg_paint_resource_element();
 }
 
 void SVGFilterElement::visit_edges(Cell::Visitor& visitor)
