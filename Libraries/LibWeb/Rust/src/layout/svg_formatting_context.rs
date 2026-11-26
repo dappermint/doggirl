@@ -1121,6 +1121,8 @@ pub(super) struct SvgFormattingContext<'pass> {
     last_text_subtree_cells: Option<std::sync::Arc<Vec<FfiSvgTextCharacterCell>>>,
     /// The stretches of text in the subtree of the <text>, <tspan>, or <a> laid out last, in document order.
     last_text_subtree_spans: Vec<SvgTextRunSpan>,
+    /// Whether we are currently laying out a descendant inside an enclosing SVG text content box.
+    inside_text_box: bool,
     /// What the run's root, where this is the context of the root, hands the root's fragment.
     root_payload: RefCell<fragment_tree::PendingPayload>,
 }
@@ -1168,6 +1170,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             text_on_path_glyphs: RefCell::new(std::collections::HashMap::new()),
             last_text_subtree_cells: None,
             last_text_subtree_spans: Vec::new(),
+            inside_text_box: false,
             root_payload: RefCell::new(fragment_tree::PendingPayload::default()),
         }
     }
@@ -2706,7 +2709,10 @@ impl<'pass> SvgFormattingContext<'pass> {
                 // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this
                 // box too.
                 self.last_text_subtree_spans.clear();
+                let was_inside_text_box = self.inside_text_box;
+                self.inside_text_box = true;
                 let child_geometry = self.layout_graphics_element(run, child);
+                self.inside_text_box = was_inside_text_box;
                 contents
                     .children_bounding_box
                     .unite(float_rect_to_css_pixels(child_geometry.stroke_bounding_box));
@@ -3755,28 +3761,57 @@ impl<'pass> SvgFormattingContext<'pass> {
         geometry
     }
 
-    /// Places a shape with the fragment it last committed, where laying it out again would produce that fragment: the
-    /// shape has no boxes below it, nothing marked it for layout since that commit, and it resolves against the viewport
-    /// it was committed in. Then neither this pass nor the commit redoes a shape that a change to a sibling did not
-    /// touch. Returns the geometry of the shape, if it placed the shape, which is laid out in `cells`.
+    /// Places a shape or standalone `<text>` element with the fragment it last committed, where laying it out again
+    /// would produce that fragment: nothing marked it for layout since that commit, it has no child boxes below it,
+    /// and it resolves only against the viewport it was committed in and its own style/attributes. Then neither this
+    /// pass nor the commit redoes a shape or text label that a change to a sibling did not touch. Returns the geometry
+    /// of the element, if it placed it, which is laid out in `cells`.
     fn place_unchanged_committed_shape(
         &self,
         shape: Node,
         cells: &Cell<used_values::RootInputCells>,
     ) -> Option<SvgGeometry> {
-        if !self.viewport_is_committed_viewport
-            || self.node_kind(shape) != NodeKind::SVGGeometryBox
-            || !self.first_child(shape).is_invalid()
-        {
+        if !self.viewport_is_committed_viewport {
             return None;
         }
-        // A line's coordinates are attribute lengths resolved here against the initial containing block, the root font
-        // and size query containers, and a change to any of those does not mark the line for layout.
-        if self.svg_attributes(shape).geometry_kind == SVG_GEOMETRY_KIND_LINE {
-            return None;
+        let kind = self.node_kind(shape);
+        match kind {
+            NodeKind::SVGGeometryBox => {
+                if !self.first_child(shape).is_invalid() {
+                    return None;
+                }
+            }
+            NodeKind::SVGTextBox => {
+                if self.inside_text_box {
+                    return None;
+                }
+                let attributes = self.svg_attributes(shape);
+                if !attributes.is_text_element || !svg_length_is_local_to_viewport_and_element(attributes.text_length) {
+                    return None;
+                }
+                if !self
+                    .run
+                    .pass
+                    .children(shape)
+                    .all(|child| node_facts::kind_is_text(self.node_kind(child)))
+                {
+                    return None;
+                }
+                if let Some(positions) = self.run.pass.arena().svg_text_positions(shape)
+                    && positions.iter().any(|pos| {
+                        !svg_length_is_local_to_viewport_and_element(pos.x)
+                            || !svg_length_is_local_to_viewport_and_element(pos.y)
+                            || !svg_length_is_local_to_viewport_and_element(pos.dx)
+                            || !svg_length_is_local_to_viewport_and_element(pos.dy)
+                    })
+                {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         self.run.fragments.as_ref()?;
-        // A committed fragment stops being current when something marks its box for layout.
+        // A committed fragment stops being current when something marks its box for layout or edits a text child.
         let link = self
             .run
             .pass
@@ -3788,7 +3823,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             self.run.pass.frame,
             fragment_tree::committed_content_size_of(&self.run.pass, link.placement.containing_block),
         );
-        // The transform and the viewport are what the shape's geometry takes from outside its own boxes.
+        // The transform and the viewport are what the element's geometry takes from outside its own boxes.
         let committed_geometry = fragment.svg()?.geometry;
         let geometry = self.geometry_of(
             shape,
@@ -3912,7 +3947,10 @@ impl<'pass> SvgFormattingContext<'pass> {
                 .borrow_mut()
                 .entry(child)
                 .or_insert_with(|| (libgfx_rust::path::Path::new(), Vec::new()));
+            let was_inside_text_box = self.inside_text_box;
+            self.inside_text_box = true;
             let geometry = self.layout_graphics_element(run, child);
+            self.inside_text_box = was_inside_text_box;
             bounding_box.unite(float_rect_to_css_pixels(geometry.stroke_bounding_box));
         }
         bounding_box
@@ -4144,6 +4182,16 @@ fn document_element_style<'pass>(pass: &LayoutPass<'pass>, node: Node) -> Option
         ancestor = data.parent.get();
     }
     None
+}
+
+/// Whether an SVG length attribute resolves solely against the enclosing SVG viewport, absolute units, or the
+/// element's own font metrics (so it cannot change without either changing the viewport or invalidating the element).
+fn svg_length_is_local_to_viewport_and_element(value: FfiSvgLengthValue) -> bool {
+    match value.kind {
+        SVG_LENGTH_KIND_NONE | SVG_LENGTH_KIND_NUMBER | SVG_LENGTH_KIND_PERCENTAGE => true,
+        SVG_LENGTH_KIND_LENGTH => crate::css::style_compute::length_unit_is_local_to_element(value.unit),
+        _ => false,
+    }
 }
 
 /// The pixels an absolute or relative `<length>` an SVG element's attribute gives resolves to.

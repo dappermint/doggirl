@@ -206,6 +206,10 @@ pub(crate) struct StyleJobAnswer {
     styled_rows: crate::layout::StyledRows,
     /// The styles installed for every element and pseudo-element once the transaction installed its rows.
     installed_styles: super::computed::InstalledStyles,
+    /// Viewport and root font metrics after this transaction's installations, used for lock-free transition decisions.
+    transition_length_inputs: std::cell::Cell<Option<super::engine_sample::TransitionLengthInputs>>,
+    /// The document element of the styled root, if known, used to detect root font record updates.
+    document_element: Option<StyleNodeID>,
 }
 
 /// A record a transaction's rows name, with the record the host holds for it.
@@ -371,6 +375,18 @@ impl StyleJobAnswer {
         let index = steps.binary_search_by_key(&node, |step| step.node()).ok()?;
         Some(&steps[index])
     }
+
+    /// Viewport and root font metrics for lock-free transition decisions, if still valid for this transaction.
+    pub(crate) fn transition_length_inputs(&self) -> Option<super::engine_sample::TransitionLengthInputs> {
+        self.transition_length_inputs.get()
+    }
+
+    /// Invalidates the cached transition length inputs when the document element's held record changes.
+    pub(crate) fn invalidate_transition_length_inputs_if_document_element(&self, node: Option<StyleNodeID>) {
+        if node.is_none() || self.document_element.is_none_or(|doc| Some(doc) == node) {
+            self.transition_length_inputs.set(None);
+        }
+    }
 }
 
 impl StyleJob {
@@ -415,6 +431,17 @@ impl StyleJob {
         let mut installation_for_host = engine.take_installation();
         // The render side knows what it publishes: the host swaps the installation's records in without echoing them.
         installation_for_host.note_held_by_the_host(engine);
+        let transition_length_inputs = engine.transition_length_inputs();
+        let is_document_element = |node: StyleNodeID| {
+            engine.projection.adjustment_facts(node) & super::bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0
+        };
+        let document_element = match is_document_element(self.root) {
+            true => Some(self.root),
+            false => std::iter::successors(engine.projection.first_element_child(self.root), |&child| {
+                engine.projection.next_element_sibling(child)
+            })
+            .find(|&child| is_document_element(child)),
+        };
         let installed_styles = engine.computed_group_sets.publish_installed_styles();
         let answer = StyleJobAnswer {
             output,
@@ -426,6 +453,8 @@ impl StyleJob {
             installation_for_host,
             styled_rows: Default::default(),
             installed_styles,
+            transition_length_inputs: std::cell::Cell::new(Some(transition_length_inputs)),
+            document_element,
         };
         if engine.process_style.verifies_reads {
             verify_installed_styles(answer.installed_styles(), answer.rows());

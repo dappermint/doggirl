@@ -91,6 +91,18 @@ impl<'a> StyleRecordView<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct ViewLonghands<'a>(&'a super::pipeline::Record);
 
+impl<'a> ViewLonghands<'a> {
+    /// The base longhands and optional animated overlay of `record`, without requiring an `&Arc<Record>`.
+    pub(crate) fn split_record(
+        record: &'a super::pipeline::Record,
+    ) -> (Self, Option<&'a crate::css::animated_overlay::AnimatedOverlay>) {
+        match record.sample_of_animations() {
+            Some(sample) => (Self(&sample.base), Some(&sample.animated_overlay)),
+            None => (Self(record), None),
+        }
+    }
+}
+
 /// The longhands two records hold the very same computed values of, being in groups the records
 /// share.
 #[derive(Clone, Copy)]

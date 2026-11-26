@@ -412,10 +412,78 @@ Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<ShapedGl
     return intervals;
 }
 
-static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, FFI::JoiningContext joining_context = {}, bool vertical_forms = false)
-{
-    hb_buffer_t* buffer = hb_buffer_create();
+namespace {
 
+struct ThreadLocalHarfBuzzBuffer {
+    hb_buffer_t* buffer { nullptr };
+    bool in_use { false };
+
+    ~ThreadLocalHarfBuzzBuffer()
+    {
+        if (buffer)
+            hb_buffer_destroy(buffer);
+    }
+};
+
+#ifdef AK_COMPILER_CLANG
+AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", thread_local ThreadLocalHarfBuzzBuffer s_thread_local_hb_buffer)
+#else
+thread_local ThreadLocalHarfBuzzBuffer s_thread_local_hb_buffer;
+#endif
+
+struct ScopedHarfBuzzBuffer {
+    hb_buffer_t* buffer { nullptr };
+    bool borrowed { false };
+
+    ScopedHarfBuzzBuffer()
+    {
+        if (!s_thread_local_hb_buffer.in_use) {
+            if (!s_thread_local_hb_buffer.buffer)
+                s_thread_local_hb_buffer.buffer = hb_buffer_create();
+            else
+                hb_buffer_reset(s_thread_local_hb_buffer.buffer);
+            s_thread_local_hb_buffer.in_use = true;
+            buffer = s_thread_local_hb_buffer.buffer;
+            borrowed = true;
+        } else {
+            buffer = hb_buffer_create();
+        }
+    }
+
+    ~ScopedHarfBuzzBuffer()
+    {
+        if (borrowed) {
+            hb_buffer_clear_contents(buffer);
+            s_thread_local_hb_buffer.in_use = false;
+        } else if (buffer) {
+            hb_buffer_destroy(buffer);
+        }
+    }
+
+    ScopedHarfBuzzBuffer(ScopedHarfBuzzBuffer const&) = delete;
+    ScopedHarfBuzzBuffer& operator=(ScopedHarfBuzzBuffer const&) = delete;
+};
+
+static bool utf16_view_is_all_ascii(Utf16View const& string)
+{
+    if (string.has_ascii_storage())
+        return true;
+    if (string.has_latin1_storage()) {
+        u8 acc = 0;
+        for (auto byte : string.latin1_span())
+            acc |= byte;
+        return acc < 0x80;
+    }
+    u16 acc = 0;
+    for (auto unit : string.utf16_span())
+        acc |= static_cast<u16>(unit);
+    return acc < 0x80;
+}
+
+}
+
+static void setup_text_shaping(hb_buffer_t* buffer, Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, bool is_ascii, FFI::JoiningContext joining_context = {}, bool vertical_forms = false)
+{
     // A zero width joiner as context before or after the text gives the letters at its edges the forms that join them
     // to letters outside it.
     static constexpr hb_codepoint_t ZERO_WIDTH_JOINER = 0x200D;
@@ -424,14 +492,17 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
 
     if (string.has_ascii_storage()) {
         hb_buffer_add_utf8(buffer, string.ascii_span().data(), string.length_in_code_units(), 0, -1);
+    } else if (string.has_latin1_storage()) {
+        hb_buffer_add_latin1(buffer, string.latin1_span().data(), string.length_in_code_units(), 0, -1);
+    } else {
+        hb_buffer_add_utf16(buffer, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units(), 0, -1);
+    }
+
+    if (is_ascii) {
         // Fast path for ASCII: we know it's Latin script, LTR direction.
         hb_buffer_set_script(buffer, HB_SCRIPT_LATIN);
         hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
     } else {
-        if (string.has_latin1_storage())
-            hb_buffer_add_latin1(buffer, string.latin1_span().data(), string.length_in_code_units(), 0, -1);
-        else
-            hb_buffer_add_utf16(buffer, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units(), 0, -1);
         // For non-ASCII, set direction from text_type if known, otherwise guess.
         if (text_type == FFI::TextType::Ltr) {
             hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
@@ -486,8 +557,6 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
     }
 
     hb_shape(hb_font, buffer, hb_features.data(), hb_features.size());
-
-    return buffer;
 }
 
 // https://drafts.csswg.org/css-text-4/#word-separator
@@ -587,34 +656,38 @@ struct TrailingWhitespace {
     float ascii_advance { 0 };
 };
 
-struct ShapedGlyphs {
-    Vector<ShapedGlyph> glyphs;
+struct ShapedGlyphsMetadata {
     float width { 0 };
     TrailingWhitespace trailing_whitespace;
     bool requires_context_for_breaks { false };
 };
 
-static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, float word_spacing, FFI::JoiningContext joining_context, bool vertical_forms)
+static ShapedGlyphsMetadata build_origin_relative_shape_into(Vector<ShapedGlyph>& glyphs, Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, float word_spacing, FFI::JoiningContext joining_context, bool vertical_forms)
 {
     auto const& metrics = font.pixel_metrics();
-    auto* buffer = setup_text_shaping(string, font, text_type, letter_spacing, joining_context, vertical_forms);
+    bool const is_ascii = utf16_view_is_all_ascii(string);
+    ScopedHarfBuzzBuffer scoped_buffer;
+    auto* buffer = scoped_buffer.buffer;
+    setup_text_shaping(buffer, string, font, text_type, letter_spacing, is_ascii, joining_context, vertical_forms);
 
     u32 glyph_count;
     auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
     auto const* positions = hb_buffer_get_glyph_positions(buffer, &glyph_count);
 
-    Vector<ShapedGlyph> glyphs;
+    glyphs.clear_with_capacity();
     glyphs.ensure_capacity(glyph_count);
     FloatPoint point;
     bool requires_context_for_breaks = false;
 
     // The trailing whitespace advance is recorded so that trimming it at line end can subtract exactly what shaping
     // added, spacing included.
-    TrailingWhitespace trailing_whitespace { .length_in_code_units = length_of_trailing_whitespace_run(string), .advance = 0 };
+    TrailingWhitespace trailing_whitespace { .length_in_code_units = is_ascii ? length_of_trailing_ascii_whitespace_run(string) : length_of_trailing_whitespace_run(string), .advance = 0 };
     auto first_trailing_whitespace_offset = string.length_in_code_units() - trailing_whitespace.length_in_code_units;
-    auto first_trailing_ascii_whitespace_offset = string.length_in_code_units() - length_of_trailing_ascii_whitespace_run(string);
+    auto first_trailing_ascii_whitespace_offset = is_ascii
+        ? first_trailing_whitespace_offset
+        : string.length_in_code_units() - length_of_trailing_ascii_whitespace_run(string);
 
-    auto is_right_to_left = hb_buffer_get_direction(buffer) == HB_DIRECTION_RTL;
+    auto is_right_to_left = !is_ascii && hb_buffer_get_direction(buffer) == HB_DIRECTION_RTL;
     auto cluster_length_in_code_units = [&](auto index) -> size_t {
         auto starting_offset = glyph_info[index].cluster;
         if (is_right_to_left) {
@@ -640,12 +713,23 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
 
     // A glyph is left unpainted only when everything in its cluster is default-ignorable. A cluster that merely starts
     // with one, such as a Hangul syllable whose initial is the choseong filler, still shows its other characters.
-    auto should_paint_glyph = [&](auto index) {
+    auto should_paint_glyph = [&](auto index, size_t cluster_len) {
         auto starting_offset = glyph_info[index].cluster;
         if (starting_offset >= string.length_in_code_units())
             return true;
+        if (is_ascii) {
+            for (size_t offset = starting_offset, end = starting_offset + cluster_len; offset < end; ++offset) {
+                u16 unit = string.code_unit_at(offset);
+                // Printable ASCII [0x20, 0x7E] is never Default_Ignorable_Code_Point or a Hangul filler.
+                if (unit >= 0x20 && unit <= 0x7E)
+                    return true;
+                if (!Unicode::code_point_has_default_ignorable_code_point_property(unit))
+                    return true;
+            }
+            return false;
+        }
         auto has_hangul_filler = false;
-        for (auto code_point : string.substring_view(starting_offset, cluster_length_in_code_units(index))) {
+        for (auto code_point : string.substring_view(starting_offset, cluster_len)) {
             if (is_hangul_filler(code_point)) {
                 has_hangul_filler = true;
                 continue;
@@ -663,10 +747,10 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
     //     for our coordinates, where y grows downward.
     bool should_paint = true;
     for (size_t i = 0; i < glyph_count; ++i) {
+        auto glyph_length = glyph_length_in_code_units(i);
         // Every glyph of a cluster gets the same answer, so it's worked out once, at the cluster's first glyph.
         if (i == 0 || glyph_info[i - 1].cluster != glyph_info[i].cluster)
-            should_paint = should_paint_glyph(i);
-        auto glyph_length = glyph_length_in_code_units(i);
+            should_paint = should_paint_glyph(i, glyph_length);
         requires_context_for_breaks |= glyph_length > 1
             || (hb_glyph_info_get_glyph_flags(&glyph_info[i]) & HB_GLYPH_FLAG_UNSAFE_TO_BREAK);
         auto position = point
@@ -682,11 +766,15 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
         auto is_last_glyph_of_cluster = i + 1 == glyph_count || glyph_info[i + 1].cluster != glyph_info[i].cluster;
         float extra_advance = 0;
         if (is_last_glyph_of_cluster) {
-            if (letter_spacing != 0 && cluster_takes_letter_spacing(string, glyph_info[i].cluster))
+            if (letter_spacing != 0 && (is_ascii || cluster_takes_letter_spacing(string, glyph_info[i].cluster)))
                 extra_advance = letter_spacing;
-            if (auto starting_offset = glyph_info[i].cluster; starting_offset < string.length_in_code_units()
-                && is_word_separator(string.code_point_at(starting_offset)))
-                extra_advance += word_spacing;
+            if (word_spacing != 0) {
+                if (auto starting_offset = glyph_info[i].cluster; starting_offset < string.length_in_code_units()) {
+                    u32 cp = is_ascii ? string.code_unit_at(starting_offset) : string.code_point_at(starting_offset);
+                    if (is_word_separator(cp))
+                        extra_advance += word_spacing;
+                }
+            }
         }
 
         glyphs.unchecked_append({
@@ -714,14 +802,15 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
             trailing_whitespace.ascii_advance += glyphs.last().glyph_width;
     }
 
-    hb_buffer_destroy(buffer);
-
-    return ShapedGlyphs { move(glyphs), point.x(), trailing_whitespace, requires_context_for_breaks };
+    return ShapedGlyphsMetadata { point.x(), trailing_whitespace, requires_context_for_breaks };
 }
 
 float measure_text_width(Utf16View const& string, Font const& font, float letter_spacing)
 {
-    auto* buffer = setup_text_shaping(string, font, FFI::TextType::Common, letter_spacing);
+    bool const is_ascii = utf16_view_is_all_ascii(string);
+    ScopedHarfBuzzBuffer scoped_buffer;
+    auto* buffer = scoped_buffer.buffer;
+    setup_text_shaping(buffer, string, font, FFI::TextType::Common, letter_spacing, is_ascii);
 
     u32 glyph_count;
     auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
@@ -732,11 +821,10 @@ float measure_text_width(Utf16View const& string, Font const& font, float letter
     for (size_t i = 0; i < glyph_count; ++i) {
         point_x += positions[i].x_advance;
         if (letter_spacing != 0 && (i + 1 == glyph_count || glyph_info[i + 1].cluster != glyph_info[i].cluster)
-            && cluster_takes_letter_spacing(string, glyph_info[i].cluster))
+            && (is_ascii || cluster_takes_letter_spacing(string, glyph_info[i].cluster)))
             ++cluster_count;
     }
 
-    hb_buffer_destroy(buffer);
     return static_cast<float>(point_x / text_shaping_resolution + cluster_count * letter_spacing);
 }
 
@@ -780,7 +868,13 @@ extern "C" void ladybird_gfx_shape_text_uncached(
     auto text = length_in_code_units == 0
         ? Utf16View {}
         : Utf16View { reinterpret_cast<char16_t const*>(text_utf16), length_in_code_units };
-    auto shape = Gfx::build_origin_relative_shape(
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Vector<Gfx::ShapedGlyph> s_glyphs_scratch)
+#else
+    static thread_local Vector<Gfx::ShapedGlyph> s_glyphs_scratch;
+#endif
+    auto meta = Gfx::build_origin_relative_shape_into(
+        s_glyphs_scratch,
         text,
         *static_cast<Gfx::Font const*>(font),
         text_type,
@@ -790,13 +884,15 @@ extern "C" void ladybird_gfx_shape_text_uncached(
         vertical_forms);
     emit(
         sink,
-        reinterpret_cast<Gfx::FFI::ShapedGlyph const*>(shape.glyphs.data()),
-        shape.glyphs.size(),
-        shape.width,
-        shape.trailing_whitespace.length_in_code_units,
-        shape.trailing_whitespace.advance,
-        shape.trailing_whitespace.ascii_advance,
-        shape.requires_context_for_breaks);
+        reinterpret_cast<Gfx::FFI::ShapedGlyph const*>(s_glyphs_scratch.data()),
+        s_glyphs_scratch.size(),
+        meta.width,
+        meta.trailing_whitespace.length_in_code_units,
+        meta.trailing_whitespace.advance,
+        meta.trailing_whitespace.ascii_advance,
+        meta.requires_context_for_breaks);
+    if (s_glyphs_scratch.capacity() > 4096)
+        s_glyphs_scratch.clear();
 }
 
 extern "C" float ladybird_gfx_font_measure_text_width(

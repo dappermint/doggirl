@@ -34,8 +34,8 @@ struct RecordFont {
 }
 
 impl RecordFont {
-    fn of(view: &super::StyleRecordView<'_>) -> Self {
-        let font = unsafe { view.payloads[group_index::FONT].cast::<FontValues>().deref() };
+    fn of_payloads(payloads: &crate::css::computed_values::StyleGroups, dependency_flags: u8) -> Self {
+        let font = unsafe { payloads[group_index::FONT].cast::<FontValues>().deref() };
         let first_available = font.first_available_font_metrics();
         Self {
             metrics: FfiFontMetrics {
@@ -45,14 +45,71 @@ impl RecordFont {
                 zero_advance: drive_font_metric(first_available.zero_advance),
                 line_height: font.line_height_used().to_double(),
             },
-            depends_on_viewport_metrics: view.dependency_flags & FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS != 0,
-            inline_axis_is_horizontal: view.payloads.inherited_bits().writing_mode()
+            depends_on_viewport_metrics: dependency_flags & FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS != 0,
+            inline_axis_is_horizontal: payloads.inherited_bits().writing_mode()
                 == crate::css::css_enums::writing_mode::HORIZONTAL_TB,
         }
+    }
+
+    fn of(view: &super::StyleRecordView<'_>) -> Self {
+        Self::of_payloads(view.payloads, view.dependency_flags)
+    }
+
+    fn of_record(record: &super::pipeline::Record) -> Self {
+        let dependency_flags = record
+            .sample_of_animations()
+            .map_or_else(|| record.view_dependency_flags(), |sample| sample.dependency_flags);
+        Self::of_payloads(&record.payloads, dependency_flags)
+    }
+}
+
+/// What resolving a transition's lengths needs from the style engine, beside the element's own record.
+#[derive(Clone, Copy)]
+pub(crate) struct TransitionLengthInputs {
+    pub(crate) viewport_width: f64,
+    pub(crate) viewport_height: f64,
+    pub(crate) root_font_metrics: FfiFontMetrics,
+    pub(crate) root_font_metrics_depend_on_viewport_metrics: bool,
+}
+
+impl TransitionLengthInputs {
+    pub(crate) fn for_record(
+        &self,
+        record: &super::pipeline::Record,
+    ) -> crate::css::animation::FfiAnimationLengthResolutionContext {
+        let record = RecordFont::of_record(record);
+        crate::css::style_compute::animation_length_resolution_context(&FfiLengthResolutionContext {
+            viewport_width: self.viewport_width,
+            viewport_height: self.viewport_height,
+            font_metrics: record.metrics,
+            root_font_metrics: self.root_font_metrics,
+            font_metrics_depend_on_viewport_metrics: record.depends_on_viewport_metrics,
+            root_font_metrics_depend_on_viewport_metrics: self.root_font_metrics_depend_on_viewport_metrics,
+            has_container_width_basis: false,
+            has_container_height_basis: false,
+            container_width_basis: 0.0,
+            container_height_basis: 0.0,
+            container_width_basis_depends_on_viewport_metrics: false,
+            container_height_basis_depends_on_viewport_metrics: false,
+            subject_inline_axis_is_horizontal: record.inline_axis_is_horizontal,
+            resolved_viewport_relative_length: std::ptr::null_mut(),
+            zoom: 1.0,
+        })
     }
 }
 
 impl RetainedState {
+    /// What resolving a transition's lengths needs from the engine, beside the element's own record.
+    pub(crate) fn transition_length_inputs(&self) -> TransitionLengthInputs {
+        let (root_font_metrics, root_font_metrics_depend_on_viewport_metrics) = self.root_font_metrics();
+        TransitionLengthInputs {
+            viewport_width: self.document_style_computation_inputs.viewport_width,
+            viewport_height: self.document_style_computation_inputs.viewport_height,
+            root_font_metrics,
+            root_font_metrics_depend_on_viewport_metrics,
+        }
+    }
+
     /// The record the host holds for the element `node`, as the engine notes it.
     fn held_record(&self, node: StyleNodeID) -> Option<&std::sync::Arc<super::pipeline::Record>> {
         self.held_style_records.get(node)

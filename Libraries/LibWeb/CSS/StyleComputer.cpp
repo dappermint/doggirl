@@ -1151,6 +1151,30 @@ void StyleComputer::set_style_engine_sheet_id_for(StyleSheetState& sheet, SheetI
         sheet.set_style_engine_sheet_id(sheet_id);
 }
 
+static void deduplicate_presentational_hint_properties(Vector<StyleProperty>& properties)
+{
+    auto const size = properties.size();
+    if (size <= 1)
+        return;
+    if (size <= 12) {
+        for (size_t i = size; i > 0; --i) {
+            auto const property_id = properties[i - 1].property_id;
+            for (size_t j = i; j < properties.size(); ++j) {
+                if (properties[j].property_id == property_id) {
+                    properties.remove(i - 1);
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    HashTable<CSS::PropertyID> seen_properties;
+    for (size_t i = size; i > 0; --i) {
+        if (seen_properties.set(properties[i - 1].property_id) != AK::HashSetResult::InsertedNewEntry)
+            properties.remove(i - 1);
+    }
+}
+
 Vector<StyleProperty> StyleComputer::collect_presentational_hint_properties(DOM::AbstractElement abstract_element)
 {
     Vector<StyleProperty> properties;
@@ -1172,11 +1196,7 @@ Vector<StyleProperty> StyleComputer::collect_presentational_hint_properties(DOM:
         if (is<HTML::HTMLImageElement>(element) || is<HTML::HTMLVideoElement>(element) || is<HTML::HTMLInputElement>(element))
             collect_aspect_ratio_from_dimension_values(properties, width, height);
     }
-    HashTable<CSS::PropertyID> seen_properties;
-    for (size_t i = properties.size(); i > 0; --i) {
-        if (seen_properties.set(properties[i - 1].property_id) != AK::HashSetResult::InsertedNewEntry)
-            properties.remove(i - 1);
-    }
+    deduplicate_presentational_hint_properties(properties);
     // Which properties a hint decides is a fact about the element, and this is the one place that
     // knows it: mapping the attributes needs the element fully built, and for a table cell it needs
     // the table's computed style, so it cannot be done when the element arrives.
