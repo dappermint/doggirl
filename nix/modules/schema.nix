@@ -1171,8 +1171,16 @@ let
 
   computedLaunchEnv = doggirlLib.mkLaunchEnv cfg.launch;
 
+  resolvedUnwrappedPackage =
+    if cfg.unwrappedPackage != null then
+      cfg.unwrappedPackage
+    else if cfg.localAppPath == null && pkgs.stdenv.hostPlatform.system == "aarch64-darwin" then
+      doggirlLib.mkDoggirlReleaseBin pkgs { }
+    else
+      null;
+
   defaultWrappedPackage = doggirlLib.mkDoggirlWrapper pkgs {
-    unwrapped = cfg.unwrappedPackage;
+    unwrapped = resolvedUnwrappedPackage;
     inherit (cfg) localAppPath appName bundleIdentifier;
     extraArgs = computedLaunchArgs;
     extraEnv = computedLaunchEnv;
@@ -1240,7 +1248,7 @@ in
 
     bundleIdentifier = mkOption {
       type = types.str;
-      default = constants.bundleIdentifiers.development;
+      default = constants.bundleIdentifiers.release;
       description = "CFBundleIdentifier used for the macOS launcher bundle.";
     };
 

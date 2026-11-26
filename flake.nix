@@ -46,21 +46,30 @@
     {
       lib = doggirlLib;
 
-      overlays.default = final: prev: {
-        inherit doggirlLib;
-        doggirl-config-apply = final.callPackage ./nix/packages/config-apply.nix { };
-        doggirl = doggirlLib.mkDoggirlWrapper final { };
-        doggirl-from-source =
-          args:
-          let
-            rustToolchain =
-              if final ? rust-bin then
-                final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
-              else
-                prev.rustc;
-          in
-          doggirlLib.mkDoggirlFromSource final ({ inherit rustToolchain; } // args);
-      };
+      overlays.default =
+        final: prev:
+        {
+          inherit doggirlLib;
+          doggirl-config-apply = final.callPackage ./nix/packages/config-apply.nix { };
+          doggirl = doggirlLib.mkDoggirlWrapper final (
+            lib.optionalAttrs (final.stdenv.hostPlatform.system == "aarch64-darwin") {
+              unwrapped = doggirlLib.mkDoggirlReleaseBin final { };
+            }
+          );
+          doggirl-from-source =
+            args:
+            let
+              rustToolchain =
+                if final ? rust-bin then
+                  final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
+                else
+                  prev.rustc;
+            in
+            doggirlLib.mkDoggirlFromSource final ({ inherit rustToolchain; } // args);
+        }
+        // lib.optionalAttrs (final.stdenv.hostPlatform.system == "aarch64-darwin") {
+          doggirl-unwrapped = doggirlLib.mkDoggirlReleaseBin final { };
+        };
 
       darwinModules = {
         default = darwinModule;
@@ -73,14 +82,23 @@
       };
 
       packages = forAllSystems (
-        { pkgs, ... }:
+        { system, pkgs, ... }:
         let
-          doggirl = doggirlLib.mkDoggirlWrapper pkgs { };
+          doggirl-unwrapped =
+            if system == "aarch64-darwin" then doggirlLib.mkDoggirlReleaseBin pkgs { } else null;
+          doggirl = doggirlLib.mkDoggirlWrapper pkgs (
+            lib.optionalAttrs (doggirl-unwrapped != null) {
+              unwrapped = doggirl-unwrapped;
+            }
+          );
           doggirl-config-apply = pkgs.callPackage ./nix/packages/config-apply.nix { };
         in
         {
           default = doggirl;
           inherit doggirl doggirl-config-apply;
+        }
+        // lib.optionalAttrs (doggirl-unwrapped != null) {
+          inherit doggirl-unwrapped;
         }
       );
 
