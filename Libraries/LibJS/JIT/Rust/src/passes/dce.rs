@@ -97,15 +97,10 @@ fn remove_dead_nodes(graph: &mut Graph, work: &Zone) {
             return;
         }
     }
-    let mut removed = ZoneBitSet::new_in(count, work);
-    for block in &graph.blocks {
-        for node in block.nodes() {
-            if !live.contains(node.index()) {
-                removed.insert(node.index());
-            }
-        }
+    for block in &mut graph.blocks {
+        block.body.retain(|node| live.contains(node.index()));
+        block.phis.retain(|node| live.contains(node.index()));
     }
-    edit::remove_nodes(graph, &removed);
 }
 
 #[cfg(test)]

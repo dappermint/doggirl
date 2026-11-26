@@ -14,6 +14,7 @@ use super::strict_at;
 use crate::bytecode::encoding::OptionalOperand;
 use crate::bytecode::op;
 use crate::bytecode::property_access::Strict;
+use crate::gc::class::cast_ref;
 use crate::gc::root::{MarkedValues, MarkedVec};
 use crate::interpreter::runtime_functions::{
     SlowPathControl, asm_try, handle_asm_exception, unimplemented_runtime_function,
@@ -25,8 +26,8 @@ use crate::layout::execution_context::ExecutionContext;
 use crate::layout::feedback::CallFeedbackForwarding;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
-    self, CallerMode, create_mapped_arguments_object, create_unmapped_arguments_object, function_object_as_object,
-    function_with_frame_as_this_environment, get_this_environment, perform_eval,
+    self, CallerMode, call_raw_native_function_fast, create_mapped_arguments_object, create_unmapped_arguments_object,
+    function_object_as_object, function_with_frame_as_this_environment, get_this_environment, perform_eval,
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
@@ -43,6 +44,7 @@ use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_environment::FunctionEnvironment;
 use crate::runtime::function_object::FunctionObject;
+use crate::runtime::native_function::{RawNativeFunction, call_raw_native_function};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object::{Object, StackFrameInfo};
 use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, PropertyAttributes};
@@ -309,6 +311,14 @@ pub(crate) fn execute_asm_call(
     throw_if_needed_for_asm_call(vm, callee, call_type)?;
 
     let function = callee.as_function();
+    if call_type == CallType::Call {
+        let function_object = function_object_as_object(function);
+        if function_object.is_raw_native_function() {
+            let raw_native = Gc::from_ref(cast_ref::<Object, RawNativeFunction>(&function_object));
+            *dst = call_raw_native_function_fast(vm, raw_native, this_value, arguments)?;
+            return Ok(());
+        }
+    }
 
     let argument_count = argument_count_of(arguments.len());
     let stack_frame_info = stack_frame_info_for_call(vm, function, argument_count)?;
@@ -494,6 +504,50 @@ fn call_with_argument_array_impl(
 
     let argument_array = as_array_exotic_object(arguments);
     let argument_array_length = argument_array.indexed_array_like_size();
+
+    if call_type == CallType::Call {
+        let function_object = function_object_as_object(function);
+        if function_object.is_raw_native_function() {
+            if vm.did_reach_stack_space_limit() {
+                return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+            }
+            let raw_native = Gc::from_ref(cast_ref::<Object, RawNativeFunction>(&function_object));
+            let caller_context = running_execution_context(vm);
+            let stack = vm.interpreter_stack();
+            let stack_mark = stack.top.get();
+            let Some(callee_context_ptr) = stack.allocate(0, 0, argument_array_length) else {
+                return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+            };
+            let _deallocate_guard = ScopeGuard::new(|| {
+                if stack.top.get() > stack_mark {
+                    stack.deallocate(stack_mark);
+                }
+            });
+            // SAFETY: The frame was just allocated and stays allocated until the guard frees it.
+            let callee_context = unsafe { callee_context_ptr.as_ref() };
+            let callee_context_argument_values = callee_context.arguments();
+            for (index, slot) in callee_context_argument_values.iter().enumerate() {
+                let index = u32::try_from(index).expect("the argument index fits in u32");
+                if let Some(value) = argument_array.indexed_get(index) {
+                    slot.set(value.value);
+                } else {
+                    slot.set(Value::UNDEFINED);
+                }
+            }
+            callee_context.passed_argument_count.set(argument_array_length);
+            callee_context.function.set(Some(function));
+            callee_context.this_value.set(this_value);
+            callee_context
+                .lexical_environment
+                .set(caller_context.lexical_environment.get());
+
+            vm.push_execution_context_in_realm(callee_context_ptr, Some(raw_native.realm()));
+            let retval = call_raw_native_function(raw_native.native_function(vm), vm);
+            vm.pop_execution_context();
+            *dst = retval?;
+            return Ok(());
+        }
+    }
 
     let stack_frame_info = stack_frame_info_for_call(vm, function, argument_array_length)?;
 

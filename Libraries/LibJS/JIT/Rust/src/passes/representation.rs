@@ -88,6 +88,13 @@ const UNBOXED: [Unboxed; 3] = [
 ];
 
 pub fn run(graph: &mut Graph, work: &Zone) {
+    let has_tagged_phi = graph
+        .blocks
+        .iter()
+        .any(|block| block.phis.iter().any(|phi| graph.node(*phi).repr == Some(Repr::Tagged)));
+    if !has_tagged_phi {
+        return;
+    }
     for unboxed in &UNBOXED {
         unbox_phis(graph, unboxed, work);
     }
@@ -176,8 +183,14 @@ fn checkable_inputs<'w>(
     work: &'w Zone,
 ) -> ZoneMap<'w, NodeId, (BlockId, &'w [Option<edit::EnteringValues<'w>>])> {
     let mut checkable = ZoneMap::new_in(work);
+    if checked.is_empty() {
+        return checkable;
+    }
     let mut entering = ZoneVec::new_in(work);
     for (index, block) in graph.blocks.iter().enumerate() {
+        if !block.phis.iter().any(|phi| checked.contains(phi.index())) {
+            continue;
+        }
         let block_id = BlockId::from_index(index);
         let gated = match (unboxed.check_op.as_ref(), block.start_frame_state) {
             (Some(check), Some(state)) => {
@@ -188,17 +201,21 @@ fn checkable_inputs<'w>(
             }
             _ => true,
         };
+        if gated {
+            continue;
+        }
         // OPTIMIZATION: The frame state entering the block from a predecessor is the same for every phi, and blocks of
         //               large functions can have hundreds of phis with as many values in that frame state.
         entering.clear();
         entering.resize(block.predecessors.len(), None);
         for phi in &block.phis {
+            if !checked.contains(phi.index()) {
+                continue;
+            }
             let inputs =
                 work.alloc_slice_from_iter(block.predecessors.iter().zip(&graph.node(*phi).inputs).enumerate().map(
                     |(entry, (predecessor, input))| {
-                        let checkable = !gated
-                            && checked.contains(phi.index())
-                            && graph.node(*input).repr == Some(Repr::Tagged)
+                        let checkable = graph.node(*input).repr == Some(Repr::Tagged)
                             && graph.control(*predecessor).op == (Op::Jump { target: block_id });
                         checkable
                             .then(|| {
@@ -267,7 +284,7 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
             if candidates.contains(phi.index())
                 && graph.node(*phi).inputs.iter().enumerate().any(|(index, input)| {
                     unboxed_input(graph, unboxed, *input, &candidates).is_none()
-                        && checkable.get(phi).expect("phis are checkable").1[index].is_none()
+                        && checkable.get(phi).is_none_or(|(_, states)| states[index].is_none())
                 })
             {
                 candidates.remove(phi.index());
@@ -295,7 +312,6 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
     let mut inputs = ZoneVec::new_in(work);
     for phi in candidates.iter() {
         let phi_id = NodeId::from_index(phi);
-        let (block, states) = *checkable.get(&phi_id).expect("phis are checkable");
         phi_inputs.assign(&graph.nodes[phi].inputs);
         inputs.clear();
         for (index, input) in phi_inputs.iter().copied().enumerate() {
@@ -312,6 +328,9 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
                         .or_insert_with(|| convert_int32(graph, integer)),
                 },
                 None => {
+                    let (block, states) = *checkable
+                        .get(&phi_id)
+                        .expect("candidate phis with unboxable inputs are checkable");
                     let predecessor = graph.block(block).predecessors[index];
                     let (template, values) = states[index].expect("candidate phis only have unboxable inputs");
                     *checks
