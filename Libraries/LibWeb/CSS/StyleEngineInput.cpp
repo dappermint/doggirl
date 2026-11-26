@@ -2543,6 +2543,8 @@ void record_element_parts_changed(DOM::Element& element)
 
 void record_element_emptiness_changed(DOM::Element& element, DOM::Node const& changing_child, bool counted_before, bool counts_after)
 {
+    if (counted_before == counts_after)
+        return;
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
         return;

@@ -20,5 +20,6 @@ struct Default { };
 
 WEB_API WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document&, Utf16FlyString local_name, Optional<Utf16FlyString> namespace_, Optional<Utf16FlyString> prefix = {}, Optional<Utf16FlyString> is = Optional<Utf16FlyString> {}, bool synchronous_custom_elements_flag = false, Variant<GC::Ptr<HTML::CustomElementRegistry>, Default> registry = Default {});
 WEB_API GC::Ref<Element> create_builtin_html_element_by_raw_local_name(Document&, FlatPtr raw_local_name, GC::Ptr<HTML::CustomElementRegistry>);
+WEB_API GC::Ref<Element> create_builtin_html_element_for_fragment(Document&, u8 tag_kind, bool uses_document_global_registry, GC::Ptr<HTML::CustomElementRegistry>);
 
 }

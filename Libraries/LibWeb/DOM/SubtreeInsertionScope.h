@@ -31,6 +31,11 @@ public:
     void set_descendants_covered_by_subtree_arrival(bool value) { m_descendants_covered_by_subtree_arrival = value; }
     bool may_be_in_shadow_tree() const { return m_parent_is_in_shadow_tree || m_saw_shadow_root; }
     void note_shadow_root_visited() { m_saw_shadow_root = true; }
+    void reset_for_next_child()
+    {
+        m_descendants_covered_by_subtree_arrival = false;
+        m_saw_shadow_root = false;
+    }
 
 private:
     GC::Ref<Node> m_parent;
