@@ -55,7 +55,9 @@ public:
 
     // Republishes the element's parsed attributes to the layout node arena, which is where a running
     // layout pass reads them.
+    bool attribute_affects_svg_attribute_facts(Utf16FlyString const& local_name) const;
     void publish_svg_attribute_facts();
+    void synchronize_dirty_presentation_attribute_style(Badge<DOM::Document>);
 
     bool is_resource_element() const;
     bool is_referenceable_in_display_none_subtree() const;
@@ -114,6 +116,7 @@ private:
     GC::Ptr<SVGAnimatedString> m_class_name_animated_string;
 
     mutable Optional<Vector<CSS::StyleProperty>> m_presentation_attribute_style;
+    bool m_presentation_attribute_style_dirty { false };
 
     // Many reflecting attributes are marked as SameObject so we cache the objects we create here.
     HashMap<Utf16FlyString, GC::Ref<SVGAnimatedLength>> m_reflected_attribute_cache;

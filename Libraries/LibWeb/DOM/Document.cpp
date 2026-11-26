@@ -853,6 +853,23 @@ void Document::mark_style_attribute_dirty(Element& element)
         m_elements_with_dirty_style_attributes.set(element);
 }
 
+void Document::mark_svg_presentation_attributes_dirty(SVG::SVGElement& element)
+{
+    if (element.is_connected())
+        m_elements_with_dirty_svg_presentation_attributes.set(element);
+}
+
+void Document::synchronize_dirty_svg_presentation_attributes()
+{
+    if (m_elements_with_dirty_svg_presentation_attributes.is_empty())
+        return;
+    auto elements = move(m_elements_with_dirty_svg_presentation_attributes);
+    for (auto& element : elements) {
+        if (&element.document() == this)
+            element.synchronize_dirty_presentation_attribute_style({});
+    }
+}
+
 void Document::synchronize_dirty_style_attributes()
 {
     // OPTIMIZATION: A style update synchronizes the style attribute of an element whose declarations script changed
@@ -2521,6 +2538,7 @@ bool Document::is_clean_for_layout_geometry_read(Layout::BegunRead const& read) 
     return m_has_completed_style_update
         && layout_is_up_to_date()
         && m_elements_with_dirty_style_attributes.is_empty()
+        && m_elements_with_dirty_svg_presentation_attributes.is_empty()
         && !style_computer().style_engine().has_pending_transaction(read)
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
@@ -2579,6 +2597,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         && !may_have_style_query_dependencies) {
         if (embedding_document_chain_is_clean()) {
             synchronize_dirty_style_attributes();
+            synchronize_dirty_svg_presentation_attributes();
             auto& style_engine = style_computer().style_engine();
             // NB: Asking gives the nodes waiting to arrive their identities, whose layout tree update marks can make the
             //     layout stale that was up to date above. An element that holds a mark no build answers, as a child of a
@@ -4085,6 +4104,8 @@ void Document::adopt_node_steps(Node& node)
         //     make the answer more conservative.
         if (old_document.may_have_blocking_wheel_event_listener())
             set_may_have_blocking_wheel_event_listener();
+        if (old_document.has_svg_paint_resource_element())
+            set_has_svg_paint_resource_element();
 
         GC::RootVector<GC::Ref<ShadowRoot>> shadow_roots_with_adopted_sheets;
 

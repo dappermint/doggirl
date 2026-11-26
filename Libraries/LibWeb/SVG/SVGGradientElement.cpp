@@ -18,6 +18,7 @@ namespace Web::SVG {
 SVGGradientElement::SVGGradientElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGElement(document, move(qualified_name))
 {
+    document.set_has_svg_paint_resource_element();
 }
 
 void SVGGradientElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)

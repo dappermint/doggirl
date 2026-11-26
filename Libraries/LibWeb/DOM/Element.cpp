@@ -1467,7 +1467,7 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
         // An SVG element's parsed attributes are layout input, published under its style node. Published here,
         // after the change steps, rather than from SVGElement's: each SVG element runs its base class's steps before it
         // parses the new value itself.
-        if (auto* svg_element = as_if<SVG::SVGElement>(*this))
+        if (auto* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->attribute_affects_svg_attribute_facts(local_name))
             svg_element->publish_svg_attribute_facts();
         if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
             Layout::publish_table_spans(*this);

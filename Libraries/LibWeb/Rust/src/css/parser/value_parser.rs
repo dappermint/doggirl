@@ -37,6 +37,7 @@ use crate::css::parser::grid_parser::parse_grid_property;
 use crate::css::parser::images_gradients_parser::{is_image_function_name, parse_image_property, parse_image_value};
 use crate::css::parser::positions_shapes_parser::{
     is_position_shape_function_name, parse_anchor_fit_property, parse_geometry_property, parse_position_property,
+    svg_presentation_path_value,
 };
 use crate::css::parser::token_stream::TokenStream;
 use crate::css::parser::transforms_effects_parser::{
@@ -6498,20 +6499,31 @@ pub unsafe extern "C" fn rust_parse_css_value(
         *out_status = FfiParseStatus::NotHandled;
         return std::ptr::null();
     };
-    let mut source_utf16 = Vec::with_capacity(source.len());
-    source.append_to(&mut source_utf16);
-    let outcome = match component_values_from_source(source) {
-        Ok(values) => {
-            if property_id == property_id::CUSTOM || contains_arbitrary_substitution_function(&values) {
-                match consume_a_list_of_component_values(tokenize_for_parser(source_utf16.as_slice())) {
-                    Ok(values) => parse_css_value_with_utf16_source(context, property_id, &values, &source_utf16),
-                    Err(()) => ParseOutcome::NotHandled,
-                }
-            } else {
-                parse_css_value_after_substitution_scan(context, property_id, &values, &[], Default::default())
-            }
+    let outcome = if property_id == property_id::D && context.is_svg_presentation_attribute {
+        let parsed_path = match source {
+            TokenizerInput::Latin1(bytes) => crate::svg::parse_latin1_path(bytes, true),
+            TokenizerInput::Utf16(units) => crate::svg::parse_utf16_path(units, true),
+        };
+        match parsed_path.and_then(svg_presentation_path_value) {
+            Some(value) => ParseOutcome::Parsed(StyleValueArc::new(value)),
+            None => ParseOutcome::Invalid,
         }
-        Err(()) => ParseOutcome::NotHandled,
+    } else {
+        match component_values_from_source(source) {
+            Ok(values) => {
+                if property_id == property_id::CUSTOM || contains_arbitrary_substitution_function(&values) {
+                    let mut source_utf16 = Vec::with_capacity(source.len());
+                    source.append_to(&mut source_utf16);
+                    match consume_a_list_of_component_values(tokenize_for_parser(source_utf16.as_slice())) {
+                        Ok(values) => parse_css_value_with_utf16_source(context, property_id, &values, &source_utf16),
+                        Err(()) => ParseOutcome::NotHandled,
+                    }
+                } else {
+                    parse_css_value_after_substitution_scan(context, property_id, &values, &[], Default::default())
+                }
+            }
+            Err(()) => ParseOutcome::NotHandled,
+        }
     };
     let (status, value) = match outcome {
         ParseOutcome::Parsed(value) => (FfiParseStatus::Parsed, StyleValueArc::into_raw(value).cast()),

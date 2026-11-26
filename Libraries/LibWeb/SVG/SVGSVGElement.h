@@ -126,10 +126,10 @@ private:
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void children_changed(ChildrenChangedMetadata const&) override;
 
-    void update_fallback_view_box_for_svg_as_image();
+    Optional<ViewBox> fallback_view_box_for_svg_as_image() const;
     void create_time_container_if_outermost();
 
-    Optional<ViewBox> m_fallback_view_box_for_svg_as_image;
+    mutable Optional<Optional<ViewBox>> m_cached_fallback_view_box_for_svg_as_image;
 
     mutable Optional<Optional<CSS::Length>> m_cached_width_attribute_length;
     mutable Optional<Optional<CSS::Length>> m_cached_height_attribute_length;
