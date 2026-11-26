@@ -61,6 +61,7 @@ void SVGSVGElement::adopted_from(DOM::Document& old_document)
     // A time container follows the document timeline of the document it was created for, so an adopted svg element
     // creates a new one once it is inserted.
     m_time_container = nullptr;
+    m_cached_fallback_view_box_for_svg_as_image = {};
 }
 
 void SVGSVGElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
@@ -131,11 +132,11 @@ void SVGSVGElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16
 
     if (name.equals_ignoring_ascii_case(SVG::AttributeNames::width)) {
         m_cached_width_attribute_length = {};
-        update_fallback_view_box_for_svg_as_image();
+        m_cached_fallback_view_box_for_svg_as_image = {};
     }
     if (name.equals_ignoring_ascii_case(SVG::AttributeNames::height)) {
         m_cached_height_attribute_length = {};
-        update_fallback_view_box_for_svg_as_image();
+        m_cached_fallback_view_box_for_svg_as_image = {};
     }
 }
 
@@ -217,12 +218,14 @@ void SVGSVGElement::children_changed(ChildrenChangedMetadata const&)
     }
 }
 
-void SVGSVGElement::update_fallback_view_box_for_svg_as_image()
+Optional<ViewBox> SVGSVGElement::fallback_view_box_for_svg_as_image() const
 {
+    if (m_cached_fallback_view_box_for_svg_as_image.has_value())
+        return *m_cached_fallback_view_box_for_svg_as_image;
+
     // AD-HOC: This creates a fallback viewBox for SVGs used as images.
     //         If the <svg> element has width and height, but no viewBox,
     //         we fall back to a synthetic viewBox="0 0 width height".
-
     Optional<double> width;
     Optional<double> height;
 
@@ -234,11 +237,11 @@ void SVGSVGElement::update_fallback_view_box_for_svg_as_image()
     if (auto height_length = height_attribute_length(); height_length.has_value())
         height = height_length->to_px(resolution_context).to_double();
 
-    if (width.has_value() && width.value() > 0 && height.has_value() && height.value() > 0) {
-        m_fallback_view_box_for_svg_as_image = ViewBox { 0, 0, width.value(), height.value() };
-    } else {
-        m_fallback_view_box_for_svg_as_image = {};
-    }
+    Optional<ViewBox> result;
+    if (width.has_value() && width.value() > 0 && height.has_value() && height.value() > 0)
+        result = ViewBox { 0, 0, width.value(), height.value() };
+    m_cached_fallback_view_box_for_svg_as_image = result;
+    return result;
 }
 
 // The active view is the one input to the published attribute facts that no attribute of this element names, so
@@ -277,8 +280,8 @@ Optional<ViewBox> SVGSVGElement::active_view_box() const
         return view_box;
 
     // NOTE: If the parent is a document, we're an <svg> element used as an image.
-    if (parent() && parent()->is_document() && m_fallback_view_box_for_svg_as_image.has_value())
-        return m_fallback_view_box_for_svg_as_image;
+    if (parent() && parent()->is_document())
+        return fallback_view_box_for_svg_as_image();
 
     return {};
 }

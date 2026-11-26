@@ -311,20 +311,13 @@ struct PresentationAttributeValueKeyTraits : DefaultTraits<PresentationAttribute
 static RefPtr<CSS::StyleValue const> parse_presentation_attribute_uncached(DOM::Document const& document, CSS::PropertyID property_id, Utf16View value)
 {
     CSS::Parser::ParsingParams parsing_context { document, CSS::Parser::ParsingMode::SVGPresentationAttribute };
-    // NB: <path>'s `d` presentational attribute is a special case - the attribute and the CSS properties
-    //     syntaxes differ with the attribute being a raw path string but the CSS property only accepting a
-    //     path() function. To account for this we wrap the attribute value in a path function before parsing.
-    if (property_id == CSS::PropertyID::D) {
-        return parse_css_value(parsing_context, Utf16String::formatted("path({})", CSS::serialize_a_string(value)), property_id);
-    }
-
     // NB: The transform, gradientTransform, and patternTransform attributes use the SVG
     //     transform-list grammar (optional commas, unitless values, three-argument
     //     rotate), which the CSS transform property doesn't accept - so parse the SVG
     //     grammar and re-express the resulting matrix as a single-function transform
     //     list, the shape the CSS parser produces for the transform property.
     if (property_id == CSS::PropertyID::Transform) {
-        auto transform_list = parse_transform(Utf16String::from_utf16(value));
+        auto transform_list = parse_transform(value);
         if (!transform_list.has_value())
             return {};
         auto matrix = transform_from_transform_list(*transform_list);
@@ -341,6 +334,8 @@ static RefPtr<CSS::StyleValue const> parse_presentation_attribute_uncached(DOM::
             CSS::StyleValueList::Separator::Space);
     }
 
+    // NB: <path>'s `d` presentational attribute holds raw SVG path data rather than a CSS path() function,
+    //     which rust_parse_css_value handles directly in SVGPresentationAttribute mode.
     return parse_css_value(parsing_context, value, property_id);
 }
 
@@ -349,6 +344,8 @@ static RefPtr<CSS::StyleValue const> parse_presentation_attribute_uncached(DOM::
 // mode, and a parsed value is immutable, so the copies share one.
 RefPtr<CSS::StyleValue const> SVGElement::parse_presentation_attribute(CSS::PropertyID property_id, Utf16View value) const
 {
+    if (property_id == CSS::PropertyID::D && value.length_in_code_units() > 256)
+        return parse_presentation_attribute_uncached(document(), property_id, value);
     if (property_id != CSS::PropertyID::D && property_id != CSS::PropertyID::Transform && value.contains(u'('))
         return parse_presentation_attribute_uncached(document(), property_id, value);
 
@@ -362,7 +359,7 @@ RefPtr<CSS::StyleValue const> SVGElement::parse_presentation_attribute(CSS::Prop
 
     auto parsed = parse_presentation_attribute_uncached(document(), property_id, value);
     // A page that generates its attributes would grow this without bound.
-    if (values.size() >= 4096)
+    if (values.size() >= 16384)
         values.clear();
     values.set({ property_id, in_quirks_mode, value_hash, Utf16String::from_utf16(value) }, parsed);
     return parsed;
@@ -385,7 +382,10 @@ void SVGElement::update_presentation_attribute_style(Utf16FlyString const& name,
     });
     if (style_value) {
         if (existing_index.has_value()) {
-            (*m_presentation_attribute_style)[*existing_index].value = style_value.release_nonnull();
+            auto& existing = (*m_presentation_attribute_style)[*existing_index].value;
+            if (existing->equals(*style_value))
+                return;
+            existing = style_value.release_nonnull();
         } else {
             m_presentation_attribute_style->append({ .property_id = *property_id, .value = style_value.release_nonnull() });
         }
@@ -395,11 +395,26 @@ void SVGElement::update_presentation_attribute_style(Utf16FlyString const& name,
         return;
     }
 
+    document().flush_deferred_style_change_event();
+    if (style_node_id() != 0 && !m_presentation_attribute_style_dirty) {
+        m_presentation_attribute_style_dirty = true;
+        document().mark_svg_presentation_attributes_dirty(*this);
+    }
+}
+
+void SVGElement::synchronize_dirty_presentation_attribute_style(Badge<DOM::Document>)
+{
+    if (!m_presentation_attribute_style_dirty)
+        return;
+    m_presentation_attribute_style_dirty = false;
+    if (!m_presentation_attribute_style.has_value() || !is_connected() || style_node_id() == 0)
+        return;
     publish_presentation_attribute_style();
 }
 
 void SVGElement::publish_presentation_attribute_style()
 {
+    m_presentation_attribute_style_dirty = false;
     document().flush_deferred_style_change_event();
 
     Vector<CSS::StyleProperty> properties;
@@ -490,12 +505,14 @@ void SVGElement::attribute_changed(Utf16FlyString const& local_name, Optional<Ut
         update_presentation_attribute_style(local_name, value, namespace_);
         invalidate_element_instances(ElementInstancesToInvalidate::All);
         update_use_elements_that_reference_this();
+        note_svg_paint_resource_description_may_have_changed();
     }
-    note_svg_paint_resource_description_may_have_changed();
 }
 
 bool SVGElement::describes_svg_paint_resource() const
 {
+    if (!document().has_svg_paint_resource_element())
+        return false;
     for (auto const* element = this; element; element = as_if<SVGElement>(element->parent_element().ptr())) {
         if (is<SVGGradientElement>(*element) || is<SVGPatternElement>(*element) || is<SVGFilterElement>(*element))
             return true;
@@ -537,6 +554,9 @@ void SVGElement::adopted_from(DOM::Document& old_document)
 {
     Base::adopted_from(old_document);
     m_presentation_attribute_style.clear();
+    m_presentation_attribute_style_dirty = false;
+    if (is<SVGGradientElement>(*this) || is<SVGPatternElement>(*this) || is<SVGFilterElement>(*this))
+        document().set_has_svg_paint_resource_element();
 }
 
 WebIDL::ExceptionOr<void> SVGElement::cloned(DOM::Node& copy, bool clone_children) const
@@ -701,6 +721,44 @@ GC::Ref<SVGAnimatedString> SVGElement::class_name()
         m_class_name_animated_string = SVGAnimatedString::create(*this, DOM::QualifiedName { AttributeNames::class_, OptionalNone {}, OptionalNone {} });
 
     return *m_class_name_animated_string;
+}
+
+bool SVGElement::attribute_affects_svg_attribute_facts(Utf16FlyString const& attribute_name) const
+{
+    auto const& tag = local_name();
+    if (tag == TagNames::g)
+        return false;
+    if (tag.is_one_of(TagNames::path, TagNames::rect, TagNames::circle, TagNames::ellipse))
+        return attribute_name == AttributeNames::pathLength;
+    if (tag == TagNames::line)
+        return attribute_name.is_one_of(AttributeNames::x1, AttributeNames::y1, AttributeNames::x2, AttributeNames::y2, AttributeNames::pathLength);
+    if (tag.is_one_of(TagNames::polygon, TagNames::polyline))
+        return attribute_name.is_one_of(AttributeNames::points, AttributeNames::pathLength);
+
+    if (attribute_name.is_one_of(
+            AttributeNames::viewBox,
+            AttributeNames::preserveAspectRatio,
+            AttributeNames::patternUnits,
+            AttributeNames::patternContentUnits,
+            AttributeNames::maskUnits,
+            AttributeNames::maskContentUnits,
+            AttributeNames::clipPathUnits,
+            AttributeNames::x,
+            AttributeNames::y,
+            AttributeNames::width,
+            AttributeNames::height,
+            AttributeNames::dx,
+            AttributeNames::dy,
+            AttributeNames::textLength,
+            AttributeNames::lengthAdjust,
+            AttributeNames::href,
+            AttributeNames::xlink_href,
+            AttributeNames::startOffset))
+        return true;
+
+    return is_svg_svg_element()
+        && (attribute_name.equals_ignoring_ascii_case(AttributeNames::width)
+            || attribute_name.equals_ignoring_ascii_case(AttributeNames::height));
 }
 
 void SVGElement::publish_svg_attribute_facts()
