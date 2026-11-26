@@ -333,10 +333,18 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
     auto const reveal_waiting = document.descendant_style_arrival_pending() ? CSS::MainEffects::RevealWaiting : CSS::MainEffects::None;
     GC::RootVector<StyleComputer::PendingTransitionOverlay, 8> pending_transition_overlays;
     HashTable<DOM::Element const*> pending_transition_elements;
+    Animations::AnimationUpdateContext pending_animation_samples;
+    HashTable<DOM::Element const*> pending_animation_elements;
     bool style_update_begun_for_transitions = false;
     ScopeGuard end_style_update_for_transitions = [&] {
         if (style_update_begun_for_transitions)
             style_computer.end_style_update();
+    };
+    auto flush_pending_animation_samples = [&] {
+        if (pending_animation_elements.is_empty())
+            return;
+        pending_animation_samples.publish();
+        pending_animation_elements.clear();
     };
     auto flush_pending_transition_overlays = [&] {
         if (pending_transition_overlays.is_empty())
@@ -352,13 +360,15 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         pending_transition_elements.clear();
     };
     auto flush_if_ancestor_pending = [&](DOM::Element const& target) {
-        if (pending_transition_elements.is_empty())
+        if (pending_transition_elements.is_empty() && pending_animation_elements.is_empty())
             return;
         for (GC::Ptr<DOM::Element const> ancestor = &target; ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
-            if (pending_transition_elements.contains(ancestor.ptr())) {
+            if (!pending_animation_elements.is_empty() && pending_animation_elements.contains(ancestor.ptr()))
+                flush_pending_animation_samples();
+            if (!pending_transition_elements.is_empty() && pending_transition_elements.contains(ancestor.ptr()))
                 flush_pending_transition_overlays();
+            if (pending_transition_elements.is_empty() && pending_animation_elements.is_empty())
                 return;
-            }
         }
     };
     for (auto const& element_effects : ReadonlySpan<InstalledElementEffects> { effects, effect_count }) {
@@ -429,10 +439,24 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
             bool const settle_composition = (has_animations || has_custom_overlay) && runs_transition_step;
             if (settle_composition)
                 StyleEngineFFI::style_engine_begin_composition_settling(style_computer.style_engine().host(), &read, element->style_node_id().value());
-            if (has_animations)
-                sample_animations_for_installed_record(abstract_element);
-            else if (has_custom_overlay)
+            if (has_animations) {
+                bool const can_batch_animation_sample = !runs_transition_step
+                    && element_effects.pseudo_elements_composed == 0
+                    && !display_none_before.has_value()
+                    && !has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants);
+                if (can_batch_animation_sample) {
+                    if (auto const& style = abstract_element.installed_style()) {
+                        Animations::AnimationUpdateContext::ElementData element_data { style, style_computer.reconstruct_computed_properties_for_animation(style) };
+                        element_data.base_is_current = true;
+                        pending_animation_samples.elements.set(abstract_element, move(element_data));
+                        pending_animation_elements.set(element);
+                    }
+                } else {
+                    sample_animations_for_installed_record(abstract_element);
+                }
+            } else if (has_custom_overlay) {
                 style_computer.stop_publishing_animated_custom_properties(abstract_element);
+            }
             if (runs_transition_step) {
                 if (!style_update_begun_for_transitions) {
                     style_computer.begin_style_update();
@@ -465,6 +489,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         // do: those it found below the element in the tree the transaction was computed from. That can be another
         // tree than the document's now, where a write made beside a transaction that flew moved an element in it.
         if (has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants)) {
+            flush_pending_animation_samples();
             flush_pending_transition_overlays();
             VERIFY(element_effects.cleared_descendants_begin <= element_effects.cleared_descendants_end);
             VERIFY(element_effects.cleared_descendants_end <= all_cleared_descendants.size());
@@ -476,6 +501,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         if (has_flag(main_effects, CSS::MainEffects::VisibilityFlip))
             document.throttled_animation_visibility_changed();
     }
+    flush_pending_animation_samples();
     flush_pending_transition_overlays();
     swap_in_styles_until(all_swaps.size());
 

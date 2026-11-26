@@ -471,58 +471,35 @@ pub(crate) struct TransitionDecision {
     pub(crate) element: Option<crate::css::style::tree::StyleNodeID>,
 }
 
-impl TransitionDecision {
-    /// Lock-free fast check when the target has no existing transitions, no element in the document holds
-    /// animations or provisional transitions, and the caller has already ruled out a single zero delay+duration:
-    /// returns `true` when the style change cannot produce any transition action, avoiding an engine round-trip.
-    pub(crate) fn is_noop_without_engine(&self) -> bool {
-        let after = crate::css::style::StyleRecordView::of_host_record(&self.after);
-        if after.animated_overlay.is_some() {
-            return false;
-        }
-        let after_longhands = after.longhands();
-        let before = crate::css::style::StyleRecordView::of_host_record(&self.before);
-        if before.animated_overlay.is_some() {
-            return false;
-        }
-        if std::sync::Arc::ptr_eq(&self.before, &self.after) {
-            return true;
-        }
-        if !same_custom_properties(&self.before, &self.after)
-            && !crate::css::style_compute::custom_property_transition_entries(after_longhands).is_empty()
-        {
-            return false;
-        }
-        let before_longhands = before.longhands();
-        let to_compare = before_longhands
-            .shared_with(after_longhands)
-            .map(|shared| shared.longhands_to_compare());
-        let entries = crate::css::style_compute::transition_entries(after_longhands);
-        for entry in &entries {
-            if entry.duration.max(0.0) + entry.delay <= 0.0 {
-                continue;
-            }
-            if let Some(to_compare) = to_compare
-                && let Some(index) = entry
-                    .property_id
-                    .checked_sub(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID)
-                && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
-            {
-                continue;
-            }
-            let Some(before_val) = before_longhands.handle(entry.property_id) else {
-                return false;
-            };
-            let Some(after_val) = after_longhands.handle(entry.property_id) else {
-                return false;
-            };
-            if !values_equal(before_val.pointer(), after_val.pointer()) {
-                return false;
-            }
-        }
-        true
+/// Lock-free, allocation-free fast check over two un-overlaid records when the target has no
+/// existing transitions and no ancestor animations: returns `true` when the style change cannot
+/// start any transition, avoiding retaining `Arc<Record>` or entering the style engine.
+pub(crate) fn is_noop_without_engine_unoverlaid_records(
+    before: &crate::css::style::pipeline::Record,
+    after: &crate::css::style::pipeline::Record,
+) -> bool {
+    if std::ptr::eq(before, after) {
+        return true;
     }
+    let after_longhands = crate::css::style::ViewLonghands::of_record(after);
+    if !same_custom_properties(before, after)
+        && crate::css::style_compute::has_active_custom_property_transition(after_longhands)
+    {
+        return false;
+    }
+    let before_longhands = crate::css::style::ViewLonghands::of_record(before);
+    let to_compare = before_longhands
+        .shared_with(after_longhands)
+        .map(|shared| shared.longhands_to_compare());
+    !crate::css::style_compute::has_active_changed_longhand_transition(
+        before_longhands,
+        after_longhands,
+        to_compare.as_ref(),
+        values_equal,
+    )
+}
 
+impl TransitionDecision {
     /// Runs the CSS Transitions decision algorithm for every property the after-change style's `transition-*` values
     /// name, then for every property of an `existing` transition they do not name, and answers one action per property
     /// in that order. The transitions resolve their transforms against `reference_box`, the transform reference box of

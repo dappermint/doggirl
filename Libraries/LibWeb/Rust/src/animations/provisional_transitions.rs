@@ -58,11 +58,14 @@ impl ProvisionalTransitions {
     }
 
     pub(crate) fn has_states(&self, target: TransitionTarget) -> bool {
-        self.by_target.contains_key(&target)
+        !self.states.is_empty() && self.by_target.contains_key(&target)
     }
 
     /// The indices of the states of `target`.
     pub(crate) fn indices_of(&self, target: TransitionTarget) -> SmallVec<[usize; 2]> {
+        if self.states.is_empty() {
+            return SmallVec::new();
+        }
         self.by_target.get(&target).cloned().unwrap_or_default()
     }
 
