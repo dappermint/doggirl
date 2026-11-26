@@ -52,9 +52,40 @@ public:
     GC::Ptr<Element const> closest(Element const&) const;
 
 private:
+    enum class FastPathKind : u8 {
+        None,
+        SimpleCompound,
+        SimpleDescendantSimpleCompound,
+        SimpleChildSimpleCompound,
+    };
+
+    enum class AttributeMatchKind : u8 {
+        None,
+        HasAttribute,
+        ExactCaseSensitive,
+        ExactCaseInsensitive,
+        ExactLegacyHtmlCaseInsensitive,
+    };
+
+    struct FastCompound {
+        uintptr_t tag_name { 0 };
+        uintptr_t id { 0 };
+        uintptr_t classes[2] { 0, 0 };
+        uintptr_t attribute_name { 0 };
+        uintptr_t attribute_value { 0 };
+        u8 class_count { 0 };
+        AttributeMatchKind attribute_match_kind { AttributeMatchKind::None };
+    };
+
     explicit SelectorQuery(CSS::SelectorList&&);
 
     CSS::SelectorFFI::DomSelectorProgram const& program(Document const&) const;
+    static bool matches_simple_compound(Element const&, FastCompound const&, bool is_html_document);
+    bool matches_fast(Element const&) const;
+    template<typename Callback>
+    void walk_subject_subtree(ParentNode&, bool is_html_document, Callback&&) const;
+    template<typename Callback>
+    void for_each_fast_match(ParentNode&, Callback&&) const;
 
     CSS::SelectorList m_selectors;
     // The selectors compiled for the DOM matcher, when a query first needs them, for an HTML document or not.
@@ -65,6 +96,15 @@ private:
     // Whether the selector is a lone `*`, which every element matches: a query then collects the
     // subtree's elements without matching any of them.
     bool m_matches_every_element { false };
+
+    // Inline C++ fast path for simple 1- and 2-compound selectors in non-quirks documents.
+    FastPathKind m_fast_path_kind { FastPathKind::None };
+    FastCompound m_fast_subject {};
+    FastCompound m_fast_ancestor {};
+    u64 m_subject_filter_bits { 0 };
+    u64 m_ancestor_filter_bits { 0 };
+    u32 m_subject_attribute_filter_bits { 0 };
+    u32 m_ancestor_attribute_filter_bits { 0 };
 
     // Whether matching can only change when the dom_tree_version (plus character_data_version, see below) of the
     // tree the element is in changes. Queries with selectors that depend on other state (:hover, :checked, :target,

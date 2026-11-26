@@ -249,6 +249,7 @@ public:
     void invalidate_lang_value_of_inclusive_ancestors();
 
     void set_attribute(FlyString qualified_name, Utf16String const& verified_value);
+    void set_attribute(Utf16FlyString const& qualified_name, Utf16String const& verified_value);
     void set_attribute_ns(QualifiedName const&, Utf16String const& verified_value);
     void set_attribute_value(FlyString const& local_name, String const& value, Optional<FlyString> const& prefix = {}, Optional<FlyString> const& namespace_ = {});
     void set_attribute_value(Utf16FlyString const& local_name, Utf16View value, Optional<Utf16FlyString> const& prefix = {}, Optional<Utf16FlyString> const& namespace_ = {});
@@ -258,6 +259,7 @@ public:
 
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
+    void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false);
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
@@ -277,9 +279,18 @@ public:
 
     // A filter over the local names of the attributes and the classes of this element and its descendants: a name whose
     // bit is clear is on none of them. Bits are only ever added, so a name may keep its bit after it is last removed.
-    static u64 name_filter_bit(Utf16FlyString const& name) { return 1ull << (name.hash() % 64); }
+    static u64 name_filter_bit_from_raw(uintptr_t raw_identity) { return 1ull << ((static_cast<u64>(raw_identity) * 0x9e3779b97f4a7c15ull) >> 58); }
+    static u64 name_filter_bit(Utf16FlyString const& name) { return name_filter_bit_from_raw(name.raw_identity()); }
+    static u32 attribute_filter_bits_from_raw(uintptr_t raw_identity)
+    {
+        u64 hash = static_cast<u64>(raw_identity) * 0x9e3779b97f4a7c15ull;
+        return (1u << (hash >> 59)) | (1u << ((hash >> 54) & 31));
+    }
+    static u32 attribute_filter_bits(Utf16FlyString const& name) { return attribute_filter_bits_from_raw(name.raw_identity()); }
     u64 subtree_name_filter() const { return m_subtree_name_filter; }
     void add_to_subtree_name_filter(u64 bits);
+    u32 subtree_attribute_filter() const { return m_subtree_attribute_filter; }
+    void add_to_subtree_filters(u64 name_bits, u32 attribute_bits);
 
     GC::Ptr<NamedNodeMap const> attributes() const;
     GC::Ptr<NamedNodeMap> attributes();
@@ -940,6 +951,7 @@ public:
     WebIDL::ExceptionOr<void> request_pointer_lock(PointerLockOptions const&);
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
+    bool uses_document_global_custom_element_registry() const { return m_uses_document_global_custom_element_registry; }
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry>);
 
     virtual void initialize_element() { }
@@ -971,7 +983,6 @@ protected:
     virtual void prepare_for_style_computation() { }
 
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
     virtual bool id_reference_exists(Utf16View) const override;
@@ -1145,6 +1156,9 @@ private:
     mutable u32 m_parent_child_index_generation { 0 };
     mutable u32 m_child_index { 0 };
     mutable u32 m_child_index_of_type { 0 };
+    // 2-bit bloom filter over attribute local names in this element and its descendants; packed into the 4-byte slot
+    // after the child-index counters so Element keeps its size class.
+    u32 m_subtree_attribute_filter { 0 };
 
     // NB: These are declared next to the u32s above, so that they pack without padding.
     GC::Member<CSS::CSSStyleProperties> m_inline_style;

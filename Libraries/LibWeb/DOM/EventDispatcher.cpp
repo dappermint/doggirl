@@ -163,15 +163,24 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
 // https://dom.spec.whatwg.org/#concept-event-listener-invoke
 void EventDispatcher::invoke(Event::PathEntry& struct_, Event& event, Event::Phase phase, bool& legacy_output_did_listeners_throw)
 {
-    auto last_valid_shadow_adjusted_target = event.path().last_matching([&struct_](auto& entry) {
-        return entry.index <= struct_.index && entry.shadow_adjusted_target;
-    });
+    auto const& path = event.path();
+    Event::PathEntry const* last_valid_shadow_adjusted_target = nullptr;
+    if (!path.is_empty()) {
+        for (size_t i = min(struct_.index, path.size() - 1);; --i) {
+            if (path[i].index <= struct_.index && path[i].shadow_adjusted_target) {
+                last_valid_shadow_adjusted_target = &path[i];
+                break;
+            }
+            if (i == 0)
+                break;
+        }
+    }
 
-    VERIFY(last_valid_shadow_adjusted_target.has_value());
+    VERIFY(last_valid_shadow_adjusted_target);
 
     // 1. Set event’s target to the shadow-adjusted target of the last struct in event’s path,
     // that is either struct or preceding struct, whose shadow-adjusted target is non-null.
-    event.set_target(last_valid_shadow_adjusted_target.value().shadow_adjusted_target.ptr());
+    event.set_target(last_valid_shadow_adjusted_target->shadow_adjusted_target.ptr());
 
     // AD-HOC: Coalesced events have the same target as the trusted pointer event they were coalesced into.
     if (event.is_trusted()) {
@@ -197,6 +206,10 @@ void EventDispatcher::invoke(Event::PathEntry& struct_, Event& event, Event::Pha
     // 5. Initialize event’s currentTarget attribute to struct’s invocation target.
     event.set_current_target(struct_.invocation_target.ptr());
 
+    auto current_target = event.current_target();
+    if (!current_target->has_event_listeners())
+        return;
+
     // 6. Let listeners be a clone of event’s currentTarget attribute value’s event listener list.
     // NOTE: This avoids event listeners added after this point from being run. Note that removal still has an effect
     //       due to the removed field.
@@ -206,7 +219,7 @@ void EventDispatcher::invoke(Event::PathEntry& struct_, Event& event, Event::Pha
     Optional<Utf16FlyString> legacy_event_type;
     if (event.is_trusted())
         legacy_event_type = legacy_event_type_for_event_type(event.type());
-    auto listeners = event.current_target()->event_listener_list_matching(event.type(), legacy_event_type);
+    auto listeners = current_target->event_listener_list_matching(event.type(), legacy_event_type);
 
     // 7. Let invocationTargetInShadowTree be struct’s invocation-target-in-shadow-tree.
     bool invocation_target_in_shadow_tree = struct_.invocation_target_in_shadow_tree;
@@ -238,6 +251,42 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 {
     bool legacy_output_did_listeners_throw = false;
     return dispatch(target, event, legacy_target_override, legacy_output_did_listeners_throw);
+}
+
+static constexpr size_t MAX_POOLED_EVENT_PATHS = 4;
+static constexpr size_t MAX_POOLED_EVENT_PATH_CAPACITY = 64;
+
+static Vector<Event::Path, MAX_POOLED_EVENT_PATHS>& event_path_pool()
+{
+    static thread_local NeverDestroyed<Vector<Event::Path, MAX_POOLED_EVENT_PATHS>> pool;
+    return *pool;
+}
+
+static void acquire_pooled_event_path(Event& event)
+{
+    auto& path = event.path();
+    if (!path.is_empty() || path.capacity() >= 16)
+        return;
+    auto& pool = event_path_pool();
+    if (!pool.is_empty()) {
+        path = pool.take_last();
+        return;
+    }
+    path.ensure_capacity(16);
+}
+
+static void release_pooled_event_path(Event& event)
+{
+    auto& path = event.path();
+    if (path.capacity() > 0 && path.capacity() <= MAX_POOLED_EVENT_PATH_CAPACITY) {
+        auto& pool = event_path_pool();
+        if (pool.size() < MAX_POOLED_EVENT_PATHS) {
+            path.clear_with_capacity();
+            pool.unchecked_append(move(path));
+            return;
+        }
+    }
+    event.clear_path();
 }
 
 static bool button_submits_or_resets_its_form(HTML::HTMLButtonElement const& button)
@@ -388,6 +437,8 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 
     // 6. If target is not relatedTarget or target is event’s relatedTarget, then:
     if (should_dispatch && (related_target != target || event.related_target() == target)) {
+        acquire_pooled_event_path(event);
+
         // 1. Let touchTargets be a new list.
         GC::RootVector<GC::Ptr<EventTarget>> touch_targets;
 
@@ -598,7 +649,7 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     event.set_current_target(nullptr);
 
     // 9. Set event’s path to the empty list.
-    event.clear_path();
+    release_pooled_event_path(event);
 
     // 10. Unset event’s dispatch flag, stop propagation flag, and stop immediate propagation flag.
     event.set_dispatched(false);

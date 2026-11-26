@@ -206,6 +206,54 @@ pub(crate) fn relative_to(selector: &CompiledSelector, parent: SimpleSelector) -
     CompiledSelector::new(compounds.into_boxed_slice())
 }
 
+/// Fast-path classification for a single selector that the DOM query APIs can evaluate inline in C++ without
+/// crossing FFI or compiling a `DomSelectorProgram`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiSelectorFastPathKind {
+    #[default]
+    None,
+    /// Single compound selector (no combinators).
+    SimpleCompound,
+    /// Two simple compounds separated by a descendant combinator (`ancestor subject`).
+    SimpleDescendantSimpleCompound,
+    /// Two simple compounds separated by a child combinator (`ancestor > subject`).
+    SimpleChildSimpleCompound,
+}
+
+/// Attribute match predicate supported by the DOM query C++ fast path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiAttributeMatchKind {
+    #[default]
+    None,
+    HasAttribute,
+    ExactCaseSensitive,
+    ExactCaseInsensitive,
+    ExactLegacyHtmlCaseInsensitive,
+}
+
+/// Simple-selector predicates of one fast-path compound, as interned `Utf16FlyString` raw identities (0 = absent).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiSimpleCompound {
+    pub tag_name: usize,
+    pub id: usize,
+    pub classes: [usize; 2],
+    pub attribute_name: usize,
+    pub attribute_value: usize,
+    pub class_count: u8,
+    pub attribute_match_kind: FfiAttributeMatchKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiSelectorFastPath {
+    pub kind: FfiSelectorFastPathKind,
+    pub subject: FfiSimpleCompound,
+    pub ancestor: FfiSimpleCompound,
+}
+
 /// What a query reads of a selector, from one walk of the selector's arena.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -216,6 +264,144 @@ pub struct FfiSelectorQueryFacts {
     /// Whether every element matches the selector, so that a query over a subtree can collect its elements without
     /// matching any of them.
     pub matches_every_element: bool,
+    pub fast_path: FfiSelectorFastPath,
+}
+
+fn classify_simple_compound(compound: super::selector_arena::CompoundRef<'_>) -> Option<FfiSimpleCompound> {
+    use super::selector::{AttributeCaseType, AttributeMatchType, NamespaceType};
+
+    let atoms = crate::css::style::process_atoms();
+    let raw_of = |atom| atoms.local_raw_of(atom).filter(|&raw| raw != 0);
+
+    let mut result = FfiSimpleCompound::default();
+    let mut saw_any = false;
+    for simple in compound.simple_selectors.iter() {
+        saw_any = true;
+        match simple {
+            ArenaSimpleSelector::Universal(name) => {
+                if !matches!(name.namespace_type, NamespaceType::Any | NamespaceType::Default) {
+                    return None;
+                }
+            }
+            ArenaSimpleSelector::TagName(name) => {
+                if !name.name_is_ascii_lowercase
+                    || !matches!(name.namespace_type, NamespaceType::Any | NamespaceType::Default)
+                {
+                    return None;
+                }
+                let raw = raw_of(name.name)?;
+                if result.tag_name != 0 && result.tag_name != raw {
+                    return None;
+                }
+                result.tag_name = raw;
+            }
+            ArenaSimpleSelector::Id(name) => {
+                let raw = raw_of(name.name)?;
+                if result.id != 0 && result.id != raw {
+                    return None;
+                }
+                result.id = raw;
+            }
+            ArenaSimpleSelector::Class(name) => {
+                let raw = raw_of(name.name)?;
+                let count = usize::from(result.class_count);
+                if result.classes[..count].contains(&raw) {
+                    continue;
+                }
+                if count >= result.classes.len() {
+                    return None;
+                }
+                result.classes[count] = raw;
+                result.class_count += 1;
+            }
+            ArenaSimpleSelector::Attribute(attribute) => {
+                if !attribute.qualified_name.name_is_ascii_lowercase
+                    || !matches!(
+                        attribute.qualified_name.namespace_type,
+                        NamespaceType::Default | NamespaceType::None
+                    )
+                {
+                    return None;
+                }
+                let raw = raw_of(attribute.qualified_name.name)?;
+                let (match_kind, value_raw) = match attribute.match_type {
+                    AttributeMatchType::HasAttribute => (FfiAttributeMatchKind::HasAttribute, 0),
+                    AttributeMatchType::ExactValue => {
+                        let value_raw = if attribute.value.is_empty() {
+                            0
+                        } else {
+                            raw_of(attribute.value_identity)?
+                        };
+                        let match_kind = match attribute.case_type {
+                            AttributeCaseType::Insensitive => FfiAttributeMatchKind::ExactCaseInsensitive,
+                            AttributeCaseType::Sensitive => FfiAttributeMatchKind::ExactCaseSensitive,
+                            AttributeCaseType::Default => {
+                                if attribute.names_a_legacy_case_insensitive_attribute {
+                                    FfiAttributeMatchKind::ExactLegacyHtmlCaseInsensitive
+                                } else {
+                                    FfiAttributeMatchKind::ExactCaseSensitive
+                                }
+                            }
+                        };
+                        (match_kind, value_raw)
+                    }
+                    _ => return None,
+                };
+                if result.attribute_match_kind != FfiAttributeMatchKind::None {
+                    if result.attribute_name == raw
+                        && result.attribute_match_kind == match_kind
+                        && result.attribute_value == value_raw
+                    {
+                        continue;
+                    }
+                    return None;
+                }
+                result.attribute_name = raw;
+                result.attribute_value = value_raw;
+                result.attribute_match_kind = match_kind;
+            }
+            _ => return None,
+        }
+    }
+    if !saw_any || (result.tag_name == 0 && result.id == 0 && result.class_count == 0 && result.attribute_name == 0) {
+        return None;
+    }
+    Some(result)
+}
+
+fn classify_fast_path(selector: ArenaSelector<'_>) -> FfiSelectorFastPath {
+    if selector.is_relative_anchor() {
+        return FfiSelectorFastPath::default();
+    }
+    let Some(subject) = classify_simple_compound(selector.first_compound()) else {
+        return FfiSelectorFastPath::default();
+    };
+    match selector.left() {
+        None => FfiSelectorFastPath {
+            kind: FfiSelectorFastPathKind::SimpleCompound,
+            subject,
+            ancestor: FfiSimpleCompound::default(),
+        },
+        Some((combinator, left))
+            if !left.is_relative_anchor()
+                && left.left().is_none()
+                && matches!(combinator, Combinator::Descendant | Combinator::ImmediateChild) =>
+        {
+            let Some(ancestor) = classify_simple_compound(left.first_compound()) else {
+                return FfiSelectorFastPath::default();
+            };
+            FfiSelectorFastPath {
+                kind: match combinator {
+                    Combinator::Descendant => FfiSelectorFastPathKind::SimpleDescendantSimpleCompound,
+                    Combinator::ImmediateChild => FfiSelectorFastPathKind::SimpleChildSimpleCompound,
+                    _ => unreachable!(),
+                },
+                subject,
+                ancestor,
+            }
+        }
+        _ => FfiSelectorFastPath::default(),
+    }
 }
 
 fn collect_query_facts(selector: ArenaSelector<'_>, facts: &mut FfiSelectorQueryFacts) {
@@ -254,6 +440,9 @@ fn query_facts(selector: ArenaSelector<'_>) -> FfiSelectorQueryFacts {
             name.namespace_type,
             super::selector::NamespaceType::Any | super::selector::NamespaceType::Default
         );
+    }
+    if !facts.matches_every_element {
+        facts.fast_path = classify_fast_path(selector);
     }
     facts
 }

@@ -215,6 +215,7 @@ GC_DEFINE_ALLOCATOR(EventTarget);
 
 EventTarget::EventTarget()
 {
+    set_wrappable_flag(WrappableFlag::IsEventTarget);
 }
 
 EventTarget::~EventTarget() = default;

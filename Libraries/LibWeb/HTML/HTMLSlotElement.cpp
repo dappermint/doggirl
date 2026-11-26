@@ -23,6 +23,7 @@ GC_DEFINE_ALLOCATOR(HTMLSlotElement);
 HTMLSlotElement::HTMLSlotElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
+    m_is_html_slot_element = true;
 }
 
 HTMLSlotElement::~HTMLSlotElement() = default;

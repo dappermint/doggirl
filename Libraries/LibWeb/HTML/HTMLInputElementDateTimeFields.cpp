@@ -83,19 +83,25 @@ static Utf16View field_placeholder(FieldKind kind)
 
 bool HTMLInputElement::date_time_fields_use_12_hour_clock() const
 {
-    return any_of(m_date_time_fields, [](auto const& field) { return field.kind == FieldKind::DayPeriod; });
+    if (!m_rare_input_data)
+        return false;
+    return any_of(m_rare_input_data->date_time_fields, [](auto const& field) { return field.kind == FieldKind::DayPeriod; });
 }
 
 // NB: Fields the user filled in that do not make a value, because some are still empty or they name a day that does
 //     not exist, describe input that cannot be converted to a valid string.
 bool HTMLInputElement::date_time_fields_describe_bad_input() const
 {
-    return m_value.is_empty() && any_of(m_date_time_fields, [](auto const& field) { return field.value.has_value(); });
+    if (!m_rare_input_data)
+        return false;
+    return m_value.is_empty() && any_of(m_rare_input_data->date_time_fields, [](auto const& field) { return field.value.has_value(); });
 }
 
 Optional<HTMLInputElement::DateTimeField const&> HTMLInputElement::date_time_field(DateTimeField::Kind kind) const
 {
-    for (auto const& field : m_date_time_fields) {
+    if (!m_rare_input_data)
+        return {};
+    for (auto const& field : m_rare_input_data->date_time_fields) {
         if (field.kind == kind)
             return field;
     }
@@ -172,13 +178,14 @@ bool HTMLInputElement::date_time_fields_want_seconds() const
 
 void HTMLInputElement::create_date_time_fields()
 {
-    VERIFY(m_date_time_fields_container);
-    m_date_time_fields_container->remove_all_children();
-    m_date_time_fields.clear();
-    m_day_period_names.clear();
-    m_active_date_time_field = 0;
-    m_date_time_field_typed_digits = 0;
-    m_date_time_fields_show_seconds = date_time_fields_want_seconds();
+    VERIFY(m_rare_input_data && m_rare_input_data->date_time_fields_container);
+    auto& rare_data = *m_rare_input_data;
+    rare_data.date_time_fields_container->remove_all_children();
+    rare_data.date_time_fields.clear();
+    rare_data.day_period_names.clear();
+    rare_data.active_date_time_field = 0;
+    rare_data.date_time_field_typed_digits = 0;
+    rare_data.date_time_fields_show_seconds = date_time_fields_want_seconds();
 
     Vector<Variant<FieldKind, Utf16String>> parts;
 
@@ -198,7 +205,7 @@ void HTMLInputElement::create_date_time_fields()
         if (first_is_one_of(type_state(), TypeAttributeState::Time, TypeAttributeState::LocalDateAndTime)) {
             pattern.hour = Unicode::CalendarPatternStyle::TwoDigit;
             pattern.minute = Unicode::CalendarPatternStyle::TwoDigit;
-            if (m_date_time_fields_show_seconds)
+            if (rare_data.date_time_fields_show_seconds)
                 pattern.second = Unicode::CalendarPatternStyle::TwoDigit;
         }
 
@@ -215,7 +222,7 @@ void HTMLInputElement::create_date_time_fields()
             for (auto hour : { 1, 13 }) {
                 for (auto const& part : formatter->format_to_parts(hour * 3600000.0)) {
                     if (part.type == u"dayPeriod"sv)
-                        m_day_period_names.append(part.value);
+                        rare_data.day_period_names.append(part.value);
                 }
             }
         }
@@ -224,22 +231,22 @@ void HTMLInputElement::create_date_time_fields()
     auto& realm = HTML::relevant_realm(*this);
     for (auto const& part : parts) {
         if (auto const* literal = part.get_pointer<Utf16String>()) {
-            MUST(m_date_time_fields_container->append_child(DOM::Text::create(document(), *literal)));
+            MUST(rare_data.date_time_fields_container->append_child(DOM::Text::create(document(), *literal)));
             continue;
         }
 
         auto kind = part.get<FieldKind>();
-        if (kind == FieldKind::DayPeriod && m_day_period_names.size() != 2)
+        if (kind == FieldKind::DayPeriod && rare_data.day_period_names.size() != 2)
             continue;
 
         auto element = MUST(DOM::create_element(document(), HTML::TagNames::span, Namespace::HTML));
         MUST(element->append_child(DOM::Text::create(document(), {})));
-        MUST(m_date_time_fields_container->append_child(element));
+        MUST(rare_data.date_time_fields_container->append_child(element));
 
-        auto index = m_date_time_fields.size();
+        auto index = rare_data.date_time_fields.size();
         auto mousedown_function = JS::NativeFunction::create(
             realm, GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this, index), [](auto& self, auto& index, JS::VM&) {
-                if (index < self.m_date_time_fields.size())
+                if (self.m_rare_input_data && index < self.m_rare_input_data->date_time_fields.size())
                     self.set_active_date_time_field(index);
                 return JS::js_undefined();
             }),
@@ -247,35 +254,37 @@ void HTMLInputElement::create_date_time_fields()
         auto mousedown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousedown_function, realm);
         element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(mousedown_callback));
 
-        m_date_time_fields.append({ .kind = kind, .value = {}, .element = element });
+        rare_data.date_time_fields.append({ .kind = kind, .value = {}, .element = element });
     }
 
-    m_date_time_fields_value = {};
+    rare_data.date_time_fields_value = {};
     update_date_time_fields();
 }
 
 void HTMLInputElement::update_date_time_fields()
 {
-    if (!m_date_time_fields_container)
+    if (!m_rare_input_data || !m_rare_input_data->date_time_fields_container)
         return;
+
+    auto& rare_data = *m_rare_input_data;
 
     // NB: Script and the picker change the value; the fields then show it. Fields the user is still filling in keep
     //     their numbers while the value stays empty.
-    if (m_date_time_fields_value != m_value) {
+    if (rare_data.date_time_fields_value != m_value) {
         // NB: Only a value from outside the fields decides whether they show seconds, so that clearing a field the
         //     user is editing does not build the fields again and lose what they typed into the others.
-        if (date_time_fields_want_seconds() != m_date_time_fields_show_seconds) {
+        if (date_time_fields_want_seconds() != rare_data.date_time_fields_show_seconds) {
             create_date_time_fields();
             return;
         }
 
-        m_date_time_fields_value = m_value;
-        m_date_time_field_typed_digits = 0;
-        for (auto& field : m_date_time_fields)
+        rare_data.date_time_fields_value = m_value;
+        rare_data.date_time_field_typed_digits = 0;
+        for (auto& field : rare_data.date_time_fields)
             field.value = {};
 
         auto set = [&](FieldKind kind, Optional<i32> value) {
-            for (auto& field : m_date_time_fields) {
+            for (auto& field : rare_data.date_time_fields) {
                 if (field.kind == kind)
                     field.value = value;
             }
@@ -343,15 +352,18 @@ void HTMLInputElement::update_date_time_fields()
 
 void HTMLInputElement::update_date_time_field_elements()
 {
+    if (!m_rare_input_data)
+        return;
+    auto const& rare_data = *m_rare_input_data;
     bool const is_focused = document().focused_area().ptr() == this;
-    for (size_t index = 0; index < m_date_time_fields.size(); ++index) {
-        auto const& field = m_date_time_fields[index];
+    for (size_t index = 0; index < rare_data.date_time_fields.size(); ++index) {
+        auto const& field = rare_data.date_time_fields[index];
 
         Utf16String text;
         if (!field.value.has_value())
             text = Utf16String::from_utf16(field_placeholder(field.kind));
         else if (field.kind == FieldKind::DayPeriod)
-            text = m_day_period_names[*field.value];
+            text = rare_data.day_period_names[*field.value];
         else if (field.kind == FieldKind::Year)
             text = Utf16String::formatted("{:04}", *field.value);
         else
@@ -361,7 +373,7 @@ void HTMLInputElement::update_date_time_field_elements()
         if (text_node.data() != text)
             text_node.set_data(text);
 
-        bool const is_active = is_focused && index == m_active_date_time_field;
+        bool const is_active = is_focused && index == rare_data.active_date_time_field;
         auto style = is_active
             ? "font-variant-numeric: tabular-nums; border-radius: 2px; background-color: AccentColor; color: AccentColorText;"_utf16
             : "font-variant-numeric: tabular-nums; border-radius: 2px;"_utf16;
@@ -372,32 +384,34 @@ void HTMLInputElement::update_date_time_field_elements()
 
 void HTMLInputElement::set_active_date_time_field(size_t index)
 {
-    VERIFY(index < m_date_time_fields.size());
-    m_active_date_time_field = index;
-    m_date_time_field_typed_digits = 0;
+    VERIFY(m_rare_input_data && index < m_rare_input_data->date_time_fields.size());
+    m_rare_input_data->active_date_time_field = index;
+    m_rare_input_data->date_time_field_typed_digits = 0;
     update_date_time_field_elements();
 }
 
 // NB: A step that is not a whole number of minutes adds a seconds field to a time input, and one that is takes it away.
 void HTMLInputElement::update_date_time_fields_for_step()
 {
-    if (m_date_time_fields_container && date_time_fields_want_seconds() != m_date_time_fields_show_seconds)
+    if (m_rare_input_data && m_rare_input_data->date_time_fields_container && date_time_fields_want_seconds() != m_rare_input_data->date_time_fields_show_seconds)
         create_date_time_fields();
 }
 
 // NB: Moving focus backwards into the input lands on its last field, so that the fields are reached in reverse.
 void HTMLInputElement::activate_last_date_time_field()
 {
-    if (!m_date_time_fields.is_empty())
-        set_active_date_time_field(m_date_time_fields.size() - 1);
+    if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
+        set_active_date_time_field(m_rare_input_data->date_time_fields.size() - 1);
 }
 
 void HTMLInputElement::date_time_fields_did_change()
 {
+    VERIFY(m_rare_input_data);
+    auto& rare_data = *m_rare_input_data;
     Utf16String new_value;
 
-    auto all_fields_filled = all_of(m_date_time_fields, [](auto const& field) { return field.value.has_value(); });
-    if (all_fields_filled && !m_date_time_fields.is_empty()) {
+    auto all_fields_filled = all_of(rare_data.date_time_fields, [](auto const& field) { return field.value.has_value(); });
+    if (all_fields_filled && !rare_data.date_time_fields.is_empty()) {
         auto value_of = [&](FieldKind kind) { return date_time_field_value(kind).value_or(0); };
 
         auto hour = value_of(FieldKind::Hour);
@@ -433,7 +447,7 @@ void HTMLInputElement::date_time_fields_did_change()
     }
 
     // NB: The fields already show the value they make, so it must not be parsed back into them.
-    m_date_time_fields_value = new_value;
+    rare_data.date_time_fields_value = new_value;
     update_date_time_field_elements();
     // AD-HOC: Whether the fields describe bad input changes which validity pseudo-classes match, even when the
     //         value stays empty.
@@ -443,12 +457,13 @@ void HTMLInputElement::date_time_fields_did_change()
 
 bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 modifiers, u32 code_point)
 {
-    if (m_date_time_fields.is_empty())
+    if (!m_rare_input_data || m_rare_input_data->date_time_fields.is_empty())
         return false;
     if (modifiers & (UIEvents::Mod_Ctrl | UIEvents::Mod_Alt | UIEvents::Mod_Super))
         return false;
 
-    auto field_count = m_date_time_fields.size();
+    auto& rare_data = *m_rare_input_data;
+    auto field_count = rare_data.date_time_fields.size();
     auto move_to = [&](size_t index) {
         set_active_date_time_field(index);
         return true;
@@ -457,23 +472,23 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
     // NB: Tab moves between the fields before it moves focus away from the input.
     if (key == UIEvents::Key_Tab) {
         if (modifiers & UIEvents::Mod_Shift) {
-            if (m_active_date_time_field > 0)
-                return move_to(m_active_date_time_field - 1);
-        } else if (m_active_date_time_field + 1 < field_count) {
-            return move_to(m_active_date_time_field + 1);
+            if (rare_data.active_date_time_field > 0)
+                return move_to(rare_data.active_date_time_field - 1);
+        } else if (rare_data.active_date_time_field + 1 < field_count) {
+            return move_to(rare_data.active_date_time_field + 1);
         }
         return false;
     }
     if (key == UIEvents::Key_Left)
-        return move_to(m_active_date_time_field > 0 ? m_active_date_time_field - 1 : 0);
+        return move_to(rare_data.active_date_time_field > 0 ? rare_data.active_date_time_field - 1 : 0);
     if (key == UIEvents::Key_Right)
-        return move_to(AK::min(m_active_date_time_field + 1, field_count - 1));
+        return move_to(AK::min(rare_data.active_date_time_field + 1, field_count - 1));
     if (key == UIEvents::Key_Home)
         return move_to(0);
     if (key == UIEvents::Key_End)
         return move_to(field_count - 1);
 
-    auto& field = m_date_time_fields[m_active_date_time_field];
+    auto& field = rare_data.date_time_fields[rare_data.active_date_time_field];
     auto minimum = date_time_field_minimum(field.kind);
     auto maximum = date_time_field_maximum(field.kind);
 
@@ -492,7 +507,7 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
         } else {
             field.value = *field.value <= minimum ? maximum : *field.value - 1;
         }
-        m_date_time_field_typed_digits = 0;
+        rare_data.date_time_field_typed_digits = 0;
         date_time_fields_did_change();
         return true;
     }
@@ -501,7 +516,7 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
         if (!is_mutable())
             return true;
         field.value = {};
-        m_date_time_field_typed_digits = 0;
+        rare_data.date_time_field_typed_digits = 0;
         date_time_fields_did_change();
         return true;
     }
@@ -514,8 +529,8 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
 
     if (field.kind == FieldKind::DayPeriod) {
         // NB: A day period is chosen by the first letter of its name.
-        for (size_t index = 0; index < m_day_period_names.size(); ++index) {
-            auto name = m_day_period_names[index].utf16_view();
+        for (size_t index = 0; index < rare_data.day_period_names.size(); ++index) {
+            auto name = rare_data.day_period_names[index].utf16_view();
             if (name.is_empty())
                 continue;
             auto first = name.code_point_at(0);
@@ -523,8 +538,8 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
                 field.value = static_cast<i32>(index);
                 date_time_fields_did_change();
                 // NB: The change event can change the type of the input, which builds other fields or none.
-                if (m_active_date_time_field + 1 < m_date_time_fields.size())
-                    set_active_date_time_field(m_active_date_time_field + 1);
+                if (rare_data.active_date_time_field + 1 < rare_data.date_time_fields.size())
+                    set_active_date_time_field(rare_data.active_date_time_field + 1);
                 return true;
             }
         }
@@ -536,35 +551,35 @@ bool HTMLInputElement::handle_date_time_field_key(UIEvents::KeyCode key, u32 mod
         auto maximum_digits = field.kind == FieldKind::Year ? 4 : 2;
 
         i32 typed = digit;
-        if (m_date_time_field_typed_digits > 0 && field.value.has_value())
+        if (rare_data.date_time_field_typed_digits > 0 && field.value.has_value())
             typed = *field.value * 10 + digit;
         if (typed > maximum) {
             // NB: A digit that would overflow the field starts the field over.
             typed = digit;
-            m_date_time_field_typed_digits = 0;
+            rare_data.date_time_field_typed_digits = 0;
         }
-        ++m_date_time_field_typed_digits;
+        ++rare_data.date_time_field_typed_digits;
 
         // NB: The field is done once no further digit could keep it in range.
-        bool const is_complete = m_date_time_field_typed_digits >= maximum_digits || static_cast<i64>(typed) * 10 > maximum;
+        bool const is_complete = rare_data.date_time_field_typed_digits >= maximum_digits || static_cast<i64>(typed) * 10 > maximum;
         field.value = is_complete ? AK::max(typed, minimum) : typed;
 
         if (is_complete) {
-            m_date_time_field_typed_digits = 0;
-            if (m_active_date_time_field + 1 < field_count)
-                m_active_date_time_field = m_active_date_time_field + 1;
+            rare_data.date_time_field_typed_digits = 0;
+            if (rare_data.active_date_time_field + 1 < field_count)
+                rare_data.active_date_time_field = rare_data.active_date_time_field + 1;
         }
         date_time_fields_did_change();
         return true;
     }
 
     // NB: A separator ends the field being typed into.
-    if (m_date_time_field_typed_digits > 0) {
+    if (rare_data.date_time_field_typed_digits > 0) {
         if (field.value.has_value())
             field.value = AK::max(*field.value, minimum);
-        m_date_time_field_typed_digits = 0;
-        if (m_active_date_time_field + 1 < field_count)
-            m_active_date_time_field = m_active_date_time_field + 1;
+        rare_data.date_time_field_typed_digits = 0;
+        if (rare_data.active_date_time_field + 1 < field_count)
+            rare_data.active_date_time_field = rare_data.active_date_time_field + 1;
         date_time_fields_did_change();
     }
     return true;

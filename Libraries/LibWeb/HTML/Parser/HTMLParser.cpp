@@ -45,6 +45,7 @@
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
+#include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/HTMLMetaElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
@@ -125,9 +126,85 @@ template<typename CodeUnit>
 static Utf16String utf16_string_from_ascii_code_units(ReadonlySpan<CodeUnit> code_units)
 {
     return Utf16String::create_uninitialized_ascii(code_units.size(), [&](Bytes buffer) {
-        for (size_t i = 0; i < code_units.size(); ++i)
-            buffer[i] = static_cast<u8>(code_units[i]);
+        if constexpr (sizeof(CodeUnit) == 1) {
+            if (!code_units.is_empty())
+                __builtin_memcpy(buffer.data(), code_units.data(), code_units.size());
+        } else {
+            for (size_t i = 0; i < code_units.size(); ++i)
+                buffer[i] = static_cast<u8>(code_units[i]);
+        }
     });
+}
+
+struct CachedAsciiAttributeValueEntry {
+    u32 hash { 0 };
+    Utf16String value;
+    bool is_fly_string { false };
+};
+
+static Array<CachedAsciiAttributeValueEntry, 64>& ascii_attribute_value_cache()
+{
+    static thread_local NeverDestroyed<Array<CachedAsciiAttributeValueEntry, 64>> s_cache;
+    return *s_cache;
+}
+
+static bool ascii_bytes_contain_whitespace(ReadonlyBytes bytes)
+{
+    for (u8 byte : bytes) {
+        if (byte <= ' ' && Infra::is_ascii_whitespace(byte))
+            return true;
+    }
+    return false;
+}
+
+// OPTIMIZATION: Repeated ASCII attribute values just above the 7-byte short-string threshold (such as "checkbox",
+//               "completed", or repeated class names in list markup) share a single immutable string buffer instead of
+//               allocating and freeing a new buffer for every element.
+template<typename CodeUnit>
+static Utf16String cached_ascii_attribute_value(ReadonlySpan<CodeUnit> code_units, bool prefer_fly_string)
+{
+    auto const length = code_units.size();
+    if (length < 8 || length > 32)
+        return utf16_string_from_ascii_code_units(code_units);
+
+    u32 hash = static_cast<u32>(length) * 2654435761u;
+    hash = (hash ^ static_cast<u32>(code_units[0])) * 2246822519u;
+    hash = (hash ^ static_cast<u32>(code_units[length / 2])) * 3266489917u;
+    hash = (hash ^ static_cast<u32>(code_units[length - 1])) * 668265263u;
+    if (hash == 0)
+        hash = 1;
+
+    auto& entry = ascii_attribute_value_cache()[(hash ^ (hash >> 16)) & 63];
+    if (entry.hash == hash && entry.value.length_in_code_units() == length) {
+        auto cached_bytes = entry.value.utf16_view().latin1_span();
+        bool matches = true;
+        if constexpr (sizeof(CodeUnit) == 1) {
+            matches = memcmp(cached_bytes.data(), code_units.data(), length) == 0;
+        } else {
+            for (size_t i = 0; i < length; ++i) {
+                if (static_cast<u16>(cached_bytes[i]) != static_cast<u16>(code_units[i])) {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if (matches) {
+            if (prefer_fly_string && !entry.is_fly_string && !ascii_bytes_contain_whitespace(cached_bytes)) {
+                entry.value = Utf16FlyString { entry.value }.to_utf16_string();
+                entry.is_fly_string = true;
+            }
+            return entry.value;
+        }
+    }
+
+    auto value = utf16_string_from_ascii_code_units(code_units);
+    bool is_fly_string = false;
+    if (prefer_fly_string && !ascii_bytes_contain_whitespace(value.utf16_view().latin1_span())) {
+        value = Utf16FlyString { value }.to_utf16_string();
+        is_fly_string = true;
+    }
+    entry = { hash, value, is_fly_string };
+    return value;
 }
 
 static Utf16String utf16_string_from_span(ReadonlyBytes latin1, IsKnownToBeASCII is_known_to_be_ascii)
@@ -162,14 +239,32 @@ static Utf16String const& newline_then_spaces_string(size_t length)
     return *string;
 }
 
-// OPTIMIZATION: Markup indents tags with a newline followed by spaces, so many Text nodes hold such a run. Like Blink,
-//               share one string for each length of these runs instead of allocating one for every Text node.
+static Utf16String const& newline_then_tabs_string(size_t length)
+{
+    VERIFY(length > 1 && length < newline_then_spaces_table_size);
+    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> newline_then_tabs_strings;
+    auto& string = (*newline_then_tabs_strings)[length];
+    if (!string.has_value()) {
+        Array<char, newline_then_spaces_table_size> characters;
+        characters[0] = '\n';
+        characters.span().slice(1, length - 1).fill('\t');
+        string = Utf16String::from_utf8_without_validation({ characters.data(), length });
+    }
+    return *string;
+}
+
+// OPTIMIZATION: Markup indents tags with a newline followed by spaces or tabs, so many Text nodes hold such a run.
+//               Like Blink, share one string for each length of these runs instead of allocating one for every Text node.
 template<typename CharT, typename... IsKnownToBeASCIIOrNothing>
 static Utf16String text_node_data_from_span(ReadonlySpan<CharT> text, IsKnownToBeASCIIOrNothing... is_known_to_be_ascii)
 {
-    if (text.size() > 1 && text.size() < newline_then_spaces_table_size && text[0] == '\n'
-        && all_of(text.slice(1), [](CharT ch) { return ch == ' '; }))
-        return newline_then_spaces_string(text.size());
+    if (text.size() > 1 && text.size() < newline_then_spaces_table_size && text[0] == '\n') {
+        auto second = text[1];
+        if (second == ' ' && all_of(text.slice(2), [](CharT ch) { return ch == ' '; }))
+            return newline_then_spaces_string(text.size());
+        if (second == '\t' && all_of(text.slice(2), [](CharT ch) { return ch == '\t'; }))
+            return newline_then_tabs_string(text.size());
+    }
     return utf16_string_from_span(text, is_known_to_be_ascii...);
 }
 
@@ -1566,6 +1661,10 @@ public:
     {
         auto& document = context.document();
         auto registry = look_up_a_custom_element_registry(context);
+        bool const skip_observer_checks = document.editing_history_if_exists() == nullptr
+            && !document.page().accessibility_interested()
+            && !document.page().listen_for_dom_mutations()
+            && document.document_translator_if_exists() == nullptr;
         GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
         auto append = [&](GC::Ref<DOM::Node> node) {
             if (parents.is_empty())
@@ -1580,18 +1679,35 @@ public:
             switch (operation.kind) {
             case RustFfiHtmlFragmentOperationKind::OpenElement:
             case RustFfiHtmlFragmentOperationKind::AppendVoidElement: {
-                auto element = MUST(DOM::create_element(document, Utf16FlyString::from_raw(operation.tag_name), Namespace::HTML, {}, {}, false, registry));
+                auto element = DOM::create_builtin_html_element_by_raw_local_name(document, operation.tag_name, registry);
                 element->ensure_attribute_capacity(operation.length);
+                bool const is_input = operation.tag_name == TagNames::input.raw_identity();
+                bool input_needs_reset = false;
                 for (auto const& attribute : attributes.slice(operation.start, operation.length)) {
-                    auto is_ascii = attribute.value_is_ascii ? IsKnownToBeASCII::Yes : IsKnownToBeASCII::No;
+                    bool const is_class = attribute.known_name == AttributeNames::class_.raw_identity();
+                    if (is_input
+                        && (attribute.known_name == AttributeNames::value.raw_identity()
+                            || attribute.known_name == AttributeNames::checked.raw_identity())) {
+                        input_needs_reset = true;
+                    }
                     auto value = with_code_units(attribute.value_start, attribute.value_length, [&](auto code_units) {
-                        return utf16_string_from_span(code_units, is_ascii);
+                        if (attribute.value_is_ascii)
+                            return cached_ascii_attribute_value(code_units, is_class);
+                        return utf16_string_from_span(code_units, IsKnownToBeASCII::No);
                     });
-                    element->append_attribute(DOM::QualifiedName { attribute_name(attribute), {}, {} }, move(value));
+                    element->append_attribute_from_detached_parser(attribute_qualified_name(attribute), move(value), skip_observer_checks);
                 }
-                auto& html_element = as<HTMLElement>(*element);
-                if (html_element.is_form_associated_element() && html_element.is_resettable())
-                    html_element.reset_algorithm();
+                // NB: Among the built-in HTML tags accepted by the fragment scanner, only <input> is resettable,
+                //     and fragment.rs restricts <input> to type="text" or type="checkbox" (or default text). For a
+                //     brand-new detached text/checkbox input without value or checked attributes, reset_algorithm()
+                //     leaves every state field unchanged.
+                if (input_needs_reset) {
+                    as<HTMLElement>(*element).reset_algorithm();
+                } else if (is_input) {
+                    auto type_state = as<HTMLInputElement>(*element).type_state();
+                    VERIFY(type_state == HTMLInputElement::TypeAttributeState::Text
+                        || type_state == HTMLInputElement::TypeAttributeState::Checkbox);
+                }
                 append(element);
                 if (operation.kind == RustFfiHtmlFragmentOperationKind::OpenElement)
                     parents.append(element);
@@ -1627,17 +1743,112 @@ private:
         return callback(m_input.utf16_span().slice(start, length));
     }
 
-    Utf16FlyString attribute_name(RustFfiHtmlFragmentAttribute const& attribute) const
+    DOM::QualifiedName attribute_qualified_name(RustFfiHtmlFragmentAttribute const& attribute) const
     {
-        if (attribute.known_name)
-            return Utf16FlyString::from_raw(attribute.known_name);
-        // NB: The scanner only takes names of lowercase ASCII letters, digits and hyphens.
-        if (m_input.has_latin1_storage()) {
-            auto name = m_input.latin1_span().slice(attribute.name_start, attribute.name_length);
-            return Utf16FlyString::from_utf8_without_validation({ name.data(), name.size() });
+        if (auto raw = attribute.known_name) {
+            if (raw == AttributeNames::class_.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_class { DOM::QualifiedName { AttributeNames::class_, {}, {} } };
+                return *s_class;
+            }
+            if (raw == AttributeNames::type.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_type { DOM::QualifiedName { AttributeNames::type, {}, {} } };
+                return *s_type;
+            }
+            if (raw == AttributeNames::value.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_value { DOM::QualifiedName { AttributeNames::value, {}, {} } };
+                return *s_value;
+            }
+            if (raw == AttributeNames::id.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_id { DOM::QualifiedName { AttributeNames::id, {}, {} } };
+                return *s_id;
+            }
+            if (raw == AttributeNames::checked.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_checked { DOM::QualifiedName { AttributeNames::checked, {}, {} } };
+                return *s_checked;
+            }
+            if (raw == AttributeNames::href.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_href { DOM::QualifiedName { AttributeNames::href, {}, {} } };
+                return *s_href;
+            }
+            if (raw == AttributeNames::style.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_style { DOM::QualifiedName { AttributeNames::style, {}, {} } };
+                return *s_style;
+            }
+            if (raw == AttributeNames::name.raw_identity()) {
+                static NeverDestroyed<DOM::QualifiedName> s_name { DOM::QualifiedName { AttributeNames::name, {}, {} } };
+                return *s_name;
+            }
+            static NeverDestroyed<HashMap<FlatPtr, DOM::QualifiedName>> s_known_attribute_qualified_names;
+            auto& cache = *s_known_attribute_qualified_names;
+            if (auto it = cache.find(raw); it != cache.end())
+                return it->value;
+            DOM::QualifiedName qualified_name { Utf16FlyString::from_raw(raw), {}, {} };
+            cache.set(raw, qualified_name);
+            return qualified_name;
         }
-        auto name = m_input.utf16_span().slice(attribute.name_start, attribute.name_length);
-        return Utf16FlyString::from_utf16({ name.data(), name.size() });
+        if (m_input.has_latin1_storage())
+            return cached_custom_attribute_qualified_name(m_input.latin1_span().slice(attribute.name_start, attribute.name_length));
+        return cached_custom_attribute_qualified_name(m_input.utf16_span().slice(attribute.name_start, attribute.name_length));
+    }
+
+    struct CachedCustomName {
+        u32 hash { 0 };
+        Optional<DOM::QualifiedName> qualified_name;
+    };
+
+    static Array<CachedCustomName, 64>& custom_attribute_name_cache()
+    {
+        static thread_local NeverDestroyed<Array<CachedCustomName, 64>> s_custom_name_cache;
+        return *s_custom_name_cache;
+    }
+
+    template<typename CodeUnit>
+    static DOM::QualifiedName cached_custom_attribute_qualified_name(ReadonlySpan<CodeUnit> name)
+    {
+        auto const length = name.size();
+        if (length == 0 || length > 32) {
+            if constexpr (sizeof(CodeUnit) == 1)
+                return DOM::QualifiedName { Utf16FlyString::from_utf8_without_validation({ name.data(), length }), {}, {} };
+            else
+                return DOM::QualifiedName { Utf16FlyString::from_utf16({ name.data(), length }), {}, {} };
+        }
+
+        u32 hash = static_cast<u32>(length) * 2654435761u;
+        hash = (hash ^ static_cast<u32>(name[0])) * 2246822519u;
+        hash = (hash ^ static_cast<u32>(name[length / 2])) * 3266489917u;
+        hash = (hash ^ static_cast<u32>(name[length - 1])) * 668265263u;
+        if (hash == 0)
+            hash = 1;
+
+        auto& entry = custom_attribute_name_cache()[(hash ^ (hash >> 16)) & 63];
+        if (entry.hash == hash && entry.qualified_name.has_value()) {
+            auto cached_view = entry.qualified_name->local_name().view();
+            if (cached_view.length_in_code_units() == length && cached_view.has_latin1_storage()) {
+                auto cached_bytes = cached_view.latin1_span();
+                bool matches = true;
+                if constexpr (sizeof(CodeUnit) == 1) {
+                    matches = memcmp(cached_bytes.data(), name.data(), length) == 0;
+                } else {
+                    for (size_t i = 0; i < length; ++i) {
+                        if (static_cast<u16>(cached_bytes[i]) != static_cast<u16>(name[i])) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                }
+                if (matches)
+                    return *entry.qualified_name;
+            }
+        }
+
+        Utf16FlyString fly_name;
+        if constexpr (sizeof(CodeUnit) == 1)
+            fly_name = Utf16FlyString::from_utf8_without_validation({ name.data(), length });
+        else
+            fly_name = Utf16FlyString::from_utf16({ name.data(), length });
+        DOM::QualifiedName qualified_name { fly_name, {}, {} };
+        entry = { hash, qualified_name };
+        return qualified_name;
     }
 
     Utf16View m_input;

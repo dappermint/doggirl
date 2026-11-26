@@ -35,6 +35,9 @@ struct ImplTraits : public Traits<QualifiedName::Impl*> {
     }
 };
 
+static constexpr size_t qualified_name_cache_size = 256;
+static QualifiedName::Impl* s_qualified_name_cache[qualified_name_cache_size] {};
+
 static HashTable<QualifiedName::Impl*, ImplTraits>& impls()
 {
     static NeverDestroyed<HashTable<QualifiedName::Impl*, ImplTraits>> impls;
@@ -44,15 +47,22 @@ static HashTable<QualifiedName::Impl*, ImplTraits>& impls()
 static NonnullRefPtr<QualifiedName::Impl> ensure_impl(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_)
 {
     unsigned hash = hash_impl(local_name, prefix, namespace_);
+    auto& slot = s_qualified_name_cache[hash & (qualified_name_cache_size - 1)];
+    if (slot && slot->local_name == local_name && slot->prefix == prefix && slot->namespace_ == namespace_)
+        return *slot;
 
     auto it = impls().find(hash, [&](QualifiedName::Impl* entry) {
         return entry->local_name == local_name
             && entry->prefix == prefix
             && entry->namespace_ == namespace_;
     });
-    if (it != impls().end())
+    if (it != impls().end()) {
+        slot = *it;
         return *(*it);
-    return adopt_ref(*new QualifiedName::Impl(local_name, prefix, namespace_));
+    }
+    auto impl = adopt_ref(*new QualifiedName::Impl(local_name, prefix, namespace_));
+    slot = impl.ptr();
+    return impl;
 }
 
 QualifiedName::QualifiedName(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_)
@@ -72,6 +82,10 @@ QualifiedName::Impl::Impl(Utf16FlyString const& a_local_name, Optional<Utf16FlyS
 
 QualifiedName::Impl::~Impl()
 {
+    unsigned hash = hash_impl(local_name, prefix, namespace_);
+    auto& slot = s_qualified_name_cache[hash & (qualified_name_cache_size - 1)];
+    if (slot == this)
+        slot = nullptr;
     impls().remove(this);
 }
 

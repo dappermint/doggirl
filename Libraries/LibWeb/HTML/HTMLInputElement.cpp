@@ -126,42 +126,48 @@ void HTMLInputElement::set_user_validity(bool flag)
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
+void HTMLInputElement::RareInputData::visit_edges(Cell::Visitor& visitor)
+{
+    visitor.visit(search_clear_button);
+    visitor.visit(date_time_fields_container);
+    for (auto const& field : date_time_fields)
+        visitor.visit(field.element);
+    visitor.visit(image_button_alt_text_node);
+    visitor.visit(up_button_element);
+    visitor.visit(down_button_element);
+    visitor.visit(color_well_element);
+    visitor.visit(file_button);
+    visitor.visit(file_label);
+    visitor.visit(slider_runnable_track);
+    visitor.visit(slider_progress_element);
+    visitor.visit(slider_thumb_container);
+    visitor.visit(slider_thumb);
+    visitor.visit(slider_ticks_element);
+    visitor.visit(slider_drag_mousemove_listener);
+    visitor.visit(slider_drag_mouseup_listener);
+    visitor.visit(resource_request);
+    visitor.visit(radio_button_group_registry);
+    visitor.visit(legacy_pre_activation_behavior_checked_element_in_group);
+    visitor.visit(selected_files);
+}
+
 void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_inner_text_element);
     visitor.visit(m_text_node);
-    visitor.visit(m_date_time_fields_container);
-    for (auto const& field : m_date_time_fields)
-        visitor.visit(field.element);
-    visitor.visit(m_image_button_alt_text_node);
     visitor.visit(m_placeholder_element);
-    visitor.visit(m_search_clear_button);
     visitor.visit(m_placeholder_text_node);
-    visitor.visit(m_up_button_element);
-    visitor.visit(m_down_button_element);
-    visitor.visit(m_color_well_element);
-    visitor.visit(m_file_button);
-    visitor.visit(m_file_label);
-    visitor.visit(m_legacy_pre_activation_behavior_checked_element_in_group);
-    visitor.visit(m_radio_button_group_registry);
-    visitor.visit(m_selected_files);
-    visitor.visit(m_slider_runnable_track);
-    visitor.visit(m_slider_progress_element);
-    visitor.visit(m_slider_thumb_container);
-    visitor.visit(m_slider_thumb);
-    visitor.visit(m_slider_ticks_element);
-    visitor.visit(m_slider_drag_mousemove_listener);
-    visitor.visit(m_slider_drag_mouseup_listener);
-    visitor.visit(m_resource_request);
+    if (m_rare_input_data)
+        m_rare_input_data->visit_edges(visitor);
 }
 
 void HTMLInputElement::adopted_from(DOM::Document& old_document)
 {
     Base::adopted_from(old_document);
 
-    if (m_load_event_delayer.has_value())
-        m_load_event_delayer.emplace(document());
+    if (m_rare_input_data && m_rare_input_data->load_event_delayer.has_value())
+        m_rare_input_data->load_event_delayer.emplace(document());
 
     // NB: See handle_src_attribute().
     if (old_document.is_temporary_document_for_fragment_parsing()) {
@@ -232,8 +238,8 @@ void HTMLInputElement::set_checked(bool checked)
 
     // NB: The registry unchecks the other members of the group and republishes their validity. The tree walks
     //     below are a fallback for radio buttons that have no registry.
-    if (m_radio_button_group_registry) {
-        m_radio_button_group_registry->checked_state_changed(m_radio_button_group_name, *this);
+    if (m_rare_input_data && m_rare_input_data->radio_button_group_registry) {
+        m_rare_input_data->radio_button_group_registry->checked_state_changed(m_rare_input_data->radio_button_group_name, *this);
     } else if (type_state() == TypeAttributeState::RadioButton && name().has_value() && !name()->is_empty()) {
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
             if (&element != this && is_in_same_radio_button_group_as(element))
@@ -348,9 +354,10 @@ GC::Ptr<FileAPI::FileList> HTMLInputElement::files()
     if (m_type != TypeAttributeState::FileUpload)
         return nullptr;
 
-    if (!m_selected_files)
-        m_selected_files = FileAPI::FileList::create();
-    return m_selected_files;
+    auto& rare_data = ensure_rare_input_data();
+    if (!rare_data.selected_files)
+        rare_data.selected_files = FileAPI::FileList::create();
+    return rare_data.selected_files;
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-files
@@ -361,7 +368,7 @@ void HTMLInputElement::set_files(GC::Ptr<FileAPI::FileList> files)
         return;
 
     // 2. Replace the element's selected files with the given value.
-    m_selected_files = files;
+    ensure_rare_input_data().selected_files = files;
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#attr-input-accept
@@ -573,7 +580,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::E
             CSSPixels x { mouse_event->offset_x() };
             CSSPixels y { mouse_event->offset_y() };
 
-            m_selected_coordinate = { x.to_int(), y.to_int() };
+            ensure_rare_input_data().selected_coordinate = { x.to_int(), y.to_int() };
         }
 
         // 4. Submit the element's form owner from the element with userInvolvement set to event's user navigation involvement.
@@ -683,11 +690,12 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
     auto multiple = has_attribute(HTML::AttributeNames::multiple);
 
     // 1. Update element's selected files so that it represents the user's selection.
-    if (m_selected_files && multiple && multiple_handling == MultipleHandling::Append) {
+    auto& rare_data = ensure_rare_input_data();
+    if (rare_data.selected_files && multiple && multiple_handling == MultipleHandling::Append) {
         for (size_t i = 0; i < files->length(); ++i)
-            m_selected_files->add_file(*files->item(i));
+            rare_data.selected_files->add_file(*files->item(i));
     } else {
-        m_selected_files = files;
+        rare_data.selected_files = files;
     }
 
     update_file_input_shadow_tree();
@@ -725,8 +733,8 @@ Utf16String HTMLInputElement::value() const
     case ValueAttributeMode::Filename:
         // On getting, return the string "C:\fakepath\" followed by the name of the first file in the list of selected
         // files, if any, or the empty string if the list is empty.
-        if (m_selected_files && m_selected_files->item(0))
-            return Utf16String::formatted("C:\\fakepath\\{}", m_selected_files->item(0)->name());
+        if (m_rare_input_data && m_rare_input_data->selected_files && m_rare_input_data->selected_files->item(0))
+            return Utf16String::formatted("C:\\fakepath\\{}", m_rare_input_data->selected_files->item(0)->name());
         return {};
     }
 
@@ -820,10 +828,10 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
                 set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units(), SelectionDirection::None, SelectionSource::ValueChange);
 
             update_shadow_tree();
-        } else if (!m_date_time_fields.is_empty()) {
+        } else if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty()) {
             // NB: Setting the value replaces what the user typed into the date and time fields, even when the value
             //     stays the same, as it does for fields that do not yet make a value.
-            m_date_time_fields_value = {};
+            m_rare_input_data->date_time_fields_value = {};
             CSS::Invalidation::invalidate_style_after_validity_change(*this);
             update_shadow_tree();
         }
@@ -845,7 +853,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
         if (!value.is_empty())
             return WebIDL::InvalidStateError::create("Setting value of input type file to non-empty string"_utf16);
 
-        m_selected_files = nullptr;
+        if (m_rare_input_data)
+            m_rare_input_data->selected_files = nullptr;
         break;
     }
 
@@ -958,11 +967,11 @@ void HTMLInputElement::update_text_input_decorations()
     // so `:placeholder-shown` moves with it and the style engine has to be told.
     CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
 
-    if (m_search_clear_button) {
+    if (m_rare_input_data && m_rare_input_data->search_clear_button) {
         if (m_value.is_empty())
-            set_own_inline_style(*m_search_clear_button, hidden_text_input_decoration_style());
+            set_own_inline_style(*m_rare_input_data->search_clear_button, hidden_text_input_decoration_style());
         else
-            m_search_clear_button->set_inline_style(nullptr);
+            m_rare_input_data->search_clear_button->set_inline_style(nullptr);
     }
 
     if (!m_placeholder_element)
@@ -1012,14 +1021,14 @@ void HTMLInputElement::update_text_input_shadow_tree()
     update_text_input_decorations();
     update_date_time_fields();
 
-    if (m_type == TypeAttributeState::Number && m_up_button_element && m_down_button_element) {
+    if (m_type == TypeAttributeState::Number && m_rare_input_data && m_rare_input_data->up_button_element && m_rare_input_data->down_button_element) {
         // The `textfield` appearance is used to hide the stepper buttons.
         if (auto style = computed_style(); style && style->appearance() == CSS::Appearance::Textfield) {
-            set_own_inline_style(*m_up_button_element, stepper_button_style_when_hidden());
-            set_own_inline_style(*m_down_button_element, stepper_button_style_when_hidden());
+            set_own_inline_style(*m_rare_input_data->up_button_element, stepper_button_style_when_hidden());
+            set_own_inline_style(*m_rare_input_data->down_button_element, stepper_button_style_when_hidden());
         } else {
-            set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
-            set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
+            set_own_inline_style(*m_rare_input_data->up_button_element, stepper_button_style_when_visible());
+            set_own_inline_style(*m_rare_input_data->down_button_element, stepper_button_style_when_visible());
         }
     }
 }
@@ -1208,18 +1217,19 @@ void HTMLInputElement::create_image_button_alt_text_shadow_tree()
     // Keep the wrapper from introducing a block or a bidi isolate so the fallback behaves as
     // ordinary phrasing content.
     wrapper->set_attribute_value(HTML::AttributeNames::style, "display: inline; unicode-bidi: normal;"_utf16);
-    m_image_button_alt_text_node = DOM::Text::create(document(), get_attribute_value(HTML::AttributeNames::alt));
-    MUST(wrapper->append_child(*m_image_button_alt_text_node));
+    auto& alt_text_node = ensure_rare_input_data().image_button_alt_text_node;
+    alt_text_node = DOM::Text::create(document(), get_attribute_value(HTML::AttributeNames::alt));
+    MUST(wrapper->append_child(*alt_text_node));
     MUST(shadow_root->append_child(*wrapper));
 }
 
 void HTMLInputElement::remove_image_button_alt_text_shadow_tree()
 {
-    if (!m_image_button_alt_text_node)
+    if (!m_rare_input_data || !m_rare_input_data->image_button_alt_text_node)
         return;
 
     set_shadow_root(nullptr);
-    m_image_button_alt_text_node = nullptr;
+    m_rare_input_data->image_button_alt_text_node = nullptr;
 }
 
 void HTMLInputElement::update_image_button_alt_text_shadow_tree()
@@ -1236,12 +1246,12 @@ void HTMLInputElement::update_image_button_alt_text_shadow_tree()
         return;
     }
 
-    if (!m_image_button_alt_text_node) {
+    if (!m_rare_input_data || !m_rare_input_data->image_button_alt_text_node) {
         create_image_button_alt_text_shadow_tree();
         return;
     }
 
-    m_image_button_alt_text_node->set_data(alt_text);
+    m_rare_input_data->image_button_alt_text_node->set_data(alt_text);
 }
 
 void HTMLInputElement::create_text_input_shadow_tree()
@@ -1288,15 +1298,18 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(element->append_child(*text_container));
     }
 
-    m_date_time_fields_container = nullptr;
-    m_date_time_fields.clear();
+    if (m_rare_input_data) {
+        m_rare_input_data->date_time_fields_container = nullptr;
+        m_rare_input_data->date_time_fields.clear();
+    }
     if (has_date_picker()) {
         // NB: Date and time inputs are edited one field at a time, so they have no editable text.
         m_inner_text_element = nullptr;
         m_text_node = nullptr;
-        m_date_time_fields_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-        m_date_time_fields_container->set_attribute_value(HTML::AttributeNames::style, "flex: 1; min-width: 0; height: 1lh; overflow: hidden; white-space: pre;"_utf16);
-        MUST(text_container->append_child(*m_date_time_fields_container));
+        auto& container = ensure_rare_input_data().date_time_fields_container;
+        container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+        container->set_attribute_value(HTML::AttributeNames::style, "flex: 1; min-width: 0; height: 1lh; overflow: hidden; white-space: pre;"_utf16);
+        MUST(text_container->append_child(*container));
         create_date_time_fields();
     }
 
@@ -1335,37 +1348,39 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     if (type_state() == TypeAttributeState::Search) {
-        m_search_clear_button = MUST(DOM::create_element(document(), TagNames::button, Namespace::HTML));
-        m_search_clear_button->set_attribute_value(AttributeNames::type, "button"_utf16);
-        m_search_clear_button->set_attribute_value(ARIA::AttributeNames::aria_label, "Clear search"_utf16);
-        MUST(m_search_clear_button->set_text_content(u"\N{MULTIPLICATION SIGN}"_utf16));
-        MUST(element->append_child(*m_search_clear_button));
-        m_search_clear_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::WebkitSearchCancelButton);
+        auto& search_clear_button = ensure_rare_input_data().search_clear_button;
+        search_clear_button = MUST(DOM::create_element(document(), TagNames::button, Namespace::HTML));
+        search_clear_button->set_attribute_value(AttributeNames::type, "button"_utf16);
+        search_clear_button->set_attribute_value(ARIA::AttributeNames::aria_label, "Clear search"_utf16);
+        MUST(search_clear_button->set_text_content(u"\N{MULTIPLICATION SIGN}"_utf16));
+        MUST(element->append_child(*search_clear_button));
+        search_clear_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::WebkitSearchCancelButton);
     }
     if (type_state() == TypeAttributeState::Number) {
         // NB: The buttons start out with the style they have when shown, so that the style application that follows
         //     only rewrites their declarations when appearance hides them.
 
+        auto& rare_data = ensure_rare_input_data();
         auto stepper_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
         stepper_container->set_attribute_value(HTML::AttributeNames::style, "display: flex; flex-direction: column; align-self: stretch;"_utf16);
         MUST(element->append_child(stepper_container));
 
         // Up button
-        m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
-        set_own_inline_style(*m_up_button_element, stepper_button_style_when_visible());
+        rare_data.up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*rare_data.up_button_element, stepper_button_style_when_visible());
 
         auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 0.7em; height: 0.5em;"_utf16);
         up_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_utf16_string());
         up_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "5 7 14 10"_utf16);
-        MUST(m_up_button_element->append_child(up_button_svg));
+        MUST(rare_data.up_button_element->append_child(up_button_svg));
 
         auto up_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
         up_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_utf16);
         up_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z"_utf16);
         MUST(up_button_svg->append_child(up_button_svg_path));
 
-        MUST(stepper_container->append_child(*m_up_button_element));
+        MUST(stepper_container->append_child(*rare_data.up_button_element));
 
         auto mouseup_callback_function = JS::NativeFunction::create(
             HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
@@ -1384,25 +1399,25 @@ void HTMLInputElement::create_text_input_shadow_tree()
             }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto step_up_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*up_callback_function, HTML::relevant_realm(*this));
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_up_callback));
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
+        rare_data.up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_up_callback));
+        rare_data.up_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
 
         // Down button
-        m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
-        set_own_inline_style(*m_down_button_element, stepper_button_style_when_visible());
+        rare_data.down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
+        set_own_inline_style(*rare_data.down_button_element, stepper_button_style_when_visible());
 
         auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
         down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 0.7em; height: 0.5em;"_utf16);
         down_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_utf16_string());
         down_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "5 7 14 10"_utf16);
-        MUST(m_down_button_element->append_child(down_button_svg));
+        MUST(rare_data.down_button_element->append_child(down_button_svg));
 
         auto down_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
         down_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_utf16);
         down_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"_utf16);
         MUST(down_button_svg->append_child(down_button_svg_path));
 
-        MUST(stepper_container->append_child(*m_down_button_element));
+        MUST(stepper_container->append_child(*rare_data.down_button_element));
 
         auto down_callback_function = JS::NativeFunction::create(
             HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
@@ -1411,8 +1426,8 @@ void HTMLInputElement::create_text_input_shadow_tree()
             }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto step_down_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*down_callback_function, HTML::relevant_realm(*this));
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_down_callback));
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
+        rare_data.down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_down_callback));
+        rare_data.down_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback));
     }
 
     if (has_date_picker()) {
@@ -1462,18 +1477,19 @@ void HTMLInputElement::create_color_input_shadow_tree()
     MUST(shadow_root->append_child(swatch_wrapper));
     swatch_wrapper->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::WebkitColorSwatchWrapper);
 
-    m_color_well_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    MUST(m_color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
-    MUST(swatch_wrapper->append_child(*m_color_well_element));
-    m_color_well_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::ColorSwatch);
+    auto& color_well_element = ensure_rare_input_data().color_well_element;
+    color_well_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    MUST(color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
+    MUST(swatch_wrapper->append_child(*color_well_element));
+    color_well_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::ColorSwatch);
 }
 
 void HTMLInputElement::update_color_well_element()
 {
-    if (!m_color_well_element)
+    if (!m_rare_input_data || !m_rare_input_data->color_well_element)
         return;
 
-    MUST(m_color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, m_value.utf16_view()));
+    MUST(m_rare_input_data->color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, m_value.utf16_view()));
 }
 
 void HTMLInputElement::create_file_input_shadow_tree()
@@ -1482,12 +1498,13 @@ void HTMLInputElement::create_file_input_shadow_tree()
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
-    m_file_button = DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    MUST(shadow_root->append_child(*m_file_button));
-    m_file_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::FileSelectorButton);
+    auto& rare_data = ensure_rare_input_data();
+    rare_data.file_button = DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    MUST(shadow_root->append_child(*rare_data.file_button));
+    rare_data.file_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::FileSelectorButton);
 
-    m_file_label = DOM::create_element(document(), HTML::TagNames::label, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    m_file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_utf16);
+    rare_data.file_label = DOM::create_element(document(), HTML::TagNames::label, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    rare_data.file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_utf16);
 
     auto on_button_click = GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
         show_the_picker_if_applicable(self);
@@ -1497,28 +1514,29 @@ void HTMLInputElement::create_file_input_shadow_tree()
     auto& realm = HTML::relevant_realm(*this);
     auto on_button_click_function = JS::NativeFunction::create(realm, on_button_click, 0, Utf16FlyString {}, &realm);
     auto on_button_click_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(on_button_click_function, realm);
-    m_file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(on_button_click_callback));
+    rare_data.file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(on_button_click_callback));
 
     update_file_input_shadow_tree();
 
-    MUST(shadow_root->append_child(*m_file_label));
+    MUST(shadow_root->append_child(*rare_data.file_label));
 }
 
 void HTMLInputElement::update_file_input_shadow_tree()
 {
-    if (!m_file_button || !m_file_label)
+    if (!m_rare_input_data || !m_rare_input_data->file_button || !m_rare_input_data->file_label)
         return;
 
+    auto& rare_data = *m_rare_input_data;
     auto files_label = has_attribute(HTML::AttributeNames::multiple) ? "files"sv : "file"sv;
-    m_file_button->string_replace_all(Utf16String::formatted("Select {}...", files_label));
+    rare_data.file_button->string_replace_all(Utf16String::formatted("Select {}...", files_label));
 
-    if (m_selected_files && m_selected_files->length() > 0) {
-        if (m_selected_files->length() == 1)
-            m_file_label->string_replace_all(m_selected_files->item(0)->name());
+    if (rare_data.selected_files && rare_data.selected_files->length() > 0) {
+        if (rare_data.selected_files->length() == 1)
+            rare_data.file_label->string_replace_all(rare_data.selected_files->item(0)->name());
         else
-            m_file_label->string_replace_all(Utf16String::formatted("{} files selected.", m_selected_files->length()));
+            rare_data.file_label->string_replace_all(Utf16String::formatted("{} files selected.", rare_data.selected_files->length()));
     } else {
-        m_file_label->string_replace_all(Utf16String::formatted("No {} selected.", files_label));
+        rare_data.file_label->string_replace_all(Utf16String::formatted("No {} selected.", files_label));
     }
 }
 
@@ -1565,25 +1583,26 @@ void HTMLInputElement::create_range_input_shadow_tree()
     MUST(slider_container->style()->set_property(CSS::PropertyID::Height, "100%"_utf16));
     MUST(shadow_root->append_child(*slider_container));
 
-    m_slider_runnable_track = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(slider_container->append_child(*m_slider_runnable_track));
-    m_slider_runnable_track->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
+    auto& rare_data = ensure_rare_input_data();
+    rare_data.slider_runnable_track = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    MUST(slider_container->append_child(*rare_data.slider_runnable_track));
+    rare_data.slider_runnable_track->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
 
-    m_slider_progress_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_progress_element));
-    m_slider_progress_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
+    rare_data.slider_progress_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    MUST(rare_data.slider_runnable_track->append_child(*rare_data.slider_progress_element));
+    rare_data.slider_progress_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
 
     // Keep the thumb's positioning grid inside the track so pages can style the track's display.
-    m_slider_thumb_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    m_slider_thumb_container->set_attribute_value(HTML::AttributeNames::style, "display: grid; grid-template-rows: minmax(0, 1fr); inline-size: 100%; block-size: 100%; align-items: inherit;"_utf16);
-    MUST(m_slider_runnable_track->append_child(*m_slider_thumb_container));
+    rare_data.slider_thumb_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    rare_data.slider_thumb_container->set_attribute_value(HTML::AttributeNames::style, "display: grid; grid-template-rows: minmax(0, 1fr); inline-size: 100%; block-size: 100%; align-items: inherit;"_utf16);
+    MUST(rare_data.slider_runnable_track->append_child(*rare_data.slider_thumb_container));
 
-    m_slider_thumb = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_thumb_container->append_child(*m_slider_thumb));
-    m_slider_thumb->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderThumb);
+    rare_data.slider_thumb = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    MUST(rare_data.slider_thumb_container->append_child(*rare_data.slider_thumb));
+    rare_data.slider_thumb->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderThumb);
 
-    m_slider_ticks_element = nullptr;
-    m_slider_tick_positions.clear();
+    rare_data.slider_ticks_element = nullptr;
+    rare_data.slider_tick_positions.clear();
     update_slider_shadow_tree_elements();
 }
 
@@ -1644,7 +1663,8 @@ void HTMLInputElement::start_slider_drag(CSSPixelPoint viewport_position)
             return JS::js_undefined();
         }),
         0, Utf16FlyString {}, &realm);
-    m_slider_drag_mousemove_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm));
+    auto& rare_data = ensure_rare_input_data();
+    rare_data.slider_drag_mousemove_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm));
 
     auto mouseup_callback_function = JS::NativeFunction::create(
         realm, GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
@@ -1654,18 +1674,18 @@ void HTMLInputElement::start_slider_drag(CSSPixelPoint viewport_position)
             return JS::js_undefined();
         }),
         0, Utf16FlyString {}, &realm);
-    m_slider_drag_mouseup_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm));
+    rare_data.slider_drag_mouseup_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm));
 
     auto& window = relevant_window(*this);
-    window.add_event_listener_without_options(UIEvents::EventNames::mousemove, *m_slider_drag_mousemove_listener);
-    window.add_event_listener_without_options(UIEvents::EventNames::mouseup, *m_slider_drag_mouseup_listener);
+    window.add_event_listener_without_options(UIEvents::EventNames::mousemove, *rare_data.slider_drag_mousemove_listener);
+    window.add_event_listener_without_options(UIEvents::EventNames::mouseup, *rare_data.slider_drag_mouseup_listener);
 }
 
 void HTMLInputElement::set_slider_value_from_position(CSSPixelPoint viewport_position)
 {
-    if (type_state() != TypeAttributeState::Range || !m_slider_runnable_track || !m_slider_thumb)
+    if (type_state() != TypeAttributeState::Range || !m_rare_input_data || !m_rare_input_data->slider_runnable_track || !m_rare_input_data->slider_thumb)
         return;
-    auto fraction = slider_fraction_at_position(*m_slider_runnable_track, *m_slider_thumb, viewport_position);
+    auto fraction = slider_fraction_at_position(*m_rare_input_data->slider_runnable_track, *m_rare_input_data->slider_thumb, viewport_position);
     if (!fraction.has_value())
         return;
     double minimum = *min();
@@ -1681,13 +1701,15 @@ void HTMLInputElement::set_slider_value_from_position(CSSPixelPoint viewport_pos
 
 void HTMLInputElement::end_slider_drag()
 {
+    if (!m_rare_input_data)
+        return;
     auto& window = relevant_window(*this);
-    if (m_slider_drag_mousemove_listener)
-        window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, *m_slider_drag_mousemove_listener);
-    if (m_slider_drag_mouseup_listener)
-        window.remove_event_listener_without_options(UIEvents::EventNames::mouseup, *m_slider_drag_mouseup_listener);
-    m_slider_drag_mousemove_listener = nullptr;
-    m_slider_drag_mouseup_listener = nullptr;
+    if (m_rare_input_data->slider_drag_mousemove_listener)
+        window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, *m_rare_input_data->slider_drag_mousemove_listener);
+    if (m_rare_input_data->slider_drag_mouseup_listener)
+        window.remove_event_listener_without_options(UIEvents::EventNames::mouseup, *m_rare_input_data->slider_drag_mouseup_listener);
+    m_rare_input_data->slider_drag_mousemove_listener = nullptr;
+    m_rare_input_data->slider_drag_mouseup_listener = nullptr;
 }
 
 void HTMLInputElement::user_interaction_did_change_input_value(Utf16FlyString const& input_type, Optional<Utf16String> const& data)
@@ -1732,29 +1754,33 @@ void HTMLInputElement::update_slider_shadow_tree_elements()
     auto style = computed_style();
     bool const is_native = !style || style->appearance() != CSS::Appearance::None;
 
-    if (m_slider_runnable_track) {
+    if (!m_rare_input_data)
+        return;
+    auto& rare_data = *m_rare_input_data;
+
+    if (rare_data.slider_runnable_track) {
         // The thumb occupies the middle column. The two outer columns share its travel along the inline axis.
         auto columns = Utf16String::formatted("minmax(0, {}fr) auto minmax(0, {}fr)", position, 100 - position);
-        MUST(m_slider_thumb_container->style()->set_property(CSS::PropertyID::GridTemplateColumns, columns.utf16_view()));
-        MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BorderRadius, is_native ? u"2px"sv : u"0"sv));
+        MUST(rare_data.slider_thumb_container->style()->set_property(CSS::PropertyID::GridTemplateColumns, columns.utf16_view()));
+        MUST(rare_data.slider_runnable_track->style()->set_property(CSS::PropertyID::BorderRadius, is_native ? u"2px"sv : u"0"sv));
         // NB: A slider with `appearance: none` draws no band for its track, and its track wraps the thumb, so that a
         //     thumb of any size sits in the middle of the slider. An author who sizes the track positions the thumb
         //     on it themselves.
-        MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::AlignItems, is_native ? u"center"sv : u"start"sv));
+        MUST(rare_data.slider_runnable_track->style()->set_property(CSS::PropertyID::AlignItems, is_native ? u"center"sv : u"start"sv));
         if (is_native) {
-            (void)MUST(m_slider_runnable_track->style()->remove_property(CSS::PropertyID::BlockSize));
-            (void)MUST(m_slider_runnable_track->style()->remove_property(CSS::PropertyID::BackgroundColor));
+            (void)MUST(rare_data.slider_runnable_track->style()->remove_property(CSS::PropertyID::BlockSize));
+            (void)MUST(rare_data.slider_runnable_track->style()->remove_property(CSS::PropertyID::BackgroundColor));
         } else {
-            MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BlockSize, "auto"_utf16));
-            MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BackgroundColor, "transparent"_utf16));
+            MUST(rare_data.slider_runnable_track->style()->set_property(CSS::PropertyID::BlockSize, "auto"_utf16));
+            MUST(rare_data.slider_runnable_track->style()->set_property(CSS::PropertyID::BackgroundColor, "transparent"_utf16));
         }
     }
 
-    if (m_slider_progress_element) {
+    if (rare_data.slider_progress_element) {
         auto inline_size = Utf16String::formatted("calc({}% + {}px)", position, thumb_width / 2 - thumb_offset);
-        MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::InlineSize, inline_size.utf16_view()));
+        MUST(rare_data.slider_progress_element->style()->set_property(CSS::PropertyID::InlineSize, inline_size.utf16_view()));
         auto fill_color = is_native ? (enabled() ? u"AccentColor"sv : u"GrayText"sv) : u"transparent"sv;
-        MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::BackgroundColor, fill_color));
+        MUST(rare_data.slider_progress_element->style()->set_property(CSS::PropertyID::BackgroundColor, fill_color));
     }
 
     update_slider_ticks();
@@ -1764,9 +1790,10 @@ void HTMLInputElement::update_slider_shadow_tree_elements()
 //     positions the center of its thumb takes for them.
 void HTMLInputElement::update_slider_ticks()
 {
-    if (!m_slider_runnable_track)
+    if (!m_rare_input_data || !m_rare_input_data->slider_runnable_track)
         return;
 
+    auto& rare_data = *m_rare_input_data;
     Vector<double> positions;
     auto style = computed_style();
     bool const is_native = !style || style->appearance() != CSS::Appearance::None;
@@ -1785,29 +1812,29 @@ void HTMLInputElement::update_slider_ticks()
         }
     }
 
-    if (positions == m_slider_tick_positions)
+    if (positions == rare_data.slider_tick_positions)
         return;
-    m_slider_tick_positions = move(positions);
+    rare_data.slider_tick_positions = move(positions);
 
-    if (m_slider_tick_positions.is_empty()) {
-        if (m_slider_ticks_element)
-            m_slider_ticks_element->remove();
-        m_slider_ticks_element = nullptr;
+    if (rare_data.slider_tick_positions.is_empty()) {
+        if (rare_data.slider_ticks_element)
+            rare_data.slider_ticks_element->remove();
+        rare_data.slider_ticks_element = nullptr;
         return;
     }
-    if (!m_slider_ticks_element) {
-        m_slider_ticks_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-        m_slider_ticks_element->set_attribute_value(HTML::AttributeNames::style, "position: absolute; inset-inline: 0; inset-block-start: calc(100% + 2px); block-size: 4px; pointer-events: none;"_utf16);
+    if (!rare_data.slider_ticks_element) {
+        rare_data.slider_ticks_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+        rare_data.slider_ticks_element->set_attribute_value(HTML::AttributeNames::style, "position: absolute; inset-inline: 0; inset-block-start: calc(100% + 2px); block-size: 4px; pointer-events: none;"_utf16);
         // NB: The ticks go before the thumb in tree order, so the thumb paints over them.
-        m_slider_runnable_track->insert_before(*m_slider_ticks_element, m_slider_thumb_container);
+        rare_data.slider_runnable_track->insert_before(*rare_data.slider_ticks_element, rare_data.slider_thumb_container);
     }
 
     static constexpr double thumb_width = 16;
-    m_slider_ticks_element->replace_all(nullptr);
-    for (auto position : m_slider_tick_positions) {
+    rare_data.slider_ticks_element->replace_all(nullptr);
+    for (auto position : rare_data.slider_tick_positions) {
         auto tick = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
         tick->set_attribute_value(HTML::AttributeNames::style, Utf16String::formatted("position: absolute; inset-inline-start: calc({}% + {}px); inline-size: 1px; block-size: 100%; background-color: color-mix(in srgb, CanvasText 40%, transparent);", position, thumb_width / 2 - thumb_width * position / 100 - 0.5));
-        MUST(m_slider_ticks_element->append_child(tick));
+        MUST(rare_data.slider_ticks_element->append_child(tick));
     }
 }
 
@@ -1819,11 +1846,11 @@ void HTMLInputElement::suggestions_source_element_did_change()
 
 void HTMLInputElement::did_receive_focus()
 {
-    if (!m_date_time_fields.is_empty()) {
+    if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty()) {
         // NB: Keyboard focus starts at the first field; a click picks the field it lands on.
         if (document().last_focus_trigger() == FocusTrigger::Key)
-            m_active_date_time_field = 0;
-        m_date_time_field_typed_digits = 0;
+            m_rare_input_data->active_date_time_field = 0;
+        m_rare_input_data->date_time_field_typed_digits = 0;
         update_date_time_field_elements();
     }
 
@@ -1846,8 +1873,8 @@ void HTMLInputElement::did_lose_focus()
 {
     reveal_cursor_if_pending();
 
-    if (!m_date_time_fields.is_empty()) {
-        m_date_time_field_typed_digits = 0;
+    if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty()) {
+        m_rare_input_data->date_time_field_typed_digits = 0;
         update_date_time_field_elements();
     }
 
@@ -1868,7 +1895,8 @@ void HTMLInputElement::did_lose_focus()
 
 void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
-    PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
+    if (name == HTML::AttributeNames::popovertarget || name == HTML::AttributeNames::popovertargetaction)
+        PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
 
     if (name == HTML::AttributeNames::checked) {
         // https://html.spec.whatwg.org/multipage/input.html#the-input-element:concept-input-checked-dirty-2
@@ -1888,7 +1916,8 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
         // and its value has changed since the last time the type attribute was in the Image Button state
         if (type_state() == TypeAttributeState::ImageButton) {
             if (auto src = attribute(AttributeNames::src); src.has_value()) {
-                if (*src != m_last_src_value)
+                auto last_src_value = m_rare_input_data ? m_rare_input_data->last_src_value.utf16_view() : Utf16View {};
+                if (*src != last_src_value)
                     handle_src_attribute(*src).release_value_but_fixme_should_propagate_errors();
             }
         }
@@ -1959,14 +1988,14 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
     } else if (name == HTML::AttributeNames::name) {
         update_radio_button_group_registration();
     } else if (name == HTML::AttributeNames::required) {
-        if (m_radio_button_group_registry && old_value.has_value() != value.has_value())
-            m_radio_button_group_registry->required_state_changed(m_radio_button_group_name, *this);
+        if (m_rare_input_data && m_rare_input_data->radio_button_group_registry && old_value.has_value() != value.has_value())
+            m_rare_input_data->radio_button_group_registry->required_state_changed(m_rare_input_data->radio_button_group_name, *this);
     }
 
     // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
     //         therefore which validity pseudo-classes match. Re-setting an attribute to its current value cannot
-    //         change validity, so skip the invalidation in that case.
-    if (old_value != value && first_is_one_of(name, HTML::AttributeNames::type, HTML::AttributeNames::value, HTML::AttributeNames::required, HTML::AttributeNames::pattern, HTML::AttributeNames::min, HTML::AttributeNames::max, HTML::AttributeNames::step, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength, HTML::AttributeNames::multiple))
+    //         change validity, and detached elements have no style or ancestors to invalidate.
+    if (is_connected() && old_value != value && first_is_one_of(name, HTML::AttributeNames::type, HTML::AttributeNames::value, HTML::AttributeNames::required, HTML::AttributeNames::pattern, HTML::AttributeNames::min, HTML::AttributeNames::max, HTML::AttributeNames::step, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength, HTML::AttributeNames::multiple))
         CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
@@ -1979,12 +2008,15 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     if (old_state == new_state)
         return;
 
-    auto was_default = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::Default);
-    auto was_read_write = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::ReadWrite);
+    auto const connected = is_connected();
+    auto* form = this->form();
+    bool const needs_state_invalidation = connected || form != nullptr;
+    auto was_default = needs_state_invalidation ? SelectorMatching::element_matches_state(*this, CSS::PseudoClass::Default) : false;
+    auto was_read_write = connected ? SelectorMatching::element_matches_state(*this, CSS::PseudoClass::ReadWrite) : false;
     auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
     auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
 
-    if (checked_applies(old_state) != checked_applies(new_state)) {
+    if (connected && checked_applies(old_state) != checked_applies(new_state)) {
         CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
     }
 
@@ -2016,28 +2048,37 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
 
     // 4. Update the element's rendering and behavior to the new state's.
     m_type = new_state;
-    m_search_clear_button = nullptr;
+    if (m_rare_input_data)
+        m_rare_input_data->search_clear_button = nullptr;
     // NB: Which box the element gets depends on its state.
-    set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementTypeAttribute);
+    if (connected)
+        set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementTypeAttribute);
     // Only the Image Button state maps align, border, width, height, hspace and vspace to hints,
     // so entering or leaving it changes the element's hints without any attribute changing.
     if ((old_state == TypeAttributeState::ImageButton) != (new_state == TypeAttributeState::ImageButton))
         CSS::republish_presentational_hints(*this);
-    update_radio_button_group_registration();
-    if (auto* form = this->form(); form && (is_submit_button(old_state) || is_submit_button(new_state))) {
+    if (old_state == TypeAttributeState::RadioButton || new_state == TypeAttributeState::RadioButton || (m_rare_input_data && m_rare_input_data->radio_button_group_registry))
+        update_radio_button_group_registration();
+    if (form && (is_submit_button(old_state) || is_submit_button(new_state))) {
         submit_button_state_changed();
         form->default_button_state_maybe_changed(*this, was_default);
-    } else {
+    } else if (connected) {
         CSS::Invalidation::invalidate_style_after_default_state_change(*this, was_default);
     }
-    CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
-    CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
-    clear_element_reference_pseudo_elements();
+    if (connected) {
+        CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
+        if (document().focused_area().ptr() == this)
+            CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
+    }
+    if (connected || rare_data())
+        clear_element_reference_pseudo_elements();
     auto should_materialize_shadow_tree = shadow_root() || has_style();
     set_shadow_root(nullptr);
-    m_image_button_alt_text_node = nullptr;
-    m_date_time_fields_container = nullptr;
-    m_date_time_fields.clear();
+    if (m_rare_input_data) {
+        m_rare_input_data->image_button_alt_text_node = nullptr;
+        m_rare_input_data->date_time_fields_container = nullptr;
+        m_rare_input_data->date_time_fields.clear();
+    }
     if (should_materialize_shadow_tree)
         create_shadow_tree_if_needed();
 
@@ -2077,7 +2118,7 @@ void HTMLInputElement::signal_a_type_change()
     // - A type change is signalled for the element.
     // NB: Registering the element with its new radio button group has already unchecked the other members of the
     //     group. The tree walk below is a fallback for radio buttons that have no registry.
-    if (m_radio_button_group_registry)
+    if (m_rare_input_data && m_rare_input_data->radio_button_group_registry)
         return;
     if (type_state() == TypeAttributeState::RadioButton && checked()) {
         root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
@@ -2100,7 +2141,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     if (document().is_temporary_document_for_fragment_parsing())
         return {};
 
-    m_last_src_value = Utf16String::from_utf16(value);
+    auto& rare_data = ensure_rare_input_data();
+    rare_data.last_src_value = Utf16String::from_utf16(value);
 
     // 1. Let url be the result of encoding-parsing a URL given the src attribute's value, relative to the element's
     //    node document.
@@ -2124,11 +2166,11 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
     // NB: Fetching the image must delay the load event of the element's node document until the task that is queued by
     //     the networking task source once the resource has been fetched (defined below) has been run.
-    m_load_event_delayer.emplace(document());
+    rare_data.load_event_delayer.emplace(document());
 
-    m_resource_request = SharedResourceRequest::get_or_create(document(), *request);
+    rare_data.resource_request = SharedResourceRequest::get_or_create(document(), *request);
     CSS::record_element_replaced_content_input(*this);
-    m_resource_request->add_callbacks(
+    rare_data.resource_request->add_callbacks(
         GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
             CSS::record_element_replaced_content_input(self);
             // 1. If the download was successful and the image is available, queue an element task on the user interaction
@@ -2138,7 +2180,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
                     HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self))));
             }));
 
-            self.m_load_event_delayer.clear();
+            if (self.m_rare_input_data)
+                self.m_rare_input_data->load_event_delayer.clear();
             self.update_image_button_alt_text_shadow_tree();
             self.set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
         }),
@@ -2151,7 +2194,8 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
                     HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self))));
             }));
 
-            self.m_load_event_delayer.clear();
+            if (self.m_rare_input_data)
+                self.m_rare_input_data->load_event_delayer.clear();
             CSS::record_element_replaced_content_input(self);
 
             // NB: The element may have been rendering as blank space while the load was pending;
@@ -2160,11 +2204,12 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
             self.set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
         }),
         GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
-            self.m_load_event_delayer.clear();
+            if (self.m_rare_input_data)
+                self.m_rare_input_data->load_event_delayer.clear();
         }));
 
-    if (m_resource_request->needs_fetching()) {
-        m_resource_request->fetch_resource(request);
+    if (rare_data.resource_request->needs_fetching()) {
+        rare_data.resource_request->fetch_resource(request);
     }
     update_image_button_alt_text_shadow_tree();
 
@@ -2173,11 +2218,112 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
 
 HTMLInputElement::TypeAttributeState HTMLInputElement::parse_type_attribute(Utf16View type)
 {
-#define __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE(keyword, state) \
-    if (type.equals_ignoring_ascii_case(keyword##sv))         \
-        return HTMLInputElement::TypeAttributeState::state;
-    ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTES
-#undef __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE
+    auto const length = type.length_in_code_units();
+    if (length < 3 || length > 14)
+        return HTMLInputElement::TypeAttributeState::Text;
+
+    auto first = type.code_unit_at(0);
+    if (first >= 'A' && first <= 'Z')
+        first += 0x20;
+
+    switch (length) {
+    case 3:
+        if (first == 't' && type.equals_ignoring_ascii_case("tel"sv))
+            return HTMLInputElement::TypeAttributeState::Telephone;
+        if (first == 'u' && type.equals_ignoring_ascii_case("url"sv))
+            return HTMLInputElement::TypeAttributeState::URL;
+        break;
+    case 4:
+        switch (first) {
+        case 't':
+            if (type.equals_ignoring_ascii_case("text"sv))
+                return HTMLInputElement::TypeAttributeState::Text;
+            if (type.equals_ignoring_ascii_case("time"sv))
+                return HTMLInputElement::TypeAttributeState::Time;
+            break;
+        case 'd':
+            if (type.equals_ignoring_ascii_case("date"sv))
+                return HTMLInputElement::TypeAttributeState::Date;
+            break;
+        case 'w':
+            if (type.equals_ignoring_ascii_case("week"sv))
+                return HTMLInputElement::TypeAttributeState::Week;
+            break;
+        case 'f':
+            if (type.equals_ignoring_ascii_case("file"sv))
+                return HTMLInputElement::TypeAttributeState::FileUpload;
+            break;
+        default:
+            break;
+        }
+        break;
+    case 5:
+        switch (first) {
+        case 'e':
+            if (type.equals_ignoring_ascii_case("email"sv))
+                return HTMLInputElement::TypeAttributeState::Email;
+            break;
+        case 'm':
+            if (type.equals_ignoring_ascii_case("month"sv))
+                return HTMLInputElement::TypeAttributeState::Month;
+            break;
+        case 'r':
+            if (type.equals_ignoring_ascii_case("radio"sv))
+                return HTMLInputElement::TypeAttributeState::RadioButton;
+            if (type.equals_ignoring_ascii_case("range"sv))
+                return HTMLInputElement::TypeAttributeState::Range;
+            if (type.equals_ignoring_ascii_case("reset"sv))
+                return HTMLInputElement::TypeAttributeState::ResetButton;
+            break;
+        case 'c':
+            if (type.equals_ignoring_ascii_case("color"sv))
+                return HTMLInputElement::TypeAttributeState::Color;
+            break;
+        case 'i':
+            if (type.equals_ignoring_ascii_case("image"sv))
+                return HTMLInputElement::TypeAttributeState::ImageButton;
+            break;
+        default:
+            break;
+        }
+        break;
+    case 6:
+        switch (first) {
+        case 'h':
+            if (type.equals_ignoring_ascii_case("hidden"sv))
+                return HTMLInputElement::TypeAttributeState::Hidden;
+            break;
+        case 's':
+            if (type.equals_ignoring_ascii_case("submit"sv))
+                return HTMLInputElement::TypeAttributeState::SubmitButton;
+            if (type.equals_ignoring_ascii_case("search"sv))
+                return HTMLInputElement::TypeAttributeState::Search;
+            break;
+        case 'n':
+            if (type.equals_ignoring_ascii_case("number"sv))
+                return HTMLInputElement::TypeAttributeState::Number;
+            break;
+        case 'b':
+            if (type.equals_ignoring_ascii_case("button"sv))
+                return HTMLInputElement::TypeAttributeState::Button;
+            break;
+        default:
+            break;
+        }
+        break;
+    case 8:
+        if (first == 'c' && type.equals_ignoring_ascii_case("checkbox"sv))
+            return HTMLInputElement::TypeAttributeState::Checkbox;
+        if (first == 'p' && type.equals_ignoring_ascii_case("password"sv))
+            return HTMLInputElement::TypeAttributeState::Password;
+        break;
+    case 14:
+        if (first == 'd' && type.equals_ignoring_ascii_case("datetime-local"sv))
+            return HTMLInputElement::TypeAttributeState::LocalDateAndTime;
+        break;
+    default:
+        break;
+    }
 
     // The missing value default and the invalid value default are the Text state.
     // https://html.spec.whatwg.org/multipage/input.html#the-input-element:missing-value-default
@@ -2366,10 +2512,46 @@ Utf16String HTMLInputElement::serialize_a_color_well_control_color(CSS::StyleVal
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
+static bool contains_cr_or_lf(Utf16View value)
+{
+    if (value.is_empty())
+        return false;
+    if (value.has_latin1_storage()) {
+        for (auto byte : value.latin1_span()) {
+            if (byte == '\n' || byte == '\r')
+                return true;
+        }
+        return false;
+    }
+    for (auto code_unit : value.utf16_span()) {
+        if (code_unit == '\n' || code_unit == '\r')
+            return true;
+    }
+    return false;
+}
+
+Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16String const& value) const
+{
+    auto state = type_state();
+    if (first_is_one_of(state, TypeAttributeState::Text, TypeAttributeState::Search, TypeAttributeState::Telephone, TypeAttributeState::Password)) {
+        if (!contains_cr_or_lf(value))
+            return value;
+    } else if (value.is_empty() && state != TypeAttributeState::Range && state != TypeAttributeState::Color) {
+        return {};
+    } else if (state != TypeAttributeState::URL && state != TypeAttributeState::Email
+        && state != TypeAttributeState::Number && state != TypeAttributeState::Date
+        && state != TypeAttributeState::Month && state != TypeAttributeState::Week
+        && state != TypeAttributeState::Time && state != TypeAttributeState::LocalDateAndTime
+        && state != TypeAttributeState::Range && state != TypeAttributeState::Color) {
+        return value;
+    }
+    return value_sanitization_algorithm(value.utf16_view());
+}
+
 Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16View value) const
 {
     auto strip_newlines = [&]() {
-        if (!value.contains('\r') && !value.contains('\n'))
+        if (!contains_cr_or_lf(value))
             return Utf16String::from_utf16(value);
 
         Utf16StringBuilder builder;
@@ -2547,14 +2729,16 @@ void HTMLInputElement::reset_algorithm()
     m_dirty_checkedness = false;
 
     // empty the list of selected files,
-    if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create();
+    if (m_rare_input_data && m_rare_input_data->selected_files)
+        m_rare_input_data->selected_files = FileAPI::FileList::create();
 
     // and then invoke the value sanitization algorithm, if the type attribute's current state defines one.
     m_value = value_sanitization_algorithm(m_value);
 
     // AD-HOC: Resetting may change the value and the user validity, affecting which validity pseudo-classes match.
-    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+    //         Detached elements have no style or ancestors to invalidate.
+    if (is_connected())
+        CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
     if (m_text_node) {
         m_text_node->set_data(m_value);
@@ -2566,7 +2750,8 @@ void HTMLInputElement::reset_algorithm()
         relevant_value_was_changed();
 
     // NB: Resetting the value also forgets what the user typed into the date and time fields.
-    m_date_time_fields_value = {};
+    if (m_rare_input_data)
+        m_rare_input_data->date_time_fields_value = {};
     update_shadow_tree();
 }
 
@@ -2585,8 +2770,8 @@ void HTMLInputElement::clear_algorithm()
     m_dirty_checkedness = false;
 
     // empty the list of selected files,
-    if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create();
+    if (m_rare_input_data && m_rare_input_data->selected_files)
+        m_rare_input_data->selected_files = FileAPI::FileList::create();
 
     // and then invoke the value sanitization algorithm iff the type attribute's current state defines one.
     m_value = value_sanitization_algorithm(m_value);
@@ -2605,7 +2790,8 @@ void HTMLInputElement::clear_algorithm()
         relevant_value_was_changed();
 
     // NB: Clearing the value also forgets what the user typed into the date and time fields.
-    m_date_time_fields_value = {};
+    if (m_rare_input_data)
+        m_rare_input_data->date_time_fields_value = {};
     update_shadow_tree();
 }
 
@@ -2634,16 +2820,20 @@ RadioButtonGroupRegistry* HTMLInputElement::radio_button_group_registry()
 void HTMLInputElement::update_radio_button_group_registration()
 {
     auto* registry = radio_button_group_registry();
-    auto group_name = registry ? name().value() : Utf16FlyString {};
-    if (registry == m_radio_button_group_registry.ptr() && group_name == m_radio_button_group_name)
+    if (!registry && (!m_rare_input_data || !m_rare_input_data->radio_button_group_registry))
         return;
 
-    if (m_radio_button_group_registry)
-        m_radio_button_group_registry->remove_button(m_radio_button_group_name, *this);
-    m_radio_button_group_registry = registry;
-    m_radio_button_group_name = move(group_name);
-    if (m_radio_button_group_registry)
-        m_radio_button_group_registry->add_button(m_radio_button_group_name, *this);
+    auto group_name = registry ? name().value() : Utf16FlyString {};
+    auto& rare_data = ensure_rare_input_data();
+    if (registry == rare_data.radio_button_group_registry.ptr() && group_name == rare_data.radio_button_group_name)
+        return;
+
+    if (rare_data.radio_button_group_registry)
+        rare_data.radio_button_group_registry->remove_button(rare_data.radio_button_group_name, *this);
+    rare_data.radio_button_group_registry = registry;
+    rare_data.radio_button_group_name = move(group_name);
+    if (rare_data.radio_button_group_registry)
+        rare_data.radio_button_group_registry->add_button(rare_data.radio_button_group_name, *this);
 
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
@@ -2819,12 +3009,12 @@ void HTMLInputElement::legacy_pre_activation_behavior()
     //    element's radio button group that has its checkedness set to true, if any, and then set this element's
     //    checkedness to true.
     if (type_state() == TypeAttributeState::RadioButton) {
-        if (m_radio_button_group_registry) {
-            m_legacy_pre_activation_behavior_checked_element_in_group = m_radio_button_group_registry->checked_button(m_radio_button_group_name);
+        if (m_rare_input_data && m_rare_input_data->radio_button_group_registry) {
+            m_rare_input_data->legacy_pre_activation_behavior_checked_element_in_group = m_rare_input_data->radio_button_group_registry->checked_button(m_rare_input_data->radio_button_group_name);
         } else {
             root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
                 if (element.checked() && is_in_same_radio_button_group_as(element)) {
-                    m_legacy_pre_activation_behavior_checked_element_in_group = &element;
+                    ensure_rare_input_data().legacy_pre_activation_behavior_checked_element_in_group = &element;
                     return TraversalDecision::Break;
                 }
                 return TraversalDecision::Continue;
@@ -2852,14 +3042,14 @@ void HTMLInputElement::legacy_cancelled_activation_behavior()
     //    a radio button group, set this element's checkedness to false.
     if (type_state() == TypeAttributeState::RadioButton) {
         bool did_reselect_previous_element = false;
-        if (m_legacy_pre_activation_behavior_checked_element_in_group) {
-            auto& element_in_group = *m_legacy_pre_activation_behavior_checked_element_in_group;
+        if (m_rare_input_data && m_rare_input_data->legacy_pre_activation_behavior_checked_element_in_group) {
+            auto& element_in_group = *m_rare_input_data->legacy_pre_activation_behavior_checked_element_in_group;
             if (is_in_same_radio_button_group_as(element_in_group)) {
                 element_in_group.set_checked(true);
                 did_reselect_previous_element = true;
             }
 
-            m_legacy_pre_activation_behavior_checked_element_in_group = nullptr;
+            m_rare_input_data->legacy_pre_activation_behavior_checked_element_in_group = nullptr;
         }
 
         if (!did_reselect_previous_element)
@@ -2869,20 +3059,21 @@ void HTMLInputElement::legacy_cancelled_activation_behavior()
 
 void HTMLInputElement::legacy_cancelled_activation_behavior_was_not_called()
 {
-    m_legacy_pre_activation_behavior_checked_element_in_group = nullptr;
+    if (m_rare_input_data)
+        m_rare_input_data->legacy_pre_activation_behavior_checked_element_in_group = nullptr;
 }
 
 GC::Ptr<DecodedImageData> HTMLInputElement::image_data() const
 {
-    if (m_resource_request)
-        return m_resource_request->image_data();
+    if (m_rare_input_data && m_rare_input_data->resource_request)
+        return m_rare_input_data->resource_request->image_data();
     return nullptr;
 }
 
 bool HTMLInputElement::is_image_pending() const
 {
     // NB: A freshly created request that has not started fetching yet counts as pending too.
-    return m_resource_request && (m_resource_request->needs_fetching() || m_resource_request->is_fetching());
+    return m_rare_input_data && m_rare_input_data->resource_request && (m_rare_input_data->resource_request->needs_fetching() || m_rare_input_data->resource_request->is_fetching());
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -4270,8 +4461,8 @@ bool HTMLInputElement::suffering_from_being_missing() const
         // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type%3Dradio)%3Asuffering-from-being-missing
         // If an element in the radio button group is required, and all of the input elements in the radio button group
         // have a checkedness that is false, then the element is suffering from being missing.
-        if (m_radio_button_group_registry)
-            return m_radio_button_group_registry->group_is_suffering_from_being_missing(m_radio_button_group_name);
+        if (m_rare_input_data && m_rare_input_data->radio_button_group_registry)
+            return m_rare_input_data->radio_button_group_registry->group_is_suffering_from_being_missing(m_rare_input_data->radio_button_group_name);
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
             if (is_in_same_radio_button_group_as(element)) {
                 if (element.checked())
@@ -4508,31 +4699,31 @@ bool HTMLInputElement::suffering_from_bad_input() const
     case TypeAttributeState::Date:
         // https://html.spec.whatwg.org/multipage/input.html#date-state-(type%3Ddate)%3Asuffering-from-bad-input
         // While the user interface describes input that the user agent cannot convert to a valid date string, the control is suffering from bad input.
-        if (!m_date_time_fields.is_empty())
+        if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
             return date_time_fields_describe_bad_input();
         return !relevant_value.is_empty() && !is_valid_date_string(relevant_value);
     case TypeAttributeState::Month:
         // https://html.spec.whatwg.org/multipage/input.html#month-state-(type%3Dmonth)%3Asuffering-from-bad-input
         // While the user interface describes input that the user agent cannot convert to a valid month string, the control is suffering from bad input.
-        if (!m_date_time_fields.is_empty())
+        if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
             return date_time_fields_describe_bad_input();
         return !relevant_value.is_empty() && !is_valid_month_string(relevant_value);
     case TypeAttributeState::Week:
         // https://html.spec.whatwg.org/multipage/input.html#week-state-(type%3Dweek)%3Asuffering-from-bad-input
         // While the user interface describes input that the user agent cannot convert to a valid week string, the control is suffering from bad input.
-        if (!m_date_time_fields.is_empty())
+        if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
             return date_time_fields_describe_bad_input();
         return !relevant_value.is_empty() && !is_valid_week_string(relevant_value);
     case TypeAttributeState::Time:
         // https://html.spec.whatwg.org/multipage/#time-state-(type=time):suffering-from-bad-input
         // While the user interface describes input that the user agent cannot convert to a valid time string, the control is suffering from bad input.
-        if (!m_date_time_fields.is_empty())
+        if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
             return date_time_fields_describe_bad_input();
         return !relevant_value.is_empty() && !is_valid_time_string(relevant_value);
     case TypeAttributeState::LocalDateAndTime:
         // https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type%3Ddatetime-local)%3Asuffering-from-bad-input
         // While the user interface describes input that the user agent cannot convert to a valid normalized local date and time string, the control is suffering from bad input.
-        if (!m_date_time_fields.is_empty())
+        if (m_rare_input_data && !m_rare_input_data->date_time_fields.is_empty())
             return date_time_fields_describe_bad_input();
         return !relevant_value.is_empty() && !is_valid_local_date_and_time_string(relevant_value);
     case TypeAttributeState::Number:

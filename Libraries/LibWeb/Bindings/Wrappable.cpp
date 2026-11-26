@@ -38,10 +38,9 @@ static HashMap<GCAllocatedWrappable*, Vector<PreservedWrapper>>& non_main_world_
     return *preserved_wrappers;
 }
 
-void GCAllocatedWrappable::finalize()
+GCAllocatedWrappable::~GCAllocatedWrappable()
 {
-    Base::finalize();
-    if (has_non_main_world_preserved_wrappers())
+    if (has_non_main_world_preserved_wrappers()) [[unlikely]]
         non_main_world_preserved_wrappers().remove(this);
 }
 

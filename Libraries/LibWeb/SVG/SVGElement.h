@@ -133,6 +133,6 @@ private:
 namespace Web::DOM {
 
 template<>
-inline bool Node::fast_is<SVG::SVGElement>() const { return is_svg_element(); }
+inline bool Node::fast_is<SVG::SVGElement>() const { return is_svg_element_wrappable(); }
 
 }

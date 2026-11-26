@@ -279,6 +279,8 @@ public:
     void invalidate_compositor_keyboard_scroll_state();
     void invalidate_compositor_keyboard_scroll_state_for_document(DOM::Document const&);
     void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
+    bool keyboard_scroll_state_is_current() const { return m_keyboard_scroll_state_is_current; }
+    bool keyboard_scroll_tracks_document(DOM::Document const&) const;
     void keyboard_scroll_dom_tree_changed(DOM::Node const&);
     void keyboard_scroll_editability_changed(DOM::Document&);
     Compositing::KeyboardScrollState take_keyboard_scroll_state_for_compositor();

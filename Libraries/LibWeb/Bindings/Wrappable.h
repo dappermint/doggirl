@@ -119,11 +119,42 @@ public:
     // object's (Libraries/LibWeb/Bindings/Rust/src/bindings/event_target.rs).
     [[nodiscard]] virtual bool is_owned_by_rust_interface_object() const { return false; }
 
+    enum WrappableFlag : u8 {
+        MainWorldWrapperIsPreserved = 1 << 0,
+        HasNonMainWorldPreservedWrappers = 1 << 1,
+        IsEventTarget = 1 << 2,
+        IsNode = 1 << 3,
+        IsElement = 1 << 4,
+        IsHTMLElement = 1 << 5,
+        IsSVGElement = 1 << 6,
+        IsDocument = 1 << 7,
+    };
+
+    [[nodiscard]] bool is_event_target_wrappable() const { return (m_flags & IsEventTarget) != 0; }
+    [[nodiscard]] bool is_node_wrappable() const { return (m_flags & IsNode) != 0; }
+    [[nodiscard]] bool is_element_wrappable() const { return (m_flags & IsElement) != 0; }
+    [[nodiscard]] bool is_html_element_wrappable() const { return (m_flags & IsHTMLElement) != 0; }
+    [[nodiscard]] bool is_svg_element_wrappable() const { return (m_flags & IsSVGElement) != 0; }
+    [[nodiscard]] bool is_document_wrappable() const { return (m_flags & IsDocument) != 0; }
+
     template<typename T>
     requires(IsBaseOf<Wrappable, T> && requires { T::s_interface_name; })
     bool fast_is() const
     {
-        return implements_interface(T::s_interface_name);
+        if constexpr (T::s_interface_name == Bindings::InterfaceName::EventTarget)
+            return is_event_target_wrappable();
+        else if constexpr (T::s_interface_name == Bindings::InterfaceName::Node)
+            return is_node_wrappable();
+        else if constexpr (T::s_interface_name == Bindings::InterfaceName::Element)
+            return is_element_wrappable();
+        else if constexpr (T::s_interface_name == Bindings::InterfaceName::HTMLElement)
+            return is_html_element_wrappable();
+        else if constexpr (T::s_interface_name == Bindings::InterfaceName::SVGElement)
+            return is_svg_element_wrappable();
+        else if constexpr (T::s_interface_name == Bindings::InterfaceName::Document)
+            return is_document_wrappable();
+        else
+            return implements_interface(T::s_interface_name);
     }
 
     template<typename T>
@@ -159,6 +190,8 @@ public:
 protected:
     Wrappable();
 
+    void set_wrappable_flag(WrappableFlag flag) { m_flags |= flag; }
+
     [[nodiscard]] GC::Ptr<JS::HostObject> cached_main_world_wrapper() const;
     [[nodiscard]] GC::Ptr<JS::HostObject> cached_main_world_wrapper(WrapperWorld const&) const;
 
@@ -183,9 +216,10 @@ private:
     // and clearing this edge would make wrapper state depend on bfcache-like
     // resurrection timing. Non-main-world entries are removed by detach().
     GC::Weak<JS::HostObject> m_main_world_wrapper;
+    u8 m_flags { 0 };
 };
 
-static_assert(sizeof(Wrappable) == 24);
+static_assert(sizeof(Wrappable) == 32);
 
 // Current LibWeb implementation objects are GC-owned. Keeping that ownership
 // and its preservation flags in a separate base lets classes migrate to other
@@ -194,43 +228,35 @@ class WEB_API GCAllocatedWrappable : public Wrappable {
     WEB_NON_IDL_WRAPPABLE(GCAllocatedWrappable, Wrappable);
 
 public:
-    virtual ~GCAllocatedWrappable() override = default;
+    virtual ~GCAllocatedWrappable() override;
 
 protected:
     GCAllocatedWrappable() = default;
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
-    virtual void finalize() override;
 
 private:
     friend class WrapperWorld;
     friend WEB_API void preserve_wrapper(Wrappable&, JS::HostObject&);
     friend WEB_API bool wrapper_is_preserved(JS::HostObject const&);
 
-    enum PreservationFlag : u8 {
-        MainWorldWrapperIsPreserved = 1 << 0,
-        HasNonMainWorldPreservedWrappers = 1 << 1,
-    };
-
-    bool main_world_wrapper_is_preserved() const { return m_preservation_flags & MainWorldWrapperIsPreserved; }
+    bool main_world_wrapper_is_preserved() const { return (m_flags & MainWorldWrapperIsPreserved) != 0; }
     void set_main_world_wrapper_is_preserved(bool value)
     {
         if (value)
-            m_preservation_flags |= MainWorldWrapperIsPreserved;
+            m_flags |= MainWorldWrapperIsPreserved;
         else
-            m_preservation_flags &= ~MainWorldWrapperIsPreserved;
+            m_flags &= ~MainWorldWrapperIsPreserved;
     }
-    bool has_non_main_world_preserved_wrappers() const { return m_preservation_flags & HasNonMainWorldPreservedWrappers; }
+    bool has_non_main_world_preserved_wrappers() const { return (m_flags & HasNonMainWorldPreservedWrappers) != 0; }
     void set_has_non_main_world_preserved_wrappers(bool value)
     {
         if (value)
-            m_preservation_flags |= HasNonMainWorldPreservedWrappers;
+            m_flags |= HasNonMainWorldPreservedWrappers;
         else
-            m_preservation_flags &= ~HasNonMainWorldPreservedWrappers;
+            m_flags &= ~HasNonMainWorldPreservedWrappers;
     }
     void clear_preserved_wrappers(WrapperWorld const&);
-
-    u8 m_preservation_flags { 0 };
 };
 
 static_assert(sizeof(GCAllocatedWrappable) == 32);
