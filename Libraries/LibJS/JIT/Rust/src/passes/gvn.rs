@@ -13,7 +13,11 @@
 //! on the same values, so this one cannot fail.
 
 use ak::Zone;
+use ak::ZoneBitSet;
 use ak::ZoneVec;
+use core::hash::Hash;
+use core::hash::Hasher;
+use core::mem::discriminant;
 
 use super::dominators::CachedDominators;
 use super::edit;
@@ -24,26 +28,41 @@ use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use ak::FastHasher;
-use ak::ZoneBitSet;
-use ak::ZoneMap;
-use core::hash::Hash;
-use core::hash::Hasher;
-use core::mem::discriminant;
 
-#[inline]
+const EMPTY_NODE: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct Bucket {
+    hash: u64,
+    head: u32,
+}
+
+#[inline(always)]
 fn is_numbered(op: &Op) -> bool {
     !matches!(op, Op::Constant(_) | Op::Phi) && op.meta().is_gvn_pure()
 }
 
-#[inline]
+#[inline(always)]
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^ (x >> 32)
+}
+
+#[inline(always)]
 fn node_hash(node: &Node, replacements: &Replacements) -> u64 {
-    let mut hash = FastHasher::default();
-    discriminant(&node.op).hash(&mut hash);
-    node.inputs.len().hash(&mut hash);
-    for input in &node.inputs {
-        replacements.resolve(*input).hash(&mut hash);
+    let mut hasher = FastHasher::default();
+    discriminant(&node.op).hash(&mut hasher);
+    let mut h = hasher.finish() ^ (node.inputs.len() as u64);
+    if replacements.is_empty() {
+        for input in &node.inputs {
+            h = mix64(h ^ u64::from(input.0));
+        }
+    } else {
+        for input in &node.inputs {
+            h = mix64(h ^ u64::from(replacements.resolve(*input).0));
+        }
     }
-    hash.finish()
+    h
 }
 
 pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
@@ -56,26 +75,37 @@ fn run_with_hash(
     dominators: &mut CachedDominators,
     hash: impl Fn(&Node, &Replacements) -> u64,
 ) {
-    if graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.body)
-        .filter(|node| is_numbered(&graph.node(**node).op))
-        .take(2)
-        .count()
-        < 2
-    {
+    let mut numbered_count = 0usize;
+    for block in &graph.blocks {
+        for &node in &block.body {
+            if is_numbered(&graph.node(node).op) {
+                numbered_count += 1;
+            }
+        }
+    }
+    if numbered_count < 2 {
         return;
     }
     let dominators = dominators.get_or_compute(graph);
     let mut replacements = Replacements::new(graph, work);
     let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
-    // NB: Hash borrowed inputs instead of allocating keys. Candidates with
-    //     the same hash form a chain through `previous`; equality is checked
-    //     before reusing one, including when hashes collide.
-    let mut available: ZoneMap<u64, NodeId> = ZoneMap::new_in(work);
-    let mut previous = ZoneVec::from_elem_in(None, graph.nodes.len(), work);
-    let mut added = ZoneVec::new_in(work);
+
+    // Pre-sized non-growing open-addressed table keyed on the node hash.
+    // Leaving a dominator subtree unwinds insertions in strict LIFO order, so
+    // restoring each bucket's previous head preserves linear-probing invariants
+    // without tombstones, rehashing, or re-hashing on removal.
+    let bucket_count = (numbered_count * 2).next_power_of_two().max(16);
+    let mask = bucket_count - 1;
+    let mut buckets = ZoneVec::from_elem_in(
+        Bucket {
+            hash: 0,
+            head: EMPTY_NODE,
+        },
+        bucket_count,
+        work,
+    );
+    let mut previous = ZoneVec::from_elem_in(EMPTY_NODE, graph.nodes.len(), work);
+    let mut added: ZoneVec<(u32, u32)> = ZoneVec::with_capacity_in(numbered_count, work);
 
     // Iterative preorder walk of the dominator tree; leaving a block drops
     // what its nodes made available.
@@ -83,48 +113,62 @@ fn run_with_hash(
         Enter(BlockId),
         Leave(usize),
     }
-    let mut steps = ZoneVec::from_iter_in(
-        (0..graph.blocks.len())
-            .rev()
-            .map(BlockId::from_index)
-            .filter(|block| dominators.is_reachable(*block) && dominators.idom(*block).is_none())
-            .map(Step::Enter),
-        work,
-    );
+    let mut steps = ZoneVec::with_capacity_in(graph.blocks.len() * 2, work);
+    for block in (0..graph.blocks.len()).rev().map(BlockId::from_index) {
+        if dominators.is_reachable(block) && dominators.idom(block).is_none() {
+            steps.push(Step::Enter(block));
+        }
+    }
     while let Some(step) = steps.pop() {
         let block = match step {
             Step::Enter(block) => block,
             Step::Leave(checkpoint) => {
                 while added.len() > checkpoint {
-                    let (key, previous) = added.pop().expect("the scope added a node");
-                    if let Some(previous) = previous {
-                        available.insert(key, previous);
-                    } else {
-                        available.remove(&key);
-                    }
+                    let (slot, prev_head) = added.pop().expect("the scope added a node");
+                    buckets[slot as usize].head = prev_head;
                 }
                 continue;
             }
         };
+        let children = dominators.children(block);
+        let is_leaf = children.is_empty();
         let checkpoint = added.len();
-        for node_id in graph.block(block).body.iter().copied() {
+        let body = &graph.block(block).body;
+        let last_numbered_in_leaf = if is_leaf {
+            body.iter().rposition(|node_id| is_numbered(&graph.node(*node_id).op))
+        } else {
+            None
+        };
+        for (body_index, &node_id) in body.iter().enumerate() {
             let node = graph.node(node_id);
             if !is_numbered(&node.op) {
                 continue;
             }
             let key = hash(node, &replacements);
-            let mut candidate = available.get(&key).copied();
+            let mut slot = (key as usize) & mask;
+            loop {
+                let bucket = buckets[slot];
+                if bucket.head == EMPTY_NODE || bucket.hash == key {
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+            let mut candidate = buckets[slot].head;
             let mut existing = None;
-            while let Some(id) = candidate {
+            while candidate != EMPTY_NODE {
+                let id = NodeId(candidate);
                 let other = graph.node(id);
-                if other.op == node.op
-                    && other.inputs.len() == node.inputs.len()
-                    && other
-                        .inputs
-                        .iter()
-                        .zip(&node.inputs)
-                        .all(|(a, b)| replacements.resolve(*a) == replacements.resolve(*b))
-                {
+                let same_inputs = if replacements.is_empty() {
+                    other.inputs.as_slice() == node.inputs.as_slice()
+                } else {
+                    other.inputs.len() == node.inputs.len()
+                        && other
+                            .inputs
+                            .iter()
+                            .zip(&node.inputs)
+                            .all(|(a, b)| replacements.resolve(*a) == replacements.resolve(*b))
+                };
+                if same_inputs && other.op == node.op {
                     existing = Some(id);
                     break;
                 }
@@ -137,12 +181,22 @@ fn run_with_hash(
                 removed.insert(node_id.index());
                 continue;
             }
-            let old = available.insert(key, node_id);
-            previous[node_id.index()] = old;
-            added.push((key, old));
+            // In a dominator-tree leaf, the final numbered node can never dominate another numbered node.
+            if last_numbered_in_leaf == Some(body_index) {
+                continue;
+            }
+            let old_head = buckets[slot].head;
+            if old_head == EMPTY_NODE {
+                buckets[slot].hash = key;
+            }
+            buckets[slot].head = node_id.0;
+            previous[node_id.index()] = old_head;
+            added.push((slot as u32, old_head));
         }
-        steps.push(Step::Leave(checkpoint));
-        for child in dominators.children(block).iter().rev() {
+        if added.len() > checkpoint {
+            steps.push(Step::Leave(checkpoint));
+        }
+        for child in children.iter().rev() {
             steps.push(Step::Enter(*child));
         }
     }

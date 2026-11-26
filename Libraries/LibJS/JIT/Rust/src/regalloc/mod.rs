@@ -472,8 +472,8 @@ impl Allocation<'_> {
     }
 }
 
-/// The value each register holds.
-type Contents = [Option<NodeId>; REGISTER_COUNT];
+/// The value each register holds; slot `r` is valid iff `occupied.contains(r)`.
+type Contents = [NodeId; REGISTER_COUNT];
 
 /// The slot of the compiled function's frame that holds `value` wherever it is live, if there is one: a value loaded
 /// from one of the slots whose frame memory never changes (`Graph::unwritten_slots`).
@@ -501,11 +501,11 @@ pub fn allocate<'w>(graph: &Graph, registers: &RegisterSet, work: &'w Zone) -> R
         registers,
         liveness: &liveness,
         allocation: Allocation::for_graph(&size, work),
-        contents: [None; REGISTER_COUNT],
+        contents: [NodeId(0); REGISTER_COUNT],
         occupied: RegisterMask::default(),
         value_registers: ZoneVec::from_elem_in(None, size.nodes, work),
-        end_contents: ZoneVec::from_elem_in(None, size.blocks * REGISTER_COUNT, work),
-        end_occupied: ZoneVec::from_elem_in(0, size.blocks, work),
+        end_entries: ZoneVec::with_capacity_in(size.blocks.saturating_mul(8), work),
+        end_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
         finished: ZoneVec::from_elem_in(false, size.blocks, work),
         position: 0,
         slot_classes: &coalescing.classes,
@@ -530,10 +530,10 @@ struct Allocator<'a, 'w> {
     occupied: RegisterMask,
     /// The register each value is in, if any.
     value_registers: ZoneVec<'w, Option<u8>>,
-    /// The register contents at the end of each finished block: `REGISTER_COUNT` values for each block.
-    end_contents: ZoneVec<'w, Option<NodeId>>,
-    /// Bit mask of occupied registers at the end of each finished block.
-    end_occupied: ZoneVec<'w, u64>,
+    /// Compact occupied `(register, value)` entries at the end of finished blocks.
+    end_entries: ZoneVec<'w, (u8, NodeId)>,
+    /// Range in `end_entries` for each finished block.
+    end_runs: ZoneVec<'w, Run>,
     /// Whether each block is finished.
     finished: ZoneVec<'w, bool>,
     /// The position of the node being allocated.
@@ -604,9 +604,11 @@ impl<'w> Allocator<'_, 'w> {
             }
             self.allocation.block_end_moves[block.index()] = self.phi_moves(block, &mut cycle_temp);
             self.allocate_node(self.graph.control_id(block));
-            let start = block.index() * REGISTER_COUNT;
-            self.end_contents[start..start + REGISTER_COUNT].copy_from_slice(&self.contents);
-            self.end_occupied[block.index()] = self.occupied.0;
+            let end_start = self.end_entries.len();
+            for register in self.occupied.iter() {
+                self.end_entries.push((register, self.contents[register as usize]));
+            }
+            self.end_runs[block.index()] = Run::new(end_start, self.end_entries.len());
             self.finished[block.index()] = true;
             // NB: How many moves and exit values a node gets is known only when it is allocated.
             check_items(self.allocation.moves.len())?;
@@ -665,45 +667,12 @@ impl<'w> Allocator<'_, 'w> {
         }
     }
 
-    fn set_contents(&mut self, contents: Contents, occupied: RegisterMask) {
+    fn clear_contents(&mut self) {
         for register in self.occupied.iter() {
-            if let Some(value) = self.contents[register as usize] {
-                self.value_registers[value.index()] = None;
-            }
+            let value = self.contents[register as usize];
+            self.value_registers[value.index()] = None;
         }
-        self.contents = contents;
-        self.occupied = occupied;
-        for register in occupied.iter() {
-            if let Some(value) = self.contents[register as usize] {
-                self.value_registers[value.index()] = Some(register);
-            }
-        }
-    }
-
-    /// The register contents at the end of `predecessor` (which comes before
-    /// `block` in linear order) that are live into `block`.
-    fn contents_entering(&self, predecessor: BlockId, block: BlockId) -> (Contents, RegisterMask) {
-        assert!(
-            self.finished[predecessor.index()],
-            "blocks come after the predecessor whose state they start with"
-        );
-        let mut contents = [None; REGISTER_COUNT];
-        let live_in = self.liveness.live_in.get(block.index());
-        if live_in.is_empty() {
-            return (contents, RegisterMask::default());
-        }
-        let start = predecessor.index() * REGISTER_COUNT;
-        let pred_contents = &self.end_contents[start..start + REGISTER_COUNT];
-        let mut occupied = 0u64;
-        for register in RegisterMask(self.end_occupied[predecessor.index()]).iter() {
-            if let Some(value) = pred_contents[register as usize]
-                && live_in.binary_search(&value).is_ok()
-            {
-                contents[register as usize] = Some(value);
-                occupied |= 1u64 << register;
-            }
-        }
-        (contents, RegisterMask(occupied))
+        self.occupied = RegisterMask::default();
     }
 
     /// Whether the loop with the header `block`, if it is one, leaves `value` in its stack slot: a value that has one
@@ -715,57 +684,55 @@ impl<'w> Allocator<'_, 'w> {
             && self.liveness.needs_spill(value)
     }
 
-    /// The register contents a merge with a state predecessor starts with:
-    /// those at the end of that predecessor, live into the merge (but those
-    /// a loop leaves in their stack slots), and the phis in their registers.
-    fn merge_contents(&self, block: BlockId) -> Option<(Contents, RegisterMask)> {
-        let predecessor = state_predecessor(self.graph, block)?;
-        let (mut contents, mut occupied) = self.contents_entering(predecessor, block);
-        for register in occupied.iter() {
-            if contents[register as usize].is_some_and(|value| self.loop_leaves_in_stack(block, value)) {
-                contents[register as usize] = None;
-                occupied.0 &= !(1u64 << register);
-            }
-        }
-        for phi in &self.graph.block(block).phis {
-            if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
-                debug_assert!(contents[register as usize].is_none());
-                contents[register as usize] = Some(*phi);
-                occupied = occupied.with(register);
-            }
-        }
-        Some((contents, occupied))
-    }
-
     fn start_block(&mut self, block: BlockId) {
+        self.clear_contents();
         let block_data = self.graph.block(block);
-        if let Some((contents, occupied)) = self.merge_contents(block) {
-            self.set_contents(contents, occupied);
-            if let Some(first) = self.graph.block_nodes(block).next() {
-                self.position = self.liveness.positions[first.index()];
-            }
-            return;
-        }
-        let (contents, occupied) = match block_data.predecessors.as_slice() {
-            // NB: The only predecessor of a loop header that on-stack
-            //     replacement entries lead to may be a back edge, which is
-            //     allocated after it.
-            [predecessor] if predecessor.index() < block.index() => self.contents_entering(*predecessor, block),
-            // Merges and loop headers start with every value in its stack
-            // slot, and phis in their registers.
-            _ => {
-                let mut contents = [None; REGISTER_COUNT];
-                let mut occupied = RegisterMask::default();
-                for phi in &block_data.phis {
-                    if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
-                        contents[register as usize] = Some(*phi);
-                        occupied = occupied.with(register);
+        let live_in = self.liveness.live_in.get(block.index());
+        if let Some(predecessor) = state_predecessor(self.graph, block) {
+            assert!(
+                self.finished[predecessor.index()],
+                "blocks come after the predecessor whose state they start with"
+            );
+            if !live_in.is_empty() {
+                let run = self.end_runs[predecessor.index()].range();
+                for entry_index in run {
+                    let (register, value) = self.end_entries[entry_index];
+                    if live_in.binary_search(&value).is_ok() && !self.loop_leaves_in_stack(block, value) {
+                        self.assign_register(register, value);
                     }
                 }
-                (contents, occupied)
             }
-        };
-        self.set_contents(contents, occupied);
+            for phi in &block_data.phis {
+                if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
+                    debug_assert!(!self.occupied.contains(register));
+                    self.assign_register(register, *phi);
+                }
+            }
+        } else if let [predecessor] = block_data.predecessors.as_slice()
+            && predecessor.index() < block.index()
+        {
+            assert!(
+                self.finished[predecessor.index()],
+                "blocks come after the predecessor whose state they start with"
+            );
+            if !live_in.is_empty() {
+                let run = self.end_runs[predecessor.index()].range();
+                for entry_index in run {
+                    let (register, value) = self.end_entries[entry_index];
+                    if live_in.binary_search(&value).is_ok() {
+                        self.assign_register(register, value);
+                    }
+                }
+            }
+        } else {
+            // Merges and loop headers start with every value in its stack
+            // slot, and phis in their registers.
+            for phi in &block_data.phis {
+                if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
+                    self.assign_register(register, *phi);
+                }
+            }
+        }
         if let Some(first) = self.graph.block_nodes(block).next() {
             self.position = self.liveness.positions[first.index()];
         }
@@ -773,7 +740,8 @@ impl<'w> Allocator<'_, 'w> {
 
     #[inline(always)]
     fn free_register(&mut self, register: u8) {
-        if let Some(value) = self.contents[register as usize].take() {
+        if self.occupied.contains(register) {
+            let value = self.contents[register as usize];
             self.value_registers[value.index()] = None;
             self.occupied.0 &= !(1u64 << register);
         }
@@ -781,8 +749,8 @@ impl<'w> Allocator<'_, 'w> {
 
     #[inline(always)]
     fn assign_register(&mut self, register: u8, value: NodeId) {
-        debug_assert!(self.contents[register as usize].is_none());
-        self.contents[register as usize] = Some(value);
+        debug_assert!(!self.occupied.contains(register));
+        self.contents[register as usize] = value;
         self.occupied = self.occupied.with(register);
         self.value_registers[value.index()] = Some(register);
     }
@@ -790,7 +758,8 @@ impl<'w> Allocator<'_, 'w> {
     /// Removes the value in `register` from it. The value stays available in
     /// its frame slot or its spill slot, which it gets if it had none.
     fn evict(&mut self, register: u8) {
-        if let Some(value) = self.contents[register as usize] {
+        if self.occupied.contains(register) {
+            let value = self.contents[register as usize];
             self.ensure_home(value);
             self.free_register(register);
         }
@@ -828,7 +797,8 @@ impl<'w> Allocator<'_, 'w> {
         let victim = RegisterMask(candidates)
             .iter()
             .max_by_key(|register| {
-                let value = self.contents[*register as usize].expect("no free register");
+                debug_assert!(self.occupied.contains(*register), "no free register");
+                let value = self.contents[*register as usize];
                 (self.next_use(value), core::cmp::Reverse(*register))
             })
             .expect("a node needs more registers than the target has");
@@ -1000,16 +970,15 @@ impl<'w> Allocator<'_, 'w> {
         };
         {
             for register in RegisterMask(clobbered.0 & self.occupied.0).iter() {
-                if let Some(value) = self.contents[register as usize] {
-                    debug_assert!(
-                        self.allocation.nodes[value.index()].spill_slot.is_some()
-                            || frame_home(self.graph, value).is_some()
-                            || !self.is_live_after(value, node_id),
-                        "v{} is live across a call that clobbers its register without a spill slot",
-                        value.0
-                    );
-                    self.free_register(register);
-                }
+                let value = self.contents[register as usize];
+                debug_assert!(
+                    self.allocation.nodes[value.index()].spill_slot.is_some()
+                        || frame_home(self.graph, value).is_some()
+                        || !self.is_live_after(value, node_id),
+                    "v{} is live across a call that clobbers its register without a spill slot",
+                    value.0
+                );
+                self.free_register(register);
             }
         }
         let output = pick_output(self);
@@ -1059,9 +1028,8 @@ impl<'w> Allocator<'_, 'w> {
     fn place_merge_phis(&mut self, predecessor: BlockId, join: BlockId) {
         let mut taken = RegisterMask::default();
         for register in self.occupied.iter() {
-            if self.contents[register as usize]
-                .is_some_and(|value| self.liveness.is_live_in(join, value) && !self.loop_leaves_in_stack(join, value))
-            {
+            let value = self.contents[register as usize];
+            if self.liveness.is_live_in(join, value) && !self.loop_leaves_in_stack(join, value) {
                 taken = taken.with(register);
             }
         }
@@ -1105,19 +1073,27 @@ impl<'w> Allocator<'_, 'w> {
     /// Adds the moves at the end of `block` that put the values live into the
     /// merge `join` (and its phis' inputs) where the merge expects them, as moves that happen in parallel.
     fn add_merge_moves(&mut self, block: BlockId, join: BlockId) {
-        let (contents, occupied) = self.merge_contents(join).expect("the merge has a state predecessor");
-        let phis = &self.graph.block(join).phis;
-        for register in occupied.iter() {
-            let Some(value) = contents[register as usize] else {
-                continue;
-            };
-            if phis.contains(&value) {
-                continue;
-            }
-            let to = Location::Register(register);
-            let from = self.current_location(value);
-            if from != to {
-                self.parallel_moves.push(Move { from, to });
+        let predecessor = state_predecessor(self.graph, join).expect("the merge has a state predecessor");
+        assert!(
+            self.finished[predecessor.index()],
+            "blocks come after the predecessor whose state they start with"
+        );
+        let live_in = self.liveness.live_in.get(join.index());
+        if !live_in.is_empty() {
+            let phis = &self.graph.block(join).phis;
+            let run = self.end_runs[predecessor.index()].range();
+            for entry_index in run {
+                let (register, value) = self.end_entries[entry_index];
+                if live_in.binary_search(&value).is_ok()
+                    && !self.loop_leaves_in_stack(join, value)
+                    && !phis.contains(&value)
+                {
+                    let to = Location::Register(register);
+                    let from = self.current_location(value);
+                    if from != to {
+                        self.parallel_moves.push(Move { from, to });
+                    }
+                }
             }
         }
         self.add_phi_moves(block, join);

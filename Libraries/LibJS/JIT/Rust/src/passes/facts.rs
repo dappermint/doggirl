@@ -216,10 +216,6 @@ impl<'w, K: Ord + Copy, V: Copy> FactMap<'w, K, V> {
         self.find(key).ok().map(|index| &self.as_slice()[index].1)
     }
 
-    fn contains_key(&self, key: &K) -> bool {
-        self.get(key).is_some()
-    }
-
     fn insert(&mut self, zone: &'w Zone, key: K, value: V) {
         let entries = self.0.make_mut(zone);
         // Definitions usually arrive in increasing node order.
@@ -230,6 +226,25 @@ impl<'w, K: Ord + Copy, V: Copy> FactMap<'w, K, V> {
         match entries.binary_search_by(|(known, _)| known.cmp(&key)) {
             Ok(index) => entries[index].1 = value,
             Err(index) => entries.insert(index, (key, value)),
+        }
+    }
+
+    fn insert_if_changed(&mut self, zone: &'w Zone, key: K, value: V)
+    where
+        V: PartialEq,
+    {
+        let slice = self.as_slice();
+        if slice.last().is_none_or(|(last, _)| *last < key) {
+            self.0.make_mut(zone).push((key, value));
+            return;
+        }
+        match slice.binary_search_by(|(known, _)| known.cmp(&key)) {
+            Ok(index) => {
+                if slice[index].1 != value {
+                    self.0.make_mut(zone)[index].1 = value;
+                }
+            }
+            Err(index) => self.0.make_mut(zone).insert(index, (key, value)),
         }
     }
 
@@ -322,28 +337,6 @@ impl<'w, K: Ord + Copy> FactSet<'w, K> {
         self.as_slice().iter()
     }
 
-    fn retain(&mut self, zone: &'w Zone, mut keep: impl FnMut(&K) -> bool) {
-        match &mut self.0 {
-            Part::Frozen(slice) => {
-                if let Some(first_dropped) = slice.iter().position(|key| !keep(key)) {
-                    let mut kept = ZoneVec::with_capacity_in(slice.len() - 1, zone);
-                    kept.extend_from_slice(&slice[..first_dropped]);
-                    for entry in &slice[first_dropped + 1..] {
-                        if keep(entry) {
-                            kept.push(*entry);
-                        }
-                    }
-                    self.0 = Part::Owned(kept);
-                }
-            }
-            Part::Owned(values) => {
-                if !values.is_empty() {
-                    values.retain(keep);
-                }
-            }
-        }
-    }
-
     fn is_empty(&self) -> bool {
         self.as_slice().is_empty()
     }
@@ -370,20 +363,18 @@ impl<K: PartialEq + Copy> PartialEq for FactSet<'_, K> {
 /// A branch on a condition that tests nothing but the values of its inputs,
 /// which never change, so that a branch decides every later one on the same
 /// values: the condition, and the inputs, where constants are their values.
+/// Packed into 24 bytes (input kinds in the top 4 bits of `condition`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BranchKey {
     condition: u64,
-    inputs: [BranchInput; 2],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum BranchInput {
-    Absent,
-    Value(NodeId),
-    Constant(u64),
+    inputs: [u64; 2],
 }
 
 impl BranchKey {
+    const INPUT_ABSENT: u64 = 0;
+    const INPUT_VALUE: u64 = 1;
+    const INPUT_CONSTANT: u64 = 2;
+
     /// The key of a branch on `condition` of `inputs` (as the analysis knows
     /// them), if the condition tests their values alone.
     pub fn of(graph: &Graph, condition: BranchCondition, inputs: &[NodeId]) -> Option<Self> {
@@ -396,18 +387,21 @@ impl BranchKey {
             BranchCondition::BindingMutable { index } => 5 << 32 | u64::from(index),
             _ => return None,
         };
-        let input = |index: usize| match inputs.get(index) {
-            None => BranchInput::Absent,
-            Some(input) => graph
-                .constant_value(*input)
-                .map_or(BranchInput::Value(*input), BranchInput::Constant),
-        };
         if inputs.len() > 2 {
             return None;
         }
+        let encode = |index: usize| match inputs.get(index) {
+            None => (Self::INPUT_ABSENT, 0u64),
+            Some(input) => match graph.constant_value(*input) {
+                Some(bits) => (Self::INPUT_CONSTANT, bits),
+                None => (Self::INPUT_VALUE, u64::from(input.0)),
+            },
+        };
+        let (kind0, value0) = encode(0);
+        let (kind1, value1) = encode(1);
         Some(Self {
-            condition,
-            inputs: [input(0), input(1)],
+            condition: condition | (kind0 << 60) | (kind1 << 62),
+            inputs: [value0, value1],
         })
     }
 }
@@ -495,7 +489,7 @@ impl Kinds {
 }
 
 /// A location whose contents a fact knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Location {
     /// The named property at `offset` of `object`.
     Named { object: NodeId, offset: u32 },
@@ -516,6 +510,41 @@ pub(super) enum Location {
         index: NodeId,
         kind: ElementsKind,
     },
+}
+
+impl Location {
+    #[inline(always)]
+    fn sort_key(self) -> (u64, u64) {
+        match self {
+            Location::Named { object, offset } => (u64::from(object.0), u64::from(offset)),
+            Location::GlobalBinding { environment, index } => ((1u64 << 32) | u64::from(index), environment.0),
+            Location::Binding { environment, index } => ((2u64 << 32) | u64::from(environment.0), u64::from(index)),
+            Location::ElementCount { count, object } => ((3u64 << 32) | (count as u64), u64::from(object.0)),
+            Location::TypedArrayDataOffset { object } => ((4u64 << 32) | u64::from(object.0), 0),
+            Location::Element { storage, index, kind } => {
+                let kind_code = match kind {
+                    ElementsKind::Packed => 0u64,
+                    ElementsKind::Holey => 1u64,
+                    ElementsKind::TypedArray(element) => 2u64 + element as u64,
+                };
+                (((5u64 + kind_code) << 32) | u64::from(storage.0), u64::from(index.0))
+            }
+        }
+    }
+}
+
+impl Ord for Location {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl PartialOrd for Location {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The element counts of objects, which the op loading each names.
@@ -748,15 +777,26 @@ impl<'w> Facts<'w> {
     }
 
     fn narrow_kinds(&mut self, value: NodeId, kinds: Kinds) {
-        let known = self.kinds(value);
-        let narrowed = known.intersect(kinds);
-        if narrowed == known && (narrowed != Kinds::ALL || !self.kinds.contains_key(&value)) {
-            return;
-        }
-        if narrowed == Kinds::ALL {
-            self.kinds.remove(self.zone, &value);
-        } else {
-            self.kinds.insert(self.zone, value, narrowed);
+        let slice = self.kinds.as_slice();
+        match slice.binary_search_by(|(known, _)| known.cmp(&value)) {
+            Ok(index) => {
+                let known = slice[index].1;
+                let narrowed = known.intersect(kinds);
+                if narrowed == known {
+                    return;
+                }
+                if narrowed == Kinds::ALL {
+                    self.kinds.0.make_mut(self.zone).remove(index);
+                } else {
+                    self.kinds.0.make_mut(self.zone)[index].1 = narrowed;
+                }
+            }
+            Err(index) => {
+                let narrowed = Kinds::ALL.intersect(kinds);
+                if narrowed != Kinds::ALL {
+                    self.kinds.0.make_mut(self.zone).insert(index, (value, narrowed));
+                }
+            }
         }
     }
 
@@ -774,9 +814,7 @@ impl<'w> Facts<'w> {
 
     /// Records whether a branch like the one `key` names held.
     pub fn set_branch_outcome(&mut self, key: BranchKey, holds: bool) {
-        if self.branch_outcome(&key) != Some(holds) {
-            self.branch_outcomes.insert(self.zone, key, holds);
-        }
+        self.branch_outcomes.insert_if_changed(self.zone, key, holds);
     }
 
     /// Records that `value` is of `kind`, narrowing what was known.
@@ -862,9 +900,7 @@ impl<'w> Facts<'w> {
     }
 
     pub fn set_elements_kind(&mut self, value: NodeId, kind: ElementsKind) {
-        if self.elements_kind(value) != Some(kind) {
-            self.elements.insert(self.zone, value, kind);
-        }
+        self.elements.insert_if_changed(self.zone, value, kind);
     }
 
     pub fn shapes(&self, value: NodeId) -> Option<&'w [ShapeCheck]> {
@@ -925,9 +961,7 @@ impl<'w> Facts<'w> {
     }
 
     pub fn set_contents(&mut self, location: Location, value: NodeId) {
-        if self.contents(location) != Some(value) {
-            self.contents.insert(self.zone, location, value);
-        }
+        self.contents.insert_if_changed(self.zone, location, value);
     }
 
     /// `object` gets a new shape: the values that may be it, which are those
@@ -968,6 +1002,11 @@ impl<'w> Facts<'w> {
         });
     }
 
+    #[inline(always)]
+    pub fn has_unexposed(&self) -> bool {
+        !self.unexposed.is_empty()
+    }
+
     pub fn is_unexposed(&self, object: NodeId) -> bool {
         self.unexposed.contains(&object)
     }
@@ -986,9 +1025,7 @@ impl<'w> Facts<'w> {
     }
 
     pub fn set_refinement(&mut self, value: NodeId, refinement: NodeId) {
-        if self.refinement(value) != Some(refinement) {
-            self.refinements.insert(self.zone, value, refinement);
-        }
+        self.refinements.insert_if_changed(self.zone, value, refinement);
     }
 
     /// A branch establishes facts about `value`, which only the branch's
@@ -1053,8 +1090,7 @@ impl<'w> Facts<'w> {
             }
         }
         if writes.intersects(Locations::SHAPES) && !self.unvalidated.is_empty() {
-            let shapes = &self.shapes;
-            self.unvalidated.retain(zone, |value| shapes.contains_key(value));
+            retain_set_in_map_keys(&mut self.unvalidated.0, &self.shapes.0, zone);
         }
         if writes.intersects(Locations::SHAPES) && !self.valid_prototype_chains.is_empty() {
             self.valid_prototype_chains.clear();
@@ -1110,11 +1146,75 @@ impl<'w> Facts<'w> {
                 |shapes, other_shapes| !other_shapes.iter().any(|shape| !shapes.contains(shape)),
             );
         }
-        let shapes = &merged.shapes;
         if !merged.unvalidated.is_empty() {
-            merged.unvalidated.retain(zone, |value| shapes.contains_key(value));
+            retain_set_in_map_keys(&mut merged.unvalidated.0, &merged.shapes.0, zone);
         }
         merged
+    }
+}
+
+/// Two-pointer sorted intersection keeping entries of `set` whose keys are present in `map`.
+fn retain_set_in_map_keys<'w, K: Ord + Copy, V: Copy>(set: &mut Part<'w, K>, map: &Part<'w, (K, V)>, zone: &'w Zone) {
+    if set.as_slice().is_empty() {
+        return;
+    }
+    let b = map.as_slice();
+    if b.is_empty() {
+        set.clear();
+        return;
+    }
+    match set {
+        Part::Frozen(a) => {
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Greater => bi += 1,
+                    core::cmp::Ordering::Less => break,
+                }
+            }
+            if ai == a.len() {
+                return;
+            }
+            let mut kept = ZoneVec::with_capacity_in(a.len().min(b.len()), zone);
+            kept.extend_from_slice(&a[..ai]);
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        kept.push(a[ai]);
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            *set = Part::Owned(kept);
+        }
+        Part::Owned(a) => {
+            let mut write = 0usize;
+            let mut ai = 0usize;
+            let mut bi = 0usize;
+            while ai < a.len() && bi < b.len() {
+                match a[ai].cmp(&b[bi].0) {
+                    core::cmp::Ordering::Equal => {
+                        if write != ai {
+                            a[write] = a[ai];
+                        }
+                        write += 1;
+                        ai += 1;
+                        bi += 1;
+                    }
+                    core::cmp::Ordering::Less => ai += 1,
+                    core::cmp::Ordering::Greater => bi += 1,
+                }
+            }
+            a.truncate(write);
+        }
     }
 }
 

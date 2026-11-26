@@ -22,6 +22,7 @@ use crate::bytecode::instruction::OpCode;
 use crate::bytecode::instruction_at;
 use crate::bytecode::op;
 use crate::bytecode::property_access::remember_vm_cache_get;
+use crate::gc::class::cast_ref;
 use crate::gc::root::MarkedVec;
 use crate::interpreter::runtime_functions::{Runtime, RuntimeFunctions, SlowPathControl, handle_asm_exception};
 use crate::interpreter::slow_paths;
@@ -38,8 +39,8 @@ use crate::layout::function_object::{EcmascriptFunctionObject, FunctionObject, N
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
-    call_function_object, create_unmapped_arguments_object, function_object_as_object, length_of_array_like,
-    throw_if_too_many_arguments,
+    call_function_object, call_raw_native_function_fast, create_unmapped_arguments_object, function_object_as_object,
+    length_of_array_like, throw_if_too_many_arguments,
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
@@ -525,6 +526,13 @@ fn call_other_function_from_jit(
                 unwrap_depth + 1,
             ));
         }
+
+        return Some(
+            match call_raw_native_function_fast(vm, function, this_value, arguments) {
+                Ok(value) => site.store_result(value),
+                Err(throw) => handle_asm_exception(vm, site.pc, throw.value()),
+            },
+        );
     }
 
     if let Some(bound_function) = callee_object.downcast::<BoundFunction>() {
@@ -1554,10 +1562,22 @@ pub fn get_by_id_from_jit(
         values.dst = value;
         return Some(SlowPathControl::continue_at(pc + op::GetById::LENGTH));
     }
-    let function = value
-        .as_accessor()
-        .getter()
-        .and_then(as_ecmascript_function_object)
+    let Some(getter) = value.as_accessor().getter() else {
+        values.dst = Value::UNDEFINED;
+        return Some(SlowPathControl::continue_at(pc + op::GetById::LENGTH));
+    };
+    let getter_object = getter.upcast::<Object>();
+    if getter_object.is_raw_native_function() {
+        let raw_native = Gc::from_ref(cast_ref::<Object, RawNativeFunction>(&getter_object));
+        return Some(match call_raw_native_function_fast(vm, raw_native, values.base, &[]) {
+            Ok(result) => {
+                values.dst = result;
+                SlowPathControl::continue_at(pc + op::GetById::LENGTH)
+            }
+            Err(throw) => handle_asm_exception(vm, pc, throw.value()),
+        });
+    }
+    let function = as_ecmascript_function_object(getter)
         .filter(|function| function.can_inline_call() && vm.is_in_current_realm(function.as_function_object_gc()))?;
     let frame = vm.running_execution_context().expect("a frame is running");
     let site = JitCallSite {

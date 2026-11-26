@@ -18,7 +18,7 @@ use num_traits::{Signed, Zero};
 
 use crate::bytecode::executable::{Executable, StaticPropertyLookupCacheSite};
 use crate::compile::{CompiledEval, EvalContext, parse_eval};
-use crate::gc::class::{Extends, GcCell};
+use crate::gc::class::{Extends, GcCell, cast_ref};
 use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::root::MarkedVec;
@@ -49,7 +49,7 @@ use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::iterator::{IteratorHint, get_iterator, iterator_step_value, try_or_close_iterator};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::{ImportAttribute, ModuleRequest};
-use crate::runtime::native_function::NativeFunction;
+use crate::runtime::native_function::{NativeFunction, RawNativeFunction, call_raw_native_function};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, Object, PropertyKind, StackFrameInfo};
 use crate::runtime::object_environment::{IsWithEnvironment, ObjectEnvironment};
@@ -162,12 +162,59 @@ fn with_callee_context<T>(
 
     // SAFETY: The frame was just allocated and stays allocated until the guard frees it.
     let callee_context = unsafe { callee_context.as_ref() };
-    for (index, argument) in callee_context.arguments().iter().enumerate() {
-        argument.set(arguments_list.get(index).copied().unwrap_or(Value::UNDEFINED));
+    let argument_slots = callee_context.arguments();
+    for (slot, argument) in argument_slots.iter().zip(arguments_list) {
+        slot.set(*argument);
+    }
+    if arguments_list.len() < argument_slots.len() {
+        for slot in &argument_slots[arguments_list.len()..] {
+            slot.set(Value::UNDEFINED);
+        }
     }
     callee_context.passed_argument_count.set(arguments_list.len() as u32);
 
     body(callee_context)
+}
+
+/// Calls a `RawNativeFunction` (or `DirectGetterFunction`) directly without virtual dispatch through
+/// `ObjectMethods`/`NativeFunctionMethods`.
+#[inline]
+pub(crate) fn call_raw_native_function_fast(
+    vm: &Vm,
+    function: Gc<RawNativeFunction>,
+    this_value: Value,
+    arguments_list: &[Value],
+) -> ThrowCompletionOr<Value> {
+    if vm.did_reach_stack_space_limit() {
+        return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+    }
+    let caller_context = vm
+        .running_execution_context_if_any()
+        .expect("a native function is called from a running execution context");
+    let argument_count = u32::try_from(arguments_list.len()).expect("the argument count fits in u32");
+    let stack = vm.interpreter_stack();
+    let stack_mark = stack.top.get();
+    let Some(callee_context_ptr) = stack.allocate(0, 0, argument_count) else {
+        return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+    };
+    let _deallocate_guard = ScopeGuard::new(|| stack.deallocate(stack_mark));
+
+    // SAFETY: The frame was just allocated and stays allocated until the guard frees it.
+    let callee_context = unsafe { callee_context_ptr.as_ref() };
+    for (slot, argument) in callee_context.arguments().iter().zip(arguments_list) {
+        slot.set(*argument);
+    }
+    callee_context.passed_argument_count.set(argument_count);
+    callee_context.function.set(Some(function.as_function_object_gc()));
+    callee_context.this_value.set(this_value);
+    callee_context
+        .lexical_environment
+        .set(caller_context.lexical_environment.get());
+
+    vm.push_execution_context_in_realm(callee_context_ptr, Some(function.realm()));
+    let result = call_raw_native_function(function.native_function(vm), vm);
+    vm.pop_execution_context();
+    result
 }
 
 // 7.3.14 Call ( F, V [ , argumentsList ] ), https://tc39.es/ecma262/#sec-call
@@ -197,6 +244,10 @@ pub fn call_function_object(
 
     // 3. Return ? F.[[Call]](V, argumentsList).
     let function = function_object_as_object(function);
+    if function.is_raw_native_function() {
+        let raw_native = Gc::from_ref(cast_ref::<Object, RawNativeFunction>(&function));
+        return call_raw_native_function_fast(vm, raw_native, this_value, arguments_list);
+    }
     let Some(internal_call) = function.internal_call_method() else {
         unimplemented_runtime_function(&format!("[[Call]] of a {}", function.class().name), 0);
     };

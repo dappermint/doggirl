@@ -49,13 +49,18 @@ impl<'w> Replacements<'w> {
     }
 
     /// What a use of `value` uses after the replacements.
+    #[inline(always)]
     pub fn resolve(&self, mut value: NodeId) -> NodeId {
+        if self.map.is_empty() {
+            return value;
+        }
         while let Some(Some(replacement)) = self.map.get(value.index()) {
             value = *replacement;
         }
         value
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -134,26 +139,29 @@ pub fn make_wrapping(graph: &mut Graph, node: NodeId) {
 
 /// The constant nodes of a graph by their bits and representation, for
 /// passes that need constants: `get()` and `get_typed()` add those the
-/// graph does not have yet.
+/// graph does not have yet. Populated lazily on first lookup so passes that
+/// never materialize constants avoid scanning all nodes.
 pub struct Constants<'w> {
     nodes: ZoneMap<'w, (u64, Repr), NodeId>,
+    populated: bool,
 }
 
 impl<'w> Constants<'w> {
     /// The constants of `graph`, with their table in `work`.
-    pub fn new(graph: &Graph, work: &'w Zone) -> Self {
-        let nodes = ZoneMap::from_iter_in(
-            graph
-                .nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, node)| match (&node.op, node.repr) {
-                    (Op::Constant(bits), Some(repr)) => Some(((*bits, repr), NodeId::from_index(index))),
-                    _ => None,
-                }),
-            work,
-        );
-        Self { nodes }
+    pub fn new(_graph: &Graph, work: &'w Zone) -> Self {
+        Self {
+            nodes: ZoneMap::new_in(work),
+            populated: false,
+        }
+    }
+
+    fn populate(&mut self, graph: &Graph) {
+        self.populated = true;
+        for (index, node) in graph.nodes.iter().enumerate() {
+            if let (Op::Constant(bits), Some(repr)) = (&node.op, node.repr) {
+                self.nodes.insert((*bits, repr), NodeId::from_index(index));
+            }
+        }
     }
 
     /// The tagged constant node with `bits`.
@@ -163,6 +171,9 @@ impl<'w> Constants<'w> {
 
     /// The constant node with `bits` in representation `repr`.
     pub fn get_typed(&mut self, graph: &mut Graph, bits: u64, repr: Repr) -> NodeId {
+        if !self.populated {
+            self.populate(graph);
+        }
         *self
             .nodes
             .entry((bits, repr))
@@ -177,17 +188,21 @@ fn reachable_blocks<'w>(graph: &Graph, work: &'w Zone) -> ZoneVec<'w, bool> {
     let mut reachable = ZoneVec::from_elem_in(false, block_count, work);
     // NB: A loop header that only its back edges would reach has no
     //     predecessors if none of them was built, but is no entry.
-    let mut pending = ZoneVec::from_iter_in(graph.entries().map(BlockId::index), work);
+    let mut pending = ZoneVec::with_capacity_in(block_count, work);
+    pending.extend(graph.entries().map(BlockId::index));
     while let Some(block) = pending.pop() {
         if core::mem::replace(&mut reachable[block], true) {
             continue;
         }
-        pending.extend(
-            graph
-                .successors(BlockId::from_index(block))
-                .iter()
-                .map(|successor| successor.index()),
-        );
+        graph
+            .control(BlockId::from_index(block))
+            .op
+            .for_each_successor(|successor| {
+                let index = successor.index();
+                if !reachable[index] {
+                    pending.push(index);
+                }
+            });
     }
     reachable
 }
@@ -208,30 +223,54 @@ pub fn clean_up_control_flow(graph: &mut Graph, work: &Zone) {
 
     // Keep the predecessor entries (and their phi inputs) of reachable
     // blocks that still branch here, as many times as they do.
-    let mut remaining_edges = ZoneVec::from_iter_in(
-        (0..block_count).map(|block| ZoneVec::from_slice_in(&graph.successors(BlockId::from_index(block)), work)),
-        work,
-    );
     let mut keep = ZoneVec::new_in(work);
     for block in 0..block_count {
         if !reachable[block] {
             continue;
         }
+        let block_id = BlockId::from_index(block);
         let predecessors = &graph.blocks[block].predecessors;
-        keep.clear();
-        keep.extend(predecessors.iter().map(|predecessor| {
-            if !reachable[predecessor.index()] {
-                return false;
-            }
-            let successors = &mut remaining_edges[predecessor.index()];
-            let Some(index) = successors.iter().position(|successor| successor.index() == block) else {
-                return false;
-            };
-            successors.swap_remove(index);
-            true
-        }));
-        if keep.iter().all(|keep| *keep) {
+        if predecessors.is_empty() {
             continue;
+        }
+        // Fast check when all predecessors are distinct (the common case): avoid allocating per-block edge copies.
+        let has_duplicates = match predecessors.as_slice() {
+            [_] => false,
+            [a, b] => a == b,
+            slice => slice.iter().enumerate().any(|(i, pred)| slice[..i].contains(pred)),
+        };
+        if !has_duplicates {
+            let mut all_kept = true;
+            for &predecessor in predecessors {
+                if !reachable[predecessor.index()] || !graph.control(predecessor).op.has_successor(block_id) {
+                    all_kept = false;
+                    break;
+                }
+            }
+            if all_kept {
+                continue;
+            }
+            keep.clear();
+            keep.extend(predecessors.iter().map(|&predecessor| {
+                reachable[predecessor.index()] && graph.control(predecessor).op.has_successor(block_id)
+            }));
+        } else {
+            keep.clear();
+            for (index, &predecessor) in predecessors.iter().enumerate() {
+                if !reachable[predecessor.index()] {
+                    keep.push(false);
+                    continue;
+                }
+                let seen_before = predecessors[..index]
+                    .iter()
+                    .filter(|&prev| *prev == predecessor)
+                    .count();
+                let available = graph.control(predecessor).op.count_successor(block_id);
+                keep.push(seen_before < available);
+            }
+            if keep.iter().all(|keep| *keep) {
+                continue;
+            }
         }
         let mut index = 0;
         graph.blocks[block].predecessors.retain(|_| {
@@ -410,7 +449,13 @@ pub fn move_cold_blocks_last(graph: &mut Graph, work: &Zone) {
 /// Replaces phis whose inputs are all one value (or the phi itself) by
 /// that value, until none is left.
 pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
-    if !graph.blocks.iter().any(|block| !block.phis.is_empty()) {
+    let mut phi_blocks = ZoneVec::new_in(work);
+    for (index, block) in graph.blocks.iter().enumerate() {
+        if !block.phis.is_empty() {
+            phi_blocks.push(index);
+        }
+    }
+    if phi_blocks.is_empty() {
         return;
     }
     // NB: Nothing adds nodes here.
@@ -419,10 +464,8 @@ pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
     loop {
         replacements.clear();
         removed.clear();
-        for block in &graph.blocks {
-            if block.phis.is_empty() {
-                continue;
-            }
+        for &block_index in &phi_blocks {
+            let block = &graph.blocks[block_index];
             for phi in &block.phis {
                 let mut distinct = graph.nodes[phi.index()]
                     .inputs
@@ -442,7 +485,14 @@ pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
             return;
         }
         replacements.apply(graph);
-        remove_nodes(graph, &removed);
+        phi_blocks.retain(|&block_index| {
+            let phis = &mut graph.blocks[block_index].phis;
+            phis.retain(|phi| !removed.contains(phi.index()));
+            !phis.is_empty()
+        });
+        if phi_blocks.is_empty() {
+            return;
+        }
     }
 }
 
