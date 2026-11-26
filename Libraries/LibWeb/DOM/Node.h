@@ -176,7 +176,7 @@ public:
     bool is_slottable() const { return is_element() || is_text() || is_cdata_section(); }
     bool is_attribute() const { return type() == NodeType::ATTRIBUTE_NODE; }
     bool is_cdata_section() const { return type() == NodeType::CDATA_SECTION_NODE; }
-    virtual bool is_shadow_root() const { return false; }
+    bool is_shadow_root() const { return m_is_shadow_root; }
 
     virtual bool requires_svg_container() const { return false; }
     virtual bool is_svg_container() const { return false; }
@@ -262,7 +262,7 @@ public:
     virtual bool is_html_button_element() const { return false; }
     virtual bool is_html_details_element() const { return false; }
     virtual bool is_html_dialog_element() const { return false; }
-    virtual bool is_html_slot_element() const { return false; }
+    bool is_html_slot_element() const { return m_is_html_slot_element; }
     virtual bool is_html_embed_element() const { return false; }
     virtual bool is_html_object_element() const { return false; }
     virtual bool is_html_canvas_element() const { return false; }
@@ -680,7 +680,6 @@ protected:
     RareData const* rare_data() const { return m_rare_data; }
 
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
     GC::Member<Document> m_document;
@@ -709,6 +708,8 @@ protected:
     bool m_descendant_style_arrival_pending : 1 { false };
     bool m_child_style_arrivals_wait : 1 { false };
     bool m_has_spelling_markers : 1 { false };
+    bool m_is_shadow_root : 1 { false };
+    bool m_is_html_slot_element : 1 { false };
     u32 m_child_index_generation { 1 };
     // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
     mutable u32 m_node_directory_slot { 0 };

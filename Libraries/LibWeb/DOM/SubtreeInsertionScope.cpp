@@ -9,6 +9,7 @@
 #include <LibWeb/DOM/SubtreeInsertionScope.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::DOM {
 
@@ -16,6 +17,8 @@ SubtreeInsertionScope::SubtreeInsertionScope(Node& parent)
     : m_parent(parent)
     , m_document(parent.document())
     , m_enclosing_scope(m_document->subtree_insertion_scope())
+    , m_keyboard_scroll_tracks_document(m_document->page().keyboard_scroll_tracks_document(m_document))
+    , m_parent_is_in_shadow_tree(parent.root().is_shadow_root())
 {
     m_document->set_subtree_insertion_scope({}, this);
 }

@@ -270,11 +270,6 @@ struct LocationWrapperTraits {
     {
         preserve_identity_of_platform_object(wrapper);
     }
-
-    static void finalize(JS::HostObject& wrapper)
-    {
-        finalize_platform_object(wrapper);
-    }
 };
 
 }

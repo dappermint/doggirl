@@ -468,7 +468,25 @@ void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_e
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name)
 {
     auto* wrappable = wrappable_impl_from(JS::HostABI::object_from_abi(object));
-    return wrappable && wrappable->implements_interface(static_cast<InterfaceName>(interface_name));
+    if (!wrappable)
+        return false;
+    auto name = static_cast<InterfaceName>(interface_name);
+    switch (name) {
+    case InterfaceName::EventTarget:
+        return wrappable->is_event_target_wrappable();
+    case InterfaceName::Node:
+        return wrappable->is_node_wrappable();
+    case InterfaceName::Element:
+        return wrappable->is_element_wrappable();
+    case InterfaceName::HTMLElement:
+        return wrappable->is_html_element_wrappable();
+    case InterfaceName::SVGElement:
+        return wrappable->is_svg_element_wrappable();
+    case InterfaceName::Document:
+        return wrappable->is_document_wrappable();
+    default:
+        return wrappable->implements_interface(name);
+    }
 }
 
 GC::Cell* web_bindings_cell_of_wrapper(JSObject* wrapper)

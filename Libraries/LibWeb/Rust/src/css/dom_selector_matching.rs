@@ -277,17 +277,28 @@ pub struct DomSelectorProgram {
     /// The selectors the query matches by, and the HTML namespace's atom.
     sources: Box<[crate::css::selector::SelectorRef]>,
     html_namespace: Option<crate::css::style::AtomLease>,
+    /// Cached `required_name_bits` for `(case_sensitive, ignore_case)`, computed lazily on the first subtree walk.
+    required_name_bits_cache: std::cell::Cell<Option<(u64, u64)>>,
 }
 
 impl DomSelectorProgram {
     /// The attribute names and the classes every match carries, as bits of the DOM's filter of names in a subtree. A
     /// class compared ignoring case can be written in another case than the element's.
     fn required_name_bits(&self, dom: &FfiDomSelectorCallbacks, ignore_case: bool) -> u64 {
-        let classes: &[usize] = if ignore_case { &[] } else { &self.subject_classes };
-        self.required_attribute_names
-            .iter()
-            .chain(classes)
-            .fold(0, |bits, &name| bits | unsafe { (dom.name_filter_bit)(name) })
+        let (sensitive, insensitive) = self.required_name_bits_cache.get().unwrap_or_else(|| {
+            let attribute_bits = self
+                .required_attribute_names
+                .iter()
+                .fold(0, |bits, &name| bits | unsafe { (dom.name_filter_bit)(name) });
+            let class_bits = self
+                .subject_classes
+                .iter()
+                .fold(0, |bits, &name| bits | unsafe { (dom.name_filter_bit)(name) });
+            let cached = (attribute_bits | class_bits, attribute_bits);
+            self.required_name_bits_cache.set(Some(cached));
+            cached
+        });
+        if ignore_case { insensitive } else { sensitive }
     }
 }
 
@@ -546,6 +557,7 @@ pub unsafe extern "C" fn rust_dom_selector_program_create(
         id_lookup,
         sources: selectors.into_boxed_slice(),
         html_namespace,
+        required_name_bits_cache: std::cell::Cell::new(None),
     }))
 }
 

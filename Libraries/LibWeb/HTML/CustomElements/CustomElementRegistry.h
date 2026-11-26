@@ -44,6 +44,7 @@ public:
     WebIDL::ExceptionOr<void> initialize_for_bindings(GC::Ref<DOM::Node> root);
 
     bool is_scoped() const { return m_is_scoped; }
+    bool has_definitions() const { return !m_custom_element_definitions.is_empty(); }
     void append_scoped_document(GC::Ref<DOM::Document>);
 
     GC::Ptr<CustomElementDefinition> get_definition_with_name_and_local_name(Utf16FlyString const& name, Utf16FlyString const& local_name) const;

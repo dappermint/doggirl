@@ -61,10 +61,63 @@ static bool pseudo_class_matching_is_covered_by_version_counters(CSS::PseudoClas
 SelectorQuery::SelectorQuery(CSS::SelectorList&& selectors)
     : m_selectors(move(selectors))
 {
+    auto filter_bits_of = [](FastCompound const& compound) -> u64 {
+        u64 bits = 0;
+        for (u8 i = 0; i < compound.class_count; ++i)
+            bits |= Element::name_filter_bit_from_raw(compound.classes[i]);
+        if (compound.attribute_name)
+            bits |= Element::name_filter_bit_from_raw(compound.attribute_name);
+        return bits;
+    };
+    auto attribute_filter_bits_of = [](FastCompound const& compound) -> u32 {
+        return compound.attribute_name ? Element::attribute_filter_bits_from_raw(compound.attribute_name) : 0;
+    };
+    auto copy_compound = [](CSS::SelectorFFI::FfiSimpleCompound const& src) -> FastCompound {
+        return {
+            .tag_name = src.tag_name,
+            .id = src.id,
+            .classes = { src.classes[0], src.classes[1] },
+            .attribute_name = src.attribute_name,
+            .attribute_value = src.attribute_value,
+            .class_count = src.class_count,
+            .attribute_match_kind = static_cast<AttributeMatchKind>(src.attribute_match_kind),
+        };
+    };
+
     m_is_result_cacheable = true;
     for (auto const& selector : m_selectors) {
         auto const facts = CSS::SelectorFFI::rust_selector_query_facts(&selector->rust_selector());
-        m_matches_every_element = m_selectors.size() == 1 && facts.matches_every_element;
+        if (m_selectors.size() == 1) {
+            m_matches_every_element = facts.matches_every_element;
+            switch (facts.fast_path.kind) {
+            case CSS::SelectorFFI::FfiSelectorFastPathKind::None:
+                break;
+            case CSS::SelectorFFI::FfiSelectorFastPathKind::SimpleCompound:
+                m_fast_path_kind = FastPathKind::SimpleCompound;
+                m_fast_subject = copy_compound(facts.fast_path.subject);
+                m_subject_filter_bits = filter_bits_of(m_fast_subject);
+                m_subject_attribute_filter_bits = attribute_filter_bits_of(m_fast_subject);
+                break;
+            case CSS::SelectorFFI::FfiSelectorFastPathKind::SimpleDescendantSimpleCompound:
+                m_fast_path_kind = FastPathKind::SimpleDescendantSimpleCompound;
+                m_fast_subject = copy_compound(facts.fast_path.subject);
+                m_fast_ancestor = copy_compound(facts.fast_path.ancestor);
+                m_subject_filter_bits = filter_bits_of(m_fast_subject);
+                m_ancestor_filter_bits = filter_bits_of(m_fast_ancestor);
+                m_subject_attribute_filter_bits = attribute_filter_bits_of(m_fast_subject);
+                m_ancestor_attribute_filter_bits = attribute_filter_bits_of(m_fast_ancestor);
+                break;
+            case CSS::SelectorFFI::FfiSelectorFastPathKind::SimpleChildSimpleCompound:
+                m_fast_path_kind = FastPathKind::SimpleChildSimpleCompound;
+                m_fast_subject = copy_compound(facts.fast_path.subject);
+                m_fast_ancestor = copy_compound(facts.fast_path.ancestor);
+                m_subject_filter_bits = filter_bits_of(m_fast_subject);
+                m_ancestor_filter_bits = filter_bits_of(m_fast_ancestor);
+                m_subject_attribute_filter_bits = attribute_filter_bits_of(m_fast_subject);
+                m_ancestor_attribute_filter_bits = attribute_filter_bits_of(m_fast_ancestor);
+                break;
+            }
+        }
         // NB: The contained-pseudo-class bitmap may be under-collected for selectors containing the nesting
         //     selector, so we cannot rely on it (and `&` has no useful meaning in a query anyway).
         if (facts.contains_nesting) {
@@ -225,7 +278,7 @@ constexpr CSS::SelectorFFI::FfiDomSelectorCallbacks dom_selector_callbacks {
         }
         return nullptr;
     },
-    .name_filter_bit = [](uintptr_t local_name) { return Element::name_filter_bit(Utf16FlyString::from_raw(local_name)); },
+    .name_filter_bit = [](uintptr_t local_name) { return Element::name_filter_bit_from_raw(local_name); },
     .tree_name_filter = [](void const* node) -> u64 {
         // The filter of a document's one element child holds every name of the document's tree.
         auto const& root = node_from_ffi(node).root();
@@ -392,15 +445,267 @@ private:
 
 }
 
+static ALWAYS_INLINE Element const* parent_element_of(Node const& node)
+{
+    auto const* parent = node.parent();
+    return parent ? as_if<Element>(*parent) : nullptr;
+}
+
+bool SelectorQuery::matches_simple_compound(Element const& element, FastCompound const& compound, bool is_html_document)
+{
+    if (compound.tag_name && element.local_name().raw_identity() != compound.tag_name)
+        return false;
+    if (compound.id && (!element.id().has_value() || element.id()->raw_identity() != compound.id))
+        return false;
+    if (compound.class_count > 0) {
+        auto classes = element.class_names();
+        if (classes.size() < compound.class_count)
+            return false;
+        bool found_first = false;
+        for (auto const& class_name : classes) {
+            if (class_name.raw_identity() == compound.classes[0]) {
+                found_first = true;
+                break;
+            }
+        }
+        if (!found_first)
+            return false;
+        if (compound.class_count == 2) {
+            bool found_second = false;
+            for (auto const& class_name : classes) {
+                if (class_name.raw_identity() == compound.classes[1]) {
+                    found_second = true;
+                    break;
+                }
+            }
+            if (!found_second)
+                return false;
+        }
+    }
+    if (compound.attribute_match_kind != AttributeMatchKind::None) {
+        bool matched_attribute = false;
+        for (auto const& attribute : element.attribute_list()) {
+            if (attribute.name.local_name().raw_identity() != compound.attribute_name
+                || (attribute.name.namespace_().has_value() && !attribute.name.namespace_()->is_empty()))
+                continue;
+            switch (compound.attribute_match_kind) {
+            case AttributeMatchKind::HasAttribute:
+                matched_attribute = true;
+                break;
+            case AttributeMatchKind::ExactCaseSensitive:
+                matched_attribute = compound.attribute_value == 0
+                    ? attribute.value.is_empty()
+                    : attribute.value == Utf16FlyString::from_raw(compound.attribute_value);
+                break;
+            case AttributeMatchKind::ExactCaseInsensitive:
+                matched_attribute = compound.attribute_value == 0
+                    ? attribute.value.is_empty()
+                    : attribute.value.equals_ignoring_ascii_case(Utf16FlyString::from_raw(compound.attribute_value));
+                break;
+            case AttributeMatchKind::ExactLegacyHtmlCaseInsensitive:
+                if (compound.attribute_value == 0) {
+                    matched_attribute = attribute.value.is_empty();
+                } else {
+                    auto expected = Utf16FlyString::from_raw(compound.attribute_value);
+                    matched_attribute = (is_html_document && element.namespace_uri() == Namespace::HTML)
+                        ? attribute.value.equals_ignoring_ascii_case(expected)
+                        : attribute.value == expected;
+                }
+                break;
+            case AttributeMatchKind::None:
+                VERIFY_NOT_REACHED();
+            }
+            if (matched_attribute)
+                break;
+        }
+        if (!matched_attribute)
+            return false;
+    }
+    return true;
+}
+
+bool SelectorQuery::matches_fast(Element const& element) const
+{
+    bool const is_html_document = element.document().is_html_document();
+    if (!matches_simple_compound(element, m_fast_subject, is_html_document))
+        return false;
+    if (m_fast_path_kind == FastPathKind::SimpleCompound)
+        return true;
+    auto const* parent = parent_element_of(element);
+    if (m_fast_path_kind == FastPathKind::SimpleChildSimpleCompound)
+        return parent && matches_simple_compound(*parent, m_fast_ancestor, is_html_document);
+    for (; parent; parent = parent_element_of(*parent)) {
+        if (matches_simple_compound(*parent, m_fast_ancestor, is_html_document))
+            return true;
+    }
+    return false;
+}
+
+template<typename Callback>
+void SelectorQuery::walk_subject_subtree(ParentNode& search_root, bool is_html_document, Callback&& callback) const
+{
+    auto const filter_bits = m_subject_filter_bits;
+    auto const attr_filter_bits = m_subject_attribute_filter_bits;
+    auto* next = search_root.next_in_pre_order(&search_root);
+    while (next) {
+        if (auto* element = as_if<Element>(*next)) {
+            if ((filter_bits && (element->subtree_name_filter() & filter_bits) != filter_bits)
+                || (attr_filter_bits && (element->subtree_attribute_filter() & attr_filter_bits) != attr_filter_bits)) {
+                while (next != &search_root && !next->next_sibling())
+                    next = next->parent();
+                next = next == &search_root ? nullptr : next->next_sibling();
+                continue;
+            }
+            if (matches_simple_compound(*element, m_fast_subject, is_html_document) && callback(*element))
+                return;
+        }
+        next = next->next_in_pre_order(&search_root);
+    }
+}
+
+template<typename Callback>
+void SelectorQuery::for_each_fast_match(ParentNode& root, Callback&& callback) const
+{
+    auto const& document = root.document();
+    bool const is_html_document = document.is_html_document();
+    auto const& tree_root = root.root();
+    u64 const all_filter_bits = m_subject_filter_bits | m_ancestor_filter_bits;
+    u32 const all_attr_filter_bits = m_subject_attribute_filter_bits | m_ancestor_attribute_filter_bits;
+    if (all_filter_bits != 0 || all_attr_filter_bits != 0) {
+        u64 tree_filter = NumericLimits<u64>::max();
+        u32 tree_attr_filter = NumericLimits<u32>::max();
+        if (auto const* doc = as_if<Document>(tree_root)) {
+            auto const* doc_element = doc->document_element();
+            tree_filter = doc_element ? doc_element->subtree_name_filter() : 0;
+            tree_attr_filter = doc_element ? doc_element->subtree_attribute_filter() : 0;
+        } else if (auto const* root_element = as_if<Element>(tree_root)) {
+            tree_filter = root_element->subtree_name_filter();
+            tree_attr_filter = root_element->subtree_attribute_filter();
+        }
+        if ((tree_filter & all_filter_bits) != all_filter_bits
+            || (tree_attr_filter & all_attr_filter_bits) != all_attr_filter_bits)
+            return;
+        if (auto const* root_element = as_if<Element>(root)) {
+            if ((m_subject_filter_bits && (root_element->subtree_name_filter() & m_subject_filter_bits) != m_subject_filter_bits)
+                || (m_subject_attribute_filter_bits && (root_element->subtree_attribute_filter() & m_subject_attribute_filter_bits) != m_subject_attribute_filter_bits))
+                return;
+        }
+    }
+
+    auto is_under_root = [&](Node const& node) {
+        return &tree_root == &root ? &node != &root : node.is_descendant_of(root);
+    };
+
+    if (m_fast_subject.id && root.is_connected()) {
+        auto const* shadow_root = as_if<ShadowRoot>(tree_root);
+        auto const& element_by_id = shadow_root ? shadow_root->element_by_id() : document.element_by_id();
+        auto elements = element_by_id.elements_with_id(Utf16FlyString::from_raw(m_fast_subject.id));
+        if (elements.is_empty())
+            return;
+        if (elements.size() == 1) {
+            if (auto* element = elements[0].ptr().ptr(); element && is_under_root(*element) && matches_fast(*element))
+                callback(*element);
+            return;
+        }
+        GC::RootVector<GC::Ref<Element>, 4> candidates;
+        for (auto const& element : elements) {
+            if (element && is_under_root(*element) && matches_fast(*element))
+                candidates.append(*element);
+        }
+        if (candidates.size() > 1)
+            quick_sort(candidates, [](auto const& a, auto const& b) { return a->is_before(*b); });
+        for (auto& element : candidates) {
+            if (callback(*element))
+                return;
+        }
+        return;
+    }
+
+    if (m_fast_path_kind == FastPathKind::SimpleCompound) {
+        walk_subject_subtree(root, is_html_document, callback);
+        return;
+    }
+
+    if (m_fast_ancestor.id && root.is_connected()) {
+        auto const* shadow_root = as_if<ShadowRoot>(tree_root);
+        auto const& element_by_id = shadow_root ? shadow_root->element_by_id() : document.element_by_id();
+        auto elements = element_by_id.elements_with_id(Utf16FlyString::from_raw(m_fast_ancestor.id));
+        if (elements.is_empty())
+            return;
+        if (elements.size() == 1 && elements[0]) {
+            auto* ancestor = elements[0].ptr().ptr();
+            if (!matches_simple_compound(*ancestor, m_fast_ancestor, is_html_document))
+                return;
+            if (m_fast_path_kind == FastPathKind::SimpleChildSimpleCompound) {
+                if (ancestor == &root || is_under_root(*ancestor)) {
+                    for (auto* child = ancestor->first_child_of_type<Element>(); child; child = child->next_element_sibling()) {
+                        if (matches_simple_compound(*child, m_fast_subject, is_html_document) && callback(*child))
+                            return;
+                    }
+                }
+                return;
+            }
+            if (ancestor == &root || is_under_root(*ancestor)) {
+                walk_subject_subtree(*ancestor, is_html_document, callback);
+                return;
+            }
+            if (root.is_descendant_of(*ancestor)) {
+                walk_subject_subtree(root, is_html_document, callback);
+                return;
+            }
+            return;
+        }
+    }
+
+    if (m_fast_path_kind == FastPathKind::SimpleChildSimpleCompound) {
+        walk_subject_subtree(root, is_html_document, [&](Element& element) {
+            auto const* parent = parent_element_of(element);
+            return parent && matches_simple_compound(*parent, m_fast_ancestor, is_html_document) && callback(element);
+        });
+        return;
+    }
+
+    // SimpleDescendantSimpleCompound: check once whether root or an ancestor of root satisfies the ancestor compound.
+    for (auto const* ancestor = as_if<Element>(root); ancestor; ancestor = parent_element_of(*ancestor)) {
+        if (matches_simple_compound(*ancestor, m_fast_ancestor, is_html_document)) {
+            walk_subject_subtree(root, is_html_document, callback);
+            return;
+        }
+    }
+    if (auto const* root_element = as_if<Element>(root)) {
+        if ((m_ancestor_filter_bits && (root_element->subtree_name_filter() & m_ancestor_filter_bits) != m_ancestor_filter_bits)
+            || (m_ancestor_attribute_filter_bits && (root_element->subtree_attribute_filter() & m_ancestor_attribute_filter_bits) != m_ancestor_attribute_filter_bits))
+            return;
+    }
+    walk_subject_subtree(root, is_html_document, [&](Element& element) {
+        for (auto const* parent = parent_element_of(element); parent && parent != &root; parent = parent_element_of(*parent)) {
+            if (matches_simple_compound(*parent, m_fast_ancestor, is_html_document))
+                return callback(element);
+        }
+        return false;
+    });
+}
+
 bool SelectorQuery::matches(Element const& element, ParentNode const& scope) const
 {
     if (m_matches_every_element)
         return true;
+    if (m_fast_path_kind != FastPathKind::None && !element.document().in_quirks_mode())
+        return matches_fast(element);
     return DomSelectorQuery { program(element.document()), element, scope }.matches(element);
 }
 
 GC::Ptr<Element const> SelectorQuery::closest(Element const& element) const
 {
+    if (m_matches_every_element)
+        return &element;
+    if (m_fast_path_kind != FastPathKind::None && !element.document().in_quirks_mode()) {
+        for (auto const* current = &element; current; current = parent_element_of(*current)) {
+            if (matches_fast(*current))
+                return current;
+        }
+        return nullptr;
+    }
     return DomSelectorQuery { program(element.document()), element, element }.closest(element);
 }
 
@@ -420,10 +725,16 @@ GC::Ptr<Element> SelectorQuery::query_first(ParentNode& root) const
 
     // FIXME: This should be shadow-including. https://drafts.csswg.org/selectors-4/#match-a-selector-against-a-tree
     GC::Ptr<Element> result;
-    if (m_matches_every_element)
+    if (m_matches_every_element) {
         result = root.first_child_of_type<Element>();
-    else
+    } else if (m_fast_path_kind != FastPathKind::None && !document.in_quirks_mode()) {
+        for_each_fast_match(root, [&](Element& element) {
+            result = element;
+            return true;
+        });
+    } else {
         result = DomSelectorQuery { program(document), root, root }.first(root);
+    }
 
     if (m_is_result_cacheable) {
         auto& cache = document.query_selector_result_cache();
@@ -465,6 +776,11 @@ GC::Ref<NodeList> SelectorQuery::query_all(ParentNode& root) const
         root.for_each_in_subtree_of_type<Element>([&](auto& element) {
             nodes.append(element);
             return TraversalDecision::Continue;
+        });
+    } else if (m_fast_path_kind != FastPathKind::None && !document.in_quirks_mode()) {
+        for_each_fast_match(root, [&](Element& element) {
+            nodes.append(element);
+            return false;
         });
     } else {
         DomSelectorQuery { program(document), root, root }.collect(root, nodes);

@@ -19,5 +19,6 @@ bool is_unknown_html_element(Utf16FlyString const& tag_name);
 struct Default { };
 
 WEB_API WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document&, Utf16FlyString local_name, Optional<Utf16FlyString> namespace_, Optional<Utf16FlyString> prefix = {}, Optional<Utf16FlyString> is = Optional<Utf16FlyString> {}, bool synchronous_custom_elements_flag = false, Variant<GC::Ptr<HTML::CustomElementRegistry>, Default> registry = Default {});
+WEB_API GC::Ref<Element> create_builtin_html_element_by_raw_local_name(Document&, FlatPtr raw_local_name, GC::Ptr<HTML::CustomElementRegistry>);
 
 }
