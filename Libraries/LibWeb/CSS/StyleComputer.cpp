@@ -859,7 +859,12 @@ static void collect_aspect_ratio_from_dimension_values(Vector<StyleProperty>& pr
 // keep the frame from jumping; publishing that is the same animation overlay publication an animation sample performs,
 // on the same element, over the same base, and the step samples the transitions over the installed record as such a
 // sample does: the box-type transformation of the values they take adjusts the composition, and the base stays current.
-RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, InstalledStyle const& before_change_style) const
+void StyleComputer::PendingTransitionOverlay::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    abstract_element.visit_edges(visitor);
+}
+
+RefPtr<ComputedStyleWorkingSet> StyleComputer::prepare_transition_step_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, InstalledStyle const& before_change_style) const
 {
     auto const installed_style = abstract_element.installed_style();
     if (!installed_style || !before_change_style)
@@ -889,8 +894,6 @@ RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_inst
             return {};
     }
 
-    begin_style_update();
-    ScopeGuard end_style_update = [&] { this->end_style_update(); };
     auto new_style = start_needed_transitions(read, abstract_element, before_change);
     if (!new_style)
         return {};
@@ -903,24 +906,58 @@ RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_inst
     } else if (auto animated_properties = new_style->animated_properties_snapshot(); !animated_properties || animated_properties->is_empty()) {
         return {};
     }
-    SampledAnimationOverlay const overlay { abstract_element, *new_style };
-    StyleEngineFFI::FfiAnimationOverlayPublication publication;
-    publish_sampled_animation_overlays(read, { &overlay, 1 }, { &publication, 1 });
-    element.refresh_computed_style(read, pseudo_element, InstalledStyle::adopt(publication.record));
-    // NB: refresh_computed_style() shows the new record on the element's own layout node, unless the node shows a
-    //     style the arena derived from the old one, which applying the style derives again. A transition that starts
-    //     with an inherited property moves what that node's anonymous descendants inherit, too, and applying the
-    //     style reaches them; otherwise they show the after-change value until the next animation frame.
-    auto* layout_node = pseudo_element.has_value() ? element.pseudo_element_unsafe_layout_node(read, *pseudo_element) : element.unsafe_layout_node(read);
-    if (layout_node) {
-        if (publication.invalidation.requires_layout_node_style_application || layout_node->has_layout_derived_style())
-            layout_node->apply_style(element.style_record_identity(pseudo_element));
-        else if (publication.invalidation.requires_style_resource_update)
-            layout_node->attach_style_resources();
+    return new_style;
+}
+
+void StyleComputer::publish_pending_transition_overlays(Layout::BegunRead const& read, ReadonlySpan<PendingTransitionOverlay> pending, Span<RequiredInvalidationAfterStyleChange> invalidations_out) const
+{
+    VERIFY(pending.size() == invalidations_out.size());
+    if (pending.is_empty())
+        return;
+
+    Vector<SampledAnimationOverlay, 8> overlays;
+    overlays.ensure_capacity(pending.size());
+    for (auto const& entry : pending)
+        overlays.unchecked_append({ entry.abstract_element, *entry.new_style });
+
+    Vector<StyleEngineFFI::FfiAnimationOverlayPublication, 8> publications;
+    publications.resize(pending.size());
+    publish_sampled_animation_overlays(read, overlays.span(), publications.span());
+
+    for (size_t i = 0; i < pending.size(); ++i) {
+        auto abstract_element = pending[i].abstract_element;
+        auto& element = abstract_element.element();
+        auto pseudo_element = abstract_element.pseudo_element();
+        auto const& publication = publications[i];
+        element.refresh_computed_style(read, pseudo_element, InstalledStyle::adopt(publication.record));
+        // NB: refresh_computed_style() shows the new record on the element's own layout node, unless the node shows a
+        //     style the arena derived from the old one, which applying the style derives again. A transition that starts
+        //     with an inherited property moves what that node's anonymous descendants inherit, too, and applying the
+        //     style reaches them; otherwise they show the after-change value until the next animation frame.
+        auto* layout_node = pseudo_element.has_value() ? element.pseudo_element_unsafe_layout_node(read, *pseudo_element) : element.unsafe_layout_node(read);
+        if (layout_node) {
+            if (publication.invalidation.requires_layout_node_style_application || layout_node->has_layout_derived_style())
+                layout_node->apply_style(element.style_record_identity(pseudo_element));
+            else if (publication.invalidation.requires_style_resource_update)
+                layout_node->attach_style_resources();
+        }
+        if (auto* svg_element = as_if<SVG::SVGElement>(element); svg_element && !pseudo_element.has_value())
+            svg_element->note_svg_paint_resource_description_may_have_changed();
+        invalidations_out[i] = decode_style_invalidation(publication.invalidation.invalidation);
     }
-    if (auto* svg_element = as_if<SVG::SVGElement>(element); svg_element && !pseudo_element.has_value())
-        svg_element->note_svg_paint_resource_description_may_have_changed();
-    return decode_style_invalidation(publication.invalidation.invalidation);
+}
+
+RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, InstalledStyle const& before_change_style) const
+{
+    begin_style_update();
+    ScopeGuard end_style_update = [&] { this->end_style_update(); };
+    auto new_style = prepare_transition_step_for_installed_record(read, abstract_element, before_change_style);
+    if (!new_style)
+        return {};
+    PendingTransitionOverlay const pending { abstract_element, new_style.release_nonnull() };
+    RequiredInvalidationAfterStyleChange invalidation {};
+    publish_pending_transition_overlays(read, { &pending, 1 }, { &invalidation, 1 });
+    return invalidation;
 }
 
 void StyleComputer::adopt_lane_transitions()
@@ -978,8 +1015,35 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
     auto overlay = abstract_element.custom_property_data();
     if (!abstract_element.custom_property_data_is_animation_overlay())
         overlay = nullptr;
+    bool no_ancestor_animations = Animations::RustFFI::animations_document_animations_has_no_animations_or_provisional_transitions(&document().document_animations());
+    if (!no_ancestor_animations) {
+        if (pseudo_element.has_value()) {
+            no_ancestor_animations = true;
+        } else {
+            bool const has_any_provisional = Animations::RustFFI::animations_document_animations_has_any_provisional_transitions(&document().document_animations());
+            no_ancestor_animations = true;
+            for (auto ancestor = abstract_element.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
+                auto const ancestor_style = ancestor->installed_style();
+                if ((ancestor_style && ancestor_style.view().animated_overlay != nullptr)
+                    || ancestor->element().has_associated_animations()
+                    || (has_any_provisional && has_provisional_transition_states(*ancestor))) {
+                    no_ancestor_animations = false;
+                    break;
+                }
+            }
+        }
+    }
     Animations::RustFFI::FfiTransitionStep step {
-        .animations = &element.ensure_animations(),
+        .animations = const_cast<Animations::RustFFI::ElementAnimations*>(element.element_animations_if_created()),
+        .ensure_animations = [](void* element_ptr) -> Animations::RustFFI::ElementAnimations* {
+            return &static_cast<DOM::Element*>(element_ptr)->ensure_animations();
+        },
+        .enter_execution_context = [](void* context, void (*run)(void*), void* run_context) {
+            auto& doc = *static_cast<DOM::Document const*>(context);
+            HTML::TemporaryExecutionContext execution_context { doc.relevant_settings_object() };
+            run(run_context);
+        },
+        .execution_context = const_cast<DOM::Document*>(&document()),
         .owner = transition_owner(abstract_element),
         .pseudo_element_serialization = pseudo_element_serialization.has_value() ? pseudo_element_serialization->raw_identity() : 0,
         .has_slot = slot.has_value(),
@@ -995,15 +1059,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         .target_node = element.style_node_id().value(),
         .target_pseudo_kind = pseudo_element_to_ffi(pseudo_element),
         .element_box_slot = Layout::Node::slot_id(element.unsafe_layout_node(read)).index,
+        .no_ancestor_animations = no_ancestor_animations,
         .tree_order = Animations::compare_elements_in_tree_order_for_composite_order,
     };
-    // NB: Starting and discarding transitions settles their promises in the document's realm.
     GC::RootVector<Animations::AnimationRef> animations;
-    Animations::RustFFI::FfiTransitionStepOutcome outcome;
-    {
-        HTML::TemporaryExecutionContext execution_context { document().relevant_settings_object() };
-        outcome = Animations::RustFFI::animations_document_animations_run_transition_step(&document().document_animations(), &step, Animations::keep_animation_alive_in, &animations, Animations::web_animation_perform_host_effect);
-    }
+    auto outcome = Animations::RustFFI::animations_document_animations_run_transition_step(&document().document_animations(), &step, Animations::keep_animation_alive_in, &animations, Animations::web_animation_perform_host_effect);
     if (!outcome.changes_effects)
         return {};
 

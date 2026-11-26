@@ -214,18 +214,56 @@ static TreeScopeID tree_scope_of(DOM::Node& document_or_shadow_root)
 }
 
 template<typename Callback>
-static void for_each_shadow_including_inclusive_descendant_with_scope(DOM::Node& node, TreeScopeID tree_scope, Callback& callback)
+static void for_each_shadow_including_inclusive_descendant_with_scope(DOM::Node& root, TreeScopeID root_scope, Callback& callback)
 {
-    callback(node, tree_scope);
+    struct Frame {
+        DOM::Node* node;
+        TreeScopeID scope;
+        bool resume_children;
+    };
 
-    if (auto* element = as_if<DOM::Element>(node); element && element->shadow_root()) {
-        auto& shadow_root = *element->shadow_root();
-        auto shadow_scope = tree_scope_of(shadow_root);
-        for_each_shadow_including_inclusive_descendant_with_scope(shadow_root, shadow_scope, callback);
+    Vector<Frame, 32> stack;
+    DOM::Node* current = &root;
+    TreeScopeID current_scope = root_scope;
+    for (;;) {
+        callback(*current, current_scope);
+
+        DOM::ShadowRoot* shadow_root = current->is_element() ? static_cast<DOM::Element*>(current)->shadow_root().ptr() : nullptr;
+        if (shadow_root) {
+            if (current != &root)
+                stack.append({ current, current_scope, false });
+            stack.append({ current, current_scope, true });
+            current = shadow_root;
+            current_scope = tree_scope_of(*shadow_root);
+            continue;
+        }
+        if (auto* child = current->first_child()) {
+            if (current != &root)
+                stack.append({ current, current_scope, false });
+            current = child;
+            continue;
+        }
+
+        if (current != &root) {
+            if (auto* sibling = current->next_sibling()) {
+                current = sibling;
+                continue;
+            }
+        }
+
+        DOM::Node* next = nullptr;
+        while (!stack.is_empty()) {
+            auto frame = stack.take_last();
+            next = frame.resume_children ? frame.node->first_child() : frame.node->next_sibling();
+            if (next) {
+                current_scope = frame.scope;
+                break;
+            }
+        }
+        if (!next)
+            return;
+        current = next;
     }
-
-    for (auto* child = node.first_child(); child; child = child->next_sibling())
-        for_each_shadow_including_inclusive_descendant_with_scope(*child, tree_scope, callback);
 }
 
 TreeScopeID style_engine_tree_scope_for(DOM::Node& document_or_shadow_root)
@@ -492,6 +530,17 @@ static void release_waiting_children_holding(DOM::Node& node, StyleEngine& style
 // wait walks past the nearest node waiting to arrive to look for them.
 static void record_node_connected(DOM::Node& node, StyleEngine& style_engine)
 {
+    if (node.style_arrival_pending()) {
+        if (style_engine.may_have_waiting_children()) {
+            if (auto* element = as_if<DOM::Element>(node)) {
+                if (auto* holder = element_whose_waiting_children_hold(node);
+                    holder && !element_can_wait_to_arrive(*element, style_engine.last_relational_arrival_keys())) {
+                    release_waiting_children_until_submitted(*holder, style_engine);
+                }
+            }
+        }
+        return;
+    }
     DOM::Element* holder = nullptr;
     if (!waits_to_arrive_with_an_ancestor(node, style_engine.may_have_waiting_children() ? &holder : nullptr)) {
         mark_style_arrival_pending(node, style_engine);

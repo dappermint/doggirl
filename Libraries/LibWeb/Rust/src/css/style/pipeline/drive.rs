@@ -54,10 +54,11 @@ enum FontSizeRecascade {
     AwaitsFont(bridge::FfiFontResolutionRequest),
 }
 
-/// Driven values, with the length context they were driven against and the font the drive resolved.
+/// Driven values, with the length context they were driven against and the font the drive resolved,
+/// if it resolved one (a partial drive whose font group stays its parent's resolves none).
 pub(in crate::css::style) struct DrivenValues {
     pub(in crate::css::style) length: crate::css::style_compute::FfiLengthResolutionContext,
-    pub(in crate::css::style) font: crate::css::table_group_builder::FfiFontGroupBuildInputs,
+    pub(in crate::css::style) font: Option<crate::css::table_group_builder::FfiFontGroupBuildInputs>,
 }
 
 impl RetainedState {
@@ -326,7 +327,7 @@ impl RetainedState {
         target: crate::css::style_compute::StyleAdjustmentTarget,
         parent: Option<StyleNodeID>,
     ) -> crate::css::style_compute::FfiBoxTypeTransformationInput {
-        self.box_type_transformation_input_with(self, facts, target, parent)
+        self.box_type_transformation_input_with(self, facts, target, parent, None)
     }
 
     pub(in crate::css::style) fn box_type_transformation_input_with(
@@ -335,13 +336,21 @@ impl RetainedState {
         facts: u32,
         target: crate::css::style_compute::StyleAdjustmentTarget,
         parent: Option<StyleNodeID>,
+        mut preloaded_parent_view: Option<&computed::StyleRecordView<'_>>,
     ) -> crate::css::style_compute::FfiBoxTypeTransformationInput {
         let mut parent_display = None;
         let mut parent_writing_mode = crate::css::css_enums::writing_mode::HORIZONTAL_TB;
         let mut ancestor = parent;
         while let Some(current) = ancestor {
-            let Some(view) = records.assigned_record_view(current) else {
-                break;
+            let owned_view;
+            let view = if let Some(view) = preloaded_parent_view.take() {
+                view
+            } else {
+                let Some(view) = records.assigned_record_view(current) else {
+                    break;
+                };
+                owned_view = view;
+                &owned_view
             };
             let longhands = view.longhands();
             let display = longhands.effective_display(view.animated_overlay);
@@ -397,18 +406,30 @@ impl RetainedState {
         &self,
         records: &impl DriveRecords,
         subject: DriveSubject,
+        preloaded_parent_view: Option<&computed::StyleRecordView<'_>>,
         writer: &mut GroupValuesWriter<'_>,
         selected: Option<&[u64]>,
+        builds_font: bool,
         store: &WinnerStore,
+        dependency_summary: u32,
         inputs: &bridge::FfiDocumentStyleComputationInputs,
         suspended_font: &mut Option<font_resolution::FontRequest>,
     ) -> Option<DrivenValues> {
-        let random_base_values = store
-            .drive_random_base_values(self, subject.target.node())
-            .expect("a random function's base values are drawn before the row is driven");
-        let resource_contexts = store.drive_resource_contexts(self);
+        let random_base_values = if dependency_summary & super::winner_store::DEPENDENCY_HAS_UNFIXED_RANDOM_SHARING != 0
+        {
+            store
+                .drive_random_base_values(self, subject.target.node())
+                .expect("a random function's base values are drawn before the row is driven")
+        } else {
+            Vec::new()
+        };
+        let resource_contexts = if dependency_summary & super::winner_store::DEPENDENCY_MAY_NEED_RESOURCE_CONTEXT != 0 {
+            store.drive_resource_contexts(self)
+        } else {
+            Vec::new()
+        };
         // NB: Include the originating element when selecting a pseudo-element's query containers.
-        let container_unit_bases = (store.container_unit_mask(self) != 0)
+        let container_unit_bases = (dependency_summary & super::winner_store::DEPENDENCY_CONTAINER_UNIT_MASK != 0)
             .then(|| self.container_unit_bases_with(records, subject.target.node(), subject.target.is_pseudo()));
         let document_base_url = &self.document_resource_contexts.document_base_url;
         let store = store.view(self);
@@ -426,62 +447,14 @@ impl RetainedState {
         let DriveSubject { target, parent, facts } = subject;
         let has = |bit: u32| facts & bit != 0;
         let is_document_element = has(fact::IS_DOCUMENT_ELEMENT);
-        // HACK: Where an element's font-family is just `monospace`, a keyword font size means 13px
-        //       at medium rather than the default size. So the size an element inherits across a
-        //       change between that family and any other is recascaded over the ancestor chain,
-        //       against the medium size of the element's own family: Each keyword size an ancestor
-        //       declared, and each size relative to one, is computed again. And the element's own
-        //       size, where it's relative to the one it inherits, is computed from that result.
-        let parent_font_family_is_monospace = parent
-            .and_then(|parent| records.assigned_record_view(parent))
-            .is_some_and(|view| {
-                let font = unsafe {
-                    view.payloads[group_index::FONT]
-                        .cast::<crate::css::computed_value_types::FontValues>()
-                        .deref()
-                };
-                font.font_family.data().is_some_and(font_family_is_monospace)
-            });
-        let font_family_is_monospace = match store.winning_declaration(prop::FONT_FAMILY) {
-            Some((value, ..)) => match value.data() {
-                StyleValueData::Keyword { keyword }
-                    if *keyword == crate::css::style_compute::keyword::INHERIT
-                        || *keyword == crate::css::style_compute::keyword::UNSET =>
-                {
-                    parent_font_family_is_monospace
-                }
-                value => font_family_is_monospace(value),
-            },
-            None => parent_font_family_is_monospace,
-        };
-        let medium_font_size_raw = if font_family_is_monospace {
-            CssPixels::from_integer(13).raw_value()
-        } else {
-            inputs.default_font_size_raw
-        };
-        let mut recascaded_font_size_reads_viewport = false;
-        let mut recascaded_font_size_includes_cascaded_value = false;
-        let recascaded_font_size = if font_family_is_monospace != parent_font_family_is_monospace {
-            match self.recascaded_font_size_with(records, target, inputs, medium_font_size_raw) {
-                FontSizeRecascade::Size(recascaded, reads_viewport) => {
-                    recascaded_font_size_reads_viewport = reads_viewport;
-                    let own_size = store.winning_declaration(prop::FONT_SIZE).and_then(|(value, ..)| {
-                        crate::css::style_compute::font_size_relative_to_inherited_size(value.data(), recascaded)
-                    });
-                    recascaded_font_size_includes_cascaded_value = own_size.is_some();
-                    Some(own_size.unwrap_or(recascaded))
-                }
-                FontSizeRecascade::AwaitsFont(request) => {
-                    *suspended_font = Some(font_resolution::FontRequest::new(request));
-                    return None;
-                }
+        let owned_parent_view;
+        let parent_view = match (parent, preloaded_parent_view) {
+            (Some(_), Some(view)) => Some(view),
+            (Some(parent), None) => {
+                owned_parent_view = records.assigned_record_view(parent)?;
+                Some(&owned_parent_view)
             }
-        } else {
-            None
-        };
-        let parent_view = match parent {
-            Some(parent) => Some(records.assigned_record_view(parent)?),
-            None => None,
+            (None, _) => None,
         };
         // The document element inherits from the initial values and resolves its font against
         // the document's initial font, the way C++'s document resolution context does.
@@ -493,7 +466,7 @@ impl RetainedState {
             line_height: inputs.initial_line_height,
         };
         let (parent_metrics, parent_font_metrics_depend_on_viewport_metrics, parent_line_height_used) =
-            match &parent_view {
+            match parent_view {
                 Some(parent_view) => {
                     let parent_font = unsafe {
                         parent_view.payloads[group_index::FONT]
@@ -515,7 +488,78 @@ impl RetainedState {
                 }
                 None => (initial_metrics, false, inputs.initial_line_height),
             };
-        let snapshot = match &parent_view {
+        // A partial drive whose font group stays its parent's does not touch any font or
+        // line-height longhand (nor math-depth or monospace recascade), so its own font metrics
+        // are identical to its parent's and it can skip font resolution and font-group assembly.
+        let can_skip_font_phases = !builds_font
+            && selected.is_some()
+            && parent_view.is_some()
+            && !is_document_element
+            && !parent_font_metrics_depend_on_viewport_metrics
+            && !has(fact::CHECK_INPUT_LINE_HEIGHT | fact::FORCE_LINE_HEIGHT_NORMAL);
+        let mut recascaded_font_size_reads_viewport = false;
+        let mut recascaded_font_size_includes_cascaded_value = false;
+        let (medium_font_size_raw, recascaded_font_size) = if can_skip_font_phases {
+            debug_assert!(
+                store.winning_declaration(prop::FONT_FAMILY).is_none()
+                    && store.winning_declaration(prop::FONT_SIZE).is_none()
+                    && store.winning_declaration(prop::LINE_HEIGHT).is_none()
+                    && store.winning_declaration(prop::MATH_DEPTH).is_none()
+            );
+            (inputs.default_font_size_raw, None)
+        } else {
+            // HACK: Where an element's font-family is just `monospace`, a keyword font size means 13px
+            //       at medium rather than the default size. So the size an element inherits across a
+            //       change between that family and any other is recascaded over the ancestor chain,
+            //       against the medium size of the element's own family: Each keyword size an ancestor
+            //       declared, and each size relative to one, is computed again. And the element's own
+            //       size, where it's relative to the one it inherits, is computed from that result.
+            let parent_font_family_is_monospace = parent_view.is_some_and(|view| {
+                let font = unsafe {
+                    view.payloads[group_index::FONT]
+                        .cast::<crate::css::computed_value_types::FontValues>()
+                        .deref()
+                };
+                font.font_family.data().is_some_and(font_family_is_monospace)
+            });
+            let font_family_is_monospace = match store.winning_declaration(prop::FONT_FAMILY) {
+                Some((value, ..)) => match value.data() {
+                    StyleValueData::Keyword { keyword }
+                        if *keyword == crate::css::style_compute::keyword::INHERIT
+                            || *keyword == crate::css::style_compute::keyword::UNSET =>
+                    {
+                        parent_font_family_is_monospace
+                    }
+                    value => font_family_is_monospace(value),
+                },
+                None => parent_font_family_is_monospace,
+            };
+            let medium_font_size_raw = if font_family_is_monospace {
+                CssPixels::from_integer(13).raw_value()
+            } else {
+                inputs.default_font_size_raw
+            };
+            let recascaded_font_size = if font_family_is_monospace != parent_font_family_is_monospace {
+                match self.recascaded_font_size_with(records, target, inputs, medium_font_size_raw) {
+                    FontSizeRecascade::Size(recascaded, reads_viewport) => {
+                        recascaded_font_size_reads_viewport = reads_viewport;
+                        let own_size = store.winning_declaration(prop::FONT_SIZE).and_then(|(value, ..)| {
+                            crate::css::style_compute::font_size_relative_to_inherited_size(value.data(), recascaded)
+                        });
+                        recascaded_font_size_includes_cascaded_value = own_size.is_some();
+                        Some(own_size.unwrap_or(recascaded))
+                    }
+                    FontSizeRecascade::AwaitsFont(request) => {
+                        *suspended_font = Some(font_resolution::FontRequest::new(request));
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            (medium_font_size_raw, recascaded_font_size)
+        };
+        let snapshot = match parent_view {
             Some(parent_view) => {
                 let parent_longhands = parent_view.longhands();
                 Some(crate::css::style_compute::ParentSnapshot::from_view(
@@ -555,7 +599,7 @@ impl RetainedState {
                 });
         let subject_inline_axis_is_horizontal = match declared_writing_mode {
             Some(writing_mode) => writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB,
-            None => parent_view.as_ref().is_none_or(|view| {
+            None => parent_view.is_none_or(|view| {
                 view.payloads.inherited_bits().writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB
             }),
         };
@@ -567,13 +611,18 @@ impl RetainedState {
             line_height: inputs.root_line_height,
         };
         // A tree-counting function on a pseudo-element counts its originating element's siblings.
-        let sibling_position = self.sibling_position(subject.target.node());
+        // Only query sibling position when at least one winning declaration actually uses a
+        // tree-counting function.
+        let sibling_position = (dependency_summary & super::winner_store::DEPENDENCY_USES_TREE_COUNTING_FUNCTION != 0)
+            .then(|| self.sibling_position(subject.target.node()))
+            .flatten();
         let environment = FfiStyleComputationEnvironment {
             box_type_input: self.box_type_transformation_input_with(
                 records,
                 facts,
                 crate::css::style_compute::StyleAdjustmentTarget::Element,
                 parent,
+                parent_view,
             ),
             color_scheme_input: FfiEffectiveColorSchemeInput {
                 preferred_color_scheme: inputs.preferred_color_scheme,
@@ -659,6 +708,54 @@ impl RetainedState {
                 u64::from(results.longhand_evaluations - evaluations_before),
             );
         };
+        let can_skip_color_scheme_phase = selected.is_some()
+            && parent_view.is_some()
+            && !is_document_element
+            && store.winning_declaration(prop::COLOR_SCHEME).is_none()
+            && writer.effective_color_scheme() >= 0;
+        if can_skip_font_phases {
+            if can_skip_color_scheme_phase {
+                effective_color_scheme = writer.effective_color_scheme();
+            } else {
+                drive(
+                    &self.counters,
+                    writer,
+                    &mut results,
+                    &mut effective_color_scheme,
+                    LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
+                    None,
+                    None,
+                );
+                effective_color_scheme = writer.effective_color_scheme();
+            }
+            let remaining_length = length_context(
+                parent_metrics,
+                false,
+                document_root_font_metrics,
+                inputs.root_font_metrics_depend_on_viewport_metrics,
+            );
+            let input_line_height_metrics = FfiInputLineHeightMetrics {
+                current_line_height: 0.0,
+                minimum_line_height: 0.0,
+            };
+            drive(
+                &self.counters,
+                writer,
+                &mut results,
+                &mut effective_color_scheme,
+                LONGHAND_DRIVE_PHASE_REMAINING,
+                Some(&remaining_length),
+                Some(&input_line_height_metrics),
+            );
+            // A tree-counting value is admitted only where the retained tree places the element.
+            if results.uses_tree_counting_function && sibling_position.is_none() {
+                unreachable!("the style engine answers every row");
+            }
+            return Some(DrivenValues {
+                length: remaining_length,
+                font: None,
+            });
+        }
         let font_length = if is_document_element {
             length_context(initial_metrics, false, initial_metrics, false)
         } else {
@@ -750,16 +847,20 @@ impl RetainedState {
 
         let line_height_before_adjustments =
             engine_sample::used_line_height(|property| Some(writer.effective_value(property)), &request, &resolved);
-        drive(
-            &self.counters,
-            writer,
-            &mut results,
-            &mut effective_color_scheme,
-            LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
-            None,
-            None,
-        );
-        effective_color_scheme = writer.effective_color_scheme();
+        if can_skip_color_scheme_phase {
+            effective_color_scheme = writer.effective_color_scheme();
+        } else {
+            drive(
+                &self.counters,
+                writer,
+                &mut results,
+                &mut effective_color_scheme,
+                LONGHAND_DRIVE_PHASE_COLOR_SCHEME,
+                None,
+                None,
+            );
+            effective_color_scheme = writer.effective_color_scheme();
+        }
 
         let remaining_length = length_context(
             own_metrics(line_height_before_adjustments),
@@ -800,11 +901,19 @@ impl RetainedState {
             unreachable!("the style engine answers every row");
         }
         let values = |property| Some(writer.effective_value(property));
-        let line_height_used_after = engine_sample::used_line_height(values, &request, &resolved);
+        let line_height_used_after = if has(fact::CHECK_INPUT_LINE_HEIGHT | fact::FORCE_LINE_HEIGHT_NORMAL) {
+            engine_sample::used_line_height(values, &request, &resolved)
+        } else {
+            debug_assert_eq!(
+                line_height_before_adjustments,
+                engine_sample::used_line_height(values, &request, &resolved)
+            );
+            line_height_before_adjustments
+        };
         let font = engine_sample::font_group_build_inputs(values, &request, line_height_used_after, &resolved);
         Some(DrivenValues {
             length: remaining_length,
-            font,
+            font: Some(font),
         })
     }
 }

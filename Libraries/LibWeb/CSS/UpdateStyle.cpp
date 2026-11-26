@@ -331,6 +331,36 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
 
     // NB: No element holds children waiting to arrive where the document has none below it.
     auto const reveal_waiting = document.descendant_style_arrival_pending() ? CSS::MainEffects::RevealWaiting : CSS::MainEffects::None;
+    GC::RootVector<StyleComputer::PendingTransitionOverlay, 8> pending_transition_overlays;
+    HashTable<DOM::Element const*> pending_transition_elements;
+    bool style_update_begun_for_transitions = false;
+    ScopeGuard end_style_update_for_transitions = [&] {
+        if (style_update_begun_for_transitions)
+            style_computer.end_style_update();
+    };
+    auto flush_pending_transition_overlays = [&] {
+        if (pending_transition_overlays.is_empty())
+            return;
+        Vector<RequiredInvalidationAfterStyleChange, 8> invalidations;
+        invalidations.resize(pending_transition_overlays.size());
+        style_computer.publish_pending_transition_overlays(read, pending_transition_overlays.span(), invalidations.span());
+        for (size_t i = 0; i < pending_transition_overlays.size(); ++i) {
+            apply_element_style_invalidation_after_style_change(read, pending_transition_overlays[i].abstract_element.element(), invalidations[i]);
+            application->invalidation |= invalidations[i];
+        }
+        pending_transition_overlays.clear();
+        pending_transition_elements.clear();
+    };
+    auto flush_if_ancestor_pending = [&](DOM::Element const& target) {
+        if (pending_transition_elements.is_empty())
+            return;
+        for (GC::Ptr<DOM::Element const> ancestor = &target; ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
+            if (pending_transition_elements.contains(ancestor.ptr())) {
+                flush_pending_transition_overlays();
+                return;
+            }
+        }
+    };
     for (auto const& element_effects : ReadonlySpan<InstalledElementEffects> { effects, effect_count }) {
         auto main_effects = static_cast<CSS::MainEffects>(element_effects.effects);
         main_effects &= ~CSS::MainEffects::RevealWaiting | reveal_waiting;
@@ -349,7 +379,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         InstalledStyle const before_change = owes_a_transition_step ? element->installed_style() : InstalledStyle {};
         // So does that of a pseudo-element.
         Array<InstalledStyle, DOM::Element::computed_pseudo_elements.size()> pseudo_element_before_change {};
-        if (element) {
+        if (element && element_effects.pseudo_element_transition_steps != 0) {
             for (size_t i = 0; i < pseudo_element_before_change.size(); ++i) {
                 auto pseudo_element = DOM::Element::computed_pseudo_elements[i];
                 if ((element_effects.pseudo_element_transition_steps >> to_underlying(pseudo_element)) & 1)
@@ -387,29 +417,45 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         // The host composes the element's animations over the record it installed, and its pseudo-elements, which
         // inherit the composition, after it.
         if (has_flag(main_effects, CSS::MainEffects::Animated)) {
+            flush_if_ancestor_pending(*element);
             DOM::AbstractElement abstract_element { *element };
             if (has_flag(main_effects, CSS::MainEffects::AnimationPlan))
                 style_computer.apply_settled_animation_plan(read, abstract_element);
             if (old_style && document.is_in_style_stabilization_epoch())
                 style_computer.record_transition_stabilization_baseline(abstract_element, old_style);
-            StyleEngineFFI::style_engine_begin_composition_settling(style_computer.style_engine().host(), &read, element->style_node_id().value());
-            if (style_computer.has_animations_to_compose(abstract_element))
+            bool const has_animations = style_computer.has_animations_to_compose(abstract_element);
+            bool const has_custom_overlay = !has_animations && abstract_element.custom_property_data_is_animation_overlay();
+            bool const runs_transition_step = owes_a_transition_step && before_change;
+            bool const settle_composition = (has_animations || has_custom_overlay) && runs_transition_step;
+            if (settle_composition)
+                StyleEngineFFI::style_engine_begin_composition_settling(style_computer.style_engine().host(), &read, element->style_node_id().value());
+            if (has_animations)
                 sample_animations_for_installed_record(abstract_element);
-            else
+            else if (has_custom_overlay)
                 style_computer.stop_publishing_animated_custom_properties(abstract_element);
-            if (owes_a_transition_step && before_change) {
-                auto step_invalidation = style_computer.run_transition_step_for_installed_record(read, abstract_element, before_change);
-                apply_element_style_invalidation_after_style_change(read, *element, step_invalidation);
-                application->invalidation |= step_invalidation;
+            if (runs_transition_step) {
+                if (!style_update_begun_for_transitions) {
+                    style_computer.begin_style_update();
+                    style_update_begun_for_transitions = true;
+                }
+                if (auto new_style = style_computer.prepare_transition_step_for_installed_record(read, abstract_element, before_change)) {
+                    pending_transition_overlays.append({ abstract_element, new_style.release_nonnull() });
+                    pending_transition_elements.set(element);
+                    if (settle_composition || element_effects.pseudo_elements_composed != 0 || display_none_before.has_value() || has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants))
+                        flush_pending_transition_overlays();
+                }
             }
-            StyleEngineFFI::style_engine_end_composition_settling(style_computer.style_engine().host(), &read);
+            if (settle_composition)
+                StyleEngineFFI::style_engine_end_composition_settling(style_computer.style_engine().host(), &read);
         }
         // The host composes the records swapped in for the element's pseudo-elements that owe the plan of their
         // animations or the transition step, or whose element has animations, as it composes those it settles.
         if (element_effects.pseudo_elements_composed != 0) {
+            flush_if_ancestor_pending(*element);
             application->invalidation |= element->compose_style_pseudo_element_records(read, element_effects.pseudo_elements_composed, element_effects.pseudo_element_transition_steps, pseudo_element_before_change, pseudo_elements_displayed_before);
         }
         if (display_none_before.has_value()) {
+            flush_if_ancestor_pending(*element);
             element->apply_display_none_change(*display_none_before);
             // The animations and transitions the change terminated compose no more over the record.
             if (element->installed_style().view().animated_overlay || element->custom_property_data_is_animation_overlay({}))
@@ -419,6 +465,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         // do: those it found below the element in the tree the transaction was computed from. That can be another
         // tree than the document's now, where a write made beside a transaction that flew moved an element in it.
         if (has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants)) {
+            flush_pending_transition_overlays();
             VERIFY(element_effects.cleared_descendants_begin <= element_effects.cleared_descendants_end);
             VERIFY(element_effects.cleared_descendants_end <= all_cleared_descendants.size());
             for (auto style_node : all_cleared_descendants.slice(element_effects.cleared_descendants_begin, element_effects.cleared_descendants_end - element_effects.cleared_descendants_begin)) {
@@ -429,6 +476,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
         if (has_flag(main_effects, CSS::MainEffects::VisibilityFlip))
             document.throttled_animation_visibility_changed();
     }
+    flush_pending_transition_overlays();
     swap_in_styles_until(all_swaps.size());
 
     auto invalidation = decode_style_invalidation(document_damage);

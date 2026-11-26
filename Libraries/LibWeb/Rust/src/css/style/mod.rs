@@ -321,7 +321,7 @@ pub struct RetainedState {
 
     /// The places of the children of parents with many of them, which sibling-counting functions
     /// read, kept while the tree's DOM order stands.
-    sibling_positions: crate::fork::ForkReset<Mutex<publication::SiblingPositionCache>>,
+    sibling_positions: crate::fork::ForkReset<std::sync::RwLock<publication::SiblingPositionCache>>,
     /// The elements a style() container query asked as containers with a value counting their place among their
     /// siblings. A fork shares them, as too many only walk more. An element's identity used again stays here too.
     containers_counted_by_style_queries: Arc<Mutex<HashSet<StyleNodeID>>>,

@@ -109,9 +109,15 @@ protected:
     void visit_edges(JS::Cell::Visitor&);
     // Lets go of the animations as the GC finalizes the element, so that an animation that only the lists held is no
     // longer alive to the host before anything else runs.
-    void finalize_animations();
+    ALWAYS_INLINE void finalize_animations()
+    {
+        if (m_animations) [[unlikely]]
+            finalize_animations_slow();
+    }
 
 private:
+    static void finalize_dead_animated_elements(GC::Heap&);
+    void finalize_animations_slow();
     // The lists, created as the element first holds an animation, which the element owns.
     RustFFI::ElementAnimations* m_animations { nullptr };
 };

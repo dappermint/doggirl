@@ -2054,6 +2054,8 @@ pub struct ParsedStyleSheet {
     /// The positions among `native_roots` of the rules that are, or hold, a rule a media evaluation reads: all of the
     /// sheet an evaluation reaches while the sheet's own media holds as it did.
     media_holding_roots: Box<[u32]>,
+    /// The positions among `native_roots` of the rules that are, or hold, a `@layer` or `@import` rule.
+    layer_holding_roots: Box<[u32]>,
     diagnostics: Box<[FfiSyntaxDiagnostic]>,
     declaration_errors: Box<[u32]>,
 }
@@ -2735,6 +2737,7 @@ impl<'a> SyntaxParseBuilder<'a> {
             items: self.items.into_boxed_slice(),
             native_roots: Box::default(),
             media_holding_roots: Box::default(),
+            layer_holding_roots: Box::default(),
             diagnostics: self.diagnostics.into_boxed_slice(),
             declaration_errors: narrow(declaration_errors),
         };
@@ -2764,6 +2767,21 @@ impl<'a> SyntaxParseBuilder<'a> {
                         ParsedRuleChild::Declarations(_) => return false,
                     };
                     rule.holds_media_rules(&parsed)
+                }
+            })
+            .map(shared_rules::narrow_index)
+            .collect();
+        parsed.layer_holding_roots = (0..parsed.native_roots.len())
+            .filter(|&position| {
+                let index = parsed.native_roots[position] as usize;
+                if parsed.items.is_empty() {
+                    parsed.root(index).holds_layer_rules(&parsed)
+                } else {
+                    let rule = match parsed.items[index] {
+                        ParsedRuleChild::Rule(rule) => parsed.rule(rule),
+                        ParsedRuleChild::Declarations(_) => return false,
+                    };
+                    rule.holds_layer_rules(&parsed)
                 }
             })
             .map(shared_rules::narrow_index)

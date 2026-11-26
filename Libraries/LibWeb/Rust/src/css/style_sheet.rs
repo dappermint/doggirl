@@ -336,7 +336,7 @@ impl NativeStyleSheet {
             prefix.truncate(prefix_length);
         }
         if self.media.matches() {
-            let _ = self.rules.visit_rules(&mut |rule| {
+            let _ = self.rules.visit_layer_holding_rules(&mut |rule| {
                 visit(self, rule, prefix, visit_name);
                 ControlFlow::Continue(())
             });

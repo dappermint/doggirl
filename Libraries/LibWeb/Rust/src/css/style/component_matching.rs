@@ -1149,7 +1149,6 @@ impl<S: SelectorSubject> SelectorEvaluator<S> {
         };
         // `[ns|x]` tests the name qualified by the namespace the prefix names, which only an attribute in that
         // namespace publishes.
-        let qualified;
         let name = match attribute.qualified_name.namespace_type {
             NamespaceType::Named => {
                 match context
@@ -1157,8 +1156,10 @@ impl<S: SelectorSubject> SelectorEvaluator<S> {
                     .test_for(NamespaceType::Named, Some(attribute.qualified_name.namespace))
                 {
                     Ok(Some(namespace)) if !namespace.is_none() => {
-                        qualified = crate::css::style::AtomLease::acquire_qualified(atoms, namespace, name);
-                        qualified.atom()
+                        let Some(qualified) = atoms.lookup_qualified(namespace, name) else {
+                            return Ok(false);
+                        };
+                        qualified
                     }
                     Ok(_) => name,
                     Err(_) => return Ok(false),
@@ -1166,8 +1167,10 @@ impl<S: SelectorSubject> SelectorEvaluator<S> {
             }
             // `[*|x]` tests the any-namespace name every attribute publishes, qualified by no namespace.
             NamespaceType::Any => {
-                qualified = crate::css::style::AtomLease::acquire_qualified(atoms, StyleAtomID::NONE, name);
-                qualified.atom()
+                let Some(qualified) = atoms.lookup_qualified(StyleAtomID::NONE, name) else {
+                    return Ok(false);
+                };
+                qualified
             }
             _ => name,
         };

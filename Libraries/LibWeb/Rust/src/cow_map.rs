@@ -237,10 +237,12 @@ impl<K, V> Clone for CowMap<K, V> {
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> CowMap<K, V> {
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -259,7 +261,8 @@ impl<K: Clone + Eq + Hash, V: Clone> CowMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        Node::get(self.root.as_deref()?, hash_of(key), key)
+        let root = self.root.as_deref()?;
+        Node::get(root, hash_of(key), key)
     }
 
     pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
@@ -276,7 +279,8 @@ impl<K: Clone + Eq + Hash, V: Clone> CowMap<K, V> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        Node::get_mut(self.root.as_mut()?, hash_of(key), 0, key)
+        let root = self.root.as_mut()?;
+        Node::get_mut(root, hash_of(key), 0, key)
     }
 
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -291,13 +295,14 @@ impl<K: Clone + Eq + Hash, V: Clone> CowMap<K, V> {
         previous
     }
 
+    #[inline]
     pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let hash = hash_of(key);
         let root = self.root.as_mut()?;
+        let hash = hash_of(key);
         Node::get(root.as_ref(), hash, key)?;
         let removed = Node::remove(root, hash, 0, key);
         self.len -= 1;
@@ -346,7 +351,11 @@ impl<K: Clone + Eq + Hash, V: Clone> CowMap<K, V> {
     }
 
     /// Keeps the entries `keep` answers true for.
+    #[inline]
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        if self.root.is_none() {
+            return;
+        }
         let gone: Vec<K> = self
             .iter()
             .filter(|(key, value)| !keep(key, value))
@@ -414,6 +423,7 @@ impl<T: Clone + Eq + Hash> CowSet<T> {
         self.0.heap_size()
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -436,6 +446,7 @@ impl<T: Clone + Eq + Hash> CowSet<T> {
     }
 
     /// Answers whether the set held `value`.
+    #[inline]
     pub(crate) fn remove<Q>(&mut self, value: &Q) -> bool
     where
         T: Borrow<Q>,

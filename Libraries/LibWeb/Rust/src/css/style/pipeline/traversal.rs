@@ -625,23 +625,120 @@ struct Scratch<'a> {
     pseudo_element_cache_hits: SmallVec<[super::PseudoElementTarget; 2]>,
 }
 
-impl<'a> Scratch<'a> {
-    fn new(context: &PassContext<'a>) -> Self {
-        let state = context.state;
+const SCRATCH_BUFFER_POOL_SLOTS: usize = 16;
+
+/// Reusable heap buffers kept per worker slot across style passes to avoid reallocating
+/// Cascade's longhand table, AncestorFilter's bloom table, and Vecs on every pass, and to
+/// prevent cross-thread frees when Scratches drops on the calling thread.
+struct ReusableScratchBuffers {
+    cascade: Cascade,
+    filter: AncestorFilter,
+    ancestors: Vec<(StyleNodeID, SmallVec<[u32; 8]>)>,
+    matches: Vec<ElementMatch>,
+    reason_answers: Vec<bool>,
+    applied: Vec<ElementMatch>,
+    sharing: SharingCache,
+    revalidation_matches: Vec<ElementMatch>,
+}
+
+// SAFETY: Buffers contain no borrowed references and are only accessed while held exclusively.
+unsafe impl Send for ReusableScratchBuffers {}
+
+impl ReusableScratchBuffers {
+    fn new() -> Self {
         Self {
-            matcher: Matcher::new(context.index, state),
             cascade: Cascade::new(),
             filter: AncestorFilter::new(),
             ancestors: Vec::new(),
             matches: Vec::new(),
             reason_answers: Vec::new(),
-            reason_flipped: false,
             applied: Vec::new(),
+            sharing: SharingCache::default(),
+            revalidation_matches: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        const MAX_KEPT_CAPACITY: usize = 1024;
+        self.cascade.reset_for_reuse();
+        // Always clear the ancestor Bloom filter so saturated `u8::MAX` counters from a deep or high-collision pass
+        // cannot persist across documents or passes in the process-wide pool.
+        self.filter.clear();
+        self.ancestors.clear();
+        if self.ancestors.capacity() > MAX_KEPT_CAPACITY {
+            self.ancestors.shrink_to(MAX_KEPT_CAPACITY);
+        }
+        self.matches.clear();
+        if self.matches.capacity() > MAX_KEPT_CAPACITY {
+            self.matches.shrink_to(MAX_KEPT_CAPACITY);
+        }
+        self.reason_answers.clear();
+        if self.reason_answers.capacity() > MAX_KEPT_CAPACITY {
+            self.reason_answers.shrink_to(MAX_KEPT_CAPACITY);
+        }
+        self.applied.clear();
+        if self.applied.capacity() > MAX_KEPT_CAPACITY {
+            self.applied.shrink_to(MAX_KEPT_CAPACITY);
+        }
+        self.sharing.clear();
+        self.revalidation_matches.clear();
+        if self.revalidation_matches.capacity() > MAX_KEPT_CAPACITY {
+            self.revalidation_matches.shrink_to(MAX_KEPT_CAPACITY);
+        }
+    }
+}
+
+static SCRATCH_BUFFER_POOL: [Mutex<Option<ReusableScratchBuffers>>; SCRATCH_BUFFER_POOL_SLOTS] =
+    [const { Mutex::new(None) }; SCRATCH_BUFFER_POOL_SLOTS];
+
+pub(in crate::css::style) fn clear_scratch_buffer_pool() {
+    for slot in &SCRATCH_BUFFER_POOL {
+        if let Ok(mut guard) = slot.try_lock() {
+            *guard = None;
+        }
+    }
+}
+
+fn take_reusable_scratch_buffers(slot: usize) -> ReusableScratchBuffers {
+    let slot = slot.min(SCRATCH_BUFFER_POOL_SLOTS - 1);
+    if let Ok(mut guard) = SCRATCH_BUFFER_POOL[slot].try_lock()
+        && let Some(buffers) = guard.take()
+    {
+        return buffers;
+    }
+    ReusableScratchBuffers::new()
+}
+
+fn return_reusable_scratch_buffers(slot: usize, mut buffers: ReusableScratchBuffers) {
+    buffers.reset();
+    let slot = slot.min(SCRATCH_BUFFER_POOL_SLOTS - 1);
+    if let Ok(mut guard) = SCRATCH_BUFFER_POOL[slot].try_lock() {
+        *guard = Some(buffers);
+    }
+}
+
+impl<'a> Scratch<'a> {
+    fn new(context: &PassContext<'a>) -> Self {
+        Self::new_for_slot(context, SCRATCH_BUFFER_POOL_SLOTS - 1)
+    }
+
+    fn new_for_slot(context: &PassContext<'a>, slot: usize) -> Self {
+        let state = context.state;
+        let buffers = take_reusable_scratch_buffers(slot);
+        Self {
+            matcher: Matcher::new(context.index, state),
+            cascade: buffers.cascade,
+            filter: buffers.filter,
+            ancestors: buffers.ancestors,
+            matches: buffers.matches,
+            reason_answers: buffers.reason_answers,
+            reason_flipped: false,
+            applied: buffers.applied,
             gated: false,
             container_reads: None,
             statistics: Statistics::default(),
             substitutions: Default::default(),
-            sharing: SharingCache::default(),
+            sharing: buffers.sharing,
             moved_names: Default::default(),
             waiting_keys: SmallVec::new(),
             own_declaration_lookups: OwnDeclarationLookups::default(),
@@ -652,11 +749,27 @@ impl<'a> Scratch<'a> {
             groups: Default::default(),
             absolutized: Default::default(),
             custom_property_stores: Default::default(),
-            revalidation_matches: Vec::new(),
+            revalidation_matches: buffers.revalidation_matches,
             backing_elements_moved: false,
             cache_audit: cache_audit::CacheAudit::for_pass(context),
             pseudo_element_cache_hits: SmallVec::new(),
         }
+    }
+
+    fn recycle_buffers(self, slot: usize) {
+        return_reusable_scratch_buffers(
+            slot,
+            ReusableScratchBuffers {
+                cascade: self.cascade,
+                filter: self.filter,
+                ancestors: self.ancestors,
+                matches: self.matches,
+                reason_answers: self.reason_answers,
+                applied: self.applied,
+                sharing: self.sharing,
+                revalidation_matches: self.revalidation_matches,
+            },
+        );
     }
 
     /// `flags`, shared with the record the thread made last holding the same flags, if any.
@@ -2637,7 +2750,7 @@ impl<'a> Scratches<'a> {
             .lock()
             .expect("a thread's scratch is only ever held by that thread");
         run(slot.get_or_insert_with(|| {
-            let mut scratch = Scratch::new(context);
+            let mut scratch = Scratch::new_for_slot(context, index);
             if context.uses_caches
                 && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
             {
@@ -3068,7 +3181,7 @@ fn style_queued<T: Sync>(
             *cache.lock().expect("no thread panicked while styling") = std::mem::take(&mut scratch.groups).kept();
             styled_threads |= 1 << index;
         }
-        statistics.add(scratch);
+        statistics.add_recycling(scratch, index);
     }
     // NB: The caches of the threads that sat the pass out count it as a small one too, so the room a large pass left
     //     them goes back while only the calling thread styles, as it does for an animation.
@@ -3234,13 +3347,19 @@ impl Statistics {
         statistics.cache_audit.add(round.cache_audit);
     }
 
-    /// Add what a thread's scratch measured and gathered.
-    fn add(&mut self, scratch: Scratch<'_>) {
+    /// Add what a thread's scratch measured and gathered, returning its reusable buffers to `slot`.
+    fn add_recycling(&mut self, mut scratch: Scratch<'_>, slot: usize) {
         self.match_counters.add(&scratch.matcher.counters());
         self.cascade_counters.add(&scratch.cascade.statistics);
-        self.add_round(scratch.statistics);
-        if let Some(audit) = scratch.cache_audit {
+        self.add_round(std::mem::take(&mut scratch.statistics));
+        if let Some(audit) = scratch.cache_audit.take() {
             self.cache_audit.add(*audit);
         }
+        scratch.recycle_buffers(slot);
+    }
+
+    /// Add what a thread's scratch measured and gathered.
+    fn add(&mut self, scratch: Scratch<'_>) {
+        self.add_recycling(scratch, SCRATCH_BUFFER_POOL_SLOTS - 1);
     }
 }

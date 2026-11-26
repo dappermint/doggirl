@@ -5401,9 +5401,52 @@ pub(crate) fn transition_values_declare_transitions(
 pub(crate) fn transition_entries(
     longhands: crate::css::style::ViewLonghands<'_>,
 ) -> Vec<crate::css::transition::TransitionEntry> {
-    use crate::css::property_metadata::property_id as prop;
+    use crate::css::property_metadata::{longhand_is_logical_alias, property_id as prop};
 
     let property_values = computed_value_list(longhands, prop::TRANSITION_PROPERTY);
+    if property_values.len() == 1 {
+        let transition_property = match property_values[0].data() {
+            StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => return Vec::new(),
+            StyleValueData::CustomIdent { custom_ident } => property_id_from_custom_ident(custom_ident),
+            _ => unreachable!("computed transition-property must be none or a custom identifier"),
+        };
+        let Some(transition_property) = transition_property else {
+            return Vec::new();
+        };
+        if transition_property == prop::CUSTOM {
+            return Vec::new();
+        }
+        if transition_property != prop::ALL && !property_is_shorthand(transition_property) {
+            let property_id = if longhand_is_logical_alias(transition_property) {
+                let (writing_mode, direction) = writing_mode_and_direction_of(
+                    longhands.handle(prop::WRITING_MODE),
+                    longhands.handle(prop::DIRECTION),
+                );
+                map_logical_alias_to_physical(transition_property, writing_mode, direction)
+            } else {
+                transition_property
+            };
+            let duration_values = computed_value_list(longhands, prop::TRANSITION_DURATION);
+            let timing_function_values = computed_value_list(longhands, prop::TRANSITION_TIMING_FUNCTION);
+            let delay_values = computed_value_list(longhands, prop::TRANSITION_DELAY);
+            let behavior_values = computed_value_list(longhands, prop::TRANSITION_BEHAVIOR);
+            let delay = time_value_to_milliseconds(delay_values[0].data());
+            let duration = time_value_to_milliseconds(duration_values[0].data());
+            let timing_function = timing_function_values[0].pointer();
+            let behavior = match behavior_values[0].data() {
+                StyleValueData::Keyword { keyword } => keyword_to_transition_behavior(*keyword).unwrap(),
+                _ => unreachable!("computed transition-behavior must be a keyword"),
+            };
+            return vec![crate::css::transition::TransitionEntry {
+                property_id,
+                delay,
+                duration,
+                timing_function,
+                behavior,
+            }];
+        }
+    }
+
     let duration_values = computed_value_list(longhands, prop::TRANSITION_DURATION);
     let timing_function_values = computed_value_list(longhands, prop::TRANSITION_TIMING_FUNCTION);
     let delay_values = computed_value_list(longhands, prop::TRANSITION_DELAY);
@@ -5453,6 +5496,21 @@ pub(crate) fn transition_entries(
         }
     }
     entries
+}
+
+/// Whether `transition-property` directly names `all` or `transform`, which always expands to include `transform`.
+pub(crate) fn transition_property_names_all_or_transform(longhands: crate::css::style::ViewLonghands<'_>) -> bool {
+    use crate::css::property_metadata::property_id as prop;
+
+    computed_value_list(longhands, prop::TRANSITION_PROPERTY)
+        .iter()
+        .any(|property_value| match property_value.data() {
+            StyleValueData::CustomIdent { custom_ident } => matches!(
+                property_id_from_custom_ident(custom_ident),
+                Some(prop::ALL | prop::TRANSFORM)
+            ),
+            _ => false,
+        })
 }
 
 /// The `transition-*` values of `longhands` as they apply to custom properties: a name takes its last entry, and a

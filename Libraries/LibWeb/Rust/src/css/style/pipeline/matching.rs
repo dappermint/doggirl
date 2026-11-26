@@ -125,6 +125,12 @@ impl MatchCounters {
     }
 }
 
+struct CachedFamilySources<'a> {
+    scope: TreeScopeID,
+    family: Family,
+    sources: SmallVec<[BucketSource<'a>; 8]>,
+}
+
 pub(super) struct Matcher<'a> {
     index: &'a RuleIndex,
     /// The buckets elements reach entries of `index` by: its own, or those of a part of it.
@@ -138,6 +144,8 @@ pub(super) struct Matcher<'a> {
     stamp: u32,
     /// The filter of the element asked for last, which its candidates ask for one after another.
     last_earlier_siblings: Option<(StyleNodeID, SiblingFilter)>,
+    /// Pre-filtered non-empty bucket sources for the most recently queried `(TreeScopeID, Family)`.
+    last_family_sources: Option<CachedFamilySources<'a>>,
 
     pub(super) statistics: MatchCounters,
 }
@@ -162,6 +170,7 @@ impl<'a> Matcher<'a> {
             offered: vec![0; index.entries.len()],
             stamp: 0,
             last_earlier_siblings: None,
+            last_family_sources: None,
 
             statistics: MatchCounters::default(),
         }
@@ -435,25 +444,50 @@ impl<'a> Matcher<'a> {
         out: &mut Vec<ElementMatch>,
     ) -> Result<(), Incomplete> {
         let (scope, family) = (reach.scope, reach.family);
-        let index = self.buckets;
-        // https://drafts.csswg.org/css-scoping-1/#shadow-cascading
-        // NB: A shadow tree decides with the document's user agent and user sheets, and with its
-        //     author sheets as well where it is built from the document's styles.
-        let mut sources: SmallVec<[BucketSource<'_>; 8]> = SmallVec::new();
-        match scope {
-            TreeScopeID::DOCUMENT => sources.extend(index.bucket_sources(ScopeGroupID::DOCUMENT, false)),
-            _ => {
-                if let Some(group) = index.group_of(scope) {
-                    sources.extend(index.bucket_sources(group, false));
+        let cache_hit = self
+            .last_family_sources
+            .as_ref()
+            .is_some_and(|cached| cached.scope == scope && cached.family == family);
+        if !cache_hit {
+            let index = self.buckets;
+            // https://drafts.csswg.org/css-scoping-1/#shadow-cascading
+            // NB: A shadow tree decides with the document's user agent and user sheets, and with its
+            //     author sheets as well where it is built from the document's styles.
+            let mut sources: SmallVec<[BucketSource<'a>; 8]> = SmallVec::new();
+            let push_non_empty = |sources: &mut SmallVec<[BucketSource<'a>; 8]>,
+                                  iter: &mut dyn Iterator<Item = BucketSource<'a>>| {
+                for source in iter {
+                    if !source.buckets.family(family).is_empty() {
+                        sources.push(source);
+                    }
                 }
-                // NB: A tree built from the document's styles stands in for what they were written for, whose host they do
-                //     not name.
-                let non_author = family == Family::Host || !self.state.rules.scope_uses_document_sheets(scope);
-                sources.extend(index.bucket_sources(ScopeGroupID::DOCUMENT, non_author));
+            };
+            match scope {
+                TreeScopeID::DOCUMENT => {
+                    push_non_empty(&mut sources, &mut index.bucket_sources(ScopeGroupID::DOCUMENT, false));
+                }
+                _ => {
+                    if let Some(group) = index.group_of(scope) {
+                        push_non_empty(&mut sources, &mut index.bucket_sources(group, false));
+                    }
+                    // NB: A tree built from the document's styles stands in for what they were written for, whose host they do
+                    //     not name.
+                    let non_author = family == Family::Host || !self.state.rules.scope_uses_document_sheets(scope);
+                    push_non_empty(
+                        &mut sources,
+                        &mut index.bucket_sources(ScopeGroupID::DOCUMENT, non_author),
+                    );
+                }
             }
+            if let Some(source) = index.user_agent_buckets()
+                && !source.buckets.family(family).is_empty()
+            {
+                sources.push(source);
+            }
+            self.last_family_sources = Some(CachedFamilySources { scope, family, sources });
         }
-        sources.extend(index.user_agent_buckets());
-        if sources.is_empty() {
+        let source_count = self.last_family_sources.as_ref().unwrap().sources.len();
+        if source_count == 0 {
             return Ok(());
         }
         // NB: An entry is offered once for each tree that reaches the element: the shadow trees of
@@ -480,11 +514,9 @@ impl<'a> Matcher<'a> {
         projection.for_each_dispatch_probe(facts, is_document_root, |key, _| {
             probes.push((key, Buckets::hash_of(&key)));
         });
-        for source in sources {
+        for source_index in 0..source_count {
+            let source = self.last_family_sources.as_ref().unwrap().sources[source_index];
             let buckets = source.buckets.family(family);
-            if buckets.is_empty() {
-                continue;
-            }
             for (key, hash) in &probes {
                 if let Some(bucket) = buckets.get_hashed(key, *hash) {
                     self.offer_all(bucket, source, node, reach, keys, out)?;
