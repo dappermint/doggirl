@@ -8,12 +8,21 @@
   unwrapped ? null,
   localAppPath ? null,
   appName ? "Doggirl",
-  bundleIdentifier ? "dev.dappermint.doggirl.Development",
+  bundleIdentifier ? "dev.dappermint.doggirl",
   extraArgs ? [ ],
   extraEnv ? { },
 }:
 
 let
+  passthroughDarwinApp =
+    stdenv.hostPlatform.isDarwin
+    && unwrapped != null
+    && localAppPath == null
+    && extraArgs == [ ]
+    && extraEnv == { }
+    && appName == "Doggirl"
+    && bundleIdentifier == "dev.dappermint.doggirl";
+
   envExports = lib.concatStringsSep "\n" (
     lib.mapAttrsToList (name: value: "export ${name}=${lib.escapeShellArg (toString value)}") extraEnv
   );
@@ -117,6 +126,8 @@ let
         <string>${appName}</string>
         <key>CFBundleIconFile</key>
         <string>app_icon.icns</string>
+        <key>CFBundleIconName</key>
+        <string>AppIcon</string>
         <key>CFBundleIdentifier</key>
         <string>${bundleIdentifier}</string>
         <key>CFBundleInfoDictionaryVersion</key>
@@ -194,41 +205,62 @@ runCommand "doggirl-wrapped-0.1.0"
     chmod 0755 "$out/bin/doggirl"
     ln -s doggirl "$out/bin/ladybird"
 
-    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
-      app_dir="$out/Applications/${appName}.app"
-      mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
-      cp "$launcherScriptPath" "$app_dir/Contents/MacOS/${appName}"
-      chmod 0755 "$app_dir/Contents/MacOS/${appName}"
-      cp "$infoPlistPath" "$app_dir/Contents/Info.plist"
+    ${lib.optionalString stdenv.hostPlatform.isDarwin (
+      if passthroughDarwinApp then
+        ''
+          if [ -d "${unwrapped}/Applications/Doggirl.app" ]; then
+            mkdir -p "$out/Applications"
+            cp -a "${unwrapped}/Applications/Doggirl.app" "$out/Applications/Doggirl.app"
+          else
+            app_dir="$out/Applications/${appName}.app"
+            mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
+            cp "$launcherScriptPath" "$app_dir/Contents/MacOS/${appName}"
+            chmod 0755 "$app_dir/Contents/MacOS/${appName}"
+            cp "$infoPlistPath" "$app_dir/Contents/Info.plist"
+          fi
+        ''
+      else
+        ''
+          app_dir="$out/Applications/${appName}.app"
+          mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
+          cp "$launcherScriptPath" "$app_dir/Contents/MacOS/${appName}"
+          chmod 0755 "$app_dir/Contents/MacOS/${appName}"
+          cp "$infoPlistPath" "$app_dir/Contents/Info.plist"
 
-      python3 - "${iconsetDir}" "$app_dir/Contents/Resources/app_icon.icns" <<'PY'
-      import os
-      import struct
-      import sys
+          if [ -n ${lib.escapeShellArg resolvedUnwrapped} ] && [ -f "${resolvedUnwrapped}/Applications/Doggirl.app/Contents/Resources/Assets.car" ]; then
+            cp "${resolvedUnwrapped}/Applications/Doggirl.app/Contents/Resources/Assets.car" \
+              "$app_dir/Contents/Resources/Assets.car"
+          fi
 
-      iconset_dir, output_path = sys.argv[1], sys.argv[2]
-      entries = [
-          (b"icp4", "icon_16x16.png"),
-          (b"icp5", "icon_32x32.png"),
-          (b"ic11", "icon_16x16@2x.png"),
-          (b"ic12", "icon_32x32@2x.png"),
-          (b"ic07", "icon_128x128.png"),
-          (b"ic13", "icon_128x128@2x.png"),
-          (b"ic08", "icon_256x256.png"),
-          (b"ic14", "icon_256x256@2x.png"),
-          (b"ic09", "icon_512x512.png"),
-          (b"ic10", "icon_512x512@2x.png"),
-      ]
-      chunks = []
-      for icon_type, filename in entries:
-          with open(os.path.join(iconset_dir, filename), "rb") as f:
-              data = f.read()
-          chunks.append(icon_type + struct.pack(">I", len(data) + 8) + data)
-      body = b"".join(chunks)
-      with open(output_path, "wb") as f:
-          f.write(b"icns" + struct.pack(">I", len(body) + 8) + body)
-      PY
-    ''}
+          python3 - "${iconsetDir}" "$app_dir/Contents/Resources/app_icon.icns" <<'PY'
+          import os
+          import struct
+          import sys
+
+          iconset_dir, output_path = sys.argv[1], sys.argv[2]
+          entries = [
+              (b"icp4", "icon_16x16.png"),
+              (b"icp5", "icon_32x32.png"),
+              (b"ic11", "icon_16x16@2x.png"),
+              (b"ic12", "icon_32x32@2x.png"),
+              (b"ic07", "icon_128x128.png"),
+              (b"ic13", "icon_128x128@2x.png"),
+              (b"ic08", "icon_256x256.png"),
+              (b"ic14", "icon_256x256@2x.png"),
+              (b"ic09", "icon_512x512.png"),
+              (b"ic10", "icon_512x512@2x.png"),
+          ]
+          chunks = []
+          for icon_type, filename in entries:
+              with open(os.path.join(iconset_dir, filename), "rb") as f:
+                  data = f.read()
+              chunks.append(icon_type + struct.pack(">I", len(data) + 8) + data)
+          body = b"".join(chunks)
+          with open(output_path, "wb") as f:
+              f.write(b"icns" + struct.pack(">I", len(body) + 8) + body)
+          PY
+        ''
+    )}
 
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
         mkdir -p "$out/share/applications" "$out/share/icons/hicolor/scalable/apps"
