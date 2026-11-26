@@ -136,7 +136,7 @@ impl<'a> Utf16View<'a> {
     pub fn append_to(self, code_units: &mut Vec<u16>) {
         match self {
             Self::Ascii(units) | Self::Latin1(units) => {
-                code_units.extend(units.iter().map(|&code_unit| u16::from(code_unit)));
+                append_bytes_widened_to_utf16(code_units, units);
             }
             Self::Utf16(units) => code_units.extend_from_slice(units),
         }
@@ -277,8 +277,44 @@ impl<'a> Utf16View<'a> {
                     candidates.iter().position(|&code_unit| code_unit == first_code_unit)
                 })
             }
-            _ => (start_offset..=last_possible_offset)
-                .find(|&offset| self.substring_view(offset, needle_length) == needle),
+            (Self::Utf16(haystack), Utf16View::Ascii(needle) | Utf16View::Latin1(needle)) => {
+                let (&first_byte, rest) = needle.split_first().expect("the needle is not empty");
+                let first = u16::from(first_byte);
+                let mut offset = start_offset;
+                while offset <= last_possible_offset {
+                    offset += haystack[offset..=last_possible_offset]
+                        .iter()
+                        .position(|&code_unit| code_unit == first)?;
+                    if haystack[offset + 1..offset + needle_length]
+                        .iter()
+                        .zip(rest)
+                        .all(|(&h, &n)| h == u16::from(n))
+                    {
+                        return Some(offset);
+                    }
+                    offset += 1;
+                }
+                None
+            }
+            (Self::Ascii(haystack) | Self::Latin1(haystack), Utf16View::Utf16(needle)) => {
+                let (&first_unit, rest) = needle.split_first().expect("the needle is not empty");
+                let Ok(first) = u8::try_from(first_unit) else {
+                    return None;
+                };
+                let mut offset = start_offset;
+                while offset <= last_possible_offset {
+                    offset += memchr::memchr(first, &haystack[offset..=last_possible_offset])?;
+                    if haystack[offset + 1..offset + needle_length]
+                        .iter()
+                        .zip(rest)
+                        .all(|(&h, &n)| u16::from(h) == n)
+                    {
+                        return Some(offset);
+                    }
+                    offset += 1;
+                }
+                None
+            }
         }
     }
 
@@ -385,8 +421,8 @@ pub fn json_special_code_unit_lanes(word: u64, lowest_bits: u64) -> u64 {
     (quotation_marks | reverse_solidi | control_characters) & highest_bits
 }
 
-/// The position of the first code unit of ASCII text that a JSON string cannot hold as it is, if it has one.
-fn ascii_json_special_code_unit_position(bytes: &[u8]) -> Option<usize> {
+/// The position of the first code unit of Latin-1 (or ASCII) text that a JSON string cannot hold as it is, if it has one.
+fn latin1_json_special_code_unit_position(bytes: &[u8]) -> Option<usize> {
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for (index, chunk) in chunks.iter().enumerate() {
         let lanes = json_special_code_unit_lanes(u64::from_le_bytes(*chunk), 0x0101_0101_0101_0101);
@@ -416,6 +452,84 @@ pub fn decode_utf16_surrogate_pair(high_surrogate: u16, low_surrogate: u16) -> u
     (u32::from(high_surrogate - HIGH_SURROGATE_MIN) << 10)
         + u32::from(low_surrogate - LOW_SURROGATE_MIN)
         + FIRST_SUPPLEMENTARY_PLANE_CODE_POINT
+}
+
+/// Appends `bytes` widened to UTF-16 (`u8` -> `u16`) into `dest`.
+#[inline]
+fn append_bytes_widened_to_utf16(dest: &mut Vec<u16>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len == 0 {
+        return;
+    }
+    let old_len = dest.len();
+    dest.reserve(len);
+    // SAFETY: `dest` has capacity for `old_len + len` elements, and every index in `0..len` is written below.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = dest.as_mut_ptr().add(old_len);
+        let mut index = 0usize;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            while index + 16 <= len {
+                let v = vld1q_u8(src.add(index));
+                vst1q_u16(dst.add(index), vmovl_u8(vget_low_u8(v)));
+                vst1q_u16(dst.add(index + 8), vmovl_high_u8(v));
+                index += 16;
+            }
+            if index + 8 <= len {
+                let v = vld1_u8(src.add(index));
+                vst1q_u16(dst.add(index), vmovl_u8(v));
+                index += 8;
+            }
+        }
+        while index < len {
+            dst.add(index).write(u16::from(*src.add(index)));
+            index += 1;
+        }
+        dest.set_len(old_len + len);
+    }
+}
+
+/// First index in `units` holding a JSON special code unit (`"`, `\`, or `< 0x20`) or any UTF-16 surrogate.
+#[inline]
+fn utf16_json_special_or_surrogate_position(units: &[u16]) -> Option<usize> {
+    let mut index = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        // SAFETY: NEON is always available on aarch64 and every load stays within `units`.
+        unsafe {
+            let quote = vdupq_n_u16(0x22);
+            let backslash = vdupq_n_u16(0x5C);
+            let space = vdupq_n_u16(0x20);
+            let surrogate_mask = vdupq_n_u16(0xF800);
+            let surrogate_tag = vdupq_n_u16(0xD800);
+            while index + 8 <= units.len() {
+                let chunk = vld1q_u16(units.as_ptr().add(index));
+                let special = vorrq_u16(
+                    vorrq_u16(vceqq_u16(chunk, quote), vceqq_u16(chunk, backslash)),
+                    vorrq_u16(
+                        vcltq_u16(chunk, space),
+                        vceqq_u16(vandq_u16(chunk, surrogate_mask), surrogate_tag),
+                    ),
+                );
+                let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(special, 4)), 0);
+                if mask != 0 {
+                    return Some(index + (mask.trailing_zeros() / 8) as usize);
+                }
+                index += 8;
+            }
+        }
+    }
+    while index < units.len() {
+        let code_unit = units[index];
+        if is_json_special_code_unit(u32::from(code_unit)) || is_unicode_surrogate(code_unit) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Mirrors AK::Utf16StringBuilder: collects code units as Latin-1 bytes until one of them is above U+00FF, and builds a
@@ -472,7 +586,7 @@ impl Utf16StringBuilder {
     fn utf16_code_units(&mut self, additional: usize) -> &mut Vec<u16> {
         if let BuilderStorage::Latin1(bytes) = &self.storage {
             let mut code_units = Vec::with_capacity((bytes.len() + additional).max(bytes.capacity()));
-            code_units.extend(bytes.iter().map(|&byte| u16::from(byte)));
+            append_bytes_widened_to_utf16(&mut code_units, bytes);
             self.storage = BuilderStorage::Utf16(code_units);
         }
         match &mut self.storage {
@@ -504,7 +618,7 @@ impl Utf16StringBuilder {
         debug_assert!(ascii.is_ascii());
         match &mut self.storage {
             BuilderStorage::Latin1(bytes) => bytes.extend_from_slice(ascii),
-            BuilderStorage::Utf16(code_units) => code_units.extend(ascii.iter().map(|&byte| u16::from(byte))),
+            BuilderStorage::Utf16(code_units) => append_bytes_widened_to_utf16(code_units, ascii),
         }
     }
 
@@ -519,53 +633,75 @@ impl Utf16StringBuilder {
     /// Mirrors AK::Utf16StringBuilder::append_quoted_escaped_for_json(): the string as a JSON string literal, which
     /// QuoteJSONString specifies.
     pub fn append_quoted_escaped_for_json(&mut self, string: Utf16View<'_>) {
-        if let (BuilderStorage::Latin1(bytes), Utf16View::Ascii(units)) = (&mut self.storage, string)
-            && ascii_json_special_code_unit_position(units).is_none()
-        {
-            bytes.reserve(units.len() + 2);
-            bytes.push(b'"');
-            bytes.extend_from_slice(units);
-            bytes.push(b'"');
-            return;
-        }
-
-        // OPTIMIZATION: ASCII text has no surrogates, so the runs between the code units that need escaping are
-        //               appended as they are.
-        if let Utf16View::Ascii(mut units) = string {
-            self.append_code_unit(u16::from(b'"'));
-            while let Some(position) = ascii_json_special_code_unit_position(units) {
-                self.append_ascii_bytes(&units[..position]);
-                self.append_json_escape(u16::from(units[position]));
-                units = &units[position + 1..];
+        match string {
+            Utf16View::Ascii(mut units) | Utf16View::Latin1(mut units) => {
+                if latin1_json_special_code_unit_position(units).is_none() {
+                    match &mut self.storage {
+                        BuilderStorage::Latin1(bytes) => {
+                            bytes.reserve(units.len() + 2);
+                            bytes.push(b'"');
+                            bytes.extend_from_slice(units);
+                            bytes.push(b'"');
+                        }
+                        BuilderStorage::Utf16(code_units) => {
+                            code_units.reserve(units.len() + 2);
+                            code_units.push(u16::from(b'"'));
+                            append_bytes_widened_to_utf16(code_units, units);
+                            code_units.push(u16::from(b'"'));
+                        }
+                    }
+                    return;
+                }
+                self.append_code_unit(u16::from(b'"'));
+                while let Some(position) = latin1_json_special_code_unit_position(units) {
+                    match &mut self.storage {
+                        BuilderStorage::Latin1(bytes) => bytes.extend_from_slice(&units[..position]),
+                        BuilderStorage::Utf16(code_units) => {
+                            append_bytes_widened_to_utf16(code_units, &units[..position]);
+                        }
+                    }
+                    self.append_json_escape(u16::from(units[position]));
+                    units = &units[position + 1..];
+                }
+                match &mut self.storage {
+                    BuilderStorage::Latin1(bytes) => bytes.extend_from_slice(units),
+                    BuilderStorage::Utf16(code_units) => append_bytes_widened_to_utf16(code_units, units),
+                }
+                self.append_code_unit(u16::from(b'"'));
             }
-            self.append_ascii_bytes(units);
-            self.append_code_unit(u16::from(b'"'));
-            return;
-        }
-
-        self.append_code_unit(u16::from(b'"'));
-        let length = string.length_in_code_units();
-        let mut index = 0;
-        while index < length {
-            let code_unit = string.code_unit_at(index);
-            if is_utf16_high_surrogate(code_unit)
-                && index + 1 < length
-                && is_utf16_low_surrogate(string.code_unit_at(index + 1))
-            {
-                let code_units = self.utf16_code_units(2);
-                code_units.push(code_unit);
-                code_units.push(string.code_unit_at(index + 1));
-                index += 2;
-                continue;
+            Utf16View::Utf16(units) => {
+                self.utf16_code_units(units.len() + 2).push(u16::from(b'"'));
+                let mut index = 0;
+                while index < units.len() {
+                    let clean_end = index
+                        + utf16_json_special_or_surrogate_position(&units[index..]).unwrap_or(units.len() - index);
+                    if clean_end > index {
+                        if let BuilderStorage::Utf16(code_units) = &mut self.storage {
+                            code_units.extend_from_slice(&units[index..clean_end]);
+                        }
+                        index = clean_end;
+                        if index >= units.len() {
+                            break;
+                        }
+                    }
+                    let code_unit = units[index];
+                    if is_utf16_high_surrogate(code_unit)
+                        && index + 1 < units.len()
+                        && is_utf16_low_surrogate(units[index + 1])
+                    {
+                        if let BuilderStorage::Utf16(code_units) = &mut self.storage {
+                            code_units.push(code_unit);
+                            code_units.push(units[index + 1]);
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    self.append_json_escape(code_unit);
+                    index += 1;
+                }
+                self.append_code_unit(u16::from(b'"'));
             }
-            if is_json_special_code_unit(u32::from(code_unit)) || is_unicode_surrogate(code_unit) {
-                self.append_json_escape(code_unit);
-            } else {
-                self.append_code_unit(code_unit);
-            }
-            index += 1;
         }
-        self.append_code_unit(u16::from(b'"'));
     }
 
     /// Appends the escape sequence of a code unit that a JSON string cannot hold as it is: a JSON special code unit or
@@ -878,11 +1014,29 @@ pub fn to_utf16_fly_string(string: &Utf16String) -> Utf16FlyString {
 
 /// Concatenates views into a new string, with one byte per code unit when every view has it.
 pub fn concatenate(views: &[Utf16View<'_>]) -> Utf16String {
-    let length = views.iter().map(|view| view.length_in_code_units()).sum();
-    if views.iter().all(|view| !matches!(view, Utf16View::Utf16(_))) {
+    let mut length = 0;
+    let mut all_latin1 = true;
+    let mut all_ascii = true;
+    for view in views {
+        match view {
+            Utf16View::Ascii(units) => length += units.len(),
+            Utf16View::Latin1(units) => {
+                length += units.len();
+                if all_ascii {
+                    all_ascii = units.is_ascii();
+                }
+            }
+            Utf16View::Utf16(units) => {
+                length += units.len();
+                all_latin1 = false;
+                all_ascii = false;
+            }
+        }
+    }
+    if all_latin1 {
         return Utf16String::from_latin1_concatenation(
             length,
-            views.iter().all(|view| view.is_ascii()),
+            all_ascii,
             views.iter().map(|view| match view {
                 Utf16View::Ascii(units) | Utf16View::Latin1(units) => *units,
                 Utf16View::Utf16(_) => unreachable!("every view has one byte per code unit"),
