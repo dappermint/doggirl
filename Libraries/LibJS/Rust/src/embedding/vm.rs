@@ -263,6 +263,18 @@ pub unsafe extern "C" fn js_vm_request_interrupt(vm: *mut JSVM) {
     unsafe { vm_from_abi(vm) }.request_interrupt();
 }
 
+/// Notes that `[[IsHTMLDDA]]` objects (such as `document.all`) may exist in this VM, avoiding a later mass JIT
+/// invalidation when the first one is created.
+///
+/// # Safety
+///
+/// `vm` must be a live VM of the calling thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_note_htmldda_objects_may_exist(vm: *mut JSVM) {
+    // SAFETY: The caller passes a live VM on its thread.
+    crate::jit::dependencies::note_htmldda_object(unsafe { vm_from_abi(vm) });
+}
+
 /// Whether js_vm_request_interrupt() was called on the VM. Any thread may call this.
 ///
 /// # Safety

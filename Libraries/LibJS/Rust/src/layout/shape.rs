@@ -31,6 +31,8 @@ pub struct Shape {
     /// The descriptor array, or the DictionaryPropertyTable of a dictionary shape.
     pub property_storage: NullableMember<DescriptorArray>,
     pub storage: ShapeStorage,
+    /// 64-bit 2-bit bloom filter over PropertyKey::raw_bits() of properties in this shape (superset after deletes).
+    pub key_bloom: Cell<u64>,
 }
 
 /// Something the runtime and JIT code may rely on until it stops holding, when the set fires once and stays invalid.

@@ -123,13 +123,46 @@ pub fn size_classes(heap: &Heap) -> &[SizeClassAllocator] {
     heap.size_classes(ValueStorage::CLASS, &SIZE_CLASS_CELL_SIZES)
 }
 
+#[inline(always)]
+const fn size_class_index(capacity: u32) -> Option<usize> {
+    if capacity <= 4 {
+        return Some(0);
+    }
+    if capacity > MAX_CELL_CAPACITY {
+        return None;
+    }
+    let adjusted = capacity - 1;
+    let msb = 31 - adjusted.leading_zeros();
+    let second_bit = (adjusted >> (msb - 1)) & 1;
+    Some(((msb - 2) * 2 + 1 + second_bit) as usize)
+}
+
+const _: () = {
+    let mut capacity = 0u32;
+    while capacity <= MAX_CELL_CAPACITY + 4 {
+        let mut expected = None;
+        let mut index = 0usize;
+        while index < SIZE_CLASS_CAPACITIES.len() {
+            if capacity <= SIZE_CLASS_CAPACITIES[index] {
+                expected = Some(index);
+                break;
+            }
+            index += 1;
+        }
+        let actual = size_class_index(capacity);
+        match (actual, expected) {
+            (Some(a), Some(e)) => assert!(a == e),
+            (None, None) => {}
+            _ => panic!("size_class_index mismatch"),
+        }
+        capacity += 1;
+    }
+};
+
 /// Allocates storage for at least `capacity` values (rounded up to its size class), all set to `fill`, and returns the
 /// first value. Never collects garbage.
 pub fn allocate(heap: &Heap, capacity: u32, fill: Value) -> *mut Value {
-    let Some(index) = SIZE_CLASS_CAPACITIES
-        .iter()
-        .position(|&size_class_capacity| capacity <= size_class_capacity)
-    else {
+    let Some(index) = size_class_index(capacity) else {
         return malloc::allocate(capacity, fill);
     };
     let storage = heap.allocate_storage_with_size_class(
@@ -144,6 +177,87 @@ pub fn allocate(heap: &Heap, capacity: u32, fill: Value) -> *mut Value {
         fill,
     );
     // NB: The values follow the cell's header.
+    storage
+        .as_ptr()
+        .cast::<u8>()
+        .wrapping_add(VALUES_OFFSET)
+        .cast::<Value>()
+}
+
+/// Allocates storage for at least `capacity` values, copies `values` into the prefix, and sets the remaining slots to
+/// `tail_fill`. Never collects garbage.
+pub fn allocate_from_slice_with_capacity(heap: &Heap, values: &[Value], capacity: u32, tail_fill: Value) -> *mut Value {
+    debug_assert!(values.len() <= capacity as usize);
+    let Some(index) = size_class_index(capacity) else {
+        return malloc::allocate_from_slice_with_capacity(values, capacity, tail_fill);
+    };
+    let cell_capacity = SIZE_CLASS_CAPACITIES[index] as usize;
+    // SAFETY: Every slot in `[0..cell_capacity)` is initialized once (copied prefix + filled tail).
+    let storage = unsafe {
+        heap.allocate_storage_with_size_class_init_tail(
+            size_classes(heap)[index],
+            |_| ValueStorage {
+                header: CellHeader::for_class(ValueStorage::CLASS),
+                _padding: [0; 5],
+                capacity: SIZE_CLASS_CAPACITIES[index],
+                kind: ValueStorageKind::Cell,
+                values: [],
+            },
+            |tail_start, tail_size| {
+                debug_assert_eq!(tail_size, cell_capacity * size_of::<Value>());
+                let dst = tail_start.cast::<Value>();
+                if !values.is_empty() {
+                    core::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len());
+                }
+                if values.len() < cell_capacity {
+                    let rem = ak::slice_from_raw_parts_mut(
+                        dst.add(values.len()).cast::<core::mem::MaybeUninit<Value>>(),
+                        cell_capacity - values.len(),
+                    );
+                    rem.fill(core::mem::MaybeUninit::new(tail_fill));
+                }
+            },
+        )
+    };
+    storage
+        .as_ptr()
+        .cast::<u8>()
+        .wrapping_add(VALUES_OFFSET)
+        .cast::<Value>()
+}
+
+/// Allocates storage for at least `prefix_len` values, setting `[0..prefix_len)` to `prefix_fill` and any remaining
+/// size-class capacity to `tail_fill` in a single pass. Never collects garbage.
+pub fn allocate_with_prefix_fill(heap: &Heap, prefix_len: u32, prefix_fill: Value, tail_fill: Value) -> *mut Value {
+    let Some(index) = size_class_index(prefix_len) else {
+        return malloc::allocate(prefix_len, prefix_fill);
+    };
+    let cell_capacity = SIZE_CLASS_CAPACITIES[index] as usize;
+    let prefix = prefix_len as usize;
+    // SAFETY: Every slot in `[0..cell_capacity)` is initialized once.
+    let storage = unsafe {
+        heap.allocate_storage_with_size_class_init_tail(
+            size_classes(heap)[index],
+            |_| ValueStorage {
+                header: CellHeader::for_class(ValueStorage::CLASS),
+                _padding: [0; 5],
+                capacity: SIZE_CLASS_CAPACITIES[index],
+                kind: ValueStorageKind::Cell,
+                values: [],
+            },
+            |tail_start, tail_size| {
+                debug_assert_eq!(tail_size, cell_capacity * size_of::<Value>());
+                let dst = tail_start.cast::<core::mem::MaybeUninit<Value>>();
+                if prefix > 0 {
+                    ak::slice_from_raw_parts_mut(dst, prefix).fill(core::mem::MaybeUninit::new(prefix_fill));
+                }
+                if prefix < cell_capacity {
+                    ak::slice_from_raw_parts_mut(dst.add(prefix), cell_capacity - prefix)
+                        .fill(core::mem::MaybeUninit::new(tail_fill));
+                }
+            },
+        )
+    };
     storage
         .as_ptr()
         .cast::<u8>()
@@ -276,8 +390,36 @@ mod malloc {
                 .cast::<ValueStorageKind>()
                 .write(ValueStorageKind::Malloc);
             let values = raw.add(INDEXED_ELEMENTS_HEADER_SIZE).cast::<Value>();
-            for index in 0..capacity as usize {
-                values.add(index).write(fill);
+            ak::slice_from_raw_parts_mut(values.cast::<core::mem::MaybeUninit<Value>>(), capacity as usize)
+                .fill(core::mem::MaybeUninit::new(fill));
+            values
+        }
+    }
+
+    pub fn allocate_from_slice_with_capacity(slice: &[Value], capacity: u32, tail_fill: Value) -> *mut Value {
+        let layout = layout(capacity);
+        // SAFETY: The layout has room for at least the header.
+        let raw = unsafe { raw::allocate(layout) };
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: The allocation starts with the header, and the values follow it.
+        unsafe {
+            raw.cast::<u32>().write(capacity);
+            raw.add(size_of::<u32>())
+                .cast::<ValueStorageKind>()
+                .write(ValueStorageKind::Malloc);
+            let values = raw.add(INDEXED_ELEMENTS_HEADER_SIZE).cast::<Value>();
+            if !slice.is_empty() {
+                core::ptr::copy_nonoverlapping(slice.as_ptr(), values, slice.len());
+            }
+            let cap = capacity as usize;
+            if slice.len() < cap {
+                ak::slice_from_raw_parts_mut(
+                    values.add(slice.len()).cast::<core::mem::MaybeUninit<Value>>(),
+                    cap - slice.len(),
+                )
+                .fill(core::mem::MaybeUninit::new(tail_fill));
             }
             values
         }

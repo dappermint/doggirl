@@ -61,8 +61,8 @@ use crate::runtime::realm::Realm;
 use crate::runtime::shape::Shape;
 
 // The class that the class of every host class table of this kind extends. Its own internal methods are ordinary,
-// and no object has it as its class.
-define_cell!(HostObject, Object, extends: [Object], methods: ORDINARY_OBJECT_METHODS, finalize: finalize);
+// and no object has it as its class. Finalization is attached per derived host class only when its hooks provide one.
+define_cell!(HostObject, Object, extends: [Object], methods: ORDINARY_OBJECT_METHODS);
 
 // SAFETY: Visits the object and the embedder's two cells, which are all the cells a host object reaches.
 unsafe impl Trace for HostObject {
@@ -176,10 +176,16 @@ fn host_object_methods(table: &'static JSHostClass) -> ObjectMethods {
 
 /// The class of the objects of `table`, which extends `parent`.
 pub fn derive_host_object_class(table: &'static JSHostClass, parent: &'static Class) -> &'static Class {
-    Class::derive_runtime(
+    let finalize_fn = if table.host_object_hooks().finalize.is_some() {
+        Some(crate::gc::class::finalize::<HostObject> as unsafe extern "C" fn(*mut c_void))
+    } else {
+        parent.type_info.finalize
+    };
+    Class::derive_runtime_with_finalize(
         parent,
         table.class_name(),
         Box::leak(Box::new(host_object_methods(table))),
+        finalize_fn,
     )
 }
 

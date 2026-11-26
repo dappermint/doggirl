@@ -301,6 +301,21 @@ impl Heap {
         self.allocate_in_size_class(size_class, AllocationKind::Cell, build, tail)
     }
 
+    /// allocate() into a cell of `size_class`, initializing the bytes beyond the T through `initialize_tail`.
+    ///
+    /// # Safety
+    ///
+    /// `initialize_tail` must initialize every byte in `[tail_start, tail_start + tail_size)`.
+    pub unsafe fn allocate_with_size_class_init_tail<T: GcCell>(
+        &self,
+        size_class: SizeClassAllocator,
+        build: impl FnOnce(&DeferGc<'_>) -> T,
+        initialize_tail: impl FnOnce(*mut u8, usize),
+    ) -> Gc<T> {
+        // SAFETY: Passed on from the caller.
+        unsafe { self.allocate_in_size_class_with(size_class, AllocationKind::Cell, build, initialize_tail) }
+    }
+
     /// allocate_with_size_class() for a cell that another cell keeps its storage in, instead of malloc memory: it never
     /// collects garbage, so storage can grow while its owner is between states nothing may observe, and callers can hold
     /// on to anything across the growth. It still counts towards the next collection, which the next allocation that
@@ -312,6 +327,21 @@ impl Heap {
         tail: E,
     ) -> Gc<T> {
         self.allocate_in_size_class(size_class, AllocationKind::Storage, build, tail)
+    }
+
+    /// allocate_storage_with_size_class(), initializing the bytes beyond the T through `initialize_tail`.
+    ///
+    /// # Safety
+    ///
+    /// `initialize_tail` must initialize every byte in `[tail_start, tail_start + tail_size)`.
+    pub unsafe fn allocate_storage_with_size_class_init_tail<T: GcCell>(
+        &self,
+        size_class: SizeClassAllocator,
+        build: impl FnOnce(&DeferGc<'_>) -> T,
+        initialize_tail: impl FnOnce(*mut u8, usize),
+    ) -> Gc<T> {
+        // SAFETY: Passed on from the caller.
+        unsafe { self.allocate_in_size_class_with(size_class, AllocationKind::Storage, build, initialize_tail) }
     }
 
     #[inline(always)]
@@ -328,6 +358,28 @@ impl Heap {
                 "the tail starts 8-byte aligned"
             );
         }
+        // SAFETY: Every byte of `tail_size` is filled with `tail`.
+        unsafe {
+            self.allocate_in_size_class_with(size_class, kind, build, |tail_start, tail_size| {
+                assert!(
+                    tail_size.is_multiple_of(size_of::<E>()),
+                    "the tail of a size class is a whole number of values"
+                );
+                let count = tail_size / size_of::<E>();
+                let tail_slice = ak::slice_from_raw_parts_mut(tail_start.cast::<core::mem::MaybeUninit<E>>(), count);
+                tail_slice.fill(core::mem::MaybeUninit::new(tail));
+            })
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn allocate_in_size_class_with<T: GcCell>(
+        &self,
+        size_class: SizeClassAllocator,
+        kind: AllocationKind,
+        build: impl FnOnce(&DeferGc<'_>) -> T,
+        initialize_tail: impl FnOnce(*mut u8, usize),
+    ) -> Gc<T> {
         assert!(
             size_class.class.type_info.cell_size as usize == size_of::<T>()
                 && size_class.class.is_subclass_of(T::CLASS),
@@ -344,18 +396,6 @@ impl Heap {
             cell
         };
         let tail_size = size_class.cell_size as usize - size_of::<T>();
-        assert!(
-            tail_size.is_multiple_of(size_of::<E>()),
-            "the tail of a size class is a whole number of values"
-        );
-        let initialize_tail = |tail_start: *mut u8| {
-            let tail_start = tail_start.cast::<E>();
-            for index in 0..tail_size / size_of::<E>() {
-                // SAFETY: The cell has tail_size bytes beyond the T, which starts 8-byte aligned, as each class's size
-                // is a multiple of 8.
-                unsafe { tail_start.add(index).write(tail) };
-            }
-        };
         // SAFETY: The size class's cells are larger than a T, checked above, and have T's alignment, as its class
         // extends T's.
         unsafe {
@@ -364,7 +404,7 @@ impl Heap {
                 size_class.cell_size as usize,
                 kind,
                 build,
-                initialize_tail,
+                |tail_start| initialize_tail(tail_start, tail_size),
             )
         }
     }

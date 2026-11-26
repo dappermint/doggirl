@@ -768,7 +768,7 @@ inline fn loose_equality(
     feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
-    let mut rhs_tag = extract_tag(rhs);
+    let rhs_tag = extract_tag(rhs);
     branch_eq(rhs_tag, INT32_TAG, rhs_i32);
     let mut lhs_tag = extract_tag(lhs);
     guard lhs_tag == rhs_tag else different_tags;
@@ -786,16 +786,24 @@ inline fn loose_equality(
         goto slow;
     };
 
-    let different_tags = || {
-        lhs_tag = lhs_tag & 0xfffe;
-        guard lhs_tag == UNDEFINED_TAG else try_f64;
+    let lhs_nullish = || {
         record_arith_feedback(feedback, ARITH_FEEDBACK_OTHER);
-        rhs_tag = rhs_tag & 0xfffe;
-        guard rhs_tag != UNDEFINED_TAG else equal;
-        goto slow;
+        guard rhs is not Value<Nullish> else equal;
+        guard let Value<Object>(object) = rhs else not_equal;
+        guard object.flags lacks OBJECT_FLAG_IS_HTMLDDA else equal;
+        goto not_equal;
     };
 
-    let try_f64 = || {
+    let rhs_nullish = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_OTHER);
+        guard let Value<Object>(object) = lhs else not_equal;
+        guard object.flags lacks OBJECT_FLAG_IS_HTMLDDA else equal;
+        goto not_equal;
+    };
+
+    let different_tags = || {
+        guard lhs is not Value<Nullish> else lhs_nullish;
+        guard rhs is not Value<Nullish> else rhs_nullish;
         guard lhs is Value<f64> else other_slow;
         guard rhs is Value<f64> else other_slow;
         goto compare_f64;
@@ -803,6 +811,7 @@ inline fn loose_equality(
 
     let int32_and_other_slow = || {
         record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_OTHER);
+        guard lhs is not Value<Nullish> else not_equal;
         goto slow;
     };
 

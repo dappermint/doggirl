@@ -212,6 +212,12 @@ impl PropertyLookupCacheEntry {
 
     /// Forgets the whole entry if one of its cells died in this collection, as clear_cache_entry_if_dead does.
     fn clear_if_it_has_a_dead_cell(&self, sweep: &Sweep<'_>) {
+        if self.entry_type.get() == PropertyLookupCacheEntryType::Empty
+            && self.shape.get().is_none()
+            && self.getter.get().is_none()
+        {
+            return;
+        }
         if self.get().has_dead_cell(sweep) {
             self.set(PropertyLookupCacheEntryData::default());
         }
@@ -1155,11 +1161,23 @@ impl TemplateObjectCache {
 // avoiding repeated shape transitions.
 // We also cache the property offsets so that subsequent property writes can bypass
 // shape lookups and write directly to the correct storage slot.
+pub const INLINE_OBJECT_SHAPE_CACHE_OFFSETS: usize = 8;
+
 /// The shape is not kept alive; the VM's sweep callback forgets it when it dies.
-#[derive(Default)]
 pub struct ObjectShapeCache {
     pub shape: Cell<Option<Gc<Shape>>>,
+    pub inline_property_offsets: [Cell<u32>; INLINE_OBJECT_SHAPE_CACHE_OFFSETS],
     pub property_offsets: RefCell<Vec<u32>>,
+}
+
+impl Default for ObjectShapeCache {
+    fn default() -> Self {
+        Self {
+            shape: Cell::new(None),
+            inline_property_offsets: [const { Cell::new(u32::MAX) }; INLINE_OBJECT_SHAPE_CACHE_OFFSETS],
+            property_offsets: RefCell::new(Vec::new()),
+        }
+    }
 }
 
 /// The parts of an ObjectPropertyIteratorCacheData the interpreter does not read.
@@ -1474,7 +1492,7 @@ impl Executable {
     }
 
     /// Forgets the cells the inline caches remember that died in this collection.
-    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>) {
+    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>, ran_since_last_gc: bool) {
         for cache in &self.head.property_lookup_caches {
             cache.remove_dead_entries(sweep);
         }
@@ -1501,7 +1519,7 @@ impl Executable {
             }
         }
         if let Some(feedback) = self.feedback() {
-            feedback.remove_dead_cells(sweep);
+            feedback.remove_dead_cells(sweep, ran_since_last_gc);
         }
     }
 

@@ -81,15 +81,48 @@ struct Indices {
 }
 
 impl Indices {
+    #[inline]
     fn hash(&self, key: Value) -> u64 {
         self.hasher.hash_one(ValueTraitsKey(key))
     }
 
+    #[inline]
     fn find<V: StoredValue>(&self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
+        let key_bits = key.0;
         let key = ValueTraitsKey(key);
         self.positions
-            .find(self.hash(key.0), |&index| ValueTraitsKey(entries[index].key) == key)
+            .find(self.hash(key.0), |&index| {
+                let entry_key = entries[index].key;
+                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == key
+            })
             .copied()
+    }
+
+    #[inline]
+    fn find_or_insert<V: StoredValue>(
+        &mut self,
+        entries: &[StoredEntry<V>],
+        key: Value,
+        new_index: usize,
+    ) -> Option<usize> {
+        let hash = self.hash(key);
+        let key_bits = key.0;
+        let traits_key = ValueTraitsKey(key);
+        let hasher = &self.hasher;
+        match self.positions.entry(
+            hash,
+            |&index| {
+                let entry_key = entries[index].key;
+                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == traits_key
+            },
+            |&index| hasher.hash_one(ValueTraitsKey(entries[index].key)),
+        ) {
+            hashbrown::hash_table::Entry::Occupied(occupied) => Some(*occupied.get()),
+            hashbrown::hash_table::Entry::Vacant(vacant) => {
+                vacant.insert(new_index);
+                None
+            }
+        }
     }
 
     fn insert<V: StoredValue>(&mut self, entries: &[StoredEntry<V>], key: Value, index: usize) {
@@ -101,10 +134,14 @@ impl Indices {
     }
 
     fn remove<V: StoredValue>(&mut self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
+        let key_bits = key.0;
         let key = ValueTraitsKey(key);
         let entry = self
             .positions
-            .find_entry(self.hash(key.0), |&index| ValueTraitsKey(entries[index].key) == key)
+            .find_entry(self.hash(key.0), |&index| {
+                let entry_key = entries[index].key;
+                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == key
+            })
             .ok()?;
         Some(entry.remove().0)
     }
@@ -244,11 +281,10 @@ impl<V: StoredValue> Storage<V> {
 
     pub(crate) fn set(&mut self, key: Value, value: V) {
         if let Some(indices) = &mut self.indices {
-            if let Some(index) = indices.find(&self.entries, key) {
+            if let Some(index) = indices.find_or_insert(&self.entries, key, self.entries.len()) {
                 self.entries[index].value = value;
                 return;
             }
-            indices.insert(&self.entries, key, self.entries.len());
         } else {
             if let Some(index) = self.index_of(key) {
                 self.entries[index].value = value;

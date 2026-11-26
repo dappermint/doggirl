@@ -10,19 +10,54 @@ use core::hash::{BuildHasher, Hash, Hasher};
 
 use crate::layout::value::Value;
 use crate::runtime::value::same_value;
+use crate::utf16::Utf16View;
 
 /// A value as a hash key: hashed by its contents and compared with SameValue.
 #[derive(Clone, Copy)]
 pub struct ValueTraitsKey(pub Value);
 
+#[inline]
+fn hash_utf16_view<H: Hasher>(view: Utf16View<'_>, state: &mut H) {
+    match view {
+        Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+            state.write_u8(0);
+            state.write(bytes);
+        }
+        Utf16View::Utf16(units) => {
+            let mut or_all = 0u16;
+            for &u in units {
+                or_all |= u;
+            }
+            if or_all <= 0xff {
+                state.write_u8(0);
+                if units.len() <= 64 {
+                    let mut buf = [0u8; 64];
+                    for (dst, &src) in buf.iter_mut().zip(units) {
+                        *dst = src as u8;
+                    }
+                    state.write(&buf[..units.len()]);
+                } else {
+                    let narrowed: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+                    state.write(&narrowed);
+                }
+            } else {
+                state.write_u8(1);
+                // SAFETY: `u16` has no padding bytes and its byte slice is valid for reads.
+                let bytes =
+                    unsafe { ak::slice_from_raw_parts(units.as_ptr().cast::<u8>(), core::mem::size_of_val(units)) };
+                state.write(bytes);
+            }
+        }
+    }
+}
+
 impl Hash for ValueTraitsKey {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut value = self.0;
         assert!(!value.is_empty());
         if value.is_string() {
-            for code_unit in value.as_string().utf16_string_view().code_units() {
-                state.write_u16(code_unit);
-            }
+            hash_utf16_view(value.as_string().utf16_string_view(), state);
             return;
         }
 

@@ -517,6 +517,7 @@ impl Vm {
 
     /// Allocates a frame for an inline call of `callee_executable`, with its arguments and its linkage to the running
     /// frame, which Return uses to get back to it.
+    #[inline(always)]
     fn allocate_inline_frame(
         &self,
         callee_executable: Gc<Executable>,
@@ -541,11 +542,21 @@ impl Vm {
 
         // Copy the supplied arguments into the callee's argument slots.
         let callee_argument_values = callee_context.arguments();
-        for (slot, argument) in callee_argument_values.iter().zip(arguments) {
-            slot.set(*argument);
+        if !arguments.is_empty() {
+            // SAFETY: `arguments.len() <= passed_argument_count <= argument_count == callee_argument_values.len()`,
+            // `Cell<Value>` is `#[repr(transparent)]` over `Value`, and the freshly allocated frame does not overlap `arguments`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    arguments.as_ptr(),
+                    callee_argument_values.as_ptr().cast::<Value>().cast_mut(),
+                    arguments.len(),
+                );
+            }
         }
-        for slot in &callee_argument_values[arguments.len()..] {
-            slot.set(Value::UNDEFINED);
+        if arguments.len() < callee_argument_values.len() {
+            for slot in &callee_argument_values[arguments.len()..] {
+                slot.set(Value::UNDEFINED);
+            }
         }
         callee_context.passed_argument_count.set(passed_argument_count);
 

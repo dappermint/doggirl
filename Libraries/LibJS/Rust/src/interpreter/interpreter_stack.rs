@@ -66,6 +66,7 @@ impl InterpreterStack {
 
     /// Allocates a context whose frame has room for `registers_and_locals_count` registers and locals, `constants`
     /// constants and `argument_count` arguments, or returns None if the stack is full.
+    #[inline(always)]
     pub fn allocate(
         &self,
         registers_and_locals_count: u32,
@@ -95,6 +96,7 @@ impl InterpreterStack {
         )
     }
 
+    #[inline(always)]
     fn allocate_below(
         &self,
         end: *mut u8,
