@@ -899,7 +899,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
     /// function's script (inlined callees run in its realm). The legacy
     /// `arguments` of those that have them come from their frame states, so
     /// their arguments must all be values.
-    fn inlined_frame_bytes_of_call(&self, inputs: &[Operand]) -> Option<u32> {
+    pub(super) fn inlined_frame_bytes_of_call(&self, inputs: &[Operand]) -> Option<u32> {
         let call = self.function.inline.as_ref()?;
         if inputs.len() > crate::codegen::DIRECT_CALL_MAX_INPUTS
             || inputs.iter().any(|operand| self.holds_virtual_arguments(*operand))

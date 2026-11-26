@@ -326,11 +326,11 @@ pub fn run(graph: &mut Graph, work: &Zone) {
 /// Simplification after check elimination, which keeps every int32 check of
 /// a double: check elimination may have relied on what one established, like
 /// the int32 that an unboxing in a branch it decided takes.
-pub fn run_after_check_elimination(graph: &mut Graph, work: &Zone) {
-    simplify(graph, false, work);
+pub fn run_after_check_elimination_checked(graph: &mut Graph, work: &Zone) -> bool {
+    simplify(graph, false, work)
 }
 
-fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
+fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) -> bool {
     let dissolvable = if dissolve_checks {
         dissolvable_checks(graph, work)
     } else {
@@ -348,6 +348,7 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
     let mut inputs = ZoneVec::new_in(work);
     let mut control_inputs = ZoneVec::new_in(work);
     let mut changed_control_flow = false;
+    let mut mutated_in_place = false;
     for block in 0..graph.blocks.len() {
         let block = BlockId::from_index(block);
         let mut index = 0;
@@ -567,6 +568,7 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
                 let data = &mut graph.nodes[node.index()];
                 data.op = Op::CheckFloat64Int32;
                 data.inputs.assign(&[double]);
+                mutated_in_place = true;
                 continue;
             }
             // NB: Int32 operations take constant right-hand sides as
@@ -577,6 +579,7 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
                 && int32_of(graph, inputs[1]).is_none()
             {
                 graph.nodes[node.index()].inputs.assign(&[inputs[1], inputs[0]]);
+                mutated_in_place = true;
             }
         }
 
@@ -649,6 +652,7 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
             changed_control_flow = true;
         }
     }
+    let mut changed = changed_control_flow || mutated_in_place || !replacements.is_empty() || !removed.is_empty();
     replacements.apply(graph);
     edit::remove_nodes(graph, &removed);
     // NB: Folds can give a check users that need the int32, like the
@@ -659,7 +663,7 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
         if changed_control_flow {
             edit::clean_up_control_flow(graph, work);
         }
-        return;
+        return changed;
     }
     let mut dissolvable = dissolvable;
     dissolvable.subtract(&removed);
@@ -680,9 +684,11 @@ fn simplify(graph: &mut Graph, dissolve_checks: bool, work: &Zone) {
         replacements.replace(check, double);
         removed.insert(check.index());
     }
+    changed |= !replacements.is_empty() || !removed.is_empty();
     replacements.apply(graph);
     edit::remove_nodes(graph, &removed);
     if changed_control_flow {
         edit::clean_up_control_flow(graph, work);
     }
+    changed
 }

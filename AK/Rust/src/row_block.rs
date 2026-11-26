@@ -181,6 +181,49 @@ impl RowBlock {
         })
     }
 
+    /// Adds every item of `iter` as a list directly into the block without intermediate buffering, if the block has
+    /// room for them.
+    pub fn try_add_from_exact_iter<T: Copy + Send + Sync + 'static, I: ExactSizeIterator<Item = T>>(
+        &mut self,
+        iter: I,
+    ) -> Result<RowList<T>, RowBlockFull> {
+        const {
+            // NB: The rows of a list start at a word.
+            assert!(size_of::<T>() != 0 && align_of::<T>() <= align_of::<u64>());
+        }
+        let expected_len = iter.len();
+        if expected_len == 0 {
+            return Ok(RowList::empty());
+        }
+        if self.number == 0 {
+            return Err(RowBlockFull);
+        }
+        let _ = u32::try_from(expected_len).map_err(|_| RowBlockFull)?;
+        let byte_len = expected_len.checked_mul(size_of::<T>()).ok_or(RowBlockFull)?;
+        let start = self.words.len();
+        let end = start
+            .checked_add(byte_len.div_ceil(size_of::<u64>()))
+            .ok_or(RowBlockFull)?;
+        self.words
+            .try_resize(end, MaybeUninit::uninit())
+            .map_err(|_| RowBlockFull)?;
+        let dst = self.words[start..end].as_mut_ptr().cast::<T>();
+        let mut written = 0usize;
+        for row in iter.take(expected_len) {
+            // SAFETY: `self.words[start..end]` starts at a u64-aligned address (sufficient for `T` by the const
+            //         assert above) and has room for `expected_len` elements of `T`. `written < expected_len`.
+            unsafe { dst.add(written).write(row) };
+            written += 1;
+        }
+        Ok(RowList {
+            // NB: new() keeps the count of words in 32 bits, and written <= expected_len <= u32::MAX.
+            start: start as u32,
+            len: written as u32,
+            block: self.number,
+            rows: PhantomData,
+        })
+    }
+
     /// The words that hold the rows of `list`. Panics if the list is not a list of this block.
     fn words_of<T>(&self, list: RowList<T>) -> core::ops::Range<usize> {
         assert!(list.block == self.number, "the list is a list of this block");
@@ -320,5 +363,22 @@ mod tests {
         assert_eq!(block.memory(), 0);
         let list = block.try_add(&[5u32]).unwrap();
         assert_eq!(block.rows(list), [5]);
+    }
+
+    #[test]
+    fn try_add_from_exact_iter_matches_try_add() {
+        let mut block = RowBlock::new(1 << 12, c"test");
+        let empty = block.try_add_from_exact_iter(core::iter::empty::<u32>()).unwrap();
+        assert!(block.rows(empty).is_empty());
+        let list = block
+            .try_add_from_exact_iter((0u32..17).map(|x| u64::from(x) * 3))
+            .unwrap();
+        let expected: Vec<u64> = (0u32..17).map(|x| u64::from(x) * 3).collect();
+        assert_eq!(block.rows(list), expected.as_slice());
+        let mut tiny = RowBlock::new(16, c"test");
+        assert_eq!(
+            tiny.try_add_from_exact_iter((0u32..3).map(u64::from)),
+            Err(RowBlockFull)
+        );
     }
 }

@@ -71,6 +71,40 @@ fn executable_of(frame: &ExecutionContext) -> Gc<Executable> {
     Executable::from_head(frame.executable.get().expect("the frame runs an executable"))
 }
 
+/// Visits every frame strictly above `frame` on the running frame's chain of callers, innermost first.
+/// Returns `false` if `frame` is not on the chain (without calling `visit` on frames above it? No: callers
+/// that require `frame` to be on the chain assert the return value, and the walk only runs when `frame` is live).
+fn for_each_frame_above(
+    vm: &Vm,
+    frame: NonNull<ExecutionContext>,
+    mut visit: impl FnMut(NonNull<ExecutionContext>),
+) -> bool {
+    let mut running = NonNull::new(vm.head.running_execution_context.get());
+    while let Some(current) = running {
+        if current == frame {
+            return true;
+        }
+        visit(current);
+        running = NonNull::new(frame_of(current).caller_frame.get());
+    }
+    false
+}
+
+/// The outermost frame strictly above `frame` on the running frame's chain of callers (the one whose
+/// `caller_frame` is `frame`), or `None` if `frame` is the running frame or not on the chain.
+fn outermost_frame_above(vm: &Vm, frame: NonNull<ExecutionContext>) -> Option<NonNull<ExecutionContext>> {
+    let mut last = None;
+    let mut running = NonNull::new(vm.head.running_execution_context.get());
+    while let Some(current) = running {
+        if current == frame {
+            return last;
+        }
+        last = Some(current);
+        running = NonNull::new(frame_of(current).caller_frame.get());
+    }
+    None
+}
+
 /// The frames above `frame` on the running frame's chain of callers, innermost first, or `None` if `frame` is not on
 /// it.
 fn frames_above(vm: &Vm, frame: NonNull<ExecutionContext>) -> Option<Vec<NonNull<ExecutionContext>>> {
@@ -198,6 +232,13 @@ pub struct JitState {
     next_job_id: Cell<u64>,
     /// The addresses of the runtime functions JIT code calls, looked up the first time a compile job needs them.
     runtime_function_addresses: OnceCell<runtime_info::RuntimeFunctionAddresses>,
+    /// VM-constant allocation metadata (heap counters and size-class free lists) cached once per VM.
+    cached_allocation_info: OnceCell<Box<allocation::CachedAllocationInfo>>,
+    /// VM-constant runtime info base (offsets, layout, dynamic calls, stubs) cached once per VM.
+    cached_runtime_info: OnceCell<Box<libjs_jit::snapshot::RuntimeInfo>>,
+    /// Reusable open-list buffers for snapshot capture on this VM's thread (avoids moving `OpenLists` through the
+    /// global spare mutex and re-mapping virtual memory after compile threads go idle).
+    snapshot_open_lists: RefCell<Option<Box<libjs_jit::snapshot::OpenLists>>>,
     /// How native code enters JIT code, generated the first time it does.
     entry_trampoline: OnceCell<(ExecutableMemory, EntryTrampoline)>,
     /// The call stub JIT code shares (see `libjs_jit::codegen::generate_call_stub()`), generated the first time a
@@ -254,6 +295,9 @@ impl JitState {
             jobs: RefCell::default(),
             next_job_id: Cell::new(1),
             runtime_function_addresses: OnceCell::new(),
+            cached_allocation_info: OnceCell::new(),
+            cached_runtime_info: OnceCell::new(),
+            snapshot_open_lists: RefCell::new(None),
             entry_trampoline: OnceCell::new(),
             call_stub: OnceCell::new(),
             construct_stub: OnceCell::new(),
@@ -525,6 +569,22 @@ impl JitState {
     pub(crate) fn runtime_function_addresses(&self) -> &runtime_info::RuntimeFunctionAddresses {
         self.runtime_function_addresses
             .get_or_init(runtime_info::RuntimeFunctionAddresses::look_up)
+    }
+
+    pub(crate) fn cached_allocation_info(&self, vm: &Vm) -> &allocation::CachedAllocationInfo {
+        self.cached_allocation_info
+            .get_or_init(|| Box::new(allocation::build_cached_allocation_info(vm)))
+    }
+
+    pub(crate) fn cached_runtime_info(&self, vm: &Vm) -> &libjs_jit::snapshot::RuntimeInfo {
+        self.cached_runtime_info
+            .get_or_init(|| Box::new(runtime_info::build_cached_runtime_info(vm)))
+    }
+
+    pub(crate) fn with_snapshot_open_lists<R>(&self, f: impl FnOnce(&mut libjs_jit::snapshot::OpenLists) -> R) -> R {
+        let mut guard = self.snapshot_open_lists.borrow_mut();
+        let lists = guard.get_or_insert_with(|| Box::new(libjs_jit::snapshot::OpenLists::new()));
+        f(lists)
     }
 }
 

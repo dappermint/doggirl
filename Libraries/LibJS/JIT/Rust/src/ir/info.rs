@@ -6,13 +6,14 @@
 
 //! What the compiler knows about each op, apart from how code generation lowers it (see
 //! `codegen::lowering_info`): its effects, how it exits, which input it refines, whether it ends a block and which
-//! inputs it takes. `Op::info()` decides all of them for every op in one exhaustive match, so that a new op cannot
-//! be added without deciding each, and the passes and the verifier read them from there.
+//! inputs it takes. `meta_for_kind()`, `dynamic_meta()`, and `Op::inputs()` decide all of them exhaustively for every
+//! op, so that a new op cannot be added without deciding each, and the passes and the verifier read them from there.
 
 use super::BranchCondition;
 use super::ElementsKind;
 use super::Locations;
 use super::Op;
+use super::OpKind;
 use crate::code::ExitKind;
 use crate::code::Repr;
 use crate::snapshot::HelperResult;
@@ -192,38 +193,76 @@ pub struct OpInfo {
     pub inputs: Inputs,
 }
 
-impl OpInfo {
-    /// An op without effects or exits, taking `inputs`.
-    const fn pure(inputs: Inputs) -> Self {
-        Self {
-            properties: NodeProperties::PURE,
-            exit_kind: None,
-            refined_input: None,
-            is_control: false,
-            never_empty: false,
-            inputs,
-        }
-    }
+/// Compact 8-byte metadata for an `Op`, returned in a single register without constructing `Inputs`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpMeta {
+    pub(crate) reads: Locations,
+    pub(crate) writes: Locations,
+    pub(crate) exit_kind: Option<ExitKind>,
+    pub(crate) flags: u8,
+}
 
-    /// A check of input 0 that exits with `kind` where it fails, and has that input, refined, as its value.
-    const fn check(kind: ExitKind, inputs: Inputs) -> Self {
+const FLAG_CAN_LAZY_EXIT: u8 = 1 << 0;
+const FLAG_IS_CALL: u8 = 1 << 1;
+const FLAG_RUNS_CODE: u8 = 1 << 2;
+const FLAG_ALLOCATES: u8 = 1 << 3;
+const FLAG_REFINED_INPUT_0: u8 = 1 << 4;
+const FLAG_IS_CONTROL: u8 = 1 << 5;
+const FLAG_NEVER_EMPTY: u8 = 1 << 6;
+/// Sentinel bit in `META_TABLE` indicating that metadata depends on the op's payload.
+const FLAG_DYNAMIC: u8 = 1 << 7;
+
+const _: () = assert!(core::mem::size_of::<OpMeta>() <= 8);
+
+impl OpMeta {
+    const PURE: Self = Self {
+        reads: Locations::NONE,
+        writes: Locations::NONE,
+        exit_kind: None,
+        flags: 0,
+    };
+
+    const DYNAMIC: Self = Self {
+        flags: FLAG_DYNAMIC,
+        ..Self::PURE
+    };
+
+    const fn check(kind: ExitKind) -> Self {
         Self {
             exit_kind: Some(kind),
-            refined_input: Some(0),
-            ..Self::pure(inputs)
+            flags: FLAG_REFINED_INPUT_0,
+            ..Self::PURE
         }
     }
 
-    /// A control node taking `inputs`.
-    const fn control(inputs: Inputs) -> Self {
+    const fn control() -> Self {
         Self {
-            is_control: true,
-            ..Self::pure(inputs)
+            flags: FLAG_IS_CONTROL,
+            ..Self::PURE
         }
     }
 
     const fn with_properties(self, properties: NodeProperties) -> Self {
-        Self { properties, ..self }
+        let mut flags = self.flags & !(FLAG_CAN_LAZY_EXIT | FLAG_IS_CALL | FLAG_RUNS_CODE | FLAG_ALLOCATES);
+        if properties.can_lazy_exit {
+            flags |= FLAG_CAN_LAZY_EXIT;
+        }
+        if properties.is_call {
+            flags |= FLAG_IS_CALL;
+        }
+        if properties.runs_code {
+            flags |= FLAG_RUNS_CODE;
+        }
+        if properties.allocates {
+            flags |= FLAG_ALLOCATES;
+        }
+        Self {
+            reads: properties.reads,
+            writes: properties.writes,
+            flags,
+            ..self
+        }
     }
 
     const fn exiting(self, kind: ExitKind) -> Self {
@@ -235,57 +274,316 @@ impl OpInfo {
 
     const fn never_empty(self) -> Self {
         Self {
-            never_empty: true,
+            flags: self.flags | FLAG_NEVER_EMPTY,
             ..self
         }
     }
+
+    const fn refines_input_0(self) -> Self {
+        Self {
+            flags: self.flags | FLAG_REFINED_INPUT_0,
+            ..self
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn properties(self) -> NodeProperties {
+        NodeProperties {
+            can_lazy_exit: self.flags & FLAG_CAN_LAZY_EXIT != 0,
+            is_call: self.flags & FLAG_IS_CALL != 0,
+            reads: self.reads,
+            writes: self.writes,
+            runs_code: self.flags & FLAG_RUNS_CODE != 0,
+            allocates: self.flags & FLAG_ALLOCATES != 0,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn refined_input(self) -> Option<usize> {
+        if self.flags & FLAG_REFINED_INPUT_0 != 0 {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_control(self) -> bool {
+        self.flags & FLAG_IS_CONTROL != 0
+    }
+
+    #[inline(always)]
+    pub(crate) const fn never_empty_flag(self) -> bool {
+        self.flags & FLAG_NEVER_EMPTY != 0
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_dce_removable(self) -> bool {
+        const BLOCKING_FLAGS: u8 = FLAG_IS_CONTROL | FLAG_CAN_LAZY_EXIT | FLAG_ALLOCATES | FLAG_RUNS_CODE;
+        self.exit_kind.is_none() && (self.flags & BLOCKING_FLAGS) == 0 && self.writes.is_empty()
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_gvn_pure(self) -> bool {
+        const BLOCKING_FLAGS: u8 = FLAG_IS_CONTROL | FLAG_CAN_LAZY_EXIT | FLAG_ALLOCATES | FLAG_RUNS_CODE;
+        (self.flags & BLOCKING_FLAGS) == 0 && self.reads.is_empty() && self.writes.is_empty()
+    }
 }
 
+const fn meta_for_kind(kind: OpKind) -> OpMeta {
+    use NodeProperties as P;
+    match kind {
+        OpKind::Constant | OpKind::Phi => OpMeta::PURE,
+        OpKind::LoadSlot => OpMeta::PURE.with_properties(P::reading(Locations::FRAME)),
+        OpKind::StoreSlot => OpMeta::PURE.with_properties(P::writing(Locations::FRAME)),
+        OpKind::InitializeFrame | OpKind::EnsureFrameInitialized | OpKind::PublishFrame => {
+            OpMeta::PURE.with_properties(P::writing(Locations::FRAME))
+        }
+        OpKind::Suspend => OpMeta::PURE.with_properties(P {
+            reads: Locations::FRAME,
+            writes: Locations::FRAME,
+            ..P::PURE
+        }),
+        OpKind::LoadOuterEnvironment | OpKind::BoxCell => OpMeta::PURE,
+        OpKind::LoadEnvironmentBinding => {
+            OpMeta::PURE.with_properties(P::reading(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS)))
+        }
+        OpKind::StoreEnvironmentBinding => {
+            OpMeta::PURE.with_properties(P::writing(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS)))
+        }
+        OpKind::AppendEnvironmentBinding => {
+            OpMeta::PURE.with_properties(P::writing(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS)))
+        }
+        OpKind::SetLexicalEnvironment | OpKind::LeavePrivateEnvironment | OpKind::KeepOwnEnvironments => OpMeta::PURE
+            .with_properties(P {
+                reads: Locations::FRAME,
+                writes: Locations::FRAME,
+                ..P::PURE
+            }),
+        OpKind::IsCallable => OpMeta::PURE.never_empty(),
+        OpKind::ToBoolean => OpMeta::PURE.with_properties(P::CALL),
+        OpKind::PrimitiveToString => OpMeta::PURE.with_properties(P::ALLOCATING_CALL),
+        OpKind::CallArraySplice => OpMeta::PURE.with_properties(P {
+            is_call: true,
+            allocates: true,
+            reads: Locations::NAMED.union(Locations::ELEMENTS_AND_COUNTS),
+            writes: Locations::ELEMENTS_AND_COUNTS,
+            ..P::PURE
+        }),
+        OpKind::ToObject | OpKind::ArrayCreate => OpMeta::PURE.with_properties(P::ALLOCATING_CALL),
+        OpKind::Generic => OpMeta::PURE.with_properties(P::RUNS_ANYTHING),
+        OpKind::CallDirect | OpKind::CallNative => OpMeta::PURE.with_properties(P::RUNS_ANYTHING).never_empty(),
+        OpKind::CallNativeAccessor => OpMeta::PURE.with_properties(P::RUNS_ANYTHING),
+        OpKind::ArgumentCount => OpMeta::PURE.with_properties(P::reading(Locations::FRAME)).never_empty(),
+        OpKind::LoadFrameField => OpMeta::PURE.with_properties(P::reading(Locations::FRAME)),
+        OpKind::LoadArgument => OpMeta::PURE
+            .with_properties(P::reading(Locations::FRAME))
+            .exiting(ExitKind::ArgumentsIndex)
+            .never_empty(),
+        OpKind::CallForwardingArguments => OpMeta::PURE.with_properties(P::RUNS_ANYTHING),
+        OpKind::CheckInt32 => OpMeta::PURE.exiting(ExitKind::NotInt32),
+        OpKind::CheckNumber => OpMeta::PURE.exiting(ExitKind::BadType),
+        OpKind::BoxInt32 | OpKind::BoxBool => OpMeta::PURE.never_empty(),
+        OpKind::Int32WrappingBinary | OpKind::Int32Compare | OpKind::TaggedEquals => OpMeta::PURE,
+        OpKind::CheckTypedArray => OpMeta::check(ExitKind::BadElements),
+        OpKind::CheckArray => OpMeta::check(ExitKind::BadType),
+        OpKind::CheckPropertyAbsenceCacheable => OpMeta::check(ExitKind::BadShape),
+        OpKind::CheckNonNegativeInt32 => OpMeta::check(ExitKind::Overflow),
+        OpKind::LoadTypedArrayLength | OpKind::LoadTypedArrayDataOffset => {
+            OpMeta::PURE.with_properties(P::reading(Locations::ELEMENT_COUNTS))
+        }
+        OpKind::TypedArrayDataAddress => OpMeta::PURE,
+        OpKind::CheckTypedArrayStorage | OpKind::CheckBounds => OpMeta::check(ExitKind::OutOfBounds),
+        OpKind::LoadElementAt => OpMeta::PURE.with_properties(P::reading(Locations::ELEMENTS)),
+        OpKind::StoreElementAt => OpMeta::PURE.with_properties(P::writing(Locations::ELEMENTS)),
+        OpKind::CheckNotHole => OpMeta::check(ExitKind::OutOfBounds),
+        OpKind::CheckInitialized => OpMeta::check(ExitKind::Uninitialized),
+        OpKind::CellAddress => OpMeta::PURE,
+        OpKind::AllocateObject | OpKind::AllocateArray | OpKind::AllocateFunction | OpKind::AllocateEnvironment => {
+            OpMeta::PURE
+                .with_properties(P {
+                    allocates: true,
+                    ..P::PURE
+                })
+                .never_empty()
+        }
+        OpKind::InitializeNamed => OpMeta::PURE.with_properties(P::writing(Locations::NAMED_SLOTS)),
+        OpKind::VirtualObject => OpMeta::PURE,
+        OpKind::InitializeElement => OpMeta::PURE.with_properties(P::writing(Locations::ELEMENTS)),
+        OpKind::SliceArguments => OpMeta::PURE
+            .with_properties(P {
+                is_call: true,
+                reads: Locations::FRAME,
+                allocates: true,
+                ..P::PURE
+            })
+            .exiting(ExitKind::ArgumentsIndex)
+            .never_empty(),
+        OpKind::CheckIdentityComparable => OpMeta::check(ExitKind::BadType),
+        OpKind::CheckObject => OpMeta::check(ExitKind::NotObject),
+        OpKind::CheckClosure => OpMeta::check(ExitKind::BadCallTarget),
+        OpKind::LoadFunctionEnvironment => OpMeta::PURE,
+        OpKind::EmptyToUndefined | OpKind::Typeof => OpMeta::PURE.never_empty(),
+        OpKind::TypeofIs => OpMeta::PURE,
+        OpKind::CheckShape => OpMeta::check(ExitKind::BadShape).with_properties(P::reading(Locations::SHAPES)),
+        OpKind::CheckPrototypeChainValid => OpMeta::PURE
+            .with_properties(P::reading(Locations::SHAPES))
+            .exiting(ExitKind::BadShape),
+        OpKind::HasInPrototypeChain => OpMeta::PURE
+            .with_properties(P::reading(Locations::SHAPES))
+            .exiting(ExitKind::BadType),
+        OpKind::AssumeValid | OpKind::AssumeLegacyArgumentsUnread => OpMeta::PURE
+            .with_properties(P::reading(Locations::ALL))
+            .exiting(ExitKind::Invalidated),
+        OpKind::CheckInterrupt => OpMeta::PURE
+            .with_properties(P::writing(Locations::INTERRUPT))
+            .exiting(ExitKind::Interrupted),
+        OpKind::LoadGlobalBinding => OpMeta::PURE
+            .with_properties(P::reading(Locations::GLOBAL_BINDINGS))
+            .exiting(ExitKind::BadShape),
+        OpKind::StoreGlobalBinding => OpMeta::PURE
+            .with_properties(P {
+                reads: Locations::GLOBAL_BINDINGS,
+                writes: Locations::GLOBAL_BINDINGS,
+                ..P::PURE
+            })
+            .exiting(ExitKind::BadShape),
+        OpKind::CheckAccessorFunction => {
+            OpMeta::check(ExitKind::UnexpectedValue).with_properties(P::reading(Locations::NAMED_SLOTS))
+        }
+        OpKind::LoadAccessorFunction => OpMeta::PURE
+            .with_properties(P::reading(Locations::NAMED_SLOTS))
+            .exiting(ExitKind::BadCallTarget),
+        OpKind::AddNamed => OpMeta::PURE.with_properties(P {
+            reads: Locations::NAMED,
+            writes: Locations::NAMED,
+            ..P::PURE
+        }),
+        OpKind::Jump
+        | OpKind::Unreachable
+        | OpKind::Branch
+        | OpKind::BranchTruthy
+        | OpKind::Return
+        | OpKind::BranchOnPc => OpMeta::control(),
+        OpKind::ShapeSwitch => OpMeta::control()
+            .with_properties(P::reading(Locations::SHAPES))
+            .exiting(ExitKind::BadShape),
+        OpKind::Refine => OpMeta::PURE.refines_input_0(),
+        OpKind::UnboxInt32
+        | OpKind::UnboxDouble
+        | OpKind::Int32Abs
+        | OpKind::Int32ToFloat64
+        | OpKind::Int32Min
+        | OpKind::Int32Max
+        | OpKind::Uint32Min
+        | OpKind::Uint32ShiftRight
+        | OpKind::BoolToInt32
+        | OpKind::Float64Unary
+        | OpKind::Float64ToInt32
+        | OpKind::Float64ToUint8Clamped
+        | OpKind::Float64Binary
+        | OpKind::Float64Min
+        | OpKind::Float64Max
+        | OpKind::Float64Compare
+        | OpKind::Uint32ToFloat64
+        | OpKind::StringAddress
+        | OpKind::StringLength
+        | OpKind::LoadStringCodeUnit
+        | OpKind::SingleCharacterString
+        | OpKind::StringsEqual
+        | OpKind::IntegerToString
+        | OpKind::LoadPropertyIteratorKeyCount
+        | OpKind::LoadPropertyIteratorKey
+        | OpKind::SlowPathOutput => OpMeta::PURE,
+        OpKind::BoxFloat64 => OpMeta::PURE.never_empty(),
+        OpKind::CallFloat64Function => OpMeta::PURE.with_properties(P::CALL),
+        OpKind::CheckFloat64Int32 => OpMeta::PURE.exiting(ExitKind::NotInt32),
+        OpKind::ConcatenateStrings => OpMeta::PURE.with_properties(P {
+            allocates: true,
+            ..P::PURE
+        }),
+        OpKind::CheckAppendableArray => OpMeta::check(ExitKind::SlowPath).with_properties(P::reading(Locations::ALL)),
+        OpKind::LoadElementsLength | OpKind::LoadElementsCapacity => {
+            OpMeta::PURE.with_properties(P::reading(Locations::ELEMENT_COUNTS))
+        }
+        OpKind::AppendElement => OpMeta::PURE.with_properties(P {
+            reads: Locations::ELEMENTS_AND_COUNTS,
+            writes: Locations::ELEMENTS_AND_COUNTS,
+            ..P::PURE
+        }),
+        OpKind::CallArrayPush | OpKind::CallStoreHoleyElement => OpMeta::PURE.with_properties(P {
+            reads: Locations::ELEMENTS_AND_COUNTS,
+            writes: Locations::ELEMENTS_AND_COUNTS,
+            allocates: true,
+            ..P::PURE
+        }),
+        OpKind::OpenArrayIteration => OpMeta::PURE.with_properties(P {
+            reads: Locations::ALL,
+            allocates: true,
+            ..P::PURE
+        }),
+        OpKind::LoadArrayIteratorArray
+        | OpKind::LoadArrayIteratorIndex
+        | OpKind::LoadGeneratorCompletionType
+        | OpKind::LoadGeneratorCompletionValue => OpMeta::PURE.with_properties(P::reading(Locations::ITERATORS)),
+        OpKind::StoreArrayIteratorIndex | OpKind::FinishArrayIterator => {
+            OpMeta::PURE.with_properties(P::writing(Locations::ITERATORS))
+        }
+        OpKind::ProbePropertyCache | OpKind::ProbeKeyedCache => {
+            OpMeta::PURE.with_properties(P::reading(Locations::NAMED))
+        }
+        OpKind::ProbePropertyStore | OpKind::ProbeKeyedStore => OpMeta::PURE.with_properties(P::STORE_PROBE),
+        OpKind::ProbeGlobalCache | OpKind::ProbeHasProperty => OpMeta::PURE.with_properties(P::reading(Locations::ALL)),
+        OpKind::ProbeGlobalStore => OpMeta::PURE.with_properties(P {
+            reads: Locations::ALL,
+            writes: Locations::ALL,
+            runs_code: true,
+            ..P::PURE
+        }),
+        // Payload-dependent ops resolved by `Op::dynamic_meta()`.
+        OpKind::CallIntrinsic
+        | OpKind::Int32Binary
+        | OpKind::CheckElements
+        | OpKind::CheckValue
+        | OpKind::LoadNamed
+        | OpKind::StoreNamed
+        | OpKind::Exit
+        | OpKind::CallSlowPath => OpMeta::DYNAMIC,
+    }
+}
+
+const META_TABLE: [OpMeta; OpKind::COUNT] = {
+    let mut table = [OpMeta::PURE; OpKind::COUNT];
+    let mut index = 0usize;
+    while index < OpKind::COUNT {
+        table[index] = meta_for_kind(OpKind::ALL[index]);
+        index += 1;
+    }
+    table
+};
+
 impl Op<'_> {
-    /// What the compiler knows about the op.
-    pub fn info(&self) -> OpInfo {
-        use Inputs as I;
+    /// Compact metadata for the op, without `Inputs` (which only the verifier inspects).
+    #[inline(always)]
+    pub(crate) fn meta(&self) -> OpMeta {
+        let meta = META_TABLE[self.kind() as usize];
+        if meta.flags & FLAG_DYNAMIC == 0 {
+            return meta;
+        }
+        self.dynamic_meta()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn dynamic_meta(&self) -> OpMeta {
         use NodeProperties as P;
         match self {
-            Op::Constant(_) | Op::Phi => OpInfo::pure(I::Unchecked),
-            Op::LoadSlot { .. } => OpInfo::pure(I::NONE).with_properties(P::reading(Locations::FRAME)),
-            Op::StoreSlot { .. } => OpInfo::pure(I::Unchecked).with_properties(P::writing(Locations::FRAME)),
-            Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame => {
-                OpInfo::pure(I::NONE).with_properties(P::writing(Locations::FRAME))
-            }
-            // NB: It hands the frame's slots to the code that resumes it.
-            Op::Suspend { .. } => OpInfo::pure(I::NONE).with_properties(P {
-                reads: Locations::FRAME,
-                writes: Locations::FRAME,
-                ..P::PURE
-            }),
-            Op::LoadOuterEnvironment | Op::BoxCell => OpInfo::pure(I::POINTER),
-            Op::LoadEnvironmentBinding { .. } => OpInfo::pure(I::POINTER)
-                .with_properties(P::reading(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS))),
-            Op::StoreEnvironmentBinding { .. } => OpInfo::pure(I::Exactly(&[Repr::Pointer, Repr::Tagged]))
-                .with_properties(P::writing(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS))),
-            Op::AppendEnvironmentBinding => OpInfo::pure(I::POINTER)
-                .with_properties(P::writing(Locations::BINDINGS.union(Locations::GLOBAL_BINDINGS))),
-            Op::SetLexicalEnvironment => OpInfo::pure(I::TAGGED).with_properties(P {
-                reads: Locations::FRAME,
-                writes: Locations::FRAME,
-                ..P::PURE
-            }),
-            Op::LeavePrivateEnvironment | Op::KeepOwnEnvironments => OpInfo::pure(I::NONE).with_properties(P {
-                reads: Locations::FRAME,
-                writes: Locations::FRAME,
-                ..P::PURE
-            }),
-            Op::IsCallable => OpInfo::pure(I::TAGGED).never_empty(),
-            Op::ToBoolean => OpInfo::pure(I::TAGGED).with_properties(P::CALL),
-            Op::PrimitiveToString => OpInfo::pure(I::TAGGED).with_properties(P::ALLOCATING_CALL),
             Op::CallIntrinsic { intrinsic } => {
                 let call = intrinsic
                     .helper_call()
                     .expect("intrinsics called through a helper have one");
-                // NB: Helpers that answer with a number or a boolean make no
-                //     cells.
-                OpInfo::pure(I::HelperCall(*intrinsic)).with_properties(P {
+                // NB: Helpers that answer with a number or a boolean make no cells.
+                OpMeta::PURE.with_properties(P {
                     is_call: true,
                     allocates: matches!(call.result, HelperResult::String | HelperResult::Value),
                     reads: call.reads,
@@ -293,344 +591,252 @@ impl Op<'_> {
                     ..P::PURE
                 })
             }
-            Op::CallArraySplice => OpInfo::pure(I::AtLeast(&[Repr::Tagged, Repr::Int32, Repr::Int32], Repr::Tagged))
-                .with_properties(P {
-                    is_call: true,
-                    allocates: true,
-                    reads: Locations::NAMED.union(Locations::ELEMENTS_AND_COUNTS),
-                    writes: Locations::ELEMENTS_AND_COUNTS,
-                    ..P::PURE
-                }),
-            Op::ToObject => OpInfo::pure(I::TAGGED_2).with_properties(P::ALLOCATING_CALL),
-            Op::ArrayCreate => {
-                OpInfo::pure(I::Exactly(&[Repr::Int32, Repr::Tagged])).with_properties(P::ALLOCATING_CALL)
-            }
-            Op::Generic { .. } => OpInfo::pure(I::NONE).with_properties(P::RUNS_ANYTHING),
-            // NB: Calls return values, never the empty value.
-            Op::CallDirect { .. } | Op::CallNative { .. } => OpInfo::pure(I::TAGGED_ANY)
-                .with_properties(P::RUNS_ANYTHING)
-                .never_empty(),
-            Op::CallNativeAccessor { part, .. } => {
-                let inputs = match part {
-                    super::AccessorPart::Getter => I::TAGGED,
-                    super::AccessorPart::Setter => I::TAGGED_2,
-                };
-                OpInfo::pure(inputs).with_properties(P::RUNS_ANYTHING)
-            }
-            Op::ArgumentCount => OpInfo::pure(I::NONE)
-                .with_properties(P::reading(Locations::FRAME))
-                .never_empty(),
-            Op::LoadFrameField { .. } => OpInfo::pure(I::NONE).with_properties(P::reading(Locations::FRAME)),
-            Op::LoadArgument { .. } => OpInfo::pure(I::TAGGED)
-                .with_properties(P::reading(Locations::FRAME))
-                .exiting(ExitKind::ArgumentsIndex)
-                .never_empty(),
-            Op::CallForwardingArguments { .. } => OpInfo::pure(I::NONE).with_properties(P::RUNS_ANYTHING),
-            Op::CheckInt32 => OpInfo::pure(I::TAGGED).exiting(ExitKind::NotInt32),
-            Op::CheckNumber => OpInfo::pure(I::TAGGED).exiting(ExitKind::BadType),
-            Op::BoxInt32 => OpInfo::pure(I::INT32).never_empty(),
-            Op::BoxBool => OpInfo::pure(I::BOOL).never_empty(),
             Op::Int32Binary { op } => {
-                let info = OpInfo::pure(I::INT32_2);
                 if op.int32_can_overflow() {
-                    info.exiting(ExitKind::Overflow)
+                    OpMeta::PURE.exiting(ExitKind::Overflow)
                 } else {
-                    info
+                    OpMeta::PURE
                 }
             }
-            Op::Int32WrappingBinary { .. } | Op::Int32Compare { .. } => OpInfo::pure(I::INT32_2),
-            Op::TaggedEquals { .. } => OpInfo::pure(I::TAGGED_2),
             // NB: The elements kind of a typed array never changes.
             Op::CheckElements {
                 kind: ElementsKind::TypedArray(_),
-            } => OpInfo::check(ExitKind::BadElements, I::TAGGED),
+            } => OpMeta::check(ExitKind::BadElements),
             Op::CheckElements { .. } => {
-                OpInfo::check(ExitKind::BadElements, I::TAGGED).with_properties(P::reading(Locations::ELEMENT_COUNTS))
+                OpMeta::check(ExitKind::BadElements).with_properties(P::reading(Locations::ELEMENT_COUNTS))
             }
-            Op::CheckTypedArray => OpInfo::check(ExitKind::BadElements, I::TAGGED),
-            Op::CheckArray => OpInfo::check(ExitKind::BadType, I::TAGGED),
-            Op::CheckPropertyAbsenceCacheable => OpInfo::check(ExitKind::BadShape, I::TAGGED),
-            Op::CheckNonNegativeInt32 => OpInfo::check(ExitKind::Overflow, I::INT32),
-            Op::LoadTypedArrayLength | Op::LoadTypedArrayDataOffset => {
-                OpInfo::pure(I::POINTER).with_properties(P::reading(Locations::ELEMENT_COUNTS))
-            }
-            Op::TypedArrayDataAddress => OpInfo::pure(I::POINTER),
-            Op::CheckTypedArrayStorage => OpInfo::check(ExitKind::OutOfBounds, I::POINTER),
-            Op::CheckBounds => OpInfo::check(ExitKind::OutOfBounds, I::INT32_2),
-            Op::LoadElementAt { .. } => OpInfo::pure(I::POINTER_INT32).with_properties(P::reading(Locations::ELEMENTS)),
-            // NB: Stores within the bounds change no element count.
-            Op::StoreElementAt { kind } => {
-                let inputs = match kind.stored_repr() {
-                    Repr::Float64 => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Float64]),
-                    Repr::Int32 => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Int32]),
-                    _ => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Tagged]),
-                };
-                OpInfo::pure(inputs).with_properties(P::writing(Locations::ELEMENTS))
-            }
-            Op::CheckNotHole => OpInfo::check(ExitKind::OutOfBounds, I::TAGGED),
-            Op::CheckInitialized => OpInfo::check(ExitKind::Uninitialized, I::TAGGED),
-            Op::CellAddress => OpInfo::pure(I::TAGGED),
-            Op::AllocateObject { .. } => OpInfo::pure(I::NONE)
-                .with_properties(P {
-                    allocates: true,
-                    ..P::PURE
-                })
-                .never_empty(),
-            Op::InitializeNamed { .. } => OpInfo::pure(I::TAGGED_2).with_properties(P::writing(Locations::NAMED_SLOTS)),
-            // NB: Virtual objects are in no block, so the verifier sees no inputs of theirs.
-            Op::VirtualObject { .. } => OpInfo::pure(I::Unchecked),
-            Op::AllocateArray { .. } => OpInfo::pure(I::NONE)
-                .with_properties(P {
-                    allocates: true,
-                    ..P::PURE
-                })
-                .never_empty(),
-            Op::InitializeElement { .. } => OpInfo::pure(I::TAGGED_2).with_properties(P::writing(Locations::ELEMENTS)),
-            Op::AllocateFunction { .. } => OpInfo::pure(I::POINTER_2)
-                .with_properties(P {
-                    allocates: true,
-                    ..P::PURE
-                })
-                .never_empty(),
-            Op::AllocateEnvironment { .. } => OpInfo::pure(I::TAGGED)
-                .with_properties(P {
-                    allocates: true,
-                    ..P::PURE
-                })
-                .never_empty(),
-            Op::SliceArguments => OpInfo::pure(I::TAGGED)
-                .with_properties(P {
-                    is_call: true,
-                    reads: Locations::FRAME,
-                    allocates: true,
-                    ..P::PURE
-                })
-                .exiting(ExitKind::ArgumentsIndex)
-                .never_empty(),
-            Op::CheckIdentityComparable => OpInfo::check(ExitKind::BadType, I::TAGGED_2),
-            Op::CheckObject => OpInfo::check(ExitKind::NotObject, I::TAGGED),
-            Op::CheckClosure { .. } => OpInfo::check(ExitKind::BadCallTarget, I::TAGGED),
-            Op::LoadFunctionEnvironment { .. } => OpInfo::pure(I::POINTER),
-            Op::CheckValue { kind, .. } => OpInfo::check(*kind, I::TAGGED),
-            Op::EmptyToUndefined | Op::Typeof => OpInfo::pure(I::TAGGED).never_empty(),
-            Op::TypeofIs { .. } => OpInfo::pure(I::TAGGED),
-            Op::CheckShape { .. } => {
-                OpInfo::check(ExitKind::BadShape, I::OBJECT).with_properties(P::reading(Locations::SHAPES))
-            }
-            Op::CheckPrototypeChainValid { .. } => OpInfo::pure(I::NONE)
-                .with_properties(P::reading(Locations::SHAPES))
-                .exiting(ExitKind::BadShape),
-            Op::HasInPrototypeChain => OpInfo::pure(I::TAGGED_2)
-                .with_properties(P::reading(Locations::SHAPES))
-                .exiting(ExitKind::BadType),
-            // NB: Reading everything keeps loops whose code may invalidate
-            //     the code from hoisting it.
-            Op::AssumeValid | Op::AssumeLegacyArgumentsUnread => OpInfo::pure(I::NONE)
-                .with_properties(P::reading(Locations::ALL))
-                .exiting(ExitKind::Invalidated),
-            Op::CheckInterrupt => OpInfo::pure(I::NONE)
-                .with_properties(P::writing(Locations::INTERRUPT))
-                .exiting(ExitKind::Interrupted),
-            Op::LoadGlobalBinding { .. } => OpInfo::pure(I::NONE)
-                .with_properties(P::reading(Locations::GLOBAL_BINDINGS))
-                .exiting(ExitKind::BadShape),
-            Op::StoreGlobalBinding { .. } => OpInfo::pure(I::TAGGED)
-                .with_properties(P {
-                    reads: Locations::GLOBAL_BINDINGS,
-                    writes: Locations::GLOBAL_BINDINGS,
-                    ..P::PURE
-                })
-                .exiting(ExitKind::BadShape),
-            Op::CheckAccessorFunction { .. } => {
-                OpInfo::check(ExitKind::UnexpectedValue, I::OBJECT).with_properties(P::reading(Locations::NAMED_SLOTS))
-            }
-            Op::LoadAccessorFunction { .. } => OpInfo::pure(I::OBJECT)
-                .with_properties(P::reading(Locations::NAMED_SLOTS))
-                .exiting(ExitKind::BadCallTarget),
+            Op::CheckValue { kind, .. } => OpMeta::check(*kind),
             Op::LoadNamed { holds_data, .. } => {
-                let info = OpInfo::pure(I::OBJECT).with_properties(P::reading(Locations::NAMED_SLOTS));
+                let meta = OpMeta::PURE.with_properties(P::reading(Locations::NAMED_SLOTS));
                 if *holds_data {
-                    info
+                    meta
                 } else {
-                    info.exiting(ExitKind::BadShape)
+                    meta.exiting(ExitKind::BadShape)
                 }
             }
-            Op::AddNamed { .. } => OpInfo::pure(I::OBJECT_VALUE).with_properties(P {
-                reads: Locations::NAMED,
-                writes: Locations::NAMED,
-                ..P::PURE
-            }),
             // NB: Stores to a property an object has change no shape.
             Op::StoreNamed { holds_data, .. } => {
-                let info = OpInfo::pure(I::OBJECT_VALUE).with_properties(P {
+                let meta = OpMeta::PURE.with_properties(P {
                     reads: Locations::NAMED_SLOTS,
                     writes: Locations::NAMED_SLOTS,
                     ..P::PURE
                 });
                 if *holds_data {
-                    info
+                    meta
                 } else {
-                    info.exiting(ExitKind::BadShape)
+                    meta.exiting(ExitKind::BadShape)
                 }
             }
-            Op::Jump { .. } | Op::Unreachable => OpInfo::control(I::NONE),
-            Op::Branch { condition, .. } => OpInfo::control(I::Exactly(condition.input_reprs())),
-            Op::BranchTruthy { .. } | Op::Return => OpInfo::control(I::TAGGED),
-            Op::BranchOnPc { .. } => OpInfo::control(I::INT32),
-            Op::ShapeSwitch { .. } => OpInfo::control(I::OBJECT)
-                .with_properties(P::reading(Locations::SHAPES))
-                .exiting(ExitKind::BadShape),
-            Op::Exit { kind } => OpInfo::control(I::NONE).exiting(*kind),
-            Op::Refine { condition, .. } => OpInfo {
-                refined_input: Some(0),
-                ..OpInfo::pure(I::Exactly(condition.input_reprs()))
-            },
+            Op::Exit { kind } => OpMeta::control().exiting(*kind),
             Op::CallSlowPath {
-                saves_registers: false,
-                opcode,
-                ..
-            } => OpInfo::pure(I::TAGGED_ANY).with_properties(
-                Op::Generic {
-                    opcode: *opcode,
-                    executable: 0,
-                    pc: 0,
-                }
-                .properties(),
-            ),
-            // NB: The slow path saves the registers it clobbers, so the node
-            //     is not a call for the register allocator.
-            Op::CallSlowPath { .. } => OpInfo::pure(I::TAGGED_ANY).with_properties(P {
+                saves_registers: false, ..
+            } => OpMeta::PURE.with_properties(P::RUNS_ANYTHING),
+            // NB: The slow path saves the registers it clobbers, so the node is not a call for the register allocator.
+            Op::CallSlowPath { .. } => OpMeta::PURE.with_properties(P {
                 reads: Locations::ALL,
                 writes: Locations::ALL,
                 runs_code: true,
                 allocates: true,
                 ..P::PURE
             }),
-            Op::UnboxInt32 | Op::UnboxDouble => OpInfo::pure(I::TAGGED),
-            Op::Int32Abs | Op::Int32ToFloat64 => OpInfo::pure(I::INT32),
-            Op::Int32Min | Op::Int32Max | Op::Uint32Min | Op::Uint32ShiftRight => OpInfo::pure(I::INT32_2),
-            Op::BoolToInt32 => OpInfo::pure(I::BOOL),
-            Op::BoxFloat64 => OpInfo::pure(I::FLOAT64).never_empty(),
-            Op::Float64Unary { .. } | Op::Float64ToInt32 | Op::Float64ToUint8Clamped => OpInfo::pure(I::FLOAT64),
-            Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => {
-                OpInfo::pure(I::FLOAT64_2)
-            }
-            Op::CallFloat64Function { function } => {
-                let inputs = match function.argument_count() {
-                    1 => I::FLOAT64,
-                    _ => I::FLOAT64_2,
-                };
-                OpInfo::pure(inputs).with_properties(P::CALL)
-            }
-            Op::CheckFloat64Int32 => OpInfo::pure(I::FLOAT64).exiting(ExitKind::NotInt32),
-            Op::Uint32ToFloat64 => OpInfo::pure(I::INT32),
-            Op::StringAddress => OpInfo::pure(I::TAGGED),
-            // NB: Strings never change. These take the refinements of the
-            //     checks they rely on as inputs.
-            Op::StringLength => OpInfo::pure(I::POINTER),
-            Op::LoadStringCodeUnit => OpInfo::pure(I::POINTER_INT32),
-            Op::SingleCharacterString => OpInfo::pure(I::INT32),
-            // NB: A cache miss and strings whose characters only the slow
-            //     path reads stay that way until the slow path ran.
-            Op::StringsEqual => OpInfo::pure(I::TAGGED_2),
-            Op::ConcatenateStrings { .. } => OpInfo::pure(I::TAGGED_2).with_properties(P {
-                allocates: true,
-                ..P::PURE
-            }),
-            Op::IntegerToString => OpInfo::pure(I::INT32),
-            // NB: It reads the shapes and the indexed properties of the
-            //     prototypes too.
-            Op::CheckAppendableArray => {
-                OpInfo::check(ExitKind::SlowPath, I::TAGGED).with_properties(P::reading(Locations::ALL))
-            }
-            Op::LoadElementsLength | Op::LoadElementsCapacity => {
-                OpInfo::pure(I::POINTER).with_properties(P::reading(Locations::ELEMENT_COUNTS))
-            }
-            Op::AppendElement => {
-                OpInfo::pure(I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Tagged])).with_properties(P {
-                    reads: Locations::ELEMENTS_AND_COUNTS,
-                    writes: Locations::ELEMENTS_AND_COUNTS,
-                    ..P::PURE
-                })
-            }
-            Op::CallArrayPush => OpInfo::pure(I::TAGGED_2).with_properties(P {
-                reads: Locations::ELEMENTS_AND_COUNTS,
-                writes: Locations::ELEMENTS_AND_COUNTS,
-                allocates: true,
-                ..P::PURE
-            }),
-            Op::CallStoreHoleyElement => OpInfo::pure(I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Tagged]))
-                .with_properties(P {
-                    reads: Locations::ELEMENTS_AND_COUNTS,
-                    writes: Locations::ELEMENTS_AND_COUNTS,
-                    allocates: true,
-                    ..P::PURE
-                }),
-            // NB: The runtime watches the intrinsics anew with new watchpoint sets once the old ones fired.
-            Op::OpenArrayIteration => OpInfo::pure(I::TAGGED).with_properties(P {
-                reads: Locations::ALL,
-                allocates: true,
-                ..P::PURE
-            }),
-            Op::LoadArrayIteratorArray
-            | Op::LoadArrayIteratorIndex
-            | Op::LoadGeneratorCompletionType
-            | Op::LoadGeneratorCompletionValue => {
-                OpInfo::pure(I::POINTER).with_properties(P::reading(Locations::ITERATORS))
-            }
-            Op::StoreArrayIteratorIndex => {
-                OpInfo::pure(I::POINTER_INT32).with_properties(P::writing(Locations::ITERATORS))
-            }
-            Op::FinishArrayIterator => OpInfo::pure(I::POINTER).with_properties(P::writing(Locations::ITERATORS)),
-            // NB: The keys of a cache never change.
-            Op::LoadPropertyIteratorKeyCount => OpInfo::pure(I::TAGGED),
-            Op::LoadPropertyIteratorKey => OpInfo::pure(I::Exactly(&[Repr::Tagged, Repr::Int32])),
-            // NB: The slow path call leaves its outputs where the node reads
-            //     them, so it stays right after the call (which the verifier
-            //     checks). Its input, the call, ties it there.
-            Op::SlowPathOutput { .. } => OpInfo::pure(I::TAGGED),
-            Op::ProbePropertyCache { .. } => OpInfo::pure(I::TAGGED).with_properties(P::reading(Locations::NAMED)),
-            Op::ProbeKeyedCache { .. } => OpInfo::pure(I::OBJECT_KEY).with_properties(P::reading(Locations::NAMED)),
-            // NB: Additions may grow the object's storage.
-            Op::ProbePropertyStore { .. } => OpInfo::pure(I::TAGGED_2).with_properties(P::STORE_PROBE),
-            Op::ProbeKeyedStore { .. } => OpInfo::pure(I::TAGGED_3).with_properties(P::STORE_PROBE),
-            // NB: Global variables are properties of the global object and
-            //     bindings of the global declarative environment.
-            Op::ProbeGlobalCache { .. } => OpInfo::pure(I::POINTER_2).with_properties(P::reading(Locations::ALL)),
-            Op::ProbeGlobalStore { .. } => OpInfo::pure(I::Exactly(&[Repr::Tagged, Repr::Pointer, Repr::Pointer]))
-                .with_properties(P {
-                    reads: Locations::ALL,
-                    writes: Locations::ALL,
-                    runs_code: true,
-                    ..P::PURE
-                }),
-            Op::ProbeHasProperty { .. } => OpInfo::pure(I::OBJECT_KEY).with_properties(P::reading(Locations::ALL)),
+            _ => unreachable!("only dynamic ops reach dynamic_meta()"),
         }
     }
 
+    fn inputs(&self) -> Inputs {
+        use Inputs as I;
+        match self {
+            Op::Constant(_) | Op::Phi | Op::StoreSlot { .. } | Op::VirtualObject { .. } => I::Unchecked,
+            Op::LoadSlot { .. }
+            | Op::InitializeFrame
+            | Op::EnsureFrameInitialized
+            | Op::PublishFrame
+            | Op::Suspend { .. }
+            | Op::LeavePrivateEnvironment
+            | Op::KeepOwnEnvironments
+            | Op::Generic { .. }
+            | Op::ArgumentCount
+            | Op::LoadFrameField { .. }
+            | Op::CallForwardingArguments { .. }
+            | Op::AllocateObject { .. }
+            | Op::AllocateArray { .. }
+            | Op::CheckPrototypeChainValid { .. }
+            | Op::AssumeValid
+            | Op::AssumeLegacyArgumentsUnread
+            | Op::CheckInterrupt
+            | Op::LoadGlobalBinding { .. }
+            | Op::Jump { .. }
+            | Op::Unreachable
+            | Op::Exit { .. } => I::NONE,
+            Op::LoadOuterEnvironment
+            | Op::BoxCell
+            | Op::LoadEnvironmentBinding { .. }
+            | Op::AppendEnvironmentBinding
+            | Op::LoadTypedArrayLength
+            | Op::LoadTypedArrayDataOffset
+            | Op::TypedArrayDataAddress
+            | Op::CheckTypedArrayStorage
+            | Op::LoadFunctionEnvironment { .. }
+            | Op::StringLength
+            | Op::LoadElementsLength
+            | Op::LoadElementsCapacity
+            | Op::LoadArrayIteratorArray
+            | Op::LoadArrayIteratorIndex
+            | Op::LoadGeneratorCompletionType
+            | Op::LoadGeneratorCompletionValue
+            | Op::FinishArrayIterator => I::POINTER,
+            Op::AllocateFunction { .. } | Op::ProbeGlobalCache { .. } => I::POINTER_2,
+            Op::LoadElementAt { .. } | Op::LoadStringCodeUnit | Op::StoreArrayIteratorIndex => I::POINTER_INT32,
+            Op::StoreEnvironmentBinding { .. } => I::Exactly(&[Repr::Pointer, Repr::Tagged]),
+            Op::SetLexicalEnvironment
+            | Op::IsCallable
+            | Op::ToBoolean
+            | Op::PrimitiveToString
+            | Op::LoadArgument { .. }
+            | Op::CheckInt32
+            | Op::CheckNumber
+            | Op::CheckElements { .. }
+            | Op::CheckTypedArray
+            | Op::CheckArray
+            | Op::CheckPropertyAbsenceCacheable
+            | Op::CheckNotHole
+            | Op::CheckInitialized
+            | Op::CellAddress
+            | Op::AllocateEnvironment { .. }
+            | Op::SliceArguments
+            | Op::CheckObject
+            | Op::CheckClosure { .. }
+            | Op::CheckValue { .. }
+            | Op::EmptyToUndefined
+            | Op::Typeof
+            | Op::TypeofIs { .. }
+            | Op::StoreGlobalBinding { .. }
+            | Op::BranchTruthy { .. }
+            | Op::Return
+            | Op::UnboxInt32
+            | Op::UnboxDouble
+            | Op::StringAddress
+            | Op::CheckAppendableArray
+            | Op::OpenArrayIteration
+            | Op::LoadPropertyIteratorKeyCount
+            | Op::SlowPathOutput { .. }
+            | Op::ProbePropertyCache { .. } => I::TAGGED,
+            Op::ToObject
+            | Op::TaggedEquals { .. }
+            | Op::InitializeNamed { .. }
+            | Op::InitializeElement { .. }
+            | Op::CheckIdentityComparable
+            | Op::HasInPrototypeChain
+            | Op::StringsEqual
+            | Op::ConcatenateStrings { .. }
+            | Op::CallArrayPush
+            | Op::ProbePropertyStore { .. } => I::TAGGED_2,
+            Op::ProbeKeyedStore { .. } => I::TAGGED_3,
+            Op::CallDirect { .. } | Op::CallNative { .. } | Op::CallSlowPath { .. } => I::TAGGED_ANY,
+            Op::CallIntrinsic { intrinsic } => I::HelperCall(*intrinsic),
+            Op::CallArraySplice => I::AtLeast(&[Repr::Tagged, Repr::Int32, Repr::Int32], Repr::Tagged),
+            Op::ArrayCreate => I::Exactly(&[Repr::Int32, Repr::Tagged]),
+            Op::CallNativeAccessor { part, .. } => match part {
+                super::AccessorPart::Getter => I::TAGGED,
+                super::AccessorPart::Setter => I::TAGGED_2,
+            },
+            Op::BoxInt32
+            | Op::CheckNonNegativeInt32
+            | Op::BranchOnPc { .. }
+            | Op::Int32Abs
+            | Op::Int32ToFloat64
+            | Op::Uint32ToFloat64
+            | Op::SingleCharacterString
+            | Op::IntegerToString => I::INT32,
+            Op::Int32Binary { .. }
+            | Op::Int32WrappingBinary { .. }
+            | Op::Int32Compare { .. }
+            | Op::CheckBounds
+            | Op::Int32Min
+            | Op::Int32Max
+            | Op::Uint32Min
+            | Op::Uint32ShiftRight => I::INT32_2,
+            Op::BoxBool | Op::BoolToInt32 => I::BOOL,
+            Op::BoxFloat64
+            | Op::Float64Unary { .. }
+            | Op::Float64ToInt32
+            | Op::Float64ToUint8Clamped
+            | Op::CheckFloat64Int32 => I::FLOAT64,
+            Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => I::FLOAT64_2,
+            Op::CallFloat64Function { function } => match function.argument_count() {
+                1 => I::FLOAT64,
+                _ => I::FLOAT64_2,
+            },
+            Op::StoreElementAt { kind } => match kind.stored_repr() {
+                Repr::Float64 => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Float64]),
+                Repr::Int32 => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Int32]),
+                _ => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Tagged]),
+            },
+            Op::CheckShape { .. }
+            | Op::CheckAccessorFunction { .. }
+            | Op::LoadAccessorFunction { .. }
+            | Op::LoadNamed { .. }
+            | Op::ShapeSwitch { .. } => I::OBJECT,
+            Op::AddNamed { .. } | Op::StoreNamed { .. } => I::OBJECT_VALUE,
+            Op::Branch { condition, .. } | Op::Refine { condition, .. } => I::Exactly(condition.input_reprs()),
+            Op::AppendElement | Op::CallStoreHoleyElement => I::Exactly(&[Repr::Pointer, Repr::Int32, Repr::Tagged]),
+            Op::LoadPropertyIteratorKey => I::Exactly(&[Repr::Tagged, Repr::Int32]),
+            Op::ProbeKeyedCache { .. } | Op::ProbeHasProperty { .. } => I::OBJECT_KEY,
+            Op::ProbeGlobalStore { .. } => I::Exactly(&[Repr::Tagged, Repr::Pointer, Repr::Pointer]),
+        }
+    }
+
+    /// What the compiler knows about the op.
+    pub fn info(&self) -> OpInfo {
+        let meta = self.meta();
+        OpInfo {
+            properties: meta.properties(),
+            exit_kind: meta.exit_kind,
+            refined_input: meta.refined_input(),
+            is_control: meta.is_control(),
+            never_empty: meta.never_empty_flag(),
+            inputs: self.inputs(),
+        }
+    }
+
+    #[inline]
     pub fn properties(&self) -> NodeProperties {
-        self.info().properties
+        self.meta().properties()
     }
 
     /// Why this node exits to the interpreter, if it can exit eagerly.
+    #[inline]
     pub fn exit_kind(&self) -> Option<ExitKind> {
-        self.info().exit_kind
+        self.meta().exit_kind
     }
 
     /// Whether the node may exit to the interpreter before its side effects,
     /// resuming at the current bytecode: whether it has an exit kind.
+    #[inline]
     pub fn can_eager_exit(&self) -> bool {
         self.exit_kind().is_some()
     }
 
     /// For checks and refinements, whose value is an input known to pass
     /// them: which input that is (see "Refinements" in `Op`).
+    #[inline(always)]
     pub fn refined_input(&self) -> Option<usize> {
-        self.info().refined_input
+        self.meta().refined_input()
     }
 
+    #[inline(always)]
+    pub(crate) fn refines_input_0(&self) -> bool {
+        self.meta().flags & FLAG_REFINED_INPUT_0 != 0
+    }
+
+    #[inline(always)]
     pub fn is_control(&self) -> bool {
-        self.info().is_control
+        self.meta().is_control()
+    }
+
+    #[inline(always)]
+    pub fn never_empty(&self) -> bool {
+        self.meta().never_empty_flag()
     }
 }
 

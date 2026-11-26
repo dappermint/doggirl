@@ -253,6 +253,32 @@ impl LoweringInfo {
     }
 }
 
+/// The registers `node`'s lowering clobbers, matching `lowering_info(node).clobbers` without building the full
+/// `LoweringInfo`.
+#[inline]
+pub fn lowering_clobbers(node: &Node) -> Clobbers {
+    let clobbers = match &node.op {
+        Op::AllocateObject { .. }
+        | Op::AllocateArray { .. }
+        | Op::AllocateFunction { .. }
+        | Op::AllocateEnvironment { .. }
+        | Op::CallSlowPath {
+            saves_registers: true, ..
+        }
+        | Op::ConcatenateStrings { .. }
+        | Op::CallArrayPush
+        | Op::CallStoreHoleyElement
+        | Op::OpenArrayIteration
+        | Op::ProbePropertyCache { .. }
+        | Op::ProbePropertyStore { .. }
+        | Op::ProbeHasProperty { .. } => Clobbers::Floats,
+        op if op.properties().is_call => Clobbers::CallerSaved,
+        _ => Clobbers::Nothing,
+    };
+    debug_assert_eq!(clobbers, lowering_info(node).clobbers);
+    clobbers
+}
+
 /// What the lowering of `node` needs. Nodes without code (constants, phis, virtual objects, refinements and legacy
 /// arguments guards, which are gone before register allocation) need nothing but what every node does.
 pub fn lowering_info(node: &Node) -> LoweringInfo {
@@ -345,6 +371,7 @@ pub fn lowering_info(node: &Node) -> LoweringInfo {
         // the result.
         Op::CallNativeAccessor { .. } => LoweringInfo {
             output: OutputConstraint::Return,
+            may_leave_from_inlined_callee: true,
             ..plain.with_temps(DIRECT_CALL_TEMPS)
         },
         Op::ArgumentCount | Op::LoadFrameField { .. } | Op::LoadArgument { .. } => plain,

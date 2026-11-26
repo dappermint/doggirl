@@ -236,6 +236,9 @@ impl SiteSource<'_> {
             }
             | Op::CallNative {
                 inlined_frame_bytes, ..
+            }
+            | Op::CallNativeAccessor {
+                inlined_frame_bytes, ..
             } if self.kind == SiteKind::Call => inlined_frame_bytes,
             _ => 0,
         };

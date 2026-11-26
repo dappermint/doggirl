@@ -28,6 +28,7 @@
 use ak::Zone;
 use ak::ZoneVec;
 
+use super::dominators::CachedDominators;
 use super::dominators::Dominators;
 use crate::ir::BinaryOp;
 use crate::ir::BlockId;
@@ -231,11 +232,27 @@ fn has_loop_around(graph: &Graph, loop_: &Loop, visited: &mut ZoneBitSet, workli
     false
 }
 
-pub fn run(graph: &mut Graph, work: &Zone) {
-    if !graph.nodes.iter().any(|node| matches!(node.op, Op::CheckInterrupt)) {
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
+    let has_interrupt_check = graph.blocks.iter().any(|block| {
+        block
+            .body
+            .iter()
+            .any(|node| matches!(graph.node(*node).op, Op::CheckInterrupt))
+    });
+    if !has_interrupt_check {
         return;
     }
-    let dominators = &Dominators::of(graph, work);
+    // NB: Loops have a back edge from a later block or the block itself.
+    let has_loops = graph.blocks.iter().enumerate().any(|(index, block)| {
+        block
+            .predecessors
+            .iter()
+            .any(|predecessor| predecessor.index() >= index)
+    });
+    if !has_loops {
+        return;
+    }
+    let dominators = dominators.get_or_compute(graph);
     let mut loops = ZoneVec::new_in(work);
     for index in 0..graph.blocks.len() {
         let header = BlockId::from_index(index);

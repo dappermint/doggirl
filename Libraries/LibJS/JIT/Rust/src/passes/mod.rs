@@ -44,6 +44,7 @@ use core::fmt;
 use crate::CompileFailure;
 use crate::bytecode::FrameLayout;
 use crate::ir::Graph;
+use dominators::CachedDominators;
 use dominators::Dominators;
 
 /// One transformation of the graph.
@@ -97,8 +98,8 @@ fn fits(graph: &Graph) -> Result<(), CompileFailure> {
     Ok(())
 }
 
-/// The passes, in the order they run.
-const PASSES: &[Pass] = &[
+/// The early passes before dominator-sharing passes begin.
+const EARLY_PASSES: &[Pass] = &[
     Pass {
         name: "loop rotation",
         run: Run::Steps(loop_rotation::run),
@@ -122,66 +123,6 @@ const PASSES: &[Pass] = &[
     Pass {
         name: "simplification",
         run: Run::Once(simplify::run),
-    },
-    Pass {
-        name: "branch splitting",
-        run: Run::Steps(branch_splitting::run),
-    },
-    Pass {
-        name: "global value numbering",
-        run: Run::Once(gvn::run),
-    },
-    Pass {
-        name: "check elimination",
-        run: Run::Steps(check_elimination::run),
-    },
-    Pass {
-        name: "simplification",
-        run: Run::Once(simplify::run_after_check_elimination),
-    },
-    Pass {
-        name: "global value numbering",
-        run: Run::Once(gvn::run),
-    },
-    Pass {
-        name: "loop invariant code motion",
-        run: Run::Once(licm::run),
-    },
-    Pass {
-        name: "bounds check elimination",
-        run: Run::Once(bounds_check_elimination::run),
-    },
-    Pass {
-        name: "interrupt check elimination",
-        run: Run::Once(interrupt_check_elimination::run),
-    },
-    Pass {
-        name: "exit unboxing",
-        run: Run::Once(exit_unboxing::run),
-    },
-    Pass {
-        name: "dead code elimination",
-        run: Run::Once(dce::run),
-    },
-    Pass {
-        name: "escape analysis",
-        run: Run::Steps(escape_analysis::run),
-    },
-    Pass {
-        name: "dead code elimination",
-        run: Run::Once(dce::run),
-    },
-    Pass {
-        name: "enumerated keys",
-        run: Run::Once(enumerated_keys::run),
-    },
-    Pass {
-        name: "branch fusion",
-        run: Run::Once(branch_fusion::run),
-    },
-    Pass {
-        name: "key strings",
-        run: Run::Once(key_strings::run),
     },
 ];
 
@@ -230,15 +171,137 @@ fn run_passes(
     work.scope(|work| edit::remove_unreachable_blocks(graph, work));
     check(graph, layout, verify, work, "graph building");
     observe(graph, "graph building");
-    for pass in PASSES {
+    for pass in EARLY_PASSES {
         run_pass(pass.run, graph, work, steps)?;
         check(graph, layout, verify, work, pass.name);
         observe(graph, pass.name);
     }
-    // NB: Nodes that took different refinements of one value compute the
-    //     same once the refinements are gone, and nothing moves anymore.
-    work.scope(|work| edit::remove_refinements(graph, work));
-    run_pass(Run::Once(gvn::run), graph, work, steps)?;
+
+    // NB: Share lazily computed dominators in `steps[1]` across `branch_splitting` and the first `gvn` pass
+    //     (`branch_splitting` only uses `steps[0]`).
+    {
+        let [step0, step1] = steps;
+        step1.scope(|dom_zone| -> Result<(), CompileFailure> {
+            let mut dominators = CachedDominators::new_in(dom_zone);
+
+            fits(graph)?;
+            work.scope(|work| branch_splitting::run_with_dominators(graph, work, step0, &mut dominators));
+            step0.reset();
+            step0.trim(STEP_MEMORY_KEPT);
+            check(graph, layout, verify, work, "branch splitting");
+            observe(graph, "branch splitting");
+
+            fits(graph)?;
+            work.scope(|work| gvn::run_with_dominators(graph, work, &mut dominators));
+            check(graph, layout, verify, work, "global value numbering");
+            observe(graph, "global value numbering");
+            Ok(())
+        })?;
+        step1.trim(STEP_MEMORY_KEPT);
+    }
+
+    // Check elimination uses both step zones when facts exceed the move limit.
+    fits(graph)?;
+    let ce_changed = work.scope(|work| check_elimination::run_checked(graph, work, steps));
+    for zone in &mut *steps {
+        zone.reset();
+        zone.trim(STEP_MEMORY_KEPT);
+    }
+    check(graph, layout, verify, work, "check elimination");
+    observe(graph, "check elimination");
+
+    // NB: No remaining pass touches `steps[1]`, so keep a lazily computed `Dominators` there and reuse it across
+    //     every consecutive CFG-preserving pass through the post-refinement GVN pass.
+    {
+        let [step0, step1] = steps;
+        step1.scope(|dom_zone| -> Result<(), CompileFailure> {
+            let mut dominators = CachedDominators::new_in(dom_zone);
+
+            fits(graph)?;
+            let simplify_changed = work.scope(|work| simplify::run_after_check_elimination_checked(graph, work));
+            check(graph, layout, verify, work, "simplification");
+            observe(graph, "simplification");
+
+            fits(graph)?;
+            if ce_changed || simplify_changed {
+                work.scope(|work| gvn::run_with_dominators(graph, work, &mut dominators));
+            }
+            check(graph, layout, verify, work, "global value numbering");
+            observe(graph, "global value numbering");
+
+            fits(graph)?;
+            work.scope(|work| licm::run_with_dominators(graph, work, &mut dominators));
+            check(graph, layout, verify, work, "loop invariant code motion");
+            observe(graph, "loop invariant code motion");
+
+            fits(graph)?;
+            work.scope(|work| bounds_check_elimination::run_with_dominators(graph, work, &mut dominators));
+            check(graph, layout, verify, work, "bounds check elimination");
+            observe(graph, "bounds check elimination");
+
+            fits(graph)?;
+            work.scope(|work| interrupt_check_elimination::run_with_dominators(graph, work, &mut dominators));
+            check(graph, layout, verify, work, "interrupt check elimination");
+            observe(graph, "interrupt check elimination");
+
+            fits(graph)?;
+            work.scope(|work| exit_unboxing::run(graph, work));
+            check(graph, layout, verify, work, "exit unboxing");
+            observe(graph, "exit unboxing");
+
+            fits(graph)?;
+            let dce1_changed_cfg = work.scope(|work| dce::run_checked(graph, work));
+            if dce1_changed_cfg {
+                dominators.invalidate();
+            }
+            check(graph, layout, verify, work, "dead code elimination");
+            observe(graph, "dead code elimination");
+
+            fits(graph)?;
+            let ea_changed = work.scope(|work| escape_analysis::run_checked(graph, work, step0));
+            step0.reset();
+            step0.trim(STEP_MEMORY_KEPT);
+            check(graph, layout, verify, work, "escape analysis");
+            observe(graph, "escape analysis");
+
+            fits(graph)?;
+            if ea_changed || dce1_changed_cfg {
+                let dce2_changed_cfg = work.scope(|work| dce::run_checked(graph, work));
+                if dce2_changed_cfg {
+                    dominators.invalidate();
+                }
+            }
+            check(graph, layout, verify, work, "dead code elimination");
+            observe(graph, "dead code elimination");
+
+            fits(graph)?;
+            work.scope(|work| enumerated_keys::run(graph, work));
+            check(graph, layout, verify, work, "enumerated keys");
+            observe(graph, "enumerated keys");
+
+            fits(graph)?;
+            let branch_fusion_changed_cfg = work.scope(|work| branch_fusion::run_checked(graph, work));
+            if branch_fusion_changed_cfg {
+                dominators.invalidate();
+            }
+            check(graph, layout, verify, work, "branch fusion");
+            observe(graph, "branch fusion");
+
+            fits(graph)?;
+            work.scope(|work| key_strings::run(graph, work));
+            check(graph, layout, verify, work, "key strings");
+            observe(graph, "key strings");
+
+            // NB: Nodes that took different refinements of one value compute the
+            //     same once the refinements are gone, and nothing moves anymore.
+            work.scope(|work| edit::remove_refinements(graph, work));
+            fits(graph)?;
+            work.scope(|work| gvn::run_with_dominators(graph, work, &mut dominators));
+            Ok(())
+        })?;
+        step1.trim(STEP_MEMORY_KEPT);
+    }
+
     // NB: Checks that merged took their frame states along, which may have been the last uses of what those refer to.
     run_pass(Run::Once(dce::run), graph, work, steps)?;
     check(graph, layout, verify, work, "refinement removal");

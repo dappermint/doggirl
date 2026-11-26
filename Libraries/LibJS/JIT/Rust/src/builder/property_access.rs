@@ -425,12 +425,19 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
     /// The entries of the instruction's property cache if they all call the
     /// `part` of the same accessor property (at one offset of the receiver,
     /// or of one prototype) with the same raw native function, with the
-    /// target through which JIT code calls it (see `try_build_native_getter()`).
-    fn native_accessor_entries(&self, cache: u32, part: AccessorPart) -> Option<(&'a [CacheEntry], NativeCallTarget)> {
-        // NB: Calls in inlined callees need their inlined frames, which these calls do not build.
-        if self.function.is_virtual() {
-            return None;
-        }
+    /// target through which JIT code calls it (see `try_build_native_getter()`)
+    /// and any inlined frame bytes to reserve below the native frame.
+    fn native_accessor_entries(
+        &self,
+        cache: u32,
+        part: AccessorPart,
+        inputs: &[Operand],
+    ) -> Option<(&'a [CacheEntry], NativeCallTarget, u32)> {
+        let inlined_frame_bytes = if self.function.is_virtual() {
+            self.inlined_frame_bytes_of_call(inputs)?
+        } else {
+            0
+        };
         let entries = self.cache_entries(cache)?;
         let first = entries[0];
         let accessor = first.accessor_function?;
@@ -455,7 +462,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         if !entries.iter().all(validated) {
             target.direct_getter = None;
         }
-        Some((entries, target))
+        Some((entries, target, inlined_frame_bytes))
     }
 
     /// A `CallNativeAccessor` node calling the `part` of an accessor, the
@@ -465,6 +472,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         &mut self,
         part: AccessorPart,
         target: NativeCallTarget,
+        inlined_frame_bytes: u32,
         inputs: &[NodeId],
         dst: u32,
     ) -> NodeId {
@@ -476,7 +484,9 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         // NB: A call of a function of another realm makes this code's realm current again when it returns.
         self.embed(self.runtime.realm);
         let op = Op::CallNativeAccessor {
+            executable: self.function.index,
             pc: self.function.pc,
+            inlined_frame_bytes,
             part,
             target,
         };
@@ -497,12 +507,15 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         base: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some((entries, target)) = self.native_accessor_entries(cache, AccessorPart::Getter) else {
+        let Some((entries, target, inlined_frame_bytes)) =
+            self.native_accessor_entries(cache, AccessorPart::Getter, &[base])
+        else {
             return Ok(false);
         };
         let (object, getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
         debug_assert!(getter.is_none(), "all entries have the same checked getter");
-        let value = self.emit_native_accessor_call(AccessorPart::Getter, target, &[object], dst.raw());
+        let value =
+            self.emit_native_accessor_call(AccessorPart::Getter, target, inlined_frame_bytes, &[object], dst.raw());
         self.write(dst, value)?;
         Ok(true)
     }
@@ -516,13 +529,21 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         src: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some((entries, target)) = self.native_accessor_entries(cache, AccessorPart::Setter) else {
+        let Some((entries, target, inlined_frame_bytes)) =
+            self.native_accessor_entries(cache, AccessorPart::Setter, &[base, src])
+        else {
             return Ok(false);
         };
         let value = self.read(src)?;
         let (object, setter) = self.check_accessor_call(base, entries, AccessorPart::Setter)?;
         debug_assert!(setter.is_none(), "all entries have the same checked setter");
-        self.emit_native_accessor_call(AccessorPart::Setter, target, &[object, value], Operand::INVALID);
+        self.emit_native_accessor_call(
+            AccessorPart::Setter,
+            target,
+            inlined_frame_bytes,
+            &[object, value],
+            Operand::INVALID,
+        );
         Ok(true)
     }
 
@@ -784,7 +805,10 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         src: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some(entries) = self.cache_entries(cache) else {
+        let Some(entries) = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))
+        else {
             return Ok(false);
         };
         self.build_put(base, src, entries, None)

@@ -285,7 +285,7 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
 
 /// The opcode and the encoded length of the instruction starting at byte offset `pc`, after a check that the whole
 /// instruction lies within `bytes`.
-fn opcode_and_length(bytes: &[u8], pc: u32) -> Result<(u8, usize), DecodeError> {
+pub fn opcode_and_length(bytes: &[u8], pc: u32) -> Result<(u8, usize), DecodeError> {
     let error = |kind| DecodeError { pc, kind };
     let at = pc as usize;
     if at >= bytes.len() {

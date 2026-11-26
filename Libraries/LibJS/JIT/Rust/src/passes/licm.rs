@@ -28,6 +28,7 @@
 use ak::Zone;
 use ak::ZoneVec;
 
+use super::dominators::CachedDominators;
 use super::dominators::Dominators;
 use super::edit;
 use crate::code::ExitKind;
@@ -158,7 +159,13 @@ fn find_loops<'w>(graph: &Graph, dominators: &Dominators, work: &'w Zone) -> Zon
     loops
 }
 
+#[cfg(test)]
 pub fn run(graph: &mut Graph, work: &Zone) {
+    let mut dominators = CachedDominators::new_in(work);
+    run_with_dominators(graph, work, &mut dominators);
+}
+
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
     // NB: Loops have a back edge from a later block or the block itself.
     let has_loops = graph.blocks.iter().enumerate().any(|(index, block)| {
         block
@@ -169,15 +176,19 @@ pub fn run(graph: &mut Graph, work: &Zone) {
     if !has_loops {
         return;
     }
-    let mut dominators = Dominators::of(graph, work);
-    if add_preheaders(graph, &dominators, work) {
+    let added_preheaders = {
+        let dom = dominators.get_or_compute(graph);
+        add_preheaders(graph, dom, work)
+    };
+    let dominators = if added_preheaders {
         // NB: The phis of headers that merged their entries in a preheader
         //     only take the value the preheader brings where the loop leaves
         //     it as it is, which is then invariant in the loop.
         edit::remove_trivial_phis(graph, work);
-        dominators.compute(graph);
-    }
-    let dominators = &dominators;
+        dominators.recompute(graph)
+    } else {
+        dominators.get_or_compute(graph)
+    };
     let loops = find_loops(graph, dominators, work);
     if loops.is_empty() {
         return;

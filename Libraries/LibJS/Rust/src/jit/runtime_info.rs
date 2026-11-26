@@ -476,15 +476,12 @@ const _: () = {
 // NB: JIT code reads the cells of the fly string cache as words, null if empty.
 const _: () = assert!(size_of::<core::cell::Cell<Option<Gc<PrimitiveString>>>>() == size_of::<u64>());
 
-/// The runtime info of a compile job for code of `realm`, with what JIT code needs to allocate cells itself (which
-/// refers to the cells in `allocation.cells`).
-pub fn runtime_info(
-    vm: &Vm,
-    realm: Gc<Realm>,
-    allocation: AllocationInfos<'_>,
-    _defer_gc: &DeferGc<'_>,
-) -> RuntimeInfo {
+/// Builds the VM-constant part of `RuntimeInfo` once per VM (including call and construct stubs). Per-compile
+/// fields (`no_htmldda_objects`, GC-movable `typeof_strings`, allocation templates, and realm cells) are patched
+/// in `runtime_info()`.
+pub(crate) fn build_cached_runtime_info(vm: &Vm) -> RuntimeInfo {
     let addresses = vm.jit.runtime_function_addresses();
+    let cached_alloc = vm.jit.cached_allocation_info(vm);
     let mut layout = runtime_layout();
     layout.try_get_by_id_cache = addresses.try_get_by_id_cache;
     layout.try_put_by_id_cache = addresses.try_put_by_id_cache;
@@ -506,20 +503,8 @@ pub fn runtime_info(
     layout.key_concatenation_cache = vm.key_concatenation_cache().as_ptr().expose_provenance() as u64;
     layout.numeric_string_cache = vm.numeric_string_cache().as_ptr().expose_provenance() as u64;
     layout.large_numeric_string_cache = vm.large_numeric_string_cache().as_ptr().expose_provenance() as u64;
-    let strings = vm.cached_strings();
-    let string = |string| Value::from_string(string).0;
-    layout.typeof_strings = TypeofStrings {
-        number: string(strings.number),
-        undefined: string(strings.undefined),
-        object: string(strings.object),
-        string: string(strings.string),
-        symbol: string(strings.symbol),
-        boolean: string(strings.boolean),
-        bigint: string(strings.bigint),
-        function: string(strings.function),
-    };
     let mut info = RuntimeInfo {
-        no_htmldda_objects: !vm.jit.htmldda_objects_exist(),
+        no_htmldda_objects: true,
         slow_paths: addresses.slow_paths,
         jit_call: jit_function_address!(super::calls::libjs_jit_call),
         call_forwarding_arguments: jit_function_address!(super::calls::libjs_jit_call_forwarding_arguments),
@@ -561,15 +546,16 @@ pub fn runtime_info(
             has_property: jit_function_address!(super::intrinsics::libjs_jit_has_property),
         },
         create_arguments: jit_function_address!(super::entry_exit::libjs_jit_create_arguments),
-        object_allocation: allocation.object,
-        array_allocation: allocation.array,
-        rope_allocation: allocation.rope,
-        function_allocation: allocation.function,
+        // NB: `call_stub` and `construct_stub` inspect `object_allocation`'s VM-constant heap fields.
+        object_allocation: cached_alloc.object,
+        array_allocation: cached_alloc.array,
+        rope_allocation: cached_alloc.rope,
+        function_allocation: cached_alloc.function,
         create_lexical_environment: jit_function_address!(super::allocation::libjs_jit_create_lexical_environment),
-        realm: CellId(realm.as_ptr() as u64),
-        array_prototype: CellId(realm.array_prototype().as_ptr() as u64),
-        object_prototype: CellId(realm.object_prototype().as_ptr() as u64),
-        array_constructor: CellId(realm.intrinsics().array_constructor(vm).as_ptr() as u64),
+        realm: CellId(0),
+        array_prototype: CellId(0),
+        object_prototype: CellId(0),
+        array_constructor: CellId(0),
         no_yield_continuation: ExecutionContext::NO_YIELD_CONTINUATION,
         heap_region_base: vm.head.heap_region_base.get() as u64,
         heap_region_offset_mask: HEAP_REGION_OFFSET_MASK,
@@ -582,6 +568,39 @@ pub fn runtime_info(
     };
     info.dynamic_calls.call_stub = vm.jit.call_stub(&info);
     info.construct_stub = vm.jit.construct_stub(&info);
+    info
+}
+
+/// The runtime info of a compile job for code of `realm`, with what JIT code needs to allocate cells itself (which
+/// refers to the cells in `allocation.cells`).
+pub fn runtime_info(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    allocation: AllocationInfos<'_>,
+    _defer_gc: &DeferGc<'_>,
+) -> RuntimeInfo {
+    let mut info = vm.jit.cached_runtime_info(vm).clone();
+    info.no_htmldda_objects = !vm.jit.htmldda_objects_exist();
+    let strings = vm.cached_strings();
+    let string = |string| Value::from_string(string).0;
+    info.layout.typeof_strings = TypeofStrings {
+        number: string(strings.number),
+        undefined: string(strings.undefined),
+        object: string(strings.object),
+        string: string(strings.string),
+        symbol: string(strings.symbol),
+        boolean: string(strings.boolean),
+        bigint: string(strings.bigint),
+        function: string(strings.function),
+    };
+    info.object_allocation = allocation.object;
+    info.array_allocation = allocation.array;
+    info.rope_allocation = allocation.rope;
+    info.function_allocation = allocation.function;
+    info.realm = CellId(realm.as_ptr() as u64);
+    info.array_prototype = CellId(realm.array_prototype().as_ptr() as u64);
+    info.object_prototype = CellId(realm.object_prototype().as_ptr() as u64);
+    info.array_constructor = CellId(realm.intrinsics().array_constructor(vm).as_ptr() as u64);
     info
 }
 

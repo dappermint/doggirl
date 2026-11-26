@@ -7,6 +7,7 @@
 //! Compiled bytecode together with everything needed to run it, as owned Rust values.
 
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use ak::Utf16String;
@@ -207,6 +208,12 @@ pub struct ExecutableData {
     pub number_of_registers: u32,
     pub number_of_arguments: u32,
     pub is_strict: bool,
+    /// Shared JIT metadata flags across realms sharing this `ExecutableData` (bit 0: compiled at least once;
+    /// bit 1: `captured_binding_accesses` is known empty).
+    jit_flags: AtomicU8,
+    /// Cached bytecode instruction count shared across realms: bit 15 marks an exact count, bits 0..15 hold the
+    /// count saturated to `0x7fff` (0 means uncached). Fits in the 2-byte alignment padding before `length_identifier`.
+    cached_instruction_count: AtomicU16,
     cache_slot_counts: CacheSlotCounts,
     /// The index of the length in the property key table, plus one.
     length_identifier: Option<NonZeroU32>,
@@ -335,6 +342,8 @@ impl ExecutableData {
             number_of_registers,
             number_of_arguments,
             is_strict,
+            jit_flags: AtomicU8::new(0),
+            cached_instruction_count: AtomicU16::new(0),
             cache_slot_counts: CacheSlotCounts {
                 property_lookup: CacheSlotCounts::compact(cache_counts.property_lookup),
                 global_variable: CacheSlotCounts::compact(cache_counts.global_variable),
@@ -358,6 +367,69 @@ impl ExecutableData {
             position_source,
             tables,
             link_tables,
+        }
+    }
+
+    const JIT_FLAG_WAS_COMPILED: u8 = 1 << 0;
+    const JIT_FLAG_CAPTURED_BINDINGS_EMPTY: u8 = 1 << 1;
+    const INSTRUCTION_COUNT_EXACT_BIT: u16 = 1 << 15;
+    const INSTRUCTION_COUNT_MASK: u16 = !Self::INSTRUCTION_COUNT_EXACT_BIT;
+
+    pub fn was_jit_compiled(&self) -> bool {
+        self.jit_flags.load(Ordering::Relaxed) & Self::JIT_FLAG_WAS_COMPILED != 0
+    }
+
+    pub fn mark_jit_compiled(&self) {
+        if !self.was_jit_compiled() {
+            self.jit_flags.fetch_or(Self::JIT_FLAG_WAS_COMPILED, Ordering::Relaxed);
+        }
+    }
+
+    pub fn captured_bindings_known_empty(&self) -> bool {
+        self.jit_flags.load(Ordering::Relaxed) & Self::JIT_FLAG_CAPTURED_BINDINGS_EMPTY != 0
+    }
+
+    pub fn mark_captured_bindings_empty(&self) {
+        if !self.captured_bindings_known_empty() {
+            self.jit_flags
+                .fetch_or(Self::JIT_FLAG_CAPTURED_BINDINGS_EMPTY, Ordering::Relaxed);
+        }
+    }
+
+    /// Cached `(count, is_exact)` bytecode instruction count shared across realms.
+    pub fn cached_instruction_count(&self) -> (u32, bool) {
+        let raw = self.cached_instruction_count.load(Ordering::Relaxed);
+        (
+            u32::from(raw & Self::INSTRUCTION_COUNT_MASK),
+            raw & Self::INSTRUCTION_COUNT_EXACT_BIT != 0,
+        )
+    }
+
+    /// Updates the shared bytecode instruction count cache if `exact` or `count` exceeds what was cached.
+    pub fn update_cached_instruction_count(&self, count: u32, exact: bool) {
+        let clamped = count.min(u32::from(Self::INSTRUCTION_COUNT_MASK)) as u16;
+        let encoded = if exact && count <= u32::from(Self::INSTRUCTION_COUNT_MASK) {
+            clamped | Self::INSTRUCTION_COUNT_EXACT_BIT
+        } else {
+            clamped
+        };
+        let mut current = self.cached_instruction_count.load(Ordering::Relaxed);
+        loop {
+            let current_exact = current & Self::INSTRUCTION_COUNT_EXACT_BIT != 0;
+            let current_count = current & Self::INSTRUCTION_COUNT_MASK;
+            let new_exact = encoded & Self::INSTRUCTION_COUNT_EXACT_BIT != 0;
+            if current_exact || (!new_exact && clamped <= current_count) {
+                return;
+            }
+            match self.cached_instruction_count.compare_exchange_weak(
+                current,
+                encoded,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
     }
 

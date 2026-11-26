@@ -15,6 +15,7 @@
 use ak::Zone;
 use ak::ZoneVec;
 
+use super::dominators::CachedDominators;
 use super::dominators::Dominators;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
@@ -246,12 +247,38 @@ fn renamed(renames: &[(NodeId, NodeId)], value: NodeId) -> NodeId {
         .map_or(value, |(_, to)| *to)
 }
 
+/// Fast check for whether any block could possibly match `find_split`, before computing dominators.
+fn has_split_candidate(graph: &Graph) -> bool {
+    graph.blocks.iter().enumerate().any(|(index, data)| {
+        if data.phis.is_empty() || data.is_loop_header || data.predecessors.len() != 2 {
+            return false;
+        }
+        let block = BlockId::from_index(index);
+        let branch_block = match graph.control(block).op {
+            Op::Jump { target } if target.index() > index => {
+                let target_data = graph.block(target);
+                if target_data.predecessors != [block] || !target_data.phis.is_empty() || target_data.is_loop_header {
+                    return false;
+                }
+                target
+            }
+            Op::Branch { .. } => block,
+            _ => return false,
+        };
+        matches!(
+            graph.control(branch_block).op,
+            Op::Branch {
+                condition: BranchCondition::Bool,
+                ..
+            }
+        )
+    })
+}
+
 /// Splits one block, if any has the shape of `Split` and all uses of its
 /// phis are on one side of its branch. Returns whether it split one. The
 /// data of the split that `lists` does not keep goes in `step`.
-fn split_one(graph: &mut Graph, dominators: &mut Dominators, lists: &mut Lists, step: &Zone) -> bool {
-    dominators.compute(graph);
-    let dominators = &*dominators;
+fn split_one(graph: &mut Graph, dominators: &Dominators, lists: &mut Lists, step: &Zone) -> bool {
     // NB: Splits add nodes, so the set grows ahead of them.
     if lists.phis.capacity() < graph.nodes.len() {
         lists.phis = ZoneBitSet::new_in(graph.nodes.len().max(lists.phis.capacity() * 2), lists.zone);
@@ -397,8 +424,10 @@ fn split_one(graph: &mut Graph, dominators: &mut Dominators, lists: &mut Lists, 
     false
 }
 
-pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
-    let [step, _] = steps;
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, step: &mut Zone, dominators: &mut CachedDominators) {
+    if !has_split_candidate(graph) {
+        return;
+    }
     let mut lists = Lists {
         zone: work,
         moved: ZoneVec::new_in(work),
@@ -409,10 +438,17 @@ pub fn run(graph: &mut Graph, work: &Zone, steps: &mut [Zone; 2]) {
         renames: [ZoneVec::new_in(work), ZoneVec::new_in(work)],
         copies: ZoneVec::new_in(work),
     };
-    let mut dominators = Dominators::new_in(work);
     for _ in 0..graph.blocks.len() {
         // NB: Each split cleans up the control flow, with data as large as the graph, which goes when the split ends.
-        if !step.scope(|step| split_one(graph, &mut dominators, &mut lists, step)) {
+        let did_split = step.scope(|step| {
+            let dom = dominators.get_or_compute(graph);
+            split_one(graph, dom, &mut lists, step)
+        });
+        if !did_split {
+            break;
+        }
+        dominators.invalidate();
+        if !has_split_candidate(graph) {
             break;
         }
     }

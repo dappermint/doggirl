@@ -131,7 +131,7 @@ impl<'a> GraphBuilder<'a, '_> {
             .instruction
             .opcode();
         let layout = slow_path_layout(opcode);
-        let bytecode = &self.snapshot[self.function.executable.bytecode];
+        let bytecode = self.snapshot.bytecode(self.function.executable.bytecode);
         let at = self.function.pc as usize;
         let byte_at = |offset: u32| -> Result<u8, CompileFailure> {
             bytecode

@@ -46,6 +46,7 @@
 use ak::Zone;
 use ak::ZoneVec;
 
+use super::dominators::CachedDominators;
 use super::dominators::Dominators;
 use super::edit::Constants;
 use super::edit::Replacements;
@@ -527,7 +528,13 @@ fn entering_counters<'w>(
     entering
 }
 
+#[cfg(test)]
 pub fn run(graph: &mut Graph, work: &Zone) {
+    let mut dominators = CachedDominators::new_in(work);
+    run_with_dominators(graph, work, &mut dominators);
+}
+
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
     let mut phi_blocks = ZoneMap::new_in(work);
     let mut checks = ZoneVec::new_in(work);
     let mut shifts = ZoneVec::new_in(work);
@@ -582,7 +589,7 @@ pub fn run(graph: &mut Graph, work: &Zone) {
     if checks.is_empty() && shifts.is_empty() && arithmetic.is_empty() {
         return;
     }
-    let dominators = &Dominators::of(graph, work);
+    let dominators = dominators.get_or_compute(graph);
     let entering = entering_counters(graph, dominators, &phi_blocks, work);
     let mut ranges = Ranges {
         graph,

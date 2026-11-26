@@ -46,16 +46,19 @@ impl<'z> ZoneBitSet<'z> {
     }
 
     /// Takes all elements out. The set keeps its memory.
+    #[inline]
     pub fn clear(&mut self) {
         self.first_word = 0;
         self.extra_words.fill(0);
     }
 
     /// The exclusive upper bound of the integers this set can hold.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn contains(&self, index: usize) -> bool {
         assert!(index < self.len, "bit {index} out of range {}", self.len);
         let word = if index < 64 {
@@ -66,6 +69,7 @@ impl<'z> ZoneBitSet<'z> {
         word & (1 << (index % 64)) != 0
     }
 
+    #[inline]
     pub fn insert(&mut self, index: usize) {
         assert!(index < self.len, "bit {index} out of range {}", self.len);
         if index < 64 {
@@ -75,6 +79,7 @@ impl<'z> ZoneBitSet<'z> {
         }
     }
 
+    #[inline]
     pub fn remove(&mut self, index: usize) {
         assert!(index < self.len, "bit {index} out of range {}", self.len);
         if index < 64 {
@@ -84,6 +89,7 @@ impl<'z> ZoneBitSet<'z> {
         }
     }
 
+    #[inline]
     pub fn insert_range(&mut self, range: std::ops::Range<usize>) {
         for index in range {
             self.insert(index);
@@ -91,6 +97,7 @@ impl<'z> ZoneBitSet<'z> {
     }
 
     /// Adds every element of `other`. Returns whether this set changed.
+    #[inline]
     pub fn union_with(&mut self, other: &ZoneBitSet<'_>) -> bool {
         assert_eq!(self.len, other.len, "union of differently sized sets");
         let first_word = self.first_word | other.first_word;
@@ -105,6 +112,7 @@ impl<'z> ZoneBitSet<'z> {
     }
 
     /// Removes every element of `other`.
+    #[inline]
     pub fn subtract(&mut self, other: &ZoneBitSet<'_>) {
         assert_eq!(self.len, other.len, "difference of differently sized sets");
         self.first_word &= !other.first_word;
@@ -113,10 +121,12 @@ impl<'z> ZoneBitSet<'z> {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.first_word == 0 && self.extra_words.iter().all(|word| *word == 0)
     }
 
+    #[inline]
     pub fn count(&self) -> usize {
         self.first_word.count_ones() as usize
             + self
@@ -127,6 +137,7 @@ impl<'z> ZoneBitSet<'z> {
     }
 
     /// The elements in increasing order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         std::iter::once(&self.first_word)
             .chain(self.extra_words.iter())

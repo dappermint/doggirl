@@ -17,7 +17,7 @@ use super::Size;
 use super::check_items;
 use crate::CompileFailure;
 use crate::codegen::lowering_info::Clobbers as LoweringClobbers;
-use crate::codegen::lowering_info::lowering_info;
+use crate::codegen::lowering_info::lowering_clobbers;
 use crate::ir::BlockId;
 use crate::ir::FrameStateId;
 use crate::ir::Graph;
@@ -77,14 +77,18 @@ pub(super) struct ValueLiveness<'w> {
     /// For each frame state, the allocated values that a node uses through it, as a part of `frame_uses`.
     frame_runs: ZoneVec<'w, Run>,
     frame_uses: ZoneVec<'w, NodeId>,
+    /// For each frame state, the block (plus one) whose seed scan last expanded it.
+    frame_seen_block: ZoneVec<'w, u32>,
+    /// For each value, the block (plus one) that last queued a non-flowing-out seed for it.
+    last_seed_block: ZoneVec<'w, u32>,
+    /// Per-value use counts / write cursors for linear-time use-list scattering.
+    use_counts: ZoneVec<'w, u32>,
+    /// Seeds bucketed by value index, avoiding comparison sort on `seeds`.
+    seed_lists: Lists<'w, u32>,
     /// For each value, the block (plus one) whose backwards walk has it live at the place it is at.
     live: ZoneVec<'w, u32>,
     /// The values that were live at some place of the block that is walked.
     touched: ZoneVec<'w, NodeId>,
-    /// The values the node that is walked uses.
-    used: ZoneVec<'w, NodeId>,
-    /// For each value, the node (plus one) that was last noted as its death.
-    last_death: ZoneVec<'w, u32>,
     live_since: ZoneVec<'w, Option<(BlockId, Clobbers)>>,
 }
 
@@ -181,14 +185,16 @@ impl<'w> ValueLiveness<'w> {
             out_marks: ZoneVec::from_elem_in(0, size.blocks, work),
             // NB: A walk up passes each block one time.
             pending: ZoneVec::with_capacity_in(size.blocks, work),
-            in_pairs: ZoneVec::new_in(work),
-            out_pairs: ZoneVec::new_in(work),
+            in_pairs: ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work),
+            out_pairs: ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work),
             frame_runs: ZoneVec::from_elem_in(NOT_LISTED, size.frame_states, work),
-            frame_uses: ZoneVec::new_in(work),
+            frame_uses: ZoneVec::with_capacity_in(size.frame_states.saturating_mul(4), work),
+            frame_seen_block: ZoneVec::from_elem_in(0, size.frame_states, work),
+            last_seed_block: ZoneVec::from_elem_in(0, size.nodes, work),
+            use_counts: ZoneVec::from_elem_in(0, size.nodes, work),
+            seed_lists: Lists::new_in(work),
             live: ZoneVec::from_elem_in(0, size.nodes, work),
-            touched: ZoneVec::new_in(work),
-            used: ZoneVec::new_in(work),
-            last_death: ZoneVec::from_elem_in(0, size.nodes, work),
+            touched: ZoneVec::with_capacity_in(size.nodes.min(256), work),
             live_since: ZoneVec::from_elem_in(None, size.nodes, work),
         };
         liveness.fill(graph, work)?;
@@ -225,9 +231,47 @@ impl<'w> ValueLiveness<'w> {
     }
 
     /// Lists the allocated values of the frame state `frame`, if they are not listed yet.
-    fn list_frame_uses(&mut self, graph: &Graph, frame: FrameStateId, work: &Zone) -> Result<(), CompileFailure> {
+    fn list_frame_uses(
+        &mut self,
+        graph: &Graph,
+        frame: FrameStateId,
+        has_virtual_objects: bool,
+        work: &Zone,
+    ) -> Result<(), CompileFailure> {
         if self.frame_runs[frame.index()] != NOT_LISTED {
             return Ok(());
+        }
+        if !has_virtual_objects {
+            // NB: Without virtual objects in the graph, a frame state's values are simply its own values plus its
+            //     parent chain's values. Listing each parent once avoids quadratic re-walks across inlined frames.
+            if let Some(parent) = graph.frame_state(frame).parent {
+                self.list_frame_uses(graph, parent, false, work)?;
+                let parent_range = self.frame_runs[parent.index()].range();
+                let own_values = &graph.frame_state(frame).values;
+                let start = self.frame_uses.len();
+                self.frame_uses.reserve(parent_range.len() + own_values.len());
+                for &(_, value) in own_values {
+                    if is_allocated_value(graph, value) {
+                        self.frame_uses.push(value);
+                    }
+                }
+                for index in parent_range {
+                    let value = self.frame_uses[index];
+                    self.frame_uses.push(value);
+                }
+                self.frame_runs[frame.index()] = Run::new(start, self.frame_uses.len());
+                return check_items(self.frame_uses.len());
+            }
+            let own_values = &graph.frame_state(frame).values;
+            let start = self.frame_uses.len();
+            self.frame_uses.reserve(own_values.len());
+            for &(_, value) in own_values {
+                if is_allocated_value(graph, value) {
+                    self.frame_uses.push(value);
+                }
+            }
+            self.frame_runs[frame.index()] = Run::new(start, self.frame_uses.len());
+            return check_items(self.frame_uses.len());
         }
         let start = self.frame_uses.len();
         for (_, value) in graph.frame_state_values(frame, work) {
@@ -242,10 +286,19 @@ impl<'w> ValueLiveness<'w> {
 
     /// Notes that `value` is used in `block`, at a node or (`flows_out`) by a phi of a block that `block` continues
     /// at. Fails the compile if the seeds would be past their limit (see `check_items()`).
+    #[inline]
     fn add_seed(&mut self, value: NodeId, block: usize, flows_out: bool) -> Result<(), CompileFailure> {
-        // NB: A use in the block of the definition makes the value live into no block.
-        if !flows_out && self.blocks[value.index()] as usize == block {
-            return Ok(());
+        let value_index = value.index();
+        if !flows_out {
+            // NB: A use in the block of the definition makes the value live into no block.
+            if self.blocks[value_index] as usize == block {
+                return Ok(());
+            }
+            let block_mark = block as u32 + 1;
+            if self.last_seed_block[value_index] == block_mark {
+                return Ok(());
+            }
+            self.last_seed_block[value_index] = block_mark;
         }
         // NB: The frame states of the nodes give a block seeds that its inputs do not tell, so the seeds of one
         //     block alone can be past the limit.
@@ -258,6 +311,11 @@ impl<'w> ValueLiveness<'w> {
     /// Fills the tables, which `compute()` made for `graph`.
     fn fill(&mut self, graph: &Graph, work: &Zone) -> Result<(), CompileFailure> {
         let block_count = graph.blocks.len();
+        let node_count = graph.nodes.len();
+        let has_virtual_objects = graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, Op::VirtualObject { .. }));
 
         self.successors.begin();
         let mut position = 0;
@@ -276,19 +334,24 @@ impl<'w> ValueLiveness<'w> {
 
         // The uses of each value: where it is an input, and the blocks it is used in that are not its own.
         for (index, block) in graph.blocks.iter().enumerate() {
+            let block_mark = index as u32 + 1;
             for node_id in block.body.iter().chain(&block.control) {
                 let node = graph.node(*node_id);
                 let position = self.positions[node_id.index()];
                 for input in &node.inputs {
                     if is_allocated_value(graph, *input) {
                         self.use_pairs.push(pair(input.0, position));
+                        self.use_counts[input.index()] += 1;
                         self.add_seed(*input, index, false)?;
                     }
                 }
                 if let Some(frame) = node.frame_state {
-                    self.list_frame_uses(graph, frame, work)?;
-                    for use_index in self.frame_runs[frame.index()].range() {
-                        self.add_seed(self.frame_uses[use_index], index, false)?;
+                    self.list_frame_uses(graph, frame, has_virtual_objects, work)?;
+                    if self.frame_seen_block[frame.index()] != block_mark {
+                        self.frame_seen_block[frame.index()] = block_mark;
+                        for use_index in self.frame_runs[frame.index()].range() {
+                            self.add_seed(self.frame_uses[use_index], index, false)?;
+                        }
                     }
                 }
             }
@@ -299,36 +362,55 @@ impl<'w> ValueLiveness<'w> {
                 for (_, input) in phi_inputs_from(graph, block_id, successor) {
                     if is_allocated_value(graph, input) {
                         self.use_pairs.push(pair(input.0, end));
+                        self.use_counts[input.index()] += 1;
                         self.add_seed(input, index, true)?;
                     }
                 }
             }
         }
 
-        self.use_pairs.sort_unstable();
-        let mut index = 0;
-        while index < self.use_pairs.len() {
-            let value = high(self.use_pairs[index]);
-            let start = index;
-            while index < self.use_pairs.len() && high(self.use_pairs[index]) == value {
-                self.uses.push(low(self.use_pairs[index]));
-                index += 1;
+        // Linear-time counting scatter: `use_pairs` was appended in non-decreasing position order, so scattering
+        // per value preserves ascending position order without sorting.
+        let mut offset = 0usize;
+        for value in 0..node_count {
+            let count = self.use_counts[value] as usize;
+            if count != 0 {
+                self.use_runs[value] = Run::new(offset, offset + count);
+                self.use_counts[value] = offset as u32;
+                offset += count;
             }
-            self.use_runs[value as usize] = Run::new(start, index);
+        }
+        self.uses.resize(offset, 0);
+        for &use_pair in &self.use_pairs {
+            let value = high(use_pair) as usize;
+            let slot = self.use_counts[value] as usize;
+            self.use_counts[value] = slot as u32 + 1;
+            self.uses[slot] = low(use_pair);
         }
 
+        // Bucket seeds by value index in linear time, preserving ascending value order for `live_in`/`live_out`.
+        self.seed_lists.begin_counts(node_count);
+        for &seed_pair in &self.seeds {
+            self.seed_lists.count(high(seed_pair) as usize);
+        }
+        self.seed_lists.end_counts(0);
+        for &seed_pair in &self.seeds {
+            self.seed_lists.fill(high(seed_pair) as usize, low(seed_pair));
+        }
+        self.seed_lists.end_fill();
+
         // Walk up from the uses of each value, as far as the block of its definition.
-        self.seeds.sort_unstable();
-        let mut index = 0;
-        while index < self.seeds.len() {
-            let value = high(self.seeds[index]);
+        for value_index in 0..node_count {
+            let seeds = self.seed_lists.get(value_index);
+            if seeds.is_empty() {
+                continue;
+            }
+            let value = value_index as u32;
             let mark = value + 1;
-            let definition = self.blocks[value as usize];
+            let definition = self.blocks[value_index];
             self.pending.clear();
-            while index < self.seeds.len() && high(self.seeds[index]) == value {
-                let seed = low(self.seeds[index]);
+            for &seed in seeds {
                 let (block, flows_out) = (seed >> 1, seed & 1 != 0);
-                index += 1;
                 if flows_out {
                     if self.out_marks[block as usize] != mark {
                         self.out_marks[block as usize] = mark;
@@ -403,21 +485,16 @@ impl<'w> ValueLiveness<'w> {
                 self.live[value.index()] = mark;
                 self.touched.push(*value);
             }
+            let mut prev_frame: Option<FrameStateId> = None;
             for node_id in block.body.iter().chain(&block.control).rev() {
                 let node = graph.node(*node_id);
-                self.used.clear();
-                for input in &node.inputs {
-                    if is_allocated_value(graph, *input) {
-                        self.used.push(*input);
-                    }
-                }
                 let frame_uses = match node.frame_state {
                     Some(frame) => self.frame_runs[frame.index()].range(),
                     None => 0..0,
                 };
-                self.used.extend_from_slice(&self.frame_uses[frame_uses.clone()]);
 
-                if self.live[node_id.index()] == mark {
+                let node_was_live = self.live[node_id.index()] == mark;
+                if node_was_live {
                     check_spill(
                         &mut self.flags,
                         since(&self.live_since, node_id.index()),
@@ -427,7 +504,7 @@ impl<'w> ValueLiveness<'w> {
                 } else if is_allocated_value(graph, *node_id) {
                     self.flags[node_id.index()] |= DEAD_OUTPUT;
                 }
-                let (is_call, clobbers_floats) = match lowering_info(node).clobbers {
+                let (is_call, clobbers_floats) = match lowering_clobbers(node) {
                     LoweringClobbers::CallerSaved => (true, false),
                     // NB: Their slow paths clobber the floating point registers.
                     LoweringClobbers::Floats => (false, true),
@@ -436,7 +513,7 @@ impl<'w> ValueLiveness<'w> {
                 if is_call || clobbers_floats {
                     clobbers.float_clobbers += 1;
                     clobbers.calls += u32::from(is_call);
-                    for value in &self.frame_uses[frame_uses] {
+                    for value in &self.frame_uses[frame_uses.clone()] {
                         let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
                         if value != node_id && (is_call || is_float) {
                             self.flags[value.index()] |= NEEDS_SPILL;
@@ -444,22 +521,54 @@ impl<'w> ValueLiveness<'w> {
                     }
                 }
                 let deaths = self.dying.len();
-                for value in &self.used {
-                    if self.live[value.index()] != mark && self.last_death[value.index()] != node_id.0 + 1 {
-                        self.last_death[value.index()] = node_id.0 + 1;
-                        self.dying.push(*value);
-                        self.live_since[value.index()] = Some((block_id, clobbers));
-                    }
-                }
-                self.deaths[node_id.index()] = Run::new(deaths, self.dying.len());
-
                 self.live[node_id.index()] = 0;
-                for value in &self.used {
+                let mut self_used = false;
+                let mut mark_use = |value: NodeId| {
+                    if value == *node_id {
+                        if !self_used {
+                            self_used = true;
+                            if !node_was_live {
+                                self.dying.push(value);
+                                self.live_since[value.index()] = Some((block_id, clobbers));
+                            }
+                        }
+                        return;
+                    }
                     if self.live[value.index()] != mark {
                         self.live[value.index()] = mark;
-                        self.touched.push(*value);
+                        self.dying.push(value);
+                        self.live_since[value.index()] = Some((block_id, clobbers));
+                        self.touched.push(value);
+                    }
+                };
+                for &input in &node.inputs {
+                    if is_allocated_value(graph, input) {
+                        mark_use(input);
                     }
                 }
+                // Consecutive nodes sharing a ResumeAt frame state already have every value of that frame state
+                // marked live from the immediately following node, and cannot reference their own result.
+                let skip_frame_uses = match node.frame_state {
+                    Some(frame) if prev_frame == Some(frame) => {
+                        !node_was_live
+                            || matches!(
+                                graph.frame_states[frame.index()].mode,
+                                crate::code::ResumeMode::ResumeAt
+                            )
+                    }
+                    _ => false,
+                };
+                if !skip_frame_uses {
+                    for &value in &self.frame_uses[frame_uses] {
+                        mark_use(value);
+                    }
+                }
+                prev_frame = node.frame_state;
+                if self_used {
+                    self.live[node_id.index()] = mark;
+                    self.touched.push(*node_id);
+                }
+                self.deaths[node_id.index()] = Run::new(deaths, self.dying.len());
             }
             for phi in &block.phis {
                 self.live[phi.index()] = 0;

@@ -89,11 +89,11 @@ pub fn remove_refinements(graph: &mut Graph, work: &Zone) {
     for block in &graph.blocks {
         for node in &block.body {
             let data = graph.node(*node);
-            let Some(index) = data.op.refined_input() else {
+            if !data.op.refines_input_0() {
                 continue;
-            };
+            }
             if data.repr.is_some() {
-                replacements.replace(*node, data.inputs[index]);
+                replacements.replace(*node, data.inputs[0]);
             }
             match data.op {
                 Op::Refine { .. } => removed.insert(node.index()),
@@ -111,6 +111,9 @@ pub fn remove_refinements(graph: &mut Graph, work: &Zone) {
 /// Removes the nodes in `removed` from the blocks they are in. Nodes added
 /// after `removed` was made are kept.
 pub fn remove_nodes(graph: &mut Graph, removed: &ZoneBitSet) {
+    if removed.is_empty() {
+        return;
+    }
     let is_removed = |node: &NodeId| node.index() < removed.capacity() && removed.contains(node.index());
     for block in &mut graph.blocks {
         block.body.retain(|node| !is_removed(node));
@@ -407,6 +410,9 @@ pub fn move_cold_blocks_last(graph: &mut Graph, work: &Zone) {
 /// Replaces phis whose inputs are all one value (or the phi itself) by
 /// that value, until none is left.
 pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
+    if !graph.blocks.iter().any(|block| !block.phis.is_empty()) {
+        return;
+    }
     // NB: Nothing adds nodes here.
     let mut replacements = Replacements::new(graph, work);
     let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
@@ -414,6 +420,9 @@ pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
         replacements.clear();
         removed.clear();
         for block in &graph.blocks {
+            if block.phis.is_empty() {
+                continue;
+            }
             for phi in &block.phis {
                 let mut distinct = graph.nodes[phi.index()]
                     .inputs

@@ -15,7 +15,7 @@ use libjs_runtime_macros::{jit_abi, jit_function_address};
 
 use super::code::EntryStatus;
 use super::entry_exit::{can_enter_jit_code, enter_jit_code};
-use super::{frame_of, frames_above};
+use super::{for_each_frame_above, frame_of};
 use crate::bytecode::encoding::Operand;
 use crate::bytecode::executable::{Executable, PropertyLookupCache};
 use crate::bytecode::instruction::OpCode;
@@ -992,9 +992,12 @@ fn finish_direct_call_frames(
 ) -> SlowPathControl {
     // NB: The callee's frame, and the frames of the calls it inlined that its exit materialized, run in the
     //     interpreter from now on.
-    for callee_frame in frames_above(vm, frame).expect("the calling frame is on the running frame's chain") {
-        frame_of(callee_frame).runs_jit_code.set(false);
-    }
+    assert!(
+        for_each_frame_above(vm, frame, |callee_frame| {
+            frame_of(callee_frame).runs_jit_code.set(false);
+        }),
+        "the calling frame is on the running frame's chain"
+    );
     if status != EntryStatus::ExitInterpreter as u64 {
         let callee_frame = vm.running_execution_context().expect("the callee frame is running");
         if frame_of(callee_frame).program_counter.get() == 0 {
