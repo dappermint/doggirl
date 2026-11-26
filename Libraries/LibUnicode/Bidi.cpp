@@ -17,6 +17,8 @@ bool may_require_bidi_processing(Utf16View const& text)
         return false;
 
     for (auto code_point : text) {
+        if (code_point < 0x0590)
+            continue;
         switch (bidirectional_class(code_point)) {
         case BidiClass::RightToLeft:
         case BidiClass::RightToLeftArabic:
