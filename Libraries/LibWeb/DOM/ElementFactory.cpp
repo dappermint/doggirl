@@ -675,85 +675,115 @@ GC::Ref<Element> create_builtin_html_element_by_raw_local_name(Document& documen
     VERIFY(entry.has_value());
     auto element = entry->factory(document, entry->qualified_name);
     element->set_custom_element_registry(registry);
-    element->set_custom_element_state(CustomElementState::Uncustomized);
+    element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
     VERIFY(!element->has_attributes());
     return element;
 }
 
 GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, u8 tag_kind, bool uses_document_global_registry, GC::Ptr<HTML::CustomElementRegistry> registry)
 {
-    auto make_element = [&]<typename ElementType>(Utf16FlyString const& tag_name) -> GC::Ref<Element> {
-        static NeverDestroyed<QualifiedName> s_qualified_name { QualifiedName { tag_name, {}, Namespace::HTML } };
-        return create_element_on_heap<ElementType>(document, *s_qualified_name);
+    struct FragmentQualifiedNames {
+        QualifiedName a { HTML::TagNames::a, {}, Namespace::HTML };
+        QualifiedName article { HTML::TagNames::article, {}, Namespace::HTML };
+        QualifiedName aside { HTML::TagNames::aside, {}, Namespace::HTML };
+        QualifiedName b { HTML::TagNames::b, {}, Namespace::HTML };
+        QualifiedName big { HTML::TagNames::big, {}, Namespace::HTML };
+        QualifiedName br { HTML::TagNames::br, {}, Namespace::HTML };
+        QualifiedName button { HTML::TagNames::button, {}, Namespace::HTML };
+        QualifiedName code { HTML::TagNames::code, {}, Namespace::HTML };
+        QualifiedName div { HTML::TagNames::div, {}, Namespace::HTML };
+        QualifiedName em { HTML::TagNames::em, {}, Namespace::HTML };
+        QualifiedName footer { HTML::TagNames::footer, {}, Namespace::HTML };
+        QualifiedName header { HTML::TagNames::header, {}, Namespace::HTML };
+        QualifiedName i { HTML::TagNames::i, {}, Namespace::HTML };
+        QualifiedName input { HTML::TagNames::input, {}, Namespace::HTML };
+        QualifiedName label { HTML::TagNames::label, {}, Namespace::HTML };
+        QualifiedName li { HTML::TagNames::li, {}, Namespace::HTML };
+        QualifiedName main { HTML::TagNames::main, {}, Namespace::HTML };
+        QualifiedName nav { HTML::TagNames::nav, {}, Namespace::HTML };
+        QualifiedName ol { HTML::TagNames::ol, {}, Namespace::HTML };
+        QualifiedName s { HTML::TagNames::s, {}, Namespace::HTML };
+        QualifiedName section { HTML::TagNames::section, {}, Namespace::HTML };
+        QualifiedName small { HTML::TagNames::small, {}, Namespace::HTML };
+        QualifiedName span { HTML::TagNames::span, {}, Namespace::HTML };
+        QualifiedName strike { HTML::TagNames::strike, {}, Namespace::HTML };
+        QualifiedName strong { HTML::TagNames::strong, {}, Namespace::HTML };
+        QualifiedName tt { HTML::TagNames::tt, {}, Namespace::HTML };
+        QualifiedName u { HTML::TagNames::u, {}, Namespace::HTML };
+        QualifiedName ul { HTML::TagNames::ul, {}, Namespace::HTML };
     };
+    static NeverDestroyed<FragmentQualifiedNames> s_names;
+    auto const& names = *s_names;
 
-    auto finish = [&](GC::Ref<Element> element) -> GC::Ref<Element> {
+    // NB: None of the built-in tags handled by the fragment scanner override `Element::initialize_element()`,
+    //     so allocating directly skips an indirect no-op virtual call on every node.
+    auto make_element = [&]<typename ElementType>(QualifiedName const& qualified_name) -> GC::Ref<Element> {
+        auto element = GC::Heap::the().allocate<ElementType>(document, qualified_name);
         if (uses_document_global_registry)
             element->set_uses_document_global_custom_element_registry_for_new_element();
         else
             element->set_custom_element_registry(registry);
-        element->set_custom_element_state(CustomElementState::Uncustomized);
-        VERIFY(!element->has_attributes());
+        element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
         return element;
     };
 
     switch (static_cast<RustFfiHtmlFragmentTag>(tag_kind)) {
     case RustFfiHtmlFragmentTag::Div:
-        return finish(make_element.template operator()<HTML::HTMLDivElement>(HTML::TagNames::div));
+        return make_element.template operator()<HTML::HTMLDivElement>(names.div);
     case RustFfiHtmlFragmentTag::Li:
-        return finish(make_element.template operator()<HTML::HTMLLIElement>(HTML::TagNames::li));
+        return make_element.template operator()<HTML::HTMLLIElement>(names.li);
     case RustFfiHtmlFragmentTag::Input:
-        return finish(make_element.template operator()<HTML::HTMLInputElement>(HTML::TagNames::input));
+        return make_element.template operator()<HTML::HTMLInputElement>(names.input);
     case RustFfiHtmlFragmentTag::Label:
-        return finish(make_element.template operator()<HTML::HTMLLabelElement>(HTML::TagNames::label));
+        return make_element.template operator()<HTML::HTMLLabelElement>(names.label);
     case RustFfiHtmlFragmentTag::Button:
-        return finish(make_element.template operator()<HTML::HTMLButtonElement>(HTML::TagNames::button));
+        return make_element.template operator()<HTML::HTMLButtonElement>(names.button);
     case RustFfiHtmlFragmentTag::Span:
-        return finish(make_element.template operator()<HTML::HTMLSpanElement>(HTML::TagNames::span));
+        return make_element.template operator()<HTML::HTMLSpanElement>(names.span);
     case RustFfiHtmlFragmentTag::A:
-        return finish(make_element.template operator()<HTML::HTMLAnchorElement>(HTML::TagNames::a));
+        return make_element.template operator()<HTML::HTMLAnchorElement>(names.a);
     case RustFfiHtmlFragmentTag::Ul:
-        return finish(make_element.template operator()<HTML::HTMLUListElement>(HTML::TagNames::ul));
+        return make_element.template operator()<HTML::HTMLUListElement>(names.ul);
     case RustFfiHtmlFragmentTag::Ol:
-        return finish(make_element.template operator()<HTML::HTMLOListElement>(HTML::TagNames::ol));
+        return make_element.template operator()<HTML::HTMLOListElement>(names.ol);
     case RustFfiHtmlFragmentTag::Br:
-        return finish(make_element.template operator()<HTML::HTMLBRElement>(HTML::TagNames::br));
+        return make_element.template operator()<HTML::HTMLBRElement>(names.br);
     case RustFfiHtmlFragmentTag::Article:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::article));
+        return make_element.template operator()<HTML::HTMLElement>(names.article);
     case RustFfiHtmlFragmentTag::Aside:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::aside));
+        return make_element.template operator()<HTML::HTMLElement>(names.aside);
     case RustFfiHtmlFragmentTag::B:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::b));
+        return make_element.template operator()<HTML::HTMLElement>(names.b);
     case RustFfiHtmlFragmentTag::Big:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::big));
+        return make_element.template operator()<HTML::HTMLElement>(names.big);
     case RustFfiHtmlFragmentTag::Code:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::code));
+        return make_element.template operator()<HTML::HTMLElement>(names.code);
     case RustFfiHtmlFragmentTag::Em:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::em));
+        return make_element.template operator()<HTML::HTMLElement>(names.em);
     case RustFfiHtmlFragmentTag::Footer:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::footer));
+        return make_element.template operator()<HTML::HTMLElement>(names.footer);
     case RustFfiHtmlFragmentTag::Header:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::header));
+        return make_element.template operator()<HTML::HTMLElement>(names.header);
     case RustFfiHtmlFragmentTag::I:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::i));
+        return make_element.template operator()<HTML::HTMLElement>(names.i);
     case RustFfiHtmlFragmentTag::Main:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::main));
+        return make_element.template operator()<HTML::HTMLElement>(names.main);
     case RustFfiHtmlFragmentTag::Nav:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::nav));
+        return make_element.template operator()<HTML::HTMLElement>(names.nav);
     case RustFfiHtmlFragmentTag::S:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::s));
+        return make_element.template operator()<HTML::HTMLElement>(names.s);
     case RustFfiHtmlFragmentTag::Section:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::section));
+        return make_element.template operator()<HTML::HTMLElement>(names.section);
     case RustFfiHtmlFragmentTag::Small:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::small));
+        return make_element.template operator()<HTML::HTMLElement>(names.small);
     case RustFfiHtmlFragmentTag::Strike:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::strike));
+        return make_element.template operator()<HTML::HTMLElement>(names.strike);
     case RustFfiHtmlFragmentTag::Strong:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::strong));
+        return make_element.template operator()<HTML::HTMLElement>(names.strong);
     case RustFfiHtmlFragmentTag::Tt:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::tt));
+        return make_element.template operator()<HTML::HTMLElement>(names.tt);
     case RustFfiHtmlFragmentTag::U:
-        return finish(make_element.template operator()<HTML::HTMLElement>(HTML::TagNames::u));
+        return make_element.template operator()<HTML::HTMLElement>(names.u);
     case RustFfiHtmlFragmentTag::None:
         break;
     }
@@ -783,7 +813,7 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16Fl
             if (!prefix.has_value()) {
                 auto element = entry->factory(document, entry->qualified_name);
                 element->set_custom_element_registry(registry);
-                element->set_custom_element_state(CustomElementState::Uncustomized);
+                element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
                 VERIFY(!element->has_attributes());
                 return element;
             }

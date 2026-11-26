@@ -18,6 +18,9 @@ use ak::Utf16View;
 
 /// A code unit of the input stream, in either of the forms it is stored in.
 pub trait CodeUnit: Copy + Default + Eq + Into<u16> + From<u8> {
+    /// Whether this code-unit representation can hold UTF-16 surrogates.
+    const CAN_HAVE_SURROGATES: bool;
+
     /// Loads a block of code units as bytes, with every code unit above U+00FE as 0xFF.
     ///
     /// # Safety
@@ -40,6 +43,8 @@ pub trait CodeUnit: Copy + Default + Eq + Into<u16> + From<u8> {
 }
 
 impl CodeUnit for u8 {
+    const CAN_HAVE_SURROGATES: bool = false;
+
     #[inline(always)]
     unsafe fn load_block(code_units: *const u8) -> block::Block {
         unsafe { block::load_narrow(code_units) }
@@ -62,6 +67,8 @@ impl CodeUnit for u8 {
 }
 
 impl CodeUnit for u16 {
+    const CAN_HAVE_SURROGATES: bool = true;
+
     #[inline(always)]
     unsafe fn load_block(code_units: *const u16) -> block::Block {
         unsafe { block::load_wide(code_units) }
@@ -335,10 +342,21 @@ const CHUNK_SIZE: usize = 32;
 fn find_first<T: CodeUnit, const N: usize>(code_units: &[T], stops: [u8; N], seen_non_ascii: &mut bool) -> usize {
     let scan_block = |block: *const T| {
         // SAFETY: Both callers pass a pointer to `BLOCK_SIZE` code units.
-        let (bytes, surrogates) = unsafe { (T::load_block(block), T::surrogates_in_block(block)) };
-        let stop_mask = stops.iter().fold(surrogates, |mask, &stop| {
-            block::or_mask(mask, block::equal_mask(bytes, stop))
-        });
+        let bytes = unsafe { T::load_block(block) };
+        let mut stop_mask = if T::CAN_HAVE_SURROGATES {
+            // SAFETY: Both callers pass a pointer to `BLOCK_SIZE` code units.
+            unsafe { T::surrogates_in_block(block) }
+        } else {
+            block::equal_mask(bytes, stops[0])
+        };
+        let rest = if T::CAN_HAVE_SURROGATES {
+            &stops[..]
+        } else {
+            &stops[1..]
+        };
+        for &stop in rest {
+            stop_mask = block::or_mask(stop_mask, block::equal_mask(bytes, stop));
+        }
         (bytes, block::mask_word(stop_mask))
     };
 
@@ -411,8 +429,15 @@ pub fn quoted_attribute_value_run<T: CodeUnit>(code_units: &[T], quote: u8) -> R
 
 #[inline(always)]
 fn text_run<T: CodeUnit, const N: usize>(code_units: &[T], stops: [u8; N]) -> Run {
-    let mut length = 0;
     let mut seen_non_ascii = false;
+    if !T::CAN_HAVE_SURROGATES {
+        let length = find_first(code_units, stops, &mut seen_non_ascii);
+        return Run {
+            length,
+            is_ascii: !seen_non_ascii,
+        };
+    }
+    let mut length = 0;
     loop {
         length += find_first(&code_units[length..], stops, &mut seen_non_ascii);
         let Some(&[high, low]) = code_units.get(length..length + 2) else {
