@@ -19,8 +19,8 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use crate::embedding::abi_types::{
-    JSRealm, cell_from_abi, completion_from_abi, object_into_abi, optional_cell_from_abi, optional_object_into_abi,
-    vm_from_abi,
+    JSRealm, JSShape, cell_from_abi, cell_into_abi, completion_from_abi, object_into_abi, optional_cell_from_abi,
+    optional_object_into_abi, vm_from_abi,
 };
 use crate::embedding::error::error_data_from_host_hook;
 use crate::embedding::hooks::lend_property_key_to_abi;
@@ -489,6 +489,41 @@ impl HostObject {
         host_object.initialize(vm, realm);
         host_object
     }
+
+    /// HostObject::create_with_shape(): a host object of the class `table` describes with a premade `shape`,
+    /// skipping the prototype-transition lookup on `realm.empty_object_shape()`.
+    ///
+    /// # Safety
+    ///
+    /// `table` must be of kind JS_HOST_CLASS_OBJECT without `JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS`, `shape` must
+    /// belong to `realm`, and `wrappable` and `host_data` must be absent or live cells of the VM's heap.
+    pub unsafe fn create_with_shape(
+        vm: &Vm,
+        realm: Gc<Realm>,
+        table: &'static JSHostClass,
+        shape: Gc<Shape>,
+        wrappable: Option<NonNull<c_void>>,
+        host_data: Option<NonNull<c_void>>,
+    ) -> Gc<HostObject> {
+        debug_assert!(!table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS));
+        let (class, allocator) = runtime_class_and_allocator_of_host_class(vm, table, JS_HOST_CLASS_OBJECT);
+        let base = Object::new_with_shape(class, shape, MayInterfereWithIndexedPropertyAccess::No);
+        copy_host_class_flags_into_object(vm, table, &base);
+        let host_object = HostObject {
+            base,
+            host_class: table,
+            wrappable: ForeignCellSlot::empty(),
+            host_data: ForeignCellSlot::empty(),
+        };
+        // SAFETY: The caller passes absent or live cells, which the slots then keep alive.
+        unsafe {
+            host_object.wrappable.set(wrappable);
+            host_object.host_data.set(host_data);
+        }
+        let host_object = allocate_object_in(vm, allocator, |_| host_object);
+        host_object.initialize(vm, realm);
+        host_object
+    }
 }
 
 /// The host object an internal method of a host object class was called on.
@@ -570,6 +605,53 @@ pub unsafe extern "C" fn js_host_object_create(
             cell_from_abi::<JSRealm>(realm),
             host_class_from_abi(host_class),
             optional_cell_from_abi::<JSObject>(prototype_or_null),
+            NonNull::new(wrappable_or_null),
+            NonNull::new(host_data_or_null),
+        ))
+    }
+}
+
+/// HostObject::initial_shape_for_prototype(): returns the empty-object shape transitioned to `prototype` in `realm`.
+/// Main thread only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_host_object_initial_shape_for_prototype(
+    vm: *mut JSVM,
+    realm: *mut JSRealm,
+    prototype: *mut JSObject,
+) -> *mut JSShape {
+    // SAFETY: See the module documentation.
+    let (vm, realm, prototype) = unsafe {
+        (
+            vm_from_abi(vm),
+            cell_from_abi::<JSRealm>(realm),
+            cell_from_abi::<JSObject>(prototype),
+        )
+    };
+    let mut shape = realm.empty_object_shape();
+    if shape.prototype() != Some(prototype) {
+        shape = shape.create_prototype_transition(vm, Some(prototype));
+    }
+    cell_into_abi::<JSShape>(shape)
+}
+
+/// HostObject::create_with_shape(): creates a host object directly from a cached `shape` without repeating the
+/// prototype-transition lookup. Main thread only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_host_object_create_with_shape(
+    vm: *mut JSVM,
+    realm: *mut JSRealm,
+    host_class: *const JSHostClass,
+    shape: *mut JSShape,
+    wrappable_or_null: *mut c_void,
+    host_data_or_null: *mut c_void,
+) -> *mut JSObject {
+    // SAFETY: See the module documentation.
+    unsafe {
+        object_into_abi(HostObject::create_with_shape(
+            vm_from_abi(vm),
+            cell_from_abi::<JSRealm>(realm),
+            host_class_from_abi(host_class),
+            cell_from_abi::<JSShape>(shape),
             NonNull::new(wrappable_or_null),
             NonNull::new(host_data_or_null),
         ))

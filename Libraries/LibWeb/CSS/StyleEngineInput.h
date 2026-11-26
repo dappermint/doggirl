@@ -13,9 +13,15 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
-namespace Web::Layout::RustFFI {
+namespace Web::Layout {
+
+class NodeArena;
+
+namespace RustFFI {
 
 struct DocumentHost;
+
+}
 
 }
 
@@ -98,6 +104,10 @@ WEB_API void publish_withheld_element_features(StyleEngine&, StyleComputer&, Lay
 
 // Called while the subtree is still linked, so its old relations are still readable.
 WEB_API void record_subtree_disconnecting(DOM::Node&);
+
+// Batch variant for Node::remove_all_children() when `parent` is neither a shadow host nor in a shadow tree.
+// Collects any layout style nodes before retiring StyleNodeIDs and detaches them from `layout_arena` if present.
+WEB_API void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* layout_arena = nullptr);
 
 // Report that an element moved without leaving the tree. `moveBefore()` keeps the element's state
 // and its identity, so nothing disconnects and nothing connects, and only its relations move.

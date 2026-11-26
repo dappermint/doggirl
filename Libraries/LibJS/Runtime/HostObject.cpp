@@ -7,6 +7,7 @@
 #include <LibJS/ObjectEmbeddingABIConversions.h>
 #include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/Shape.h>
 #include <LibJS/Runtime/VM.h>
 
 namespace JS {
@@ -20,6 +21,18 @@ static_assert(JS_LAYOUT_HOST_OBJECT_HOST_DATA_SIZE == sizeof(GC::Cell*));
 GC::Ref<HostObject> HostObject::create(Realm& realm, JSHostClass const& host_class, GC::Ptr<Object> prototype, GC::Ptr<GC::Cell> wrappable, GC::Ptr<GC::Cell> host_data)
 {
     auto* object = js_host_object_create(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), &host_class, optional_object_to_abi(prototype.ptr()), wrappable.ptr(), host_data.ptr());
+    return static_cast<HostObject&>(object_from_abi(object));
+}
+
+GC::Ref<Shape> HostObject::initial_shape_for_prototype(Realm& realm, Object& prototype)
+{
+    auto* shape = js_host_object_initial_shape_for_prototype(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), object_to_abi(prototype));
+    return *cell_from_abi<Shape>(shape);
+}
+
+GC::Ref<HostObject> HostObject::create_with_shape(Realm& realm, JSHostClass const& host_class, GC::Ref<Shape> shape, GC::Ptr<GC::Cell> wrappable, GC::Ptr<GC::Cell> host_data)
+{
+    auto* object = js_host_object_create_with_shape(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), &host_class, cell_to_abi<JSShape>(*shape), wrappable.ptr(), host_data.ptr());
     return static_cast<HostObject&>(object_from_abi(object));
 }
 

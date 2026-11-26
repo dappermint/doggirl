@@ -95,6 +95,16 @@ def write_wrapper_host_class(
     )
 
 
+def interface_has_unforgeable_members(interface: Interface) -> bool:
+    if any("LegacyUnforgeable" in attr.extended_attributes for attr in interface.regular_attributes):
+        return True
+    if any("LegacyUnforgeable" in op.extended_attributes for op in interface.regular_operations):
+        return True
+    if interface.stringifier is not None and "LegacyUnforgeable" in interface.stringifier.extended_attributes:
+        return True
+    return False
+
+
 def write_create_wrapper_function(out: TextIO, context: GenerationContext, interface: Interface) -> None:
     impl_type = fully_qualified_name_for_interface(interface)
     host_class = wrapper_host_class_name(interface)
@@ -112,14 +122,26 @@ def write_create_wrapper_function(out: TextIO, context: GenerationContext, inter
         return JS::HostObject::create(realm, {host_class}, nullptr, impl);
 """
         )
-    out.write(
-        f"""    static auto const& name = "{interface.namespaced_name}"_utf16_fly_string;
+    uses_cached_shape = not is_global and "JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS" not in wrapper_host_class_flags(
+        context, interface
+    )
+    if uses_cached_shape:
+        out.write(
+            f"""    static auto const& name = "{interface.namespaced_name}"_utf16_fly_string;
+    auto wrapper = JS::HostObject::create_with_shape(realm, {host_class}, ensure_web_wrapper_shape<{interface.prototype_class}>(realm, InterfaceName::{interface.name}, name), impl);
+"""
+        )
+    else:
+        out.write(
+            f"""    static auto const& name = "{interface.namespaced_name}"_utf16_fly_string;
     auto wrapper = JS::HostObject::create(realm, {host_class}, &ensure_web_prototype<{interface.prototype_class}>(realm, name), impl);
 """
-    )
+        )
     # NB: The unforgeable attributes of a [Global] interface live on the global object, which its global mixin defines.
     for interface_in_chain in reversed(interface_and_inherited_interfaces(context, interface)):
         if "Global" in interface_in_chain.extended_attributes:
+            continue
+        if not interface_has_unforgeable_members(interface_in_chain):
             continue
         out.write(f"    {interface_in_chain.prototype_class}::define_unforgeable_attributes(realm, *wrapper);\n")
     if interface.name == "Location":

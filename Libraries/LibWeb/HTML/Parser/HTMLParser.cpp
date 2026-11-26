@@ -1765,31 +1765,58 @@ public:
                     element->ensure_attribute_capacity(operation.length);
                 bool const is_input = operation.tag_kind == RustFfiHtmlFragmentTag::Input;
                 bool input_needs_reset = false;
+                Optional<size_t> detached_input_value_attr_index;
                 for (auto const& attribute : attributes.slice(operation.start, operation.length)) {
                     bool const is_class = attribute.known_name == AttributeNames::class_.raw_identity();
-                    if (is_input
-                        && (attribute.known_name == AttributeNames::value.raw_identity()
-                            || attribute.known_name == AttributeNames::checked.raw_identity())) {
-                        input_needs_reset = true;
-                    }
                     Utf16FlyString const* preinterned_single_class = nullptr;
                     auto value = with_code_units(attribute.value_start, attribute.value_length, [&](auto code_units) {
                         if (attribute.value_is_ascii)
                             return cached_ascii_attribute_value(code_units, is_class, preinterned_single_class);
                         return utf16_string_from_span(code_units, IsKnownToBeASCII::No);
                     });
+                    if (is_input && skip_observer_checks) {
+                        if (attribute.known_name == AttributeNames::type.raw_identity()) {
+                            auto value_view = value.utf16_view();
+                            if (value_view.equals_ignoring_ascii_case("checkbox"sv)) {
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
+                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
+                                continue;
+                            }
+                            if (value_view.equals_ignoring_ascii_case("text"sv)) {
+                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
+                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
+                                continue;
+                            }
+                        } else if (attribute.known_name == AttributeNames::checked.raw_identity()) {
+                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
+                            as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
+                            continue;
+                        } else if (attribute.known_name == AttributeNames::value.raw_identity()) {
+                            detached_input_value_attr_index = element->attribute_list_size();
+                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(attribute), move(value));
+                            continue;
+                        }
+                    }
+                    if (is_input
+                        && (attribute.known_name == AttributeNames::value.raw_identity()
+                            || attribute.known_name == AttributeNames::checked.raw_identity())) {
+                        input_needs_reset = true;
+                    }
                     element->append_attribute_from_detached_parser(attribute_qualified_name(attribute), move(value), skip_observer_checks, preinterned_single_class);
                 }
                 // NB: Among the built-in HTML tags accepted by the fragment scanner, only <input> is resettable,
                 //     and fragment.rs restricts <input> to type="text" or type="checkbox" (or default text). For a
-                //     brand-new detached text/checkbox input without value or checked attributes, reset_algorithm()
-                //     leaves every state field unchanged.
+                //     brand-new detached text/checkbox input, applying type/checked/value directly matches
+                //     reset_algorithm() without redundant attribute callbacks or double sanitization.
                 if (input_needs_reset) {
                     as<HTMLElement>(*element).reset_algorithm();
                 } else if (is_input) {
-                    auto type_state = as<HTMLInputElement>(*element).type_state();
+                    auto& input = as<HTMLInputElement>(*element);
+                    auto type_state = input.type_state();
                     VERIFY(type_state == HTMLInputElement::TypeAttributeState::Text
                         || type_state == HTMLInputElement::TypeAttributeState::Checkbox);
+                    if (detached_input_value_attr_index.has_value())
+                        input.set_value_from_detached_fragment(element->attribute_list()[*detached_input_value_attr_index].value);
                 }
                 append(element);
                 if (operation.kind == RustFfiHtmlFragmentOperationKind::OpenElement) {
