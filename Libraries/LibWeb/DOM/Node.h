@@ -304,6 +304,14 @@ public:
         VERIFY(!is_connected() && &node->document() == &document());
         append_child_impl(node);
     }
+    // Links a brand-new child with no children of its own into a detached parser subtree whose root is `subtree_root`.
+    // The caller propagates subtree filters bottom-up once each open element closes.
+    void parser_append_fresh_child_without_insertion_steps(GC::Ref<Node> node, Node& subtree_root)
+    {
+        VERIFY(!is_connected() && !node->parent() && !node->has_children() && &node->document() == &document());
+        TreeNode::append_child(node);
+        node->m_root = subtree_root;
+    }
     void remove(bool suppress_observers = false);
     void remove_all_children(bool suppress_observers = false);
 
@@ -664,6 +672,15 @@ protected:
         OwnPtr<HashMap<Utf16FlyString, CollectionByTagName>> collections_by_tag_name;
         // The size the map grows to before the entries of collected collections are swept from it.
         size_t collections_by_tag_name_sweep_size { 0 };
+
+        // The collections getElementsByClassName() returned for short class-name strings while the document's quirks
+        // mode stays the same.
+        struct CollectionByClassName {
+            GC::Weak<HTMLCollection> collection;
+            bool in_quirks_mode { false };
+        };
+        OwnPtr<HashMap<Utf16FlyString, CollectionByClassName>> collections_by_class_name;
+        size_t collections_by_class_name_sweep_size { 0 };
     };
 
     void register_html_collection_with_valid_cache(HTMLCollection&);
@@ -742,6 +759,7 @@ private:
     void insert_nodes_before(ReadonlySpan<GC::Ref<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
+    void remove_child_for_remove_all_impl(GC::Ref<Node>);
     void begin_child_index_generation();
     void set_root_for_subtree(Node&);
 

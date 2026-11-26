@@ -50,6 +50,14 @@ void HTMLFormControlsCollection::collect_elements_into(GC::RootVector<GC::Ref<DO
     }
 }
 
+void HTMLFormControlsCollection::collect_elements_into_weak_vector(GC::WeakVector<DOM::Element>& elements) const
+{
+    for (auto const& element : m_form->associated_elements_in_tree_order({})) {
+        if (element_matches_filter(*element))
+            elements.append(*element);
+    }
+}
+
 void HTMLFormControlsCollection::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
