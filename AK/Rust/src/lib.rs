@@ -333,25 +333,137 @@ impl Utf16String {
     /// Creates a string in AK's native representation and initializes its storage from UTF-16, with one byte per
     /// code unit if none is above U+00FF.
     pub fn from_utf16(string: &[u16]) -> Self {
-        let is_ascii = string.iter().all(|code_unit| *code_unit <= 0x7f);
-        if is_ascii || string.iter().all(|code_unit| *code_unit <= 0xff) {
-            if is_ascii && string.len() < size_of::<usize>() {
-                let mut bytes = [0; size_of::<usize>() - 1];
-                for (index, code_unit) in string.iter().enumerate() {
-                    bytes[index] = *code_unit as u8;
-                }
-                return Self::from_short_ascii(&bytes[..string.len()]);
-            }
-
-            let result = Self::create_uninitialized(string.len(), StorageKind::one_byte(is_ascii));
-            let storage = result.long_storage();
-            for (index, code_unit) in string.iter().enumerate() {
-                // SAFETY: The allocation has space for exactly `string.len()` Latin-1 bytes.
-                unsafe { storage.add(index).write(*code_unit as u8) };
-            }
-            return result;
+        let max_bits = Self::utf16_max_code_unit_bits(string);
+        if max_bits <= 0x7f {
+            // SAFETY: Every code unit in `string` is `<= 0x7f`.
+            return unsafe { Self::from_utf16_known_ascii(string) };
         }
+        if max_bits <= 0xff {
+            // SAFETY: Every code unit in `string` is `<= 0xff` and at least one is `>= 0x80`.
+            return unsafe { Self::from_utf16_known_latin1(string) };
+        }
+        // SAFETY: At least one code unit in `string` is `> 0xff`.
+        unsafe { Self::from_utf16_known_non_latin1(string) }
+    }
 
+    /// Returns a `u16` classifying the maximum code-unit class in `string`: `<= 0x7f` if all ASCII,
+    /// `0x80..=0xff` if all Latin-1 with at least one non-ASCII code unit, and `> 0xff` otherwise.
+    #[inline]
+    fn utf16_max_code_unit_bits(string: &[u16]) -> u16 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let len = string.len();
+            let mut index = 0;
+            // SAFETY: NEON is always available on aarch64 and every load stays within `string`.
+            unsafe {
+                let mut acc = vdupq_n_u16(0);
+                while index + 8 <= len {
+                    acc = vorrq_u16(acc, vld1q_u16(string.as_ptr().add(index)));
+                    index += 8;
+                }
+                let mut combined = vmaxvq_u16(acc);
+                if combined <= 0xff {
+                    while index < len {
+                        combined |= string[index];
+                        index += 1;
+                    }
+                }
+                combined
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut combined_bits = 0u16;
+            for chunk in string.chunks(8) {
+                let mut chunk_bits = 0u16;
+                for &code_unit in chunk {
+                    chunk_bits |= code_unit;
+                }
+                combined_bits |= chunk_bits;
+                if combined_bits > 0xff {
+                    break;
+                }
+            }
+            combined_bits
+        }
+    }
+
+    /// Narrows `len` `u16` code units from `src` into `dst` as `u8`.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `len` `u16` elements, `dst` must be valid for writes of `len` `u8`
+    /// elements, and the two memory regions must not overlap.
+    #[inline]
+    unsafe fn narrow_u16_to_u8(src: *const u16, dst: *mut u8, len: usize) {
+        let mut index = 0;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            // SAFETY: Caller guarantees `src` and `dst` are valid for `len` elements and non-overlapping.
+            unsafe {
+                while index + 16 <= len {
+                    let lo = vmovn_u16(vld1q_u16(src.add(index)));
+                    let hi = vmovn_u16(vld1q_u16(src.add(index + 8)));
+                    vst1q_u8(dst.add(index), vcombine_u8(lo, hi));
+                    index += 16;
+                }
+                if index + 8 <= len {
+                    let lo = vmovn_u16(vld1q_u16(src.add(index)));
+                    vst1_u8(dst.add(index), lo);
+                    index += 8;
+                }
+            }
+        }
+        while index < len {
+            // SAFETY: Caller guarantees bounds.
+            unsafe { dst.add(index).write(*src.add(index) as u8) };
+            index += 1;
+        }
+    }
+
+    /// Creates a string from UTF-16 code units already known to be ASCII (`<= 0x7f`).
+    ///
+    /// # Safety
+    ///
+    /// Every code unit in `string` must be `<= 0x7f`.
+    pub unsafe fn from_utf16_known_ascii(string: &[u16]) -> Self {
+        debug_assert!(string.iter().all(|&u| u <= 0x7f));
+        if string.len() < size_of::<usize>() {
+            let mut bytes = [0; size_of::<usize>() - 1];
+            for (index, &code_unit) in string.iter().enumerate() {
+                bytes[index] = code_unit as u8;
+            }
+            return Self::from_short_ascii(&bytes[..string.len()]);
+        }
+        let result = Self::create_uninitialized(string.len(), StorageKind::Ascii);
+        // SAFETY: `result.long_storage()` has space for `string.len()` bytes and does not overlap `string`.
+        unsafe { Self::narrow_u16_to_u8(string.as_ptr(), result.long_storage(), string.len()) };
+        result
+    }
+
+    /// Creates a string from UTF-16 code units already known to be Latin-1 (`<= 0xff`, containing at least one `>= 0x80`).
+    ///
+    /// # Safety
+    ///
+    /// Every code unit in `string` must be `<= 0xff`, and at least one code unit must be `>= 0x80`.
+    pub unsafe fn from_utf16_known_latin1(string: &[u16]) -> Self {
+        debug_assert!(string.iter().all(|&u| u <= 0xff));
+        debug_assert!(string.iter().any(|&u| u >= 0x80));
+        let result = Self::create_uninitialized(string.len(), StorageKind::Latin1);
+        // SAFETY: `result.long_storage()` has space for `string.len()` bytes and does not overlap `string`.
+        unsafe { Self::narrow_u16_to_u8(string.as_ptr(), result.long_storage(), string.len()) };
+        result
+    }
+
+    /// Creates a string from UTF-16 code units already known to contain at least one unit above U+00FF.
+    ///
+    /// # Safety
+    ///
+    /// At least one code unit in `string` must be `> 0xff`.
+    pub unsafe fn from_utf16_known_non_latin1(string: &[u16]) -> Self {
+        debug_assert!(string.iter().any(|&u| u > 0xff));
         let result = Self::create_uninitialized(string.len(), StorageKind::Utf16);
         // SAFETY: The source and destination are non-overlapping and the allocation has space for
         // exactly `string.len()` UTF-16 code units.

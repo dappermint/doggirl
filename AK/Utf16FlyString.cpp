@@ -18,13 +18,32 @@ struct Utf16FlyStringTableHashTraits : public Traits<Detail::Utf16StringData con
     static constexpr bool may_have_slow_equality_check() { return true; }
 };
 
-struct Utf16FlyStringTable {
-    AK_ALLOC_WITH_KMALLOC;
-
+struct Utf16FlyStringShard {
     // Interned data only removes itself once its destructor holds this mutex, so lookups must try_ref() entries, and
     // nothing may drop a string reference while holding it.
     Mutex mutex;
     HashTable<Detail::Utf16StringData const*, Utf16FlyStringTableHashTraits> strings;
+};
+
+#if defined(AK_OS_MACOS) && defined(AK_ARCH_AARCH64)
+struct alignas(128) AlignedUtf16FlyStringShard : public Utf16FlyStringShard { };
+#else
+struct alignas(64) AlignedUtf16FlyStringShard : public Utf16FlyStringShard { };
+#endif
+
+struct Utf16FlyStringTable {
+    AK_ALLOC_WITH_KMALLOC;
+
+    static constexpr size_t shard_count = 64;
+
+    static constexpr size_t shard_index(u32 hash)
+    {
+        return (hash >> 24) & (shard_count - 1);
+    }
+
+    Utf16FlyStringShard& shard_for(u32 hash) { return shards[shard_index(hash)]; }
+
+    AlignedUtf16FlyStringShard shards[shard_count];
 };
 
 static Utf16FlyStringTable& utf16_fly_string_table()
@@ -37,13 +56,14 @@ namespace Detail {
 
 void did_destroy_utf16_fly_string_data(Badge<Detail::Utf16StringData>, Detail::Utf16StringData const& data)
 {
-    auto& table = utf16_fly_string_table();
-    MutexLocker locker { table.mutex };
+    auto hash = data.hash();
+    auto& shard = utf16_fly_string_table().shard_for(hash);
+    MutexLocker locker { shard.mutex };
 
     // An equal string may have replaced this entry while the destructor waited for the mutex.
-    auto it = table.strings.find(data.hash(), [&](auto const& entry) { return entry == &data; });
-    if (it != table.strings.end())
-        table.strings.remove(it);
+    auto it = shard.strings.find(hash, [&](auto const& entry) { return entry == &data; });
+    if (it != shard.strings.end())
+        shard.strings.remove(it);
 }
 
 }
@@ -62,11 +82,12 @@ Optional<Utf16FlyString> Utf16FlyString::create_fly_string_from_cache(ViewType c
             return Utf16String::from_utf16(string);
     }
 
-    auto& table = utf16_fly_string_table();
-    MutexLocker locker { table.mutex };
+    auto hash = string.hash();
+    auto& shard = utf16_fly_string_table().shard_for(hash);
+    MutexLocker locker { shard.mutex };
 
-    auto it = table.strings.find(string.hash(), [&](auto const& entry) { return *entry == string; });
-    if (it != table.strings.end() && (*it)->try_ref())
+    auto it = shard.strings.find(hash, [&](auto const& entry) { return *entry == string; });
+    if (it != shard.strings.end() && (*it)->try_ref())
         return Utf16FlyString { Detail::Utf16StringBase(adopt_ref(**it)) };
 
     return {};
@@ -114,25 +135,30 @@ Utf16FlyString::Utf16FlyString(Utf16String const& string)
         return;
     }
 
-    auto& table = utf16_fly_string_table();
-    MutexLocker locker { table.mutex };
+    auto hash = data->hash();
+    auto& shard = utf16_fly_string_table().shard_for(hash);
+    MutexLocker locker { shard.mutex };
 
-    if (auto it = table.strings.find(data); it != table.strings.end() && (*it)->try_ref()) {
+    if (auto it = shard.strings.find(hash, [&](auto const& entry) { return *entry == *data; }); it != shard.strings.end() && (*it)->try_ref()) {
         m_data = Detail::Utf16StringBase(adopt_ref(**it));
         return;
     }
 
     // Replaces any equal entry that is waiting to be removed by its destructor.
     m_data = string;
-    table.strings.set(data);
+    shard.strings.set(data);
     data->mark_as_fly_string({});
 }
 
 size_t Utf16FlyString::number_of_utf16_fly_strings()
 {
     auto& table = utf16_fly_string_table();
-    MutexLocker locker { table.mutex };
-    return table.strings.size();
+    size_t count = 0;
+    for (auto& shard : table.shards) {
+        MutexLocker locker { shard.mutex };
+        count += shard.strings.size();
+    }
+    return count;
 }
 
 }
