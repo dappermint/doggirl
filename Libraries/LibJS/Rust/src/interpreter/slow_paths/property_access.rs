@@ -33,7 +33,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::shape::{Shape, WatchpointSet};
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::function_object_as_object;
+use crate::runtime::abstract_operations::{call_function_object, function_object_as_object};
 use crate::runtime::array::Array;
 use crate::runtime::array_buffer::{ElementType, Order};
 use crate::runtime::canonical_index::{CanonicalIndex, CanonicalIndexType};
@@ -577,6 +577,7 @@ fn put_by_value_with_keyed_store_cache(
                 site_entry.property_offset = entry.property_offset;
                 site_entry.writes_data_property = entry.entry_type == PropertyLookupCacheEntryType::ChangeOwnProperty;
                 site_entry.new_shape = entry.new_shape;
+                site_entry.prototype = entry.prototype;
                 site_entry.prototype_chain_validity = entry.prototype_chain_validity;
             });
         }
@@ -590,6 +591,22 @@ fn put_by_value_with_keyed_store_cache(
                     object.put_direct_from_cache(entry.property_offset, value);
                     remember(&entry);
                     return Ok(());
+                }
+            }
+            PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain => {
+                if let Some(prototype) = entry.prototype
+                    && entry
+                        .prototype_chain_validity
+                        .is_some_and(|validity| validity.is_valid())
+                {
+                    let value_in_prototype = prototype.get_direct(entry.property_offset);
+                    if value_in_prototype.is_accessor()
+                        && let Some(setter) = value_in_prototype.as_accessor().setter()
+                    {
+                        remember(&entry);
+                        call_function_object(vm, setter, base, &[value])?;
+                        return Ok(());
+                    }
                 }
             }
             PropertyLookupCacheEntryType::AddOwnProperty => {
@@ -629,6 +646,14 @@ fn put_by_value_with_keyed_store_cache(
         {
             lookup.entry_type = PropertyLookupCacheEntryType::ChangeOwnProperty;
             lookup.property_offset = entry.property_offset;
+        }
+        PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain
+            if entry.shape == Some(shape_key) && entry.prototype.is_some() =>
+        {
+            lookup.entry_type = PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain;
+            lookup.property_offset = entry.property_offset;
+            lookup.prototype = entry.prototype;
+            lookup.prototype_chain_validity = entry.prototype_chain_validity;
         }
         PropertyLookupCacheEntryType::AddOwnProperty if entry.shape == Some(shape_key) && entry.new_shape.is_some() => {
             lookup.entry_type = PropertyLookupCacheEntryType::AddOwnProperty;

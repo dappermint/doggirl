@@ -101,7 +101,11 @@ impl Decisions<'_> {
 
     /// The value the analysis knows `value` as: what it is replaced by, and
     /// the value it refines (facts are about values, whatever refines them).
+    #[inline(always)]
     fn value(&self, graph: &Graph, value: NodeId) -> NodeId {
+        if self.replacements.is_empty() {
+            return graph.unrefined(value);
+        }
         let mut value = self.replacements.resolve(value);
         loop {
             let unrefined = graph.unrefined(value);
@@ -686,6 +690,16 @@ fn visit_node(
     facts: &mut Facts,
     decisions: &mut Decisions,
 ) {
+    let raw_inputs = graph.node(node_id).inputs.as_slice();
+    let len = raw_inputs.len();
+    if len <= 4 {
+        let mut stack_inputs = [NodeId(0); 4];
+        for (dst, &src) in stack_inputs[..len].iter_mut().zip(raw_inputs) {
+            *dst = decisions.value(graph, src);
+        }
+        visit_node_with_inputs(graph, constants, node_id, &stack_inputs[..len], facts, decisions);
+        return;
+    }
     let mut inputs = decisions.inputs.take();
     inputs.clear();
     inputs.extend(
@@ -710,13 +724,15 @@ fn visit_node_with_inputs(
 ) {
     let node = graph.node(node_id);
     let input = |index: usize| inputs[index];
-    for (index, input) in inputs.iter().enumerate() {
-        if facts.is_unexposed(*input) && !accesses_properties(&node.op, index) {
-            facts.expose(*input);
+    if facts.has_unexposed() {
+        for (index, input) in inputs.iter().enumerate() {
+            if facts.is_unexposed(*input) && !accesses_properties(&node.op, index) {
+                facts.expose(*input);
+            }
         }
-    }
-    for value in graph.legacy_argument_values_read_by(node_id, |_| true) {
-        facts.expose(decisions.value(graph, value));
+        for value in graph.legacy_argument_values_read_by(node_id, |_| true) {
+            facts.expose(decisions.value(graph, value));
+        }
     }
     // NB: A check known to pass is replaced by what refined its input
     //     before (see `Facts::refinement()`), and stays where nothing did.
