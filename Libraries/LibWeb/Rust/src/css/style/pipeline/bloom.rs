@@ -217,6 +217,10 @@ impl AncestorFilter {
         self.counters.fill(u8::MAX);
     }
 
+    pub(super) fn clear(&mut self) {
+        self.counters.fill(0);
+    }
+
     pub(super) fn insert(&mut self, hash: u32) {
         let (first, second) = Self::slots(hash);
         self.counters[first] = self.counters[first].saturating_add(1);

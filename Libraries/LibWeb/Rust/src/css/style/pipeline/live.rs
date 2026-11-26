@@ -472,6 +472,7 @@ impl Live {
         self.scratch.install = Default::default();
         self.scratch.replaced = Default::default();
         self.scratch.kept = Vec::new();
+        super::traversal::clear_scratch_buffer_pool();
     }
 
     /// The matched declarations cache the passes keep for the next.
@@ -1538,21 +1539,20 @@ impl Live {
         }
 
         // The next sibling an element that left had, which may have left as well.
-        let departed_next: LazyCell<HashMap<StyleNodeID, Option<StyleNodeID>>, _> = LazyCell::new(|| {
-            moves
-                .iter()
-                .filter(|&&(node, left, _)| left && !tree.is_live(node))
-                .map(|&(node, _, next)| (node, next))
-                .collect()
-        });
-        let live_from = |mut node: Option<StyleNodeID>| {
-            while let Some(current) = node {
-                if tree.is_live(current) {
-                    return Some(current);
-                }
-                node = departed_next.get(&current).copied().flatten();
+        let mut departed_next: Option<HashMap<StyleNodeID, Option<StyleNodeID>>> = None;
+        let mut live_from = |node: Option<StyleNodeID>| {
+            let first = node?;
+            if tree.is_live(first) {
+                return Some(first);
             }
-            None
+            let departed = departed_next.get_or_insert_with(|| {
+                moves
+                    .iter()
+                    .filter(|&&(node, left, _)| left && !tree.is_live(node))
+                    .map(|&(node, _, next)| (node, next))
+                    .collect()
+            });
+            live_after_departed(first, |id| tree.is_live(id), departed)
         };
         // What an element arriving or leaving changes for its later siblings, as all its facts
         // appearing or disappearing.
@@ -2883,6 +2883,34 @@ impl Hints {
         }
         cell.bits |= bits;
     }
+}
+
+/// The first live sibling reached from `first` along `departed_next`, path-compressing every departed sibling visited
+/// so a long run of removed siblings is walked once across a transaction.
+fn live_after_departed(
+    first: StyleNodeID,
+    is_live: impl Fn(StyleNodeID) -> bool,
+    departed_next: &mut HashMap<StyleNodeID, Option<StyleNodeID>>,
+) -> Option<StyleNodeID> {
+    let mut walked: SmallVec<[StyleNodeID; 16]> = SmallVec::new();
+    let mut current = Some(first);
+    let found = loop {
+        let Some(sibling) = current else {
+            break None;
+        };
+        if is_live(sibling) {
+            break Some(sibling);
+        }
+        let Some(&next) = departed_next.get(&sibling) else {
+            break None;
+        };
+        walked.push(sibling);
+        current = next;
+    };
+    for sibling in walked {
+        departed_next.insert(sibling, found);
+    }
+    found
 }
 
 /// The first of `first` and its later siblings not in `arrived`, as `next` tells them, remembering in `past_arrived`
@@ -4776,5 +4804,45 @@ mod tests {
         let all: HashSet<StyleNodeID> = (1..=SIBLINGS).map(StyleNodeID::element).collect();
         let found = first_not_arrived(StyleNodeID::element(1), &all, next_of(&steps), &mut HashMap::default());
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_run_of_departed_siblings_is_walked_once() {
+        let mut departed: HashMap<StyleNodeID, Option<StyleNodeID>> = (1..SIBLINGS)
+            .map(|index| (StyleNodeID::element(index), Some(StyleNodeID::element(index + 1))))
+            .collect();
+        let checks = Cell::new(0u32);
+        let is_live = |node: StyleNodeID| {
+            checks.set(checks.get() + 1);
+            node == StyleNodeID::element(SIBLINGS)
+        };
+        for first in 1..SIBLINGS {
+            let found = live_after_departed(StyleNodeID::element(first), is_live, &mut departed);
+            assert_eq!(found, Some(StyleNodeID::element(SIBLINGS)));
+        }
+        // First walk visits every node; path compression keeps later lookups O(1).
+        assert!(checks.get() <= SIBLINGS * 3);
+
+        let mut all_departed: HashMap<StyleNodeID, Option<StyleNodeID>> = (1..=SIBLINGS)
+            .map(|index| {
+                (
+                    StyleNodeID::element(index),
+                    (index < SIBLINGS).then(|| StyleNodeID::element(index + 1)),
+                )
+            })
+            .collect();
+        let dead_checks = Cell::new(0u32);
+        for first in 1..=SIBLINGS {
+            let found = live_after_departed(
+                StyleNodeID::element(first),
+                |_| {
+                    dead_checks.set(dead_checks.get() + 1);
+                    false
+                },
+                &mut all_departed,
+            );
+            assert_eq!(found, None);
+        }
+        assert!(dead_checks.get() <= SIBLINGS * 2);
     }
 }

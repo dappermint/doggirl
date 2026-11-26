@@ -182,6 +182,7 @@ RENDER_STATE_ALLOWED = {
         [
             "css/parser/sheet_source_text.rs:QUEUE",
             "css/parser/stylesheet_cache.rs:CACHE",
+            "css/style/pipeline/traversal.rs:SCRATCH_BUFFER_POOL",
         ],
     ),
     **render_state_entries(

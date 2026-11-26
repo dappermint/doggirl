@@ -1017,7 +1017,11 @@ impl CustomPropertyStore {
     /// value of, or none where the value says more than its identity: a lone CSS-wide keyword,
     /// which resolves against the store holding it, or a value still waiting on a substitution.
     pub(crate) fn resolved_value_identity(&self, name: &Utf16FlyString) -> Option<usize> {
-        let Some((entry, _)) = self.get_by_name_with_owner(name) else {
+        self.resolved_value_identity_raw(name.raw_identity())
+    }
+
+    pub(crate) fn resolved_value_identity_raw(&self, name_raw: usize) -> Option<usize> {
+        let Some(entry) = self.get(name_raw) else {
             return Some(0);
         };
         if let Some(StyleValueData::Unresolved(unresolved)) = entry.value.optional_data()
@@ -1295,6 +1299,7 @@ impl TokenResolution {
 // https://drafts.csswg.org/css-values-5/#substitution-context
 #[derive(PartialEq, Eq)]
 enum SubstitutionContextDependency {
+    BuiltinProperty(u16),
     Property(Utf16FlyString, Option<CustomFunctionIdentity>),
     // FIXME: Attribute substitution context equality should compare names ASCII-case-insensitively, as attribute lookup
     // does.
@@ -1405,13 +1410,19 @@ pub(crate) struct StyleQueryDependencies {
 }
 
 /// The tokens of each value by its address, with the value where nothing else keeps it for as long as the cache.
-type CustomPropertyTokenCache =
-    HashMap<*const StyleValueData, (Option<RetainedStyleValueData>, Arc<ComponentValueList>)>;
+pub(crate) type CustomPropertyTokenCache =
+    FastMap<*const StyleValueData, (Option<RetainedStyleValueData>, Arc<ComponentValueList>)>;
 
 pub(crate) struct VarResolutionEnvironment<'a> {
     attributes: HashMap<Vec<u16>, Vec<u16>>,
     custom_functions: &'a CustomFunctionRegistry<'a>,
     token_cache: CustomPropertyTokenCache,
+}
+
+impl VarResolutionEnvironment<'_> {
+    pub(crate) fn into_token_cache(self) -> CustomPropertyTokenCache {
+        self.token_cache
+    }
 }
 
 fn source_ends_with_comment(source: crate::css::css_tokenizer::TokenizerInput<'_>) -> bool {
@@ -1472,12 +1483,6 @@ fn tokens_for_unresolved_custom_property_value(unresolved_payload: &UnresolvedPa
         // Discard trailing comments
         trims_trailing_whitespace: source_ends_with_comment(unresolved_payload.source_text()),
     }
-}
-
-/// The tokens of a value a resolution reads, which it tokenizes once however often it reads them.
-/// The value must outlive the resolution's token cache.
-fn cached_value_tokens(data: &StyleValueData, context: &mut ASFResolutionContext<'_>) -> Arc<ComponentValueList> {
-    cached_tokens(data, None, context)
 }
 
 /// The tokens of `value`, which the resolution's token cache holds as long as it holds them.
@@ -1584,6 +1589,15 @@ pub(crate) fn prepare_var_resolution_environment<'a>(
     attributes: &[SubstitutionAttribute],
     custom_functions: &'a CustomFunctionRegistry<'a>,
 ) -> VarResolutionEnvironment<'a> {
+    prepare_var_resolution_environment_with_token_cache(attributes, custom_functions, FastMap::default())
+}
+
+/// Builds the element-wide substitution inputs reusing an existing token cache across declarations.
+pub(crate) fn prepare_var_resolution_environment_with_token_cache<'a>(
+    attributes: &[SubstitutionAttribute],
+    custom_functions: &'a CustomFunctionRegistry<'a>,
+    token_cache: CustomPropertyTokenCache,
+) -> VarResolutionEnvironment<'a> {
     let attributes = attributes
         .iter()
         .map(|attribute| (attribute.name.to_vec(), attribute.value.to_utf16().into_owned()))
@@ -1591,7 +1605,7 @@ pub(crate) fn prepare_var_resolution_environment<'a>(
     VarResolutionEnvironment {
         attributes,
         custom_functions,
-        token_cache: HashMap::new(),
+        token_cache,
     }
 }
 
@@ -2097,7 +2111,7 @@ fn resolve_custom_property_with_lookup(
     }
     let result = if let StyleValueData::Unresolved(unresolved_payload) = data {
         context.contains_attr_tainted_values |= unresolved_payload.contains_attr_tainted_values;
-        let tokens = cached_value_tokens(data, context);
+        let tokens = cached_held_value_tokens(&entry.value, context);
         if unresolved_payload.presence().has_any() {
             substitute_arbitrary_substitution_functions(
                 store,
@@ -2111,7 +2125,7 @@ fn resolve_custom_property_with_lookup(
             TokenResolution::Resolved(tokens.as_ref().clone())
         }
     } else {
-        TokenResolution::Resolved(cached_value_tokens(data, context).as_ref().clone())
+        TokenResolution::Resolved(cached_held_value_tokens(&entry.value, context).as_ref().clone())
     };
     if let TokenResolution::Resolved(tokens) = &result
         && let Some(keyword) = single_css_wide_keyword(tokens)
@@ -3833,7 +3847,7 @@ pub(crate) fn resolve_vars(
     inputs: &VarResolutionInputs,
     property_id: u16,
     root_custom_property_name: &[u16],
-    value_data: &StyleValueData,
+    written: &RetainedStyleValueData,
     environment: &mut VarResolutionEnvironment<'_>,
     style_query_dependencies: Option<&mut Option<Box<StyleQueryDependencies>>>,
 ) -> NativeVarResolution {
@@ -3846,21 +3860,17 @@ pub(crate) fn resolve_vars(
         attribute_names_are_ascii_case_insensitive,
         style_query_inputs,
     } = *inputs;
-    let root_custom_property_name = (!root_custom_property_name.is_empty()).then(|| root_custom_property_name.to_vec());
+    let is_custom = property_id == crate::css::property_metadata::property_id::CUSTOM;
     assert_eq!(
-        root_custom_property_name.is_some(),
-        property_id == crate::css::property_metadata::property_id::CUSTOM,
+        !root_custom_property_name.is_empty(),
+        is_custom,
         "substitution root must be either a named custom property or a non-custom property",
     );
-    let root_property_name = root_custom_property_name.unwrap_or_else(|| {
-        crate::css::property_metadata::property_name(property_id)
-            .encode_utf16()
-            .collect()
+    let substitution_context = Some(if is_custom {
+        SubstitutionContextDependency::Property(Utf16FlyString::from_utf16(root_custom_property_name), None)
+    } else {
+        SubstitutionContextDependency::BuiltinProperty(property_id)
     });
-    let substitution_context = Some(SubstitutionContextDependency::Property(
-        Utf16FlyString::from_utf16(&root_property_name),
-        None,
-    ));
     let VarResolutionEnvironment {
         attributes,
         custom_functions,
@@ -3881,7 +3891,7 @@ pub(crate) fn resolve_vars(
         token_cache: Some(token_cache),
         ..Default::default()
     };
-    let StyleValueData::Unresolved(unresolved_payload) = value_data else {
+    let StyleValueData::Unresolved(unresolved_payload) = written.data() else {
         return NativeVarResolution::NotHandled;
     };
     // A value holding no substitution function has nothing to resolve: it is invalid at
@@ -3890,7 +3900,7 @@ pub(crate) fn resolve_vars(
         return NativeVarResolution::Invalid;
     }
     context.contains_attr_tainted_values = unresolved_payload.contains_attr_tainted_values;
-    let tokens = cached_value_tokens(value_data, &mut context);
+    let tokens = cached_held_value_tokens(written, &mut context);
     let result = substitute_arbitrary_substitution_functions(
         store,
         registry,

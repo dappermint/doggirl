@@ -200,4 +200,8 @@ impl SharingCache {
             revalidation,
         });
     }
+
+    pub(super) fn clear(&mut self) {
+        self.candidates.clear();
+    }
 }

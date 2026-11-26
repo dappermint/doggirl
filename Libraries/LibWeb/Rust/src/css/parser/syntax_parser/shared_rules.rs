@@ -120,6 +120,21 @@ impl ParsedRuleList {
         ControlFlow::Continue(())
     }
 
+    /// Visits the rules of [`Self::visit_rules`] that are, or hold, a `@layer` or `@import` rule: of a sheet's
+    /// top-level rules, only those its parse found; of a rule's children, all.
+    pub(crate) fn visit_layer_holding_rules<'a>(
+        &'a self,
+        visit: &mut impl FnMut(SharedRule<'a>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        if self.parent.is_some() {
+            return self.visit_rules(visit);
+        }
+        for &position in &self.sheet.layer_holding_roots {
+            visit(self.rule_at(position as usize))?;
+        }
+        ControlFlow::Continue(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.parent.map_or(self.sheet.native_roots.len(), |(parent, _)| {
             self.sheet.native_children_of(self.sheet.rule(parent)).len()
@@ -235,6 +250,15 @@ impl ParsedRule {
                 .children_of(self)
                 .iter()
                 .any(|child| matches!(*child, ParsedRuleChild::Rule(rule) if sheet.rule(rule).holds_media_rules(sheet)))
+    }
+
+    /// Whether the rule is, or holds, a `@layer` rule or an `@import`, whose sheet may hold one.
+    pub(super) fn holds_layer_rules(&self, sheet: &ParsedStyleSheet) -> bool {
+        matches!(self.rule_kind, ParsedRuleKind::Layer | ParsedRuleKind::Import)
+            || (!matches!(self.rule_kind, ParsedRuleKind::Function)
+                && sheet.children_of(self).iter().any(
+                    |child| matches!(*child, ParsedRuleChild::Rule(rule) if sheet.rule(rule).holds_layer_rules(sheet)),
+                ))
     }
 }
 

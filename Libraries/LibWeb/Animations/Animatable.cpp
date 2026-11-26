@@ -7,6 +7,10 @@
  */
 
 #include "Animatable.h"
+#include <AK/HashMap.h>
+#include <AK/HashTable.h>
+#include <AK/NeverDestroyed.h>
+#include <LibGC/Heap.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -72,21 +76,91 @@ Optional<RustFFI::AnimationOwnerSlot> Animatable::owner_slot(Optional<CSS::Pseud
     return RustFFI::AnimationOwnerSlot { static_cast<u8>(to_underlying(*pseudo_element) + 1) };
 }
 
+namespace {
+
+struct AnimatedElementsRegistry {
+    HashMap<GC::Heap*, HashTable<DOM::Element*>> elements_by_heap;
+};
+
+AnimatedElementsRegistry& animated_elements_registry()
+{
+    static thread_local NeverDestroyed<AnimatedElementsRegistry> registry;
+    return *registry;
+}
+
+struct HeapRegistration {
+    GC::Heap* heap { nullptr };
+
+    explicit HeapRegistration(GC::Heap& heap)
+        : heap(&heap)
+    {
+    }
+    HeapRegistration(HeapRegistration&& other)
+        : heap(exchange(other.heap, nullptr))
+    {
+    }
+    HeapRegistration(HeapRegistration const&) = delete;
+    HeapRegistration& operator=(HeapRegistration const&) = delete;
+    HeapRegistration& operator=(HeapRegistration&&) = delete;
+
+    ~HeapRegistration()
+    {
+        if (heap)
+            animated_elements_registry().elements_by_heap.remove(heap);
+    }
+};
+
+}
+
+void Animatable::finalize_dead_animated_elements(GC::Heap& heap)
+{
+    auto& registry = animated_elements_registry();
+    auto it = registry.elements_by_heap.find(&heap);
+    if (it == registry.elements_by_heap.end() || it->value.is_empty())
+        return;
+    Vector<DOM::Element*> dead_elements;
+    for (auto* element : it->value) {
+        if (!element->is_marked())
+            dead_elements.append(element);
+    }
+    for (auto* element : dead_elements)
+        element->finalize_animations_slow();
+}
+
 Animatable::~Animatable()
 {
     finalize_animations();
 }
 
-void Animatable::finalize_animations()
+void Animatable::finalize_animations_slow()
 {
+    if (auto* element = as_if<DOM::Element>(*this)) {
+        auto& registry = animated_elements_registry();
+        if (auto it = registry.elements_by_heap.find(&element->heap()); it != registry.elements_by_heap.end())
+            it->value.remove(element);
+    }
     if (auto* animations = exchange(m_animations, nullptr))
         RustFFI::animations_element_animations_destroy(animations, as_if<DOM::Element>(*this));
 }
 
 RustFFI::ElementAnimations& Animatable::ensure_animations()
 {
-    if (!m_animations)
+    if (!m_animations) {
         m_animations = RustFFI::animations_element_animations_create();
+        if (auto* element = as_if<DOM::Element>(*this)) {
+            auto& registry = animated_elements_registry();
+            auto& heap = element->heap();
+            auto it = registry.elements_by_heap.find(&heap);
+            if (it == registry.elements_by_heap.end()) {
+                registry.elements_by_heap.set(&heap, {});
+                heap.register_sweep_callback([registration = HeapRegistration { heap }] {
+                    Animatable::finalize_dead_animated_elements(*registration.heap);
+                });
+                it = registry.elements_by_heap.find(&heap);
+            }
+            it->value.set(element);
+        }
+    }
     return *m_animations;
 }
 

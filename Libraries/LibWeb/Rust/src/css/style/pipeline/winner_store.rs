@@ -13,6 +13,7 @@ use crate::css::cascaded_properties::{CascadedValues, WinningDeclaration};
 use crate::css::style_compute::{ExternalValueDependencies, RootFontReads};
 use crate::css::style_value::ShorthandPayload;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
+use smallvec::SmallVec;
 use std::cell::Cell;
 
 pub(in crate::css::style) enum WinnerValue {
@@ -42,6 +43,12 @@ pub(in crate::css::style) struct WinnerDeclaration {
 
 /// Set on a packed `ExternalValueDependencies` word that has been computed.
 pub(in crate::css::style) const DEPENDENCIES_COMPUTED: u32 = 1 << 31;
+
+/// Packed dependency bit masks shared between `WinnerStore` and the drive pipeline.
+pub(in crate::css::style) const DEPENDENCY_CONTAINER_UNIT_MASK: u32 = 0xff;
+pub(in crate::css::style) const DEPENDENCY_USES_TREE_COUNTING_FUNCTION: u32 = 1 << 8;
+pub(in crate::css::style) const DEPENDENCY_HAS_UNFIXED_RANDOM_SHARING: u32 = 1 << 9;
+pub(in crate::css::style) const DEPENDENCY_MAY_NEED_RESOURCE_CONTEXT: u32 = 1 << 12;
 
 /// The bits a packed `ExternalValueDependencies` word may set: those `pack_dependencies` sets.
 pub(in crate::css::style) const DEPENDENCY_BITS: u32 = DEPENDENCIES_COMPUTED | ((1 << 21) - 1);
@@ -114,46 +121,62 @@ impl WinnerDeclaration {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Default)]
+enum PropertyIndex {
+    #[default]
+    Empty,
+    Table([u16; crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES]),
+}
+
 #[derive(Default)]
 pub(in crate::css::style) struct WinnerStore {
     // NB: Cascade order supplies both source slots and logical/physical tie breaking.
-    declarations: Vec<WinnerDeclaration>,
-    by_property: Vec<u16>,
+    declarations: SmallVec<[WinnerDeclaration; 16]>,
+    by_property: PropertyIndex,
 }
 
 impl WinnerStore {
-    pub(in crate::css::style) fn new(declarations: Vec<WinnerDeclaration>) -> Self {
-        let mut by_property = vec![u16::MAX; crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES];
-        for (index, declaration) in declarations.iter().enumerate() {
-            by_property
-                [usize::from(declaration.property - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID)] =
-                u16::try_from(index).expect("winner count exceeds longhand count");
+    pub(in crate::css::style) fn empty() -> Self {
+        Self {
+            declarations: SmallVec::new(),
+            by_property: PropertyIndex::Empty,
         }
+    }
+
+    pub(in crate::css::style) fn new(declarations: impl Into<SmallVec<[WinnerDeclaration; 16]>>) -> Self {
+        let declarations = declarations.into();
+        let by_property = if declarations.is_empty() {
+            PropertyIndex::Empty
+        } else {
+            let mut table = [u16::MAX; crate::css::property_metadata::NUMBER_OF_LONGHAND_PROPERTIES];
+            for (index, declaration) in declarations.iter().enumerate() {
+                table[usize::from(declaration.property - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID)] =
+                    u16::try_from(index).expect("winner count exceeds longhand count");
+            }
+            PropertyIndex::Table(table)
+        };
         Self {
             declarations,
             by_property,
         }
     }
 
+    /// Bitwise union of packed `ExternalValueDependencies` across every winning declaration.
+    pub(in crate::css::style) fn dependency_summary(&self, engine: &RetainedState) -> u32 {
+        let view = self.view(engine);
+        self.declarations
+            .iter()
+            .fold(0_u32, |bits, declaration| bits | view.dependency_bits(declaration))
+    }
+
     /// Whether no value the store holds resolves a `url()` against a style sheet's or the
     /// document's base URL. The engine keeps only such records across transactions, so a move of
     /// those base URLs, which every `history.pushState()` makes without a `<base>`, leaves nothing
     /// it keeps to forget.
+    #[cfg(test)]
     pub(in crate::css::style) fn reads_no_resource_contexts(&self, engine: &RetainedState) -> bool {
-        let view = self.view(engine);
-        !self
-            .declarations
-            .iter()
-            .any(|declaration| view.dependencies(declaration).may_need_style_sheet_resource_context)
-    }
-
-    /// The container-relative units the values the store holds resolve, as a
-    /// `container_relative_length_unit_mask`.
-    pub(in crate::css::style) fn container_unit_mask(&self, engine: &RetainedState) -> u8 {
-        let view = self.view(engine);
-        self.declarations.iter().fold(0, |mask, declaration| {
-            mask | view.dependencies(declaration).container_relative_length_unit_mask
-        })
+        self.dependency_summary(engine) & DEPENDENCY_MAY_NEED_RESOURCE_CONTEXT == 0
     }
 
     pub(in crate::css::style) fn view<'a>(&'a self, engine: &'a RetainedState) -> WinnerView<'a> {
@@ -161,7 +184,10 @@ impl WinnerStore {
     }
 
     fn declaration(&self, property: u16) -> Option<(usize, &WinnerDeclaration)> {
-        let index = usize::from(*self.by_property.get(usize::from(
+        let PropertyIndex::Table(table) = &self.by_property else {
+            return None;
+        };
+        let index = usize::from(*table.get(usize::from(
             property.checked_sub(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID)?,
         ))?);
         self.declarations.get(index).map(|declaration| (index, declaration))
@@ -219,14 +245,12 @@ impl WinnerView<'_> {
 
 impl WinnerStore {
     /// The resource context of each declaration, in cascade order, as the drive reads a winner's
-    /// source slot. Empty, and no allocation, when no declaration may read one.
+    /// source slot. Callers only invoke this when `dependency_summary` reports a resource context
+    /// dependency.
     pub(in crate::css::style) fn drive_resource_contexts(
         &self,
         engine: &RetainedState,
     ) -> Vec<crate::css::style_compute::FfiStyleSheetResourceContext> {
-        if self.reads_no_resource_contexts(engine) {
-            return Vec::new();
-        }
         let view = self.view(engine);
         self.declarations
             .iter()
@@ -247,7 +271,7 @@ impl WinnerStore {
         let view = self.view(engine);
         let mut sharings = Vec::new();
         for declaration in &self.declarations {
-            if view.dependencies(declaration).has_unfixed_random_sharing {
+            if view.dependency_bits(declaration) & DEPENDENCY_HAS_UNFIXED_RANDOM_SHARING != 0 {
                 crate::css::style_compute::collect_unfixed_random_sharings_in_value(
                     view.value(declaration).data(),
                     &mut sharings,
@@ -304,10 +328,10 @@ impl WinnerStore {
 }
 
 impl<'a> WinnerView<'a> {
-    fn dependencies(&self, declaration: &WinnerDeclaration) -> ExternalValueDependencies {
+    fn dependency_bits(&self, declaration: &WinnerDeclaration) -> u32 {
         let memoized = declaration.dependencies.get();
         if memoized & DEPENDENCIES_COMPUTED != 0 {
-            return unpack_dependencies(memoized);
+            return memoized;
         }
         // A written value's dependencies were prepared with the declaration it was written in.
         if let WinnerValue::Written { node, source, index } = &declaration.value {
@@ -321,7 +345,7 @@ impl<'a> WinnerView<'a> {
             };
             if prepared & DEPENDENCIES_COMPUTED != 0 {
                 declaration.dependencies.set(prepared);
-                return unpack_dependencies(prepared);
+                return prepared;
             }
         }
         // A value whose independence is not known reads its parent, conservatively.
@@ -330,8 +354,13 @@ impl<'a> WinnerView<'a> {
                 inheritance_dependent: true,
                 ..ExternalValueDependencies::default()
             });
-        declaration.dependencies.set(pack_dependencies(dependencies));
-        dependencies
+        let packed = pack_dependencies(dependencies);
+        declaration.dependencies.set(packed);
+        packed
+    }
+
+    fn dependencies(&self, declaration: &WinnerDeclaration) -> ExternalValueDependencies {
+        unpack_dependencies(self.dependency_bits(declaration))
     }
 
     /// The resource context of the sheet a rule declaration came from, written or substituted. An
@@ -463,7 +492,7 @@ mod tests {
                 .iter()
                 .map(|&property| DeclarationEntry::new(property, true, CascadeOperator::Declared))
                 .zip(written)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         let owners = crate::css::style_value_arc::StyleValueArc::strong_count(&observer);
         let store = WinnerStore::new(
@@ -482,7 +511,7 @@ mod tests {
                         CascadeOrigin::Author,
                     )
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         let view = store.view(&engine);
         for property in properties {
