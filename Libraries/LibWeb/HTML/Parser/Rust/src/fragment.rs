@@ -40,12 +40,48 @@ pub enum RustFfiHtmlFragmentOperationKind {
     AppendText,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiHtmlFragmentTag {
+    None = 0,
+    A,
+    Article,
+    Aside,
+    B,
+    Big,
+    Br,
+    Button,
+    Code,
+    Div,
+    Em,
+    Footer,
+    Header,
+    I,
+    Input,
+    Label,
+    Li,
+    Main,
+    Nav,
+    Ol,
+    S,
+    Section,
+    Small,
+    Span,
+    Strike,
+    Strong,
+    Tt,
+    U,
+    Ul,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RustFfiHtmlFragmentOperation {
     pub kind: RustFfiHtmlFragmentOperationKind,
     /// Whether the text of `AppendText` is all ASCII.
     pub is_ascii: bool,
+    /// Compact supported tag kind for `OpenElement` and `AppendVoidElement`, or `None` for other operations.
+    pub tag_kind: RustFfiHtmlFragmentTag,
     pub start: u32,
     pub length: u32,
     /// The identity of the `Utf16FlyString` with the local name of the element to make.
@@ -183,9 +219,37 @@ supported_tags![
 const MAX_OPEN_ELEMENTS: usize = 128;
 const MAX_ATTRIBUTES: usize = 64;
 
+/// Lookup table for valid lowercase ASCII tag/attribute name characters (`a..=z`, `0..=9`, `-`).
+const NAME_CHAR_TABLE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = b'a' as usize;
+    while i <= b'z' as usize {
+        table[i] = true;
+        i += 1;
+    }
+    let mut d = b'0' as usize;
+    while d <= b'9' as usize {
+        table[d] = true;
+        d += 1;
+    }
+    table[b'-' as usize] = true;
+    table
+};
+
+/// Lookup table for ASCII tag whitespace (`\t`, `\n`, `\x0C`, ` `).
+const TAG_WHITESPACE_TABLE: [bool; 256] = {
+    let mut table = [false; 256];
+    table[0x09] = true;
+    table[0x0A] = true;
+    table[0x0C] = true;
+    table[0x20] = true;
+    table
+};
+
 /// The whitespace between the parts of a tag.
+#[inline(always)]
 fn is_tag_whitespace(code_unit: u16) -> bool {
-    matches!(code_unit, 0x09 | 0x0A | 0x0C | 0x20)
+    code_unit <= 0x20 && TAG_WHITESPACE_TABLE[code_unit as usize]
 }
 
 fn equals_ascii<T: CodeUnit>(code_units: &[T], ascii: &[u8]) -> bool {
@@ -258,6 +322,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         self.tape.operations.push(RustFfiHtmlFragmentOperation {
             kind: RustFfiHtmlFragmentOperationKind::AppendText,
             is_ascii: run.is_ascii,
+            tag_kind: RustFfiHtmlFragmentTag::None,
             start: self.offset as u32,
             length: run.length as u32,
             tag_name: 0,
@@ -267,7 +332,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     }
 
     fn scan_end_tag(&mut self) -> bool {
-        let Some(tag) = self.scan_supported_tag() else {
+        let Some((tag, _)) = self.scan_supported_tag() else {
             return false;
         };
         self.skip_whitespace();
@@ -277,6 +342,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         self.tape.operations.push(RustFfiHtmlFragmentOperation {
             kind: RustFfiHtmlFragmentOperationKind::CloseElement,
             is_ascii: false,
+            tag_kind: RustFfiHtmlFragmentTag::None,
             start: 0,
             length: 0,
             tag_name: 0,
@@ -285,7 +351,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     }
 
     fn scan_start_tag(&mut self) -> bool {
-        let Some(tag) = self.scan_supported_tag() else {
+        let Some((tag, tag_kind)) = self.scan_supported_tag() else {
             return false;
         };
         let open_elements = &self.tape.open_elements;
@@ -335,6 +401,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
                 RustFfiHtmlFragmentOperationKind::OpenElement
             },
             is_ascii: false,
+            tag_kind,
             start: first_attribute as u32,
             length: (self.tape.attributes.len() - first_attribute) as u32,
             tag_name: self.tag_name(tag),
@@ -352,7 +419,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         let name = self.scan_name();
         // NB: Customized built-in elements are made by the general parser.
         if name.is_empty()
-            || equals_ascii(name, b"is")
+            || (name.len() == 2 && equals_ascii(name, b"is"))
             || self.tape.attributes.len() - first_attribute >= MAX_ATTRIBUTES
         {
             return false;
@@ -389,18 +456,24 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             }
         }
 
+        let known_name = self.known_attribute_name_identity(name);
+
         // NB: Other input types have insertion steps or children the fast path doesn't cover.
-        let value_code_units = &input[value_start..value_start + value.length];
-        if tag == tag_id!("input")
-            && equals_ascii(name, b"type")
-            && !equals_ascii(value_code_units, b"text")
-            && !equals_ascii(value_code_units, b"checkbox")
-        {
-            return false;
+        if tag == tag_id!("input") {
+            #[cfg(not(test))]
+            let is_type = known_name == self.hot_attributes[2];
+            #[cfg(test)]
+            let is_type = name.len() == 4 && equals_ascii(name, b"type");
+            if is_type {
+                let value_code_units = &input[value_start..value_start + value.length];
+                if !equals_ascii(value_code_units, b"text") && !equals_ascii(value_code_units, b"checkbox") {
+                    return false;
+                }
+            }
         }
 
         self.tape.attributes.push(RustFfiHtmlFragmentAttribute {
-            known_name: self.known_attribute_name_identity(name),
+            known_name,
             name_start: name_start as u32,
             name_length: name.len() as u32,
             value_start: value_start as u32,
@@ -410,7 +483,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         true
     }
 
-    fn scan_supported_tag(&mut self) -> Option<TagId> {
+    fn scan_supported_tag(&mut self) -> Option<(TagId, RustFfiHtmlFragmentTag)> {
         let name = self.scan_name();
         let mut buffer = [0; 16];
         let bytes = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer))?;
@@ -419,15 +492,23 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
 
     /// Scans a tag name or an attribute name of lowercase ASCII letters, digits and hyphens. Other names are for the
     /// general parser, which is what finding no name where one has to be leads to.
+    #[inline]
     fn scan_name(&mut self) -> &'a [T] {
         let input = self.input;
         let start = self.offset;
         let mut advance = 0;
-        for &code_unit in &input[start..] {
-            if !matches!(code_unit.into(), 0x61..=0x7A | 0x30..=0x39 | 0x2D) {
-                break;
+        if let Some(bytes) = T::as_byte_slice(&input[start..]) {
+            while advance < bytes.len() && NAME_CHAR_TABLE[bytes[advance] as usize] {
+                advance += 1;
             }
-            advance += 1;
+        } else {
+            for &code_unit in &input[start..] {
+                let unit = code_unit.into();
+                if unit > 0x7A || !NAME_CHAR_TABLE[unit as usize] {
+                    break;
+                }
+                advance += 1;
+            }
         }
         self.offset = start + advance;
         &input[start..self.offset]
@@ -458,13 +539,20 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         true
     }
 
+    #[inline]
     fn skip_whitespace(&mut self) {
         let mut advance = 0;
-        for &code_unit in &self.input[self.offset..] {
-            if !is_tag_whitespace(code_unit.into()) {
-                break;
+        if let Some(bytes) = T::as_byte_slice(&self.input[self.offset..]) {
+            while advance < bytes.len() && TAG_WHITESPACE_TABLE[bytes[advance] as usize] {
+                advance += 1;
             }
-            advance += 1;
+        } else {
+            for &code_unit in &self.input[self.offset..] {
+                if !is_tag_whitespace(code_unit.into()) {
+                    break;
+                }
+                advance += 1;
+            }
         }
         self.offset += advance;
     }
@@ -533,55 +621,56 @@ fn hot_attribute_index(bytes: &[u8]) -> Option<usize> {
 }
 
 #[inline]
-fn supported_tag_for_name(name: &[u8]) -> Option<TagId> {
+fn supported_tag_for_name(name: &[u8]) -> Option<(TagId, RustFfiHtmlFragmentTag)> {
+    use RustFfiHtmlFragmentTag as Kind;
     match name.len() {
         1 => match name[0] {
-            b'a' => Some(tag_id!("a")),
-            b'b' => Some(tag_id!("b")),
-            b'i' => Some(tag_id!("i")),
-            b's' => Some(tag_id!("s")),
-            b'u' => Some(tag_id!("u")),
+            b'a' => Some((tag_id!("a"), Kind::A)),
+            b'b' => Some((tag_id!("b"), Kind::B)),
+            b'i' => Some((tag_id!("i"), Kind::I)),
+            b's' => Some((tag_id!("s"), Kind::S)),
+            b'u' => Some((tag_id!("u"), Kind::U)),
             _ => None,
         },
         2 => match name {
-            b"li" => Some(tag_id!("li")),
-            b"ul" => Some(tag_id!("ul")),
-            b"br" => Some(tag_id!("br")),
-            b"em" => Some(tag_id!("em")),
-            b"ol" => Some(tag_id!("ol")),
-            b"tt" => Some(tag_id!("tt")),
+            b"li" => Some((tag_id!("li"), Kind::Li)),
+            b"ul" => Some((tag_id!("ul"), Kind::Ul)),
+            b"br" => Some((tag_id!("br"), Kind::Br)),
+            b"em" => Some((tag_id!("em"), Kind::Em)),
+            b"ol" => Some((tag_id!("ol"), Kind::Ol)),
+            b"tt" => Some((tag_id!("tt"), Kind::Tt)),
             _ => None,
         },
         3 => match name {
-            b"div" => Some(tag_id!("div")),
-            b"nav" => Some(tag_id!("nav")),
-            b"big" => Some(tag_id!("big")),
+            b"div" => Some((tag_id!("div"), Kind::Div)),
+            b"nav" => Some((tag_id!("nav"), Kind::Nav)),
+            b"big" => Some((tag_id!("big"), Kind::Big)),
             _ => None,
         },
         4 => match name {
-            b"span" => Some(tag_id!("span")),
-            b"main" => Some(tag_id!("main")),
-            b"code" => Some(tag_id!("code")),
+            b"span" => Some((tag_id!("span"), Kind::Span)),
+            b"main" => Some((tag_id!("main"), Kind::Main)),
+            b"code" => Some((tag_id!("code"), Kind::Code)),
             _ => None,
         },
         5 => match name {
-            b"input" => Some(tag_id!("input")),
-            b"label" => Some(tag_id!("label")),
-            b"aside" => Some(tag_id!("aside")),
-            b"small" => Some(tag_id!("small")),
+            b"input" => Some((tag_id!("input"), Kind::Input)),
+            b"label" => Some((tag_id!("label"), Kind::Label)),
+            b"aside" => Some((tag_id!("aside"), Kind::Aside)),
+            b"small" => Some((tag_id!("small"), Kind::Small)),
             _ => None,
         },
         6 => match name {
-            b"button" => Some(tag_id!("button")),
-            b"footer" => Some(tag_id!("footer")),
-            b"header" => Some(tag_id!("header")),
-            b"strong" => Some(tag_id!("strong")),
-            b"strike" => Some(tag_id!("strike")),
+            b"button" => Some((tag_id!("button"), Kind::Button)),
+            b"footer" => Some((tag_id!("footer"), Kind::Footer)),
+            b"header" => Some((tag_id!("header"), Kind::Header)),
+            b"strong" => Some((tag_id!("strong"), Kind::Strong)),
+            b"strike" => Some((tag_id!("strike"), Kind::Strike)),
             _ => None,
         },
         7 => match name {
-            b"section" => Some(tag_id!("section")),
-            b"article" => Some(tag_id!("article")),
+            b"section" => Some((tag_id!("section"), Kind::Section)),
+            b"article" => Some((tag_id!("article"), Kind::Article)),
             _ => None,
         },
         _ => None,
@@ -794,7 +883,7 @@ mod tests {
                 let tag = tag_id_for_name(name.as_bytes());
                 (tag != TagId::UNKNOWN && SUPPORTED_TAGS.contains(tag)).then_some(tag)
             };
-            assert_eq!(supported_tag_for_name(name.as_bytes()), expected, "{name}");
+            assert_eq!(supported_tag_for_name(name.as_bytes()).map(|(tag, _)| tag), expected, "{name}");
         }
         for (expected_index, &name) in HOT_ATTRIBUTE_NAMES.iter().enumerate() {
             assert_eq!(

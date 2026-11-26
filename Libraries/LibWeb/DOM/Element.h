@@ -259,7 +259,7 @@ public:
 
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
-    void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false);
+    void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false, Utf16FlyString const* preinterned_single_class = nullptr);
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
@@ -291,6 +291,11 @@ public:
     void add_to_subtree_name_filter(u64 bits);
     u32 subtree_attribute_filter() const { return m_subtree_attribute_filter; }
     void add_to_subtree_filters(u64 name_bits, u32 attribute_bits);
+    void merge_detached_child_subtree_filters(Element const& child)
+    {
+        m_subtree_name_filter |= child.m_subtree_name_filter;
+        m_subtree_attribute_filter |= child.m_subtree_attribute_filter;
+    }
 
     GC::Ptr<NamedNodeMap const> attributes() const;
     GC::Ptr<NamedNodeMap> attributes();
@@ -953,6 +958,11 @@ public:
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     bool uses_document_global_custom_element_registry() const { return m_uses_document_global_custom_element_registry; }
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry>);
+    void set_uses_document_global_custom_element_registry_for_new_element()
+    {
+        VERIFY(!rare_data());
+        m_uses_document_global_custom_element_registry = true;
+    }
 
     virtual void initialize_element() { }
 

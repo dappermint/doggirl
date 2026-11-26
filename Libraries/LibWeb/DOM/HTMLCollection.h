@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
+#include <AK/Vector.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/RootVector.h>
@@ -58,6 +60,10 @@ public:
     using Sort = GC::Ptr<GC::Function<bool(Element const&, Element const&)>>;
 
     [[nodiscard]] static GC::Ref<HTMLCollection> create(ParentNode& root, Scope, Filter, AttributeInvalidationType, Sort = nullptr, Kind = Kind::Generic);
+    [[nodiscard]] static GC::Ref<HTMLCollection> create_all(ParentNode& root, Scope);
+    [[nodiscard]] static GC::Ref<HTMLCollection> create_by_tag_name_html(ParentNode& root, Utf16FlyString qualified_name, Utf16FlyString lowercase_qualified_name);
+    [[nodiscard]] static GC::Ref<HTMLCollection> create_by_tag_name_exact(ParentNode& root, Utf16FlyString qualified_name);
+    [[nodiscard]] static GC::Ref<HTMLCollection> create_by_class_names(ParentNode& root, Vector<Utf16FlyString> class_names, bool case_insensitive);
 
     virtual ~HTMLCollection() override;
 
@@ -71,20 +77,35 @@ public:
     virtual bool is_supported_property_name(Utf16FlyString const&) const override;
 
 protected:
-    HTMLCollection(ParentNode& root, Scope, Filter, AttributeInvalidationType, Sort = nullptr, Kind = Kind::Generic);
+    enum class MatcherKind : u8 {
+        Custom,
+        All,
+        Empty,
+        TagNameHTML,
+        TagNameExact,
+        SingleClass,
+        ClassList,
+    };
+
+    HTMLCollection(ParentNode& root, Scope, GC::Ptr<GC::Function<bool(Element const&)>>, AttributeInvalidationType, Sort = nullptr, Kind = Kind::Generic, MatcherKind = MatcherKind::Custom);
 
     GC::Ref<ParentNode> root() { return *m_root; }
     GC::Ref<ParentNode const> root() const { return *m_root; }
-    bool element_matches_filter(Element const& element) const { return (*m_filter)(element); }
+    bool element_matches_filter(Element const& element) const;
 
     virtual void collect_elements_into(GC::RootVector<GC::Ref<Element>>&) const;
+    virtual void collect_elements_into_weak_vector(GC::WeakVector<Element>&) const;
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
 private:
     virtual void finalize() override;
     virtual void remove_dead_cells(Badge<GC::Heap>) override;
     virtual GC::Cell const& owner_cell(Badge<GC::Heap>) const override;
+
+    template<typename AppendFn>
+    void collect_elements_with(AppendFn&&) const;
 
     void update_cache_if_needed() const;
     void update_name_to_element_mappings_if_needed() const;
@@ -105,12 +126,19 @@ private:
     mutable OwnPtr<OrderedHashMap<Utf16FlyString, GC::Weak<Element>>> m_cached_name_to_element_mappings;
 
     GC::Ref<ParentNode> m_root;
-    Filter m_filter;
+    GC::Ptr<GC::Function<bool(Element const&)>> m_filter;
     Sort m_sort;
+
+    Utf16FlyString m_primary_name;
+    Utf16FlyString m_secondary_name;
+    Vector<Utf16FlyString> m_class_names;
+    u64 m_name_filter_mask { 0 };
 
     Scope m_scope { Scope::Descendants };
     Kind m_kind { Kind::Generic };
     AttributeInvalidationType m_attribute_invalidation_type { AttributeInvalidationType::None };
+    MatcherKind m_matcher_kind { MatcherKind::Custom };
+    bool m_case_insensitive_classes { false };
 };
 
 }

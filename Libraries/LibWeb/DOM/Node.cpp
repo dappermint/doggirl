@@ -295,7 +295,7 @@ void Node::invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadat
         if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
             continue;
 
-        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        GC::RootVector<GC::Ref<HTMLCollection>, 4> collections;
         for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
             collections.append(static_cast<HTMLCollection&>(registration));
         for (auto& collection : collections)
@@ -310,7 +310,7 @@ void Node::invalidate_html_collection_caches_in_ancestors_for_attribute_change(H
         if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
             continue;
 
-        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        GC::RootVector<GC::Ref<HTMLCollection>, 4> collections;
         for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
             collections.append(static_cast<HTMLCollection&>(registration));
         for (auto& collection : collections)
@@ -1069,6 +1069,10 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
 
     // 7. For each node in nodes, in tree order:
     // FIXME: In tree order
+    SubtreeInsertionScope subtree_insertion_scope { *this };
+    bool const style_engine_may_have_waiting_children = document().style_computer().style_engine().may_have_waiting_children();
+    auto* document_global_custom_element_registry = document().effective_global_custom_element_registry().ptr();
+
     for (auto& node_to_insert : nodes) {
         insert_node_into_children(*node_to_insert, child);
 
@@ -1078,11 +1082,9 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
 
         CSS::record_subtree_connecting(*node_to_insert);
 
-        SubtreeInsertionScope subtree_insertion_scope { *this };
-        if (node_to_insert->style_arrival_pending() && !document().style_computer().style_engine().may_have_waiting_children())
+        subtree_insertion_scope.reset_for_next_child();
+        if (node_to_insert->style_arrival_pending() && !style_engine_may_have_waiting_children)
             subtree_insertion_scope.set_descendants_covered_by_subtree_arrival(true);
-
-        auto* document_global_custom_element_registry = document().effective_global_custom_element_registry().ptr();
 
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
@@ -2762,7 +2764,8 @@ void Node::inserted()
         if (auto* parent = as_if<Element>(parent_node())) {
             // A text or comment node connects no element, so no tree delta carries it. It still decides
             // whether its parent is empty, and `:empty` is about the parent.
-            CSS::record_element_emptiness_changed(*parent, *this, false, !text->data().is_empty());
+            if (parent->style_node_id() != 0 && !text->data().is_empty())
+                CSS::record_element_emptiness_changed(*parent, *this, false, true);
 
             // A dir=auto ancestor resolves its direction from the text under it, and this text is now
             // part of that answer.
@@ -3092,6 +3095,9 @@ void Node::remove_all_children(bool suppress_observers)
         }
     }
 
+    if (first_child() != last_child())
+        begin_child_index_generation();
+
     while (GC::Ptr<Node> child = first_child()) {
         if (tracks_keyboard_scroll)
             document().page().keyboard_scroll_dom_tree_changed(*child);
@@ -3130,7 +3136,7 @@ void Node::remove_all_children(bool suppress_observers)
         }
 
         // 7. Remove node from its parent’s children.
-        remove_child_impl(*child);
+        remove_child_for_remove_all_impl(*child);
 
         // 8. If node is assigned, then run assign slottables for node’s assigned slot.
         // 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
@@ -4271,6 +4277,16 @@ void Node::remove_child_impl(GC::Ref<Node> node)
     node->set_root_for_subtree(node);
 }
 
+void Node::remove_child_for_remove_all_impl(GC::Ref<Node> node)
+{
+    if (auto count = node->m_associated_animation_count_in_subtree)
+        change_associated_animation_count_in_subtree(-static_cast<i32>(count));
+    if (auto* element = as_if<Element>(*node))
+        element->forget_child_indices();
+    TreeNode::remove_child(node);
+    node->set_root_for_subtree(node);
+}
+
 void Node::begin_child_index_generation()
 {
     if (++m_child_index_generation != 0)
@@ -4291,6 +4307,10 @@ void Node::change_associated_animation_count_in_subtree(i32 delta)
 
 void Node::set_root_for_subtree(Node& new_root)
 {
+    if (!has_children()) {
+        m_root = new_root;
+        return;
+    }
     for_each_in_inclusive_subtree([&](Node& node) {
         node.m_root = new_root;
         return TraversalDecision::Continue;

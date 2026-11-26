@@ -1199,7 +1199,7 @@ void Element::append_attribute(QualifiedName name, Utf16String value)
     handle_attribute_changes(move(attribute_name), move(old_value), move(new_value));
 }
 
-void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16String value, bool skip_observer_checks)
+void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16String value, bool skip_observer_checks, Utf16FlyString const* preinterned_single_class)
 {
     // Caller guarantees a brand-new, detached, uncustomized HTML element with no parent, observers, or classList.
     VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
@@ -1222,6 +1222,11 @@ void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16Str
 
     if (!has_editing_history && !needs_mutation_record) {
         if (local_name == HTML::AttributeNames::class_) {
+            if (preinterned_single_class) {
+                m_classes.append(*preinterned_single_class);
+                m_subtree_name_filter |= name_filter_bit(*preinterned_single_class);
+                return;
+            }
             auto value_view = attribute.value.utf16_view();
             if (!value_view.is_empty()) {
                 if (!contains_ascii_whitespace(value_view)) {
