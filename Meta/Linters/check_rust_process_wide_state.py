@@ -29,6 +29,7 @@ import sys
 # `file:name` -> why a per-copy instance is harmless: a cache of a pure function, per-thread scratch,
 # or a stub in a test binary.
 ALLOWED = {
+    "Libraries/LibGfx/Rust/src/path.rs:GLYPH_OUTLINE_CACHE": "per-thread memo of a pure function; a second copy costs memory, never an answer",
     "Libraries/LibGfx/Rust/src/text_layout.rs:SHAPING_CACHE": "per-thread memo of a pure function; a second copy costs memory, never an answer",
     "AK/Rust/src/row_block.rs:NEXT_BLOCK": "numbers the blocks, so that a block only gives the rows of its own lists; a block and its lists stay in the library that made them, so two copies never compare numbers; a block that another library reads needs the counter moved to C++",
     "AK/Rust/src/waiter_list.rs:LISTS": "only libjs_rust and libwasm_engine use it, which are in one library of a process, so they share a copy; a caller in another library needs the state moved to C++",

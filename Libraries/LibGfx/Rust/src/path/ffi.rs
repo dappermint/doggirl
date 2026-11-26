@@ -10,7 +10,7 @@
 //! own paths with `Path`.
 
 use super::encoding;
-use super::geometry::{PathGeometry, PathVerb};
+use super::geometry::PathGeometry;
 use crate::geometry::FloatPoint;
 
 /// The contours of a path, valid until the path changes or is destroyed. A path without geometry has
@@ -160,22 +160,6 @@ impl PathGeometryData {
             conic_weight_count: conic_weights.len(),
             fill_rule: geometry.fill_rule() as u8,
         }
-    }
-
-    /// Adds the contours to the path, with their points mapped.
-    ///
-    /// # Safety
-    /// The data must be that of a live path, as of() gives it.
-    pub(super) unsafe fn append_mapped_to(&self, geometry: &mut PathGeometry, map: impl Fn(FloatPoint) -> FloatPoint) {
-        // SAFETY: The caller keeps the arrays of the path live, and each of its verbs is a PathVerb.
-        let (verbs, points, conic_weights) = unsafe {
-            (
-                ak::slice_from_raw_parts(self.verbs.cast::<PathVerb>(), self.verb_count),
-                ak::slice_from_raw_parts(self.points, self.point_count),
-                ak::slice_from_raw_parts(self.conic_weights, self.conic_weight_count),
-            )
-        };
-        geometry.append_mapped_contours(verbs, points, conic_weights, map);
     }
 }
 

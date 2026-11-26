@@ -96,6 +96,9 @@ struct ResolvedFont {
     double font_size { 0 };
     // An AK::Utf16String that Rust takes over.
     FlatPtr serialized { 0 };
+    // True when every component of the parsed font shorthand is independent of element/canvas/viewport context, so
+    // the context can cache it across assignments while `environment_generation` and `CanvasFontSelection` match.
+    bool is_context_independent { false };
 };
 
 // `FontSelection` of Bindings/Rust/src/canvas_2d/canvas.rs: the text drawing styles of a context that select the fonts
@@ -435,10 +438,25 @@ static bool resolve_font(CanvasType& canvas_element, Utf16View font, CanvasFontS
 
     auto computation_context = canvas_element.canvas_font_computation_context();
 
-    auto const& computed_font_size = CSS::StyleComputer::compute_font_size(font_style_value.longhand(CSS::PropertyID::FontSize)->absolutized(computation_context), computed_math_depth, inheritance_parent, CSSPixels { 10 });
-    auto const& computed_font_style = CSS::StyleComputer::compute_font_style(font_style_value.longhand(CSS::PropertyID::FontStyle)->absolutized(computation_context));
-    auto const& computed_font_weight = CSS::StyleComputer::compute_font_weight(font_style_value.longhand(CSS::PropertyID::FontWeight)->absolutized(computation_context), inheritance_parent);
-    auto const& computed_font_width = CSS::StyleComputer::compute_font_width(font_style_value.longhand(CSS::PropertyID::FontWidth)->absolutized(computation_context));
+    auto font_size_raw = font_style_value.longhand(CSS::PropertyID::FontSize);
+    auto font_style_raw = font_style_value.longhand(CSS::PropertyID::FontStyle);
+    auto font_weight_raw = font_style_value.longhand(CSS::PropertyID::FontWeight);
+    auto font_width_raw = font_style_value.longhand(CSS::PropertyID::FontWidth);
+    auto const is_context_independent = font_size_raw && font_style_raw && font_weight_raw && font_width_raw && font_family
+        && font_size_raw->is_length() && font_size_raw->as_length().length().is_absolute()
+        && (font_style_raw->is_keyword()
+            || (font_style_raw->is_font_style()
+                && (!font_style_raw->as_font_style().angle() || font_style_raw->as_font_style().angle()->is_angle())))
+        && ((font_weight_raw->is_keyword()
+                && font_weight_raw->to_keyword() != CSS::Keyword::Bolder
+                && font_weight_raw->to_keyword() != CSS::Keyword::Lighter)
+            || font_weight_raw->is_number())
+        && (font_width_raw->is_keyword() || font_width_raw->is_percentage());
+
+    auto const& computed_font_size = CSS::StyleComputer::compute_font_size(font_size_raw->absolutized(computation_context), computed_math_depth, inheritance_parent, CSSPixels { 10 });
+    auto const& computed_font_style = CSS::StyleComputer::compute_font_style(font_style_raw->absolutized(computation_context));
+    auto const& computed_font_weight = CSS::StyleComputer::compute_font_weight(font_weight_raw->absolutized(computation_context), inheritance_parent);
+    auto const& computed_font_width = CSS::StyleComputer::compute_font_width(font_width_raw->absolutized(computation_context));
     // NB: This doesn't require absolutization since only the font-variant-caps longhand can be set and that can only be
     //     a keyword value
     auto const& computed_font_variant = font_style_value.longhand(CSS::PropertyID::FontVariant).release_nonnull();
@@ -528,6 +546,7 @@ static bool resolve_font(CanvasType& canvas_element, Utf16View font, CanvasFontS
         .font_size = computed_font_size->as_length().length().absolute_length_to_px_without_rounding(),
         // On getting, the font attribute must return the serialized form of the current font of the context (with no 'line-height' component).
         .serialized = resolved_font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue).into_raw(),
+        .is_context_independent = is_context_independent,
     };
     return true;
 }

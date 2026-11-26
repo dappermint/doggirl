@@ -173,7 +173,26 @@ impl PathGeometry {
     }
 
     pub fn clear(&mut self) {
-        *self = Self::new();
+        const MAX_RETAINED_CAPACITY: usize = 4096;
+        if self.verbs.capacity() > MAX_RETAINED_CAPACITY {
+            self.verbs = Vec::new();
+        } else {
+            self.verbs.clear();
+        }
+        if self.points.capacity() > MAX_RETAINED_CAPACITY {
+            self.points = Vec::new();
+        } else {
+            self.points.clear();
+        }
+        if self.conic_weights.capacity() > MAX_RETAINED_CAPACITY {
+            self.conic_weights = Vec::new();
+        } else {
+            self.conic_weights.clear();
+        }
+        self.fill_rule = WindingRule::Nonzero;
+        self.has_only_finite_points = true;
+        self.has_current_point = false;
+        self.last_move_to = FloatPoint::default();
     }
 
     /// The elements of the path. A move that ends the path starts nothing, and is left out.
