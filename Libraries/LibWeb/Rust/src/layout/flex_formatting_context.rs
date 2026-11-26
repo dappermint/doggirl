@@ -1497,9 +1497,8 @@ impl<'pass> FlexFormattingContext<'pass> {
         self.calculate_fit_content_size(index, axis, available_space)
     }
 
-    fn determine_used_flex_basis(&mut self, index: usize) {
-        let basis = self.used_flex_basis_for_item(index);
-        let basis_is_definite = match basis {
+    fn used_flex_basis_is_definite(&self, basis: UsedFlexBasis) -> bool {
+        match basis {
             UsedFlexBasis::Content => false,
             UsedFlexBasis::Size { value, .. } => {
                 if value.is_auto() || value.is_none() || value.is_intrinsic_sizing_constraint() {
@@ -1513,7 +1512,12 @@ impl<'pass> FlexFormattingContext<'pass> {
                     self.has_definite_main_size_used(&self.container_cells)
                 }
             }
-        };
+        }
+    }
+
+    fn determine_used_flex_basis(&mut self, index: usize) {
+        let basis = self.used_flex_basis_for_item(index);
+        let basis_is_definite = self.used_flex_basis_is_definite(basis);
         self.flex_item_details[index].used_flex_basis = basis;
         self.flex_items[index].used_flex_basis_is_definite = basis_is_definite;
     }
@@ -2402,6 +2406,53 @@ impl<'pass> FlexFormattingContext<'pass> {
             })
             .collect();
         sizing.measure_content_inline_sizes_ahead(measurements);
+    }
+
+    fn main_base_size_uses_intrinsic_block_size(&self, index: usize) -> bool {
+        if self.main_axis_is_horizontal() {
+            return false;
+        }
+        let basis = self.used_flex_basis_for_item(index);
+        match basis {
+            UsedFlexBasis::Size { value } => {
+                if self.used_flex_basis_is_definite(basis) {
+                    return false;
+                }
+                if !value.is_intrinsic_sizing_constraint() && self.has_definite_main_size(index) {
+                    return false;
+                }
+                true
+            }
+            UsedFlexBasis::Content => {
+                !(self.flex_item_details[index].inputs.preferred_aspect_ratio.is_some()
+                    && self.has_definite_cross_size(index))
+            }
+        }
+    }
+
+    fn lay_out_intrinsic_main_block_size_measurements_ahead(&self) {
+        if self.main_axis_is_horizontal() {
+            return;
+        }
+        let candidates = self.fork_candidates();
+        if candidates.is_empty() {
+            return;
+        }
+        let sizing = self.sizing();
+        let constraints = self.item_containing_block_constraints();
+        let shapes = candidates
+            .into_iter()
+            .filter(|&index| self.main_base_size_uses_intrinsic_block_size(index))
+            .filter_map(|index| {
+                let inline_size = self.intrinsic_block_inline_size(index);
+                sizing.max_content_block_size_run_shape(
+                    sizing_context::SizedBox::new(self.flex_items[index].box_, &self.flex_item_details[index].cells),
+                    inline_size,
+                    constraints,
+                )
+            })
+            .collect();
+        parallel_layout::lay_out_shapes_ahead(&self.run.pass, shapes);
     }
 
     fn lay_out_fit_content_cross_size_measurements_ahead(&self) {
@@ -4242,6 +4293,7 @@ impl<'pass> FlexFormattingContext<'pass> {
 
         self.offer_runs_of_items_measured_in_their_main_axis();
         self.measure_content_inline_sizes_of_items_ahead();
+        self.lay_out_intrinsic_main_block_size_measurements_ahead();
 
         // 4. Determine the main size of the flex container
         // Determine the main size of the flex container using the rules of the formatting context in which it participates.

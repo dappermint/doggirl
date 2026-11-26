@@ -603,7 +603,7 @@ pub(crate) fn detach_remaining_rows_for_removal(
 ) {
     // A pseudo-element's boxes are found through its generator's identity, so they go while the identity still finds
     // them. A ::backdrop box sits outside the generator's box, so no rebuild of the parent would free it.
-    if node.element_index().is_some() {
+    if node.element_index().is_some() && arena.has_bound_pseudo_element_rows(node) {
         // NB: Counters and quotes after the node's boxes move with the counters and quotes its pseudo-elements change,
         //     which only a build of the whole tree finds again.
         let pseudo_elements_change_generated_content =
@@ -620,9 +620,7 @@ pub(crate) fn detach_remaining_rows_for_removal(
         {
             arena.set_needs_full_layout_tree_update(true);
         }
-        if arena.has_bound_pseudo_element_rows(node) {
-            arena.note_boxes_removed_ahead_of_layout();
-        }
+        arena.note_boxes_removed_ahead_of_layout();
         clear_synthetic_pseudo_element_boxes(host_calls, arena, node);
     }
     let row = arena.bound_row(node);

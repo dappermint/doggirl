@@ -363,6 +363,9 @@ impl FfiViewportMapping<'_> {
             }),
         }
     }
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.host.is_some()
+    }
 }
 
 struct ResolvedTransforms {
@@ -395,7 +398,7 @@ impl ResolvedViewportMapping {
 /// The mapping between the viewport of `host`'s document and the spaces of `tree`, which the host keeps as the tree of
 /// its mappings from here on, with the compositor's animations sampled at `visual_animation_sample_time_ns` where it is
 /// some, where the document's boxes are scrolled to as the host has it when the mapping is used.
-fn viewport_mapping_through(
+pub(crate) fn viewport_mapping_through(
     host: &DocumentHost,
     tree: Arc<VisualContextTree>,
     visual_animation_sample_time_ns: Option<i64>,

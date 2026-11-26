@@ -290,7 +290,8 @@ mod joining_type {
 
 fn joining_type(code_point: u32) -> u8 {
     // OPTIMIZATION: Below U+0300, only U+00AD SOFT HYPHEN takes part in joining, as a transparent character.
-    if code_point < 0x300 && code_point != 0xad {
+    //               U+2010..=U+2027 (general punctuation: hyphens, dashes, curly quotes, ellipsis) are also non-joining.
+    if (code_point < 0x300 && code_point != 0xad) || (0x2010..=0x2027).contains(&code_point) {
         return joining_type::NON_JOINING;
     }
     unicode_layout_joining_type(code_point)
@@ -537,8 +538,100 @@ impl std::ops::Deref for ChunkedText {
     }
 }
 
+fn try_chunk_simple_ascii(
+    inputs: &TextChunkInputs<'_>,
+    first_font_and_ascii: Option<(&FontHandle, u128)>,
+) -> Option<ChunkedText> {
+    if inputs.text.is_empty() {
+        return Some(ChunkedText::default());
+    }
+    if !inputs.unidirectional_ltr
+        || inputs.splits_at_orientation_changes
+        || inputs.should_respect_linebreaks
+        || !inputs.should_wrap_lines
+        || !matches!(
+            inputs.white_space_collapse,
+            white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
+        )
+        || !matches!(inputs.word_break, word_break::NORMAL | word_break::BREAK_WORD)
+        || inputs.line_break == line_break::ANYWHERE
+    {
+        return None;
+    }
+    let (font, code_points) = first_font_and_ascii?;
+    if code_points & (1u128 << b' ') == 0 {
+        return None;
+    }
+    let text = inputs.text;
+    if !text
+        .iter()
+        .all(|&code_unit| (0x20..=0x7e).contains(&code_unit) && (code_points & (1u128 << code_unit)) != 0)
+    {
+        return None;
+    }
+    let len = text.len();
+    let mut chunks = Vec::with_capacity((len / 4).clamp(4, 64));
+    let mut i = 0;
+    while i < len {
+        if text[i] == u16::from(b' ') {
+            chunks.push(TextChunk {
+                start: i,
+                length: 1,
+                font_index: 0,
+                has_breaking_newline: false,
+                has_breaking_tab: false,
+                is_all_whitespace: true,
+                can_break_after: false,
+                text_type: line_box_fragment::GLYPH_TEXT_TYPE_LTR,
+            });
+            i += 1;
+            while i < len && text[i] == u16::from(b' ') {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        i += 1;
+        let mut can_break_after = false;
+        while i < len {
+            let next = text[i] as u8;
+            if next == b' ' {
+                break;
+            }
+            let prev = text[i - 1] as u8;
+            if !prev.is_ascii_alphanumeric() && ascii_line_break_at(text, i) == Some(true) {
+                can_break_after = true;
+                break;
+            }
+            i += 1;
+        }
+        chunks.push(TextChunk {
+            start,
+            length: i - start,
+            font_index: 0,
+            has_breaking_newline: false,
+            has_breaking_tab: false,
+            is_all_whitespace: false,
+            can_break_after,
+            text_type: line_box_fragment::GLYPH_TEXT_TYPE_LTR,
+        });
+    }
+    Some(ChunkedText {
+        chunks,
+        fonts: Box::from([font.clone()]),
+        frozen_font_list_held_for_memo_key: None,
+    })
+}
+
 pub(crate) fn chunk_text(inputs: TextChunkInputs<'_>) -> ChunkedText {
-    let mut chunker = TextChunker::new(inputs);
+    let first_font_and_ascii = inputs
+        .frozen_font_list
+        .first_font_and_ascii_code_points_it_resolves_in_text_presentation()
+        .filter(|_| inputs.font_variant_emoji != font_variant_emoji::EMOJI);
+    if let Some(chunked) = try_chunk_simple_ascii(&inputs, first_font_and_ascii) {
+        return chunked;
+    }
+    let mut chunker = TextChunker::new_with_first_font(inputs, first_font_and_ascii);
     let mut chunks = Vec::new();
     while let Some(chunk) = chunker.next_chunk() {
         chunks.push(chunk);
@@ -602,9 +695,10 @@ pub(crate) enum GraphemeSegmenter {
     },
 }
 
-// No code point below U+0300 extends or joins a grapheme cluster, and only CR joins the code point after it (CR LF).
+// No code point below U+0300 or in U+2010..=U+2027 (general punctuation: hyphens, dashes, curly quotes, ellipsis)
+// extends or joins a grapheme cluster, and only CR joins the code point after it (CR LF).
 fn is_latin_code_unit_outside_clusters(code_unit: u16) -> bool {
-    code_unit < 0x300 && code_unit != 0x0d
+    (code_unit < 0x300 && code_unit != 0x0d) || (0x2010..=0x2027).contains(&code_unit)
 }
 
 impl GraphemeSegmenter {
@@ -615,7 +709,10 @@ impl GraphemeSegmenter {
                 length_in_code_units: text.len(),
             };
         };
-        if text[first_cluster_candidate..].iter().all(|unit| *unit < 0x300) {
+        if text[first_cluster_candidate..]
+            .iter()
+            .all(|&unit| unit < 0x300 || (0x2010..=0x2027).contains(&unit))
+        {
             let line_feeds_after_carriage_returns = text
                 .windows(2)
                 .enumerate()
@@ -730,6 +827,13 @@ impl<'text> LineSegmenter<'text> {
     }
 
     fn is_boundary(&self, index: usize) -> bool {
+        // Once an ICU line segmenter is active for this text, keep advancing it sequentially so its forward
+        // BreakCache stays warm instead of jumping ahead and triggering handleSafePrevious().
+        if self.handle.get().is_none()
+            && let Some(is_boundary) = local_latin_line_break_at(self.text, index)
+        {
+            return is_boundary;
+        }
         let text_is_broken_with_ascii_rules = *self.text_is_broken_with_ascii_rules.get_or_init(|| {
             self.text
                 .iter()
@@ -862,6 +966,107 @@ fn ascii_line_break_at(text: &[u16], index: usize) -> Option<bool> {
         return Some(false);
     }
     Some(matches!(after, b'(' | b'<' | b'[' | b'{') || matches!(before, b'-' | b'?'))
+}
+
+#[inline]
+fn is_latin_alphabetic(code_unit: u16) -> bool {
+    matches!(
+        code_unit,
+        0x0041..=0x005a | 0x0061..=0x007a | 0x00c0..=0x00d6 | 0x00d8..=0x00f6 | 0x00f8..=0x017f
+    )
+}
+
+#[inline]
+fn is_latin_alphanumeric(code_unit: u16) -> bool {
+    is_latin_alphabetic(code_unit) || (0x0030..=0x0039).contains(&code_unit)
+}
+
+#[inline]
+fn is_latin_close_or_infix_punct(code_unit: u16) -> bool {
+    matches!(
+        code_unit,
+        0x0021 | 0x0029 | 0x002c | 0x002e | 0x003a | 0x003b | 0x003f | 0x005d | 0x007d
+    )
+}
+
+#[inline]
+fn is_latin_non_mandatory_break_before_space(code_unit: u16) -> bool {
+    (0x0020..=0x007e).contains(&code_unit)
+        || is_latin_alphabetic(code_unit)
+        || matches!(code_unit, 0x00ab | 0x00bb | 0x2010..=0x2027)
+}
+
+/// Local UAX #14 line break checks for Latin-1 / Latin Extended-A prose, spaces, and common European punctuation
+/// (`’`, `«`, `»`, `—`) that hold across all ICU line-break tailorings regardless of characters elsewhere in the
+/// paragraph.
+fn local_latin_line_break_at(text: &[u16], index: usize) -> Option<bool> {
+    if index == 0 || index == text.len() {
+        return Some(true);
+    }
+    let (&before, &after) = (text.get(index - 1)?, text.get(index)?);
+    // LB5: LF !
+    if before == u16::from(b'\n') {
+        return Some(true);
+    }
+    // LB6: × LF (after non-mandatory-break characters).
+    if after == u16::from(b'\n') && is_latin_non_mandatory_break_before_space(before) {
+        return Some(false);
+    }
+    // LB23 / LB25 / LB28: (AL | NU) × (AL | NU).
+    if is_latin_alphanumeric(before) && is_latin_alphanumeric(after) {
+        return Some(false);
+    }
+    // LB7: × SP (after non-mandatory-break characters).
+    if after == u16::from(b' ') && is_latin_non_mandatory_break_before_space(before) {
+        return Some(false);
+    }
+    // LB18: SP ÷ before AL/NU/OP/QU_Pi/B2 unless preceded by OP, QU_Pi, or B2.
+    if before == u16::from(b' ')
+        && (is_latin_alphanumeric(after) || matches!(after, 0x0028 | 0x005b | 0x007b | 0x00ab | 0x2014))
+    {
+        let prev_non_space = *text[..index - 1]
+            .iter()
+            .rev()
+            .find(|&&code_unit| code_unit != u16::from(b' '))?;
+        if is_latin_alphanumeric(prev_non_space)
+            || is_latin_close_or_infix_punct(prev_non_space)
+            || matches!(prev_non_space, 0x000a | 0x00bb | 0x2019)
+        {
+            return Some(true);
+        }
+        return None;
+    }
+    // LB13 / LB15d / LB21: (AL | QU_Pf) × (CL | CP | EX | IS | SY | HY).
+    if (is_latin_alphabetic(before) || matches!(before, 0x00bb | 0x2019))
+        && (is_latin_close_or_infix_punct(after) || matches!(after, 0x002d | 0x002f))
+    {
+        return Some(false);
+    }
+    // LB19a: [^$EastAsian] × QU_Pf (`’`, `»`).
+    if (is_latin_alphabetic(before) || is_latin_close_or_infix_punct(before) || before == 0x2014)
+        && matches!(after, 0x00bb | 0x2019)
+    {
+        return Some(false);
+    }
+    // LB14 / LB19a: (OP | QU) × AL.
+    if matches!(before, 0x0028 | 0x005b | 0x007b | 0x00ab | 0x2019) && is_latin_alphabetic(after) {
+        return Some(false);
+    }
+    // LB19a: B2 × QU_Pi (`—«`) and QU_Pf × B2 (`’—`, `»—`).
+    if (before == 0x2014 && after == 0x00ab) || (matches!(before, 0x00bb | 0x2019) && after == 0x2014) {
+        return Some(false);
+    }
+    // LB21 (not LB20a): (AL | NU) HY ÷ AL.
+    if before == u16::from(b'-') && is_latin_alphabetic(after) && index >= 2 && is_latin_alphanumeric(text[index - 2]) {
+        return Some(true);
+    }
+    // Em-dash (B2) adjacent to AL or closing punctuation (not B2 or QU).
+    if ((is_latin_alphabetic(before) || is_latin_close_or_infix_punct(before)) && after == 0x2014)
+        || (before == 0x2014 && is_latin_alphabetic(after))
+    {
+        return Some(true);
+    }
+    None
 }
 
 /// Mirrors LibUnicode's compute_ascii_line_boundaries() at the edges of a text of printable ASCII and ASCII whitespace,
@@ -1231,11 +1436,10 @@ struct TextChunker<'text> {
 }
 
 impl<'text> TextChunker<'text> {
-    fn new(inputs: TextChunkInputs<'text>) -> Self {
-        let first_font_and_ascii_code_points_it_resolves = inputs
-            .frozen_font_list
-            .first_font_and_ascii_code_points_it_resolves_in_text_presentation()
-            .filter(|_| inputs.font_variant_emoji != font_variant_emoji::EMOJI);
+    fn new_with_first_font(
+        inputs: TextChunkInputs<'text>,
+        first_font_and_ascii_code_points_it_resolves: Option<(&'text FontHandle, u128)>,
+    ) -> Self {
         let font_for_every_space = first_font_and_ascii_code_points_it_resolves.and_then(|(font, code_points)| {
             let space = 1u128 << b' ';
             let spaces_and_line_feeds = space | 1 << b'\n';
@@ -1319,24 +1523,28 @@ impl<'text> TextChunker<'text> {
             let offset_after_next = next_offset + code_unit_length_for_code_point(next_code_point);
             (offset_after_next < self.text.len()).then(|| code_point_at(self.text, offset_after_next))
         });
-        // OPTIMIZATION: No code point below U+0300 has the Emoji_Presentation property, so only a variation selector
-        //               or a zero width joiner can give one of them anything but the default text presentation.
-        let default_presentation = if code_point < 0x300 && !matches!(next_code_point, Some(0xfe0e | 0xfe0f | 0x200d)) {
-            EmojiPresentation {
-                is_emoji: false,
-                forced: false,
-            }
-        } else {
-            emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next)
-        };
+        // OPTIMIZATION: No code point below U+0300 or in U+2010..=U+2027 has the Emoji_Presentation property, so only
+        //               a variation selector or a zero width joiner can give one of them anything but the default text
+        //               presentation.
+        let is_fast_non_emoji_presentation = code_point < 0x300 || (0x2010..=0x2027).contains(&code_point);
+        let default_presentation =
+            if is_fast_non_emoji_presentation && !matches!(next_code_point, Some(0xfe0e | 0xfe0f | 0x200d)) {
+                EmojiPresentation {
+                    is_emoji: false,
+                    forced: false,
+                }
+            } else {
+                emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next)
+            };
         // OPTIMIZATION: Below U+0300, only '#', '*', the ASCII digits, U+00A9 and U+00AE have the Emoji property.
-        let has_emoji_property = if code_point < 0x300 {
+        //               None of U+2010..=U+2027 have the Emoji property.
+        let has_emoji_property = if is_fast_non_emoji_presentation {
             matches!(code_point, 0x23 | 0x2a | 0x30..=0x39 | 0xa9 | 0xae)
         } else {
             unicode_layout_code_point_has_emoji_property(code_point)
         };
         debug_assert!(
-            code_point >= 0x300 || {
+            !is_fast_non_emoji_presentation || {
                 let presentation =
                     emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next);
                 let has_property = unicode_layout_code_point_has_emoji_property(code_point);
@@ -1704,7 +1912,7 @@ fn tab_chunk_end(text: &[u16], start: usize, break_after_each_tab: bool) -> usiz
 #[cfg(test)]
 mod tests {
     use super::cjk_script_class::{CJK, NEUTRAL, OTHER};
-    use super::{resolve_cjk_script_runs, tab_chunk_end};
+    use super::{local_latin_line_break_at, resolve_cjk_script_runs, tab_chunk_end};
 
     fn classes(classes: &[u8]) -> Vec<(u8, i32)> {
         classes.iter().map(|class| (*class, 0)).collect()
@@ -1759,5 +1967,44 @@ mod tests {
         assert_eq!(tab_chunk_end(&text, 0, false), 3);
         assert_eq!(tab_chunk_end(&text, 2, false), 3);
         assert_eq!(tab_chunk_end(&[u16::from(b'\t')], 0, true), 1);
+    }
+
+    #[test]
+    fn local_latin_rules_handle_mixed_unicode_and_french_paragraphs() {
+        let mixed: Vec<_> = "hello world — don\u{2019}t ( open ) next".encode_utf16().collect();
+        assert_eq!(local_latin_line_break_at(&mixed, 0), Some(true));
+        assert_eq!(local_latin_line_break_at(&mixed, mixed.len()), Some(true));
+        // "hello" | " " -> LB7 forbids breaking before space.
+        assert_eq!(local_latin_line_break_at(&mixed, 5), Some(false));
+        // "hello " | "world" -> LB18 permits breaking after space.
+        assert_eq!(local_latin_line_break_at(&mixed, 6), Some(true));
+        // "( " | "open" -> preceded by OP '(', must defer to full rules (LB14 forbids break).
+        let open_idx = mixed.iter().position(|&c| c == u16::from(b'(')).unwrap() + 2;
+        assert_eq!(local_latin_line_break_at(&mixed, open_idx), None);
+        // ") " | "next" -> preceded by CP ')', LB18 permits breaking before ASCII alphanumeric.
+        let next_idx = mixed.iter().position(|&c| c == u16::from(b')')).unwrap() + 2;
+        assert_eq!(local_latin_line_break_at(&mixed, next_idx), Some(true));
+        // "— " | "don" -> preceded by em-dash, must defer to ICU.
+        let don_idx = mixed.iter().position(|&c| c == 0x2014).unwrap() + 2;
+        assert_eq!(local_latin_line_break_at(&mixed, don_idx), None);
+
+        let french: Vec<_> = "L\u{2019}\u{00e9}tat c\u{2019}est-\u{00e0}-dire \u{00ab}arriv\u{00e9}\u{00bb}\u{2014}ici"
+            .encode_utf16()
+            .collect();
+        // L | ’ -> false, ’ | é -> false, é | t -> false
+        assert_eq!(local_latin_line_break_at(&french, 1), Some(false));
+        assert_eq!(local_latin_line_break_at(&french, 2), Some(false));
+        assert_eq!(local_latin_line_break_at(&french, 3), Some(false));
+        // t | - -> false, - | à -> true (after AL)
+        let hyphen_idx = french.iter().position(|&c| c == u16::from(b'-')).unwrap();
+        assert_eq!(local_latin_line_break_at(&french, hyphen_idx), Some(false));
+        assert_eq!(local_latin_line_break_at(&french, hyphen_idx + 1), Some(true));
+        // « | a -> false, é | » -> false, » | — -> false, — | i -> true
+        let open_g = french.iter().position(|&c| c == 0x00ab).unwrap();
+        assert_eq!(local_latin_line_break_at(&french, open_g + 1), Some(false));
+        let close_g = french.iter().position(|&c| c == 0x00bb).unwrap();
+        assert_eq!(local_latin_line_break_at(&french, close_g), Some(false));
+        assert_eq!(local_latin_line_break_at(&french, close_g + 1), Some(false));
+        assert_eq!(local_latin_line_break_at(&french, close_g + 2), Some(true));
     }
 }

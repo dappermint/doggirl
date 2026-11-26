@@ -82,18 +82,37 @@ fn fly_string_equals_ascii(string: &CssString, expected: &[u8]) -> bool {
     })
 }
 
+#[inline]
+fn has_any_will_change(style: ComputedValuesView<'_>) -> bool {
+    let misc = style.misc_interaction();
+    !misc.implicit_will_change.as_slice().is_empty()
+        || matches!(handle_value(&misc.will_change), Some(StyleValueData::ValueList { .. }))
+}
+
+#[inline]
 fn will_change_has_any_property(style: ComputedValuesView<'_>, names: &[&[u8]]) -> bool {
-    let hints = style.misc_interaction().implicit_will_change.as_slice();
-    if hints
+    let misc = style.misc_interaction();
+    if misc.implicit_will_change.as_slice().is_empty()
+        && !matches!(handle_value(&misc.will_change), Some(StyleValueData::ValueList { .. }))
+    {
+        return false;
+    }
+    will_change_has_any_property_slow(style, names)
+}
+
+#[cold]
+#[inline(never)]
+fn will_change_has_any_property_slow(style: ComputedValuesView<'_>, names: &[&[u8]]) -> bool {
+    let misc = style.misc_interaction();
+    if misc
+        .implicit_will_change
+        .as_slice()
         .iter()
         .any(|&property| names.contains(&property_name(property).as_bytes()))
     {
         return true;
     }
-    let Some(value) = handle_value(&style.misc_interaction().will_change) else {
-        return false;
-    };
-    let StyleValueData::ValueList { values, .. } = value else {
+    let Some(StyleValueData::ValueList { values, .. }) = handle_value(&misc.will_change) else {
         return false;
     };
     values.as_slice().iter().any(|item| match item.data() {
@@ -257,7 +276,8 @@ fn style_establishes_fixed_positioning_containing_block(
     style: ComputedValuesView<'_>,
 ) -> bool {
     use crate::css::css_enums::{backface_visibility, content_visibility};
-    let will_change = |name: &[u8]| will_change_has_property(style, name);
+    let has_will_change = has_any_will_change(style);
+    let will_change = |name: &[u8]| has_will_change && will_change_has_property(style, name);
     let transformable = || is_transformable(arena, node);
     let transform = style.transform();
 
@@ -340,10 +360,8 @@ pub(crate) fn style_may_establish_positioning_containing_blocks(style: ComputedV
     let transform = style.transform();
     let effects = style.effects();
     let box_values = style.box_values();
-    let misc = style.misc_interaction();
     style.position() != positioning::STATIC
-        || !misc.implicit_will_change.as_slice().is_empty()
-        || matches!(handle_value(&misc.will_change), Some(StyleValueData::ValueList { .. }))
+        || has_any_will_change(style)
         || !transform.transformations.pointer.is_null()
         || !transform.translate.pointer.is_null()
         || !transform.rotate.pointer.is_null()
@@ -719,7 +737,8 @@ pub(crate) fn establishes_stacking_context(arena: &impl PaintRead, node: NodeSlo
         return false;
     };
     let box_values = style.box_values();
-    let will_change = |name: &[u8]| will_change_has_property(style, name);
+    let has_will_change = has_any_will_change(style);
+    let will_change = |name: &[u8]| has_will_change && will_change_has_property(style, name);
 
     let position = style.position();
     let has_z_index = box_values.has_z_index || will_change(b"z-index");

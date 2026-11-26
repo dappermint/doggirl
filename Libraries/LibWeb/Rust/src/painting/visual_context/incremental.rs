@@ -242,40 +242,63 @@ fn tombstone_removed_blocks(
     tree: &mut VisualContextTree,
     dirty: &VisualContextDirtySet,
     delta: &mut VisualContextTreeDelta,
-    mut trace: Option<&mut super::trace::VisualContextTrace>,
+    trace: Option<&mut super::trace::VisualContextTrace>,
 ) {
-    use super::reconcile::{NodeAction, NodeEvent, clip_role, effect_role, spatial_role};
-    for removed in &dirty.removed {
+    if let Some(trace) = trace {
+        use super::reconcile::{NodeAction, NodeEvent, clip_role, effect_role, spatial_role};
         let mut events = Vec::new();
-        let mut released = |role: &'static str| {
-            events.push(NodeEvent {
-                role,
-                action: NodeAction::Released,
-            });
-        };
+        for removed in &dirty.removed {
+            events.clear();
+            for index in &removed.node_handles.spatial {
+                let role = spatial_role(&tree.spatial_nodes[index.0 as usize].data);
+                if tree.tombstone_spatial_slot(*index) {
+                    delta.note_tombstoned();
+                    events.push(NodeEvent {
+                        role,
+                        action: NodeAction::Released,
+                    });
+                }
+            }
+            for index in removed.node_handles.clip_handles() {
+                let role = clip_role(&tree.clip_nodes[index.0 as usize].data);
+                if tree.tombstone_clip_slot(index) {
+                    delta.note_tombstoned();
+                    events.push(NodeEvent {
+                        role,
+                        action: NodeAction::Released,
+                    });
+                }
+            }
+            for index in &removed.node_handles.effects {
+                let role = effect_role(&tree.effect_nodes[index.0 as usize].data);
+                if tree.tombstone_effect_slot(*index) {
+                    delta.note_tombstoned();
+                    events.push(NodeEvent {
+                        role,
+                        action: NodeAction::Released,
+                    });
+                }
+            }
+            trace.note_removed_box_events(removed.slot, &events);
+        }
+        return;
+    }
+
+    for removed in &dirty.removed {
         for index in &removed.node_handles.spatial {
-            let role = spatial_role(&tree.spatial_nodes[index.0 as usize].data);
             if tree.tombstone_spatial_slot(*index) {
                 delta.note_tombstoned();
-                released(role);
             }
         }
         for index in removed.node_handles.clip_handles() {
-            let role = clip_role(&tree.clip_nodes[index.0 as usize].data);
             if tree.tombstone_clip_slot(index) {
                 delta.note_tombstoned();
-                released(role);
             }
         }
         for index in &removed.node_handles.effects {
-            let role = effect_role(&tree.effect_nodes[index.0 as usize].data);
             if tree.tombstone_effect_slot(*index) {
                 delta.note_tombstoned();
-                released(role);
             }
-        }
-        if let Some(trace) = trace.as_deref_mut() {
-            trace.note_removed_box_events(removed.slot, &events);
         }
     }
 }

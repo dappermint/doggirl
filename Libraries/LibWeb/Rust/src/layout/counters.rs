@@ -201,14 +201,17 @@ impl CountersSets {
         }
     }
 
+    #[inline]
+    fn element_may_hold_set(&self, element: StyleNodeID) -> bool {
+        let slot = element.element_slot();
+        self.may_hold_sets
+            .get(slot / 64)
+            .is_some_and(|word| word & (1 << (slot % 64)) != 0)
+    }
+
     /// Whether `owner` has a set of its own, apart from its parent element's.
     pub(crate) fn holds_set_of(&self, owner: CounterOwner) -> bool {
-        let slot = owner.element.element_slot();
-        let may_hold = self
-            .may_hold_sets
-            .get(slot / 64)
-            .is_some_and(|word| word & (1 << (slot % 64)) != 0);
-        may_hold && self.sets.contains_key(&owner)
+        self.element_may_hold_set(owner.element) && self.sets.contains_key(&owner)
     }
 
     /// Gives `owner` the set `set`, see [`Self::may_hold_sets`].
@@ -251,8 +254,17 @@ impl CountersSets {
 
     /// Drops the sets of an element and its pseudo-elements, once its identity is retired.
     pub(crate) fn forget(&mut self, element: StyleNodeID) {
-        for owner in CounterOwner::every_owner_of(element) {
-            self.sets.remove(&owner);
+        if !self.element_may_hold_set(element) {
+            return;
+        }
+        if !self.sets.is_empty() {
+            for owner in CounterOwner::every_owner_of(element) {
+                self.sets.remove(&owner);
+            }
+        }
+        let slot = element.element_slot();
+        if let Some(word) = Arc::make_mut(&mut self.may_hold_sets).get_mut(slot / 64) {
+            *word &= !(1 << (slot % 64));
         }
     }
 

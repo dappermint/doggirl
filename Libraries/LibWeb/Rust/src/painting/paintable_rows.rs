@@ -457,6 +457,9 @@ where
     /// that a row it commits as it was copies no chunk a published generation shares.
     pub(crate) fn begin_paintable_row_recommit(&mut self, id: NodeSlotId) {
         // The row's stamps are deliberately kept; the commit diff stamps what actually changed.
+        if self.arena.committed_side_data(id).fragment_ownership.is_none() {
+            return;
+        }
         let filter = self.arena.committed_side_data_mut(id).fragment_ownership.take();
         if filter.is_some() {
             self.arena
@@ -543,7 +546,15 @@ impl PaintableRowStore {
     }
 
     pub(crate) fn invalidate_committed_geometry(&mut self, layout_slot_index: u32) {
-        if let Some(mut slot) = RowMut::new(&mut self.committed_fragment_links, layout_slot_index as usize) {
+        let index = layout_slot_index as usize;
+        if !self
+            .committed_fragment_links
+            .get(index)
+            .is_some_and(|slot| slot.geometry_is_current)
+        {
+            return;
+        }
+        if let Some(mut slot) = RowMut::new(&mut self.committed_fragment_links, index) {
             slot.geometry_is_current = false;
         }
     }
@@ -604,7 +615,15 @@ impl PaintableRowStore {
         layout_slot_generation: u8,
         link: fragment_tree::FragmentLink,
     ) {
-        if let Some(mut slot) = RowMut::new(&mut self.committed_fragment_links, layout_slot_index as usize)
+        let index = layout_slot_index as usize;
+        if !self
+            .committed_fragment_links
+            .get(index)
+            .is_some_and(|slot| slot.layout_slot_generation == layout_slot_generation)
+        {
+            return;
+        }
+        if let Some(mut slot) = RowMut::new(&mut self.committed_fragment_links, index)
             && slot.layout_slot_generation == layout_slot_generation
         {
             slot.link = Some(link);
@@ -616,14 +635,29 @@ impl PaintableRowStore {
         layout_slot_index: u32,
         layout_slot_generation: u8,
     ) -> Option<fragment_tree::FragmentLink> {
-        RowMut::new(&mut self.committed_fragment_links, layout_slot_index as usize)
+        let index = layout_slot_index as usize;
+        if !self
+            .committed_fragment_links
+            .get(index)
+            .is_some_and(|slot| slot.layout_slot_generation == layout_slot_generation && slot.link.is_some())
+        {
+            return None;
+        }
+        RowMut::new(&mut self.committed_fragment_links, index)
             .filter(|slot| slot.layout_slot_generation == layout_slot_generation)
             .and_then(|mut slot| slot.link.take())
     }
 
     pub(crate) fn reset_committed_fragment_link_slot(&mut self, layout_slot_index: u32) {
-        self.committed_fragment_links
-            .set(layout_slot_index as usize, CommittedFragmentLinkSlot::default());
+        let index = layout_slot_index as usize;
+        if self
+            .committed_fragment_links
+            .get(index)
+            .is_some_and(|slot| *slot != CommittedFragmentLinkSlot::default())
+        {
+            self.committed_fragment_links
+                .set(index, CommittedFragmentLinkSlot::default());
+        }
     }
 }
 
@@ -815,9 +849,23 @@ impl LayoutNodeArena {
         store.rows.set(index, PaintableData::default());
         store.side_data[index] = PaintableSideData::default();
         store.committed_side_data.set(index, CommittedSideData::default());
-        store.paint_change_stamps.set(index, PaintChangeStamps::default());
-        store.visual_context_records.set(index, None);
-        set_visual_context_node_handles(&mut store.visual_context_node_handles, index, None);
+        if store
+            .paint_change_stamps
+            .get(index)
+            .is_some_and(|stamps| *stamps != PaintChangeStamps::default())
+        {
+            store.paint_change_stamps.set(index, PaintChangeStamps::default());
+        }
+        if store.visual_context_records.get(index).is_some_and(Option::is_some) {
+            store.visual_context_records.set(index, None);
+        }
+        if store
+            .visual_context_node_handles
+            .get(index)
+            .is_some_and(Option::is_some)
+        {
+            set_visual_context_node_handles(&mut store.visual_context_node_handles, index, None);
+        }
         drop_table(&mut store.stacking_context_entries, index);
         if reset.kind == crate::painting::paintable_data::PaintableRowResetKind::Freed {
             store.image_map_areas.forget(id);
@@ -862,6 +910,14 @@ impl LayoutNodeArena {
             return None;
         }
         let index = id.slot_index() as usize;
+        if self
+            .paintable_rows
+            .visual_context_records
+            .get(index)
+            .is_none_or(Option::is_none)
+        {
+            return None;
+        }
         let record = self
             .paintable_rows
             .visual_context_records
@@ -912,11 +968,15 @@ impl LayoutNodeArena {
         let rows = self.paintable_rows.side_data.len();
         let records = &mut self.paintable_rows.visual_context_records;
         for index in 0..rows {
-            records.set(index, None);
+            if records.get(index).is_some_and(Option::is_some) {
+                records.set(index, None);
+            }
         }
         let handles = &mut self.paintable_rows.visual_context_node_handles;
         for index in 0..rows {
-            set_visual_context_node_handles(handles, index, None);
+            if handles.get(index).is_some_and(Option::is_some) {
+                set_visual_context_node_handles(handles, index, None);
+            }
         }
     }
 
@@ -1137,7 +1197,11 @@ impl LayoutNodeArena {
         row: NodeSlotId,
         inputs: crate::painting::paint_order_plan::PaintOrderInputs,
     ) -> bool {
-        std::mem::replace(&mut self.committed_side_data_mut(row).order_inputs, inputs) != inputs
+        if self.committed_side_data(row).order_inputs == inputs {
+            return false;
+        }
+        self.committed_side_data_mut(row).order_inputs = inputs;
+        true
     }
 
     pub(crate) fn committed_side_data(&self, id: NodeSlotId) -> &CommittedSideData {
