@@ -23,7 +23,7 @@ impl<'heap> DeferGc<'heap> {
         body(&DeferGc::new(vm))
     }
 
-    pub(super) fn of_heap(heap: &'heap Heap) -> Self {
+    pub(crate) fn of_heap(heap: &'heap Heap) -> Self {
         heap.defer_gc();
         Self(heap)
     }

@@ -115,6 +115,8 @@ GC_API void gc_get_layout(GCLayout*, size_t layout_size);
 // region on first use.
 GC_API uintptr_t gc_heap_region_base(void);
 GC_API uintptr_t gc_primitive_storage_cage_base(void);
+// The table of 256-byte block descriptors indexed by (address - heap_region_base) / block_size.
+GC_API void const* gc_block_descriptors(void);
 
 GC_API GCHeap* gc_heap_create(GCGatherRootsCallback, void* context, bool become_thread_default);
 // Finalizes and destroys every remaining cell. Roots created with gc_root_create() must be destroyed first. The final

@@ -212,10 +212,12 @@ public:
     size_t block_count() const;
 
     void did_sweep_blocks_for_allocation(Badge<CellAllocator>, size_t swept_blocks, i64 duration_ns);
+    static i64 sweep_clock_now_ns();
 
     // A sweep runs the destructors of dead cells between these, see will_allocate().
     void will_destroy_swept_cell(Badge<CellAllocator>) { ++m_block_sweeps_in_progress; }
     void did_destroy_swept_cell(Badge<CellAllocator>) { --m_block_sweeps_in_progress; }
+    size_t* block_sweeps_in_progress_ptr(Badge<CellAllocator>) { return &m_block_sweeps_in_progress; }
 
     template<typename Callback>
     void for_each_block(Callback callback)
@@ -358,7 +360,8 @@ private:
     void free_weak_blocks();
     void run_post_gc_tasks();
 
-    bool sweep_next_block();
+    bool sweep_next_block_untimed(size_t& swept_blocks);
+    void record_sweep_duration(i64 duration_ns);
     void did_sweep(size_t swept_blocks, i64 duration_ns);
     void start_incremental_sweep();
     void finish_incremental_sweep();

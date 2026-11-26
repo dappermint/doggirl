@@ -41,6 +41,9 @@
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <setjmp.h>
+#ifdef AK_OS_MACOS
+#    include <time.h>
+#endif
 
 #ifdef HAS_ADDRESS_SANITIZER
 #    include <sanitizer/asan_interface.h>
@@ -52,11 +55,11 @@
 
 namespace GC {
 
-static constexpr size_t GC_MIN_BYTES_THRESHOLD { 32 * 1024 * 1024 };
+static constexpr size_t GC_MIN_BYTES_THRESHOLD { 48 * 1024 * 1024 };
 
 // The share of running time we want to spend collecting. A cycle costs its mark and sweep time and lasts as long as it
 // takes to allocate its budget, so meeting this share takes a budget of allocation_rate * cost * (1 - u) / u.
-static constexpr double GC_TARGET_TIME_FRACTION { 0.1 };
+static constexpr double GC_TARGET_TIME_FRACTION { 0.02 };
 
 // A heap that allocates steadily is collected from the idle timer once its garbage reaches this share of its live
 // size (or GC_MIN_BYTES_THRESHOLD, whichever is more), well before the allocation threshold. Nobody waits for those
@@ -78,7 +81,7 @@ static constexpr size_t GC_LARGE_HEAP_END_BYTES { 512 * 1024 * 1024 };
 
 // OPTIMIZATION: A program that allocates fast and keeps little alive gains from a budget far above the maximum factor,
 //               so the maximum never limits a budget below this.
-static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 256 * 1024 * 1024 };
+static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 128 * 1024 * 1024 };
 
 // NB: Memory that cells own outside the heap (array buffer contents, decoded images) is mostly large, long-lived data,
 //     and allocating more cells does not grow it. Letting it grow the threshold by the growth factor makes a page with
@@ -89,7 +92,7 @@ static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_DENOMINATOR { 10 };
 // The share of the threshold that may be allocated before the sweep that follows a collection has to be done. Until a
 // block is swept, its dead cells keep their slots and whatever memory they own outside the heap, and a program that
 // keeps the event loop busy gives the sweep timer no chance to run, so allocation pays for the sweep as it goes.
-static constexpr size_t GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR { 4 };
+static constexpr size_t GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR { 2 };
 
 static constexpr int GC_INCREMENTAL_SWEEP_INTERVAL_MS = 16;
 static constexpr int GC_INCREMENTAL_SWEEP_SLICE_MS = 5;
@@ -2135,17 +2138,14 @@ void Heap::mark_cell_allocated_during_incremental_sweep(Cell& cell)
 
 void Heap::finalize_unmarked_cells()
 {
-    for_each_block([&](auto& block) {
-        auto* finalize = block.type_info().finalize;
+    for (auto& allocator : m_all_cell_allocators) {
+        auto* finalize = allocator.type_info().finalize;
         if (!finalize)
-            return IterationDecision::Continue;
-        auto& descriptor = block_descriptor_for(&block);
-        for_each_allocated_cell(block, [&](Cell* cell) {
-            if (!is_marked(descriptor, cell))
-                finalize(cell);
-        });
-        return IterationDecision::Continue;
-    });
+            continue;
+        FFI::rust_gc_allocator_finalize_unmarked(
+            allocator.rust_allocator({}),
+            reinterpret_cast<void (*)(void*)>(finalize));
+    }
 }
 
 void Heap::sweep_weak_blocks()
@@ -2180,8 +2180,9 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
         for (auto& allocator : m_all_cell_allocators) {
             auto* rust_allocator = allocator.rust_allocator({});
             FFI::SweepStats stats {};
-            FFI::rust_gc_allocator_start_sweep(rust_allocator);
-            while (FFI::rust_gc_allocator_sweep_next_block(rust_allocator, false, &stats)) { }
+            auto pending = FFI::rust_gc_allocator_start_sweep(rust_allocator);
+            if (pending > 0)
+                FFI::rust_gc_allocator_sweep_blocks(rust_allocator, pending, false, &stats);
             collected_cells += stats.collected_cells;
             live_cells += stats.live_cells;
             collected_cell_bytes += stats.collected_cells * allocator.cell_size();
@@ -2213,20 +2214,34 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
     // from process teardown.
 }
 
+i64 Heap::sweep_clock_now_ns()
+{
+#ifdef AK_OS_MACOS
+    return static_cast<i64>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#else
+    return MonotonicTime::now().nanoseconds();
+#endif
+}
+
 void Heap::sweep_block(HeapBlock& block)
 {
-    auto start_ns = MonotonicTime::now().nanoseconds();
+    auto start_ns = sweep_clock_now_ns();
     FFI::SweepStats stats {};
     FFI::rust_gc_allocator_sweep_pending_block(block.cell_allocator().rust_allocator({}), &block, &stats);
-    did_sweep(stats.swept_blocks, MonotonicTime::now().nanoseconds() - start_ns);
+    did_sweep(stats.swept_blocks, sweep_clock_now_ns() - start_ns);
+}
+
+void Heap::record_sweep_duration(i64 duration_ns)
+{
+    m_sweep_duration_ns += duration_ns;
+    if (m_stats)
+        m_stats->sweep_duration_ns += duration_ns;
 }
 
 void Heap::did_sweep(size_t swept_blocks, i64 duration_ns)
 {
     m_blocks_swept += swept_blocks;
-    m_sweep_duration_ns += duration_ns;
-    if (m_stats)
-        m_stats->sweep_duration_ns += duration_ns;
+    record_sweep_duration(duration_ns);
 }
 
 void Heap::did_sweep_blocks_for_allocation(Badge<CellAllocator>, size_t swept_blocks, i64 duration_ns)
@@ -2235,7 +2250,7 @@ void Heap::did_sweep_blocks_for_allocation(Badge<CellAllocator>, size_t swept_bl
     did_sweep(swept_blocks, m_block_sweeps_in_progress == 0 ? duration_ns : 0);
 }
 
-bool Heap::sweep_next_block()
+bool Heap::sweep_next_block_untimed(size_t& swept_blocks)
 {
     if (!m_incremental_sweep_active)
         return true;
@@ -2245,10 +2260,10 @@ bool Heap::sweep_next_block()
 
     // Find the next allocator that has blocks pending sweep.
     while (auto* allocator = m_allocators_to_sweep.first()) {
-        auto start_ns = MonotonicTime::now().nanoseconds();
         FFI::SweepStats stats {};
         if (FFI::rust_gc_allocator_sweep_next_block(allocator->rust_allocator({}), true, &stats)) {
-            did_sweep(stats.swept_blocks, MonotonicTime::now().nanoseconds() - start_ns);
+            m_blocks_swept += stats.swept_blocks;
+            swept_blocks += stats.swept_blocks;
             if (!allocator->has_blocks_pending_sweep())
                 allocator->m_sweep_list_node.remove();
             return false;
@@ -2328,16 +2343,18 @@ void Heap::finish_pending_incremental_sweep()
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] Finishing pending sweep...");
     size_t blocks_swept = 0;
-    auto start_time = MonotonicTime::now();
+    auto start_ns = sweep_clock_now_ns();
     while (m_incremental_sweep_active) {
-        if (sweep_next_block()) {
-            auto elapsed = MonotonicTime::now() - start_time;
-            record_incremental_sweep_batch(blocks_swept, elapsed.to_microseconds(), true);
+        if (sweep_next_block_untimed(blocks_swept)) {
+            auto elapsed_ns = sweep_clock_now_ns() - start_ns;
+            record_sweep_duration(elapsed_ns);
+            record_incremental_sweep_batch(blocks_swept, elapsed_ns / 1'000, true);
             finish_incremental_sweep();
-            break;
+            return;
         }
-        ++blocks_swept;
     }
+    if (blocks_swept > 0)
+        record_sweep_duration(sweep_clock_now_ns() - start_ns);
 }
 
 void Heap::sweep_in_step_with_allocation()
@@ -2349,26 +2366,51 @@ void Heap::sweep_in_step_with_allocation()
     // allowance comes from the smallest threshold that the cells this collection found alive can give, since the
     // threshold itself is only updated once the sweep is done. A collection that something asked for does not reset
     // the bytes allocated towards the threshold, so this counts from the end of the collection instead.
-    auto smallest_threshold = max(static_cast<size_t>(static_cast<double>(m_marked_cell_bytes) * GC_MIN_GROWTH_FACTOR), GC_MIN_BYTES_THRESHOLD);
+    static_assert(GC_MIN_GROWTH_FACTOR == 2.0);
+    auto smallest_threshold = max(m_marked_cell_bytes * 2, GC_MIN_BYTES_THRESHOLD);
     auto allowance = max(smallest_threshold / GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR, static_cast<size_t>(1));
     auto allocated = min(static_cast<size_t>(m_total_allocated_bytes - m_total_allocated_bytes_at_last_collection), allowance);
-    auto blocks_due = static_cast<size_t>(static_cast<double>(m_blocks_to_sweep) * static_cast<double>(allocated) / static_cast<double>(allowance));
+    auto blocks_due = static_cast<size_t>((static_cast<unsigned __int128>(m_blocks_to_sweep) * allocated) / allowance);
     // NB: Once every block is due, the sweep goes on until it finds nothing left to sweep, which finishes it.
-    auto is_ahead = [&] { return m_blocks_swept >= blocks_due && blocks_due < m_blocks_to_sweep; };
-    if (is_ahead())
+    if (m_blocks_swept >= blocks_due && blocks_due < m_blocks_to_sweep)
         return;
 
+    // Batch at least 16 blocks per allocation-driven sweep step so we amortise clock calls, FFI crossings, and
+    // per-batch bookkeeping across multiple blocks instead of sweeping one block at a time.
+    static constexpr size_t MIN_ALLOCATION_SWEEP_BATCH = 16;
+    bool const finish_all = blocks_due >= m_blocks_to_sweep;
+    size_t const target_swept = finish_all
+        ? NumericLimits<size_t>::max()
+        : min(m_blocks_to_sweep, max(blocks_due, m_blocks_swept + MIN_ALLOCATION_SWEEP_BATCH));
+
     size_t blocks_swept = 0;
-    auto start_time = MonotonicTime::now();
-    while (!is_ahead()) {
-        if (sweep_next_block()) {
-            record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
+    auto start_ns = sweep_clock_now_ns();
+    while (finish_all || m_blocks_swept < target_swept) {
+        auto* allocator = m_allocators_to_sweep.first();
+        if (!allocator) {
+            auto elapsed_ns = sweep_clock_now_ns() - start_ns;
+            record_sweep_duration(elapsed_ns);
+            record_incremental_sweep_batch(blocks_swept, elapsed_ns / 1'000, false);
             finish_incremental_sweep();
             return;
         }
-        ++blocks_swept;
+        size_t const want = finish_all ? NumericLimits<size_t>::max() : (target_swept - m_blocks_swept);
+        FFI::SweepStats stats {};
+        auto swept = FFI::rust_gc_allocator_sweep_blocks(allocator->rust_allocator({}), want, true, &stats);
+        if (swept > 0) {
+            m_blocks_swept += stats.swept_blocks;
+            blocks_swept += stats.swept_blocks;
+        }
+        if (swept < want || !allocator->has_blocks_pending_sweep())
+            allocator->m_sweep_list_node.remove();
+        if (!m_incremental_sweep_active || is_gc_deferred())
+            break;
     }
-    record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
+    if (blocks_swept > 0) {
+        auto elapsed_ns = sweep_clock_now_ns() - start_ns;
+        record_sweep_duration(elapsed_ns);
+        record_incremental_sweep_batch(blocks_swept, elapsed_ns / 1'000, false);
+    }
 }
 
 void Heap::start_incremental_sweep_timer()
@@ -2397,24 +2439,40 @@ void Heap::sweep_on_timer()
 
     size_t blocks_swept = 0;
     bool finished_sweep = false;
-    auto start_time = MonotonicTime::now();
-    auto deadline = start_time + AK::Duration::from_milliseconds(GC_INCREMENTAL_SWEEP_SLICE_MS);
-    while (MonotonicTime::now() < deadline) {
-        if (sweep_next_block()) {
-            auto elapsed = MonotonicTime::now() - start_time;
-            record_incremental_sweep_batch(blocks_swept, elapsed.to_microseconds(), false);
+    auto start_ns = sweep_clock_now_ns();
+    auto deadline_ns = start_ns + static_cast<i64>(GC_INCREMENTAL_SWEEP_SLICE_MS) * 1'000'000;
+    auto now_ns = start_ns;
+    static constexpr size_t TIMER_SWEEP_BATCH = 32;
+    while (now_ns < deadline_ns) {
+        auto* allocator = m_allocators_to_sweep.first();
+        if (!allocator) {
+            now_ns = sweep_clock_now_ns();
+            auto elapsed_ns = now_ns - start_ns;
+            record_sweep_duration(elapsed_ns);
+            record_incremental_sweep_batch(blocks_swept, elapsed_ns / 1'000, false);
             finish_incremental_sweep();
             finished_sweep = true;
             break;
         }
-        ++blocks_swept;
+        FFI::SweepStats stats {};
+        auto swept = FFI::rust_gc_allocator_sweep_blocks(allocator->rust_allocator({}), TIMER_SWEEP_BATCH, true, &stats);
+        if (swept > 0) {
+            m_blocks_swept += stats.swept_blocks;
+            blocks_swept += stats.swept_blocks;
+        }
+        if (swept < TIMER_SWEEP_BATCH || !allocator->has_blocks_pending_sweep())
+            allocator->m_sweep_list_node.remove();
+        if (!m_incremental_sweep_active || is_gc_deferred())
+            break;
+        now_ns = sweep_clock_now_ns();
     }
 
     if (blocks_swept > 0 && !finished_sweep) {
-        auto elapsed = MonotonicTime::now() - start_time;
-        record_incremental_sweep_batch(blocks_swept, elapsed.to_microseconds(), false);
+        auto elapsed_ns = now_ns - start_ns;
+        record_sweep_duration(elapsed_ns);
+        record_incremental_sweep_batch(blocks_swept, elapsed_ns / 1'000, false);
         dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] Timer slice: {} blocks in {}ms",
-            blocks_swept, elapsed.to_milliseconds());
+            blocks_swept, elapsed_ns / 1'000'000);
     }
 }
 
@@ -2483,8 +2541,9 @@ void Heap::idle_gc_on_timer()
 void Heap::limit_gc_bytes_threshold_for_abandoned_object_graph()
 {
     // The threshold came from a live size that still counts the abandoned objects. Left alone, whatever comes next
-    // could allocate that whole budget on top of them.
-    m_gc_bytes_threshold = min(m_gc_bytes_threshold, m_allocated_bytes_since_last_gc + GC_MIN_BYTES_THRESHOLD);
+    // could allocate a very large budget on top of a huge abandoned graph, so cap it to at least the budget floor
+    // without crushing normal active allocation budgets down to GC_MIN_BYTES_THRESHOLD on frequent iframe teardowns.
+    m_gc_bytes_threshold = min(m_gc_bytes_threshold, max(m_allocated_bytes_since_last_gc + GC_MIN_BYTES_THRESHOLD, GC_MAX_BUDGET_FLOOR_BYTES));
 }
 
 void Heap::did_abandon_object_graph()
