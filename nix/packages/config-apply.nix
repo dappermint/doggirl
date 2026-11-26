@@ -224,8 +224,8 @@ writeShellApplication {
         ensure_parent_chain "$profile_config_dir" "$(dirname "$custom_path")" 0700
         ensure_parent_chain "$profile_data_dir" "$(dirname "$custom_path")" 0700
       else
-        profile_config_dir="$config_base/Ladybird/Profiles/$name"
-        profile_data_dir="$data_base/Ladybird/Profiles/$name"
+        profile_config_dir="$config_base/Doggirl/Profiles/$name"
+        profile_data_dir="$data_base/Doggirl/Profiles/$name"
         ensure_parent_chain "$profile_config_dir" "$config_base" 0700
         ensure_parent_chain "$profile_data_dir" "$data_base" 0700
       fi

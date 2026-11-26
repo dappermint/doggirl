@@ -36,9 +36,9 @@ Inside the shell, build and test as usual:
 - `$out/Applications/Doggirl.app` on macOS (with `Info.plist` URL handlers and `app_icon.icns` generated from `UI/Icons/macos/app_icon.iconset`)
 - `$out/share/applications/doggirl.desktop` on Linux
 
-Because Ladybird pins third-party dependencies through `vcpkg.json` plus custom overlay ports (`curl`, `nghttp2`, `ffmpeg`, `skia`, `angle`, `pdfjs`, `llvm-libc`, `wuffs`, `zmij`) and requires Xcode tooling on macOS, wrapping either a locally compiled `Ladybird.app` (`localAppPath`) or a prebuilt store derivation (`unwrappedPackage`) lets `darwin-rebuild switch` stay fast while keeping all launch flags (`--profile`, `--user-agent-preset`, `--disable-features`, etc.) and environment variables (`LIBJS_JIT`, `LIBJS_CODE_FLUSH`, `LIBGC_*`) declarative.
+Because Doggirl pins third-party dependencies through `vcpkg.json` plus custom overlay ports (`curl`, `nghttp2`, `ffmpeg`, `skia`, `angle`, `pdfjs`, `llvm-libc`, `wuffs`, `zmij`) and requires Xcode tooling on macOS, wrapping either a locally compiled `Doggirl.app` (`localAppPath`) or a prebuilt store derivation (`unwrappedPackage`) lets `darwin-rebuild switch` stay fast while keeping all launch flags (`--profile`, `--user-agent-preset`, `--disable-features`, etc.) and environment variables (`LIBJS_JIT`, `LIBJS_CODE_FLUSH`, `LIBGC_*`) declarative.
 
-When neither `localAppPath` nor `unwrappedPackage` is pinned, the launcher checks `DOGGIRL_APP_PATH`, `LADYBIRD_APP_PATH`, `./Build/{distribution,release,debug}/bin/Ladybird.app` and `/Applications/Ladybird.app`.
+When neither `localAppPath` nor `unwrappedPackage` is pinned, the launcher checks `DOGGIRL_APP_PATH`, `LADYBIRD_APP_PATH`, `./Build/{distribution,release,debug}/bin/Doggirl.app` and `/Applications/Doggirl.app`.
 
 ### Offline source-build helper (`lib.mkDoggirlFromSource`)
 
@@ -61,10 +61,10 @@ Verified against `Libraries/LibCore/StandardPaths.cpp`, `Libraries/LibWebView/Pr
 - **Config root**: `~/Library/Preferences` on macOS (unless `XDG_CONFIG_HOME` is set), `~/.config` on Linux
 - **Data root**: `~/Library/Application Support` on macOS (unless `XDG_DATA_HOME` is set), `~/.local/share` on Linux
 - **Named profile files** (`<name>` matching `[a-z0-9_-]+`):
-  - `<configRoot>/Ladybird/Profiles/<name>/Settings.json`
-  - `<configRoot>/Ladybird/Profiles/<name>/Permissions.json`
-  - `<configRoot>/Ladybird/Profiles/<name>/Bookmarks.json`
-  - `<dataRoot>/Ladybird/Profiles/<name>/ContentBlocking/Lists/<identifier>.txt`
+  - `<configRoot>/Doggirl/Profiles/<name>/Settings.json`
+  - `<configRoot>/Doggirl/Profiles/<name>/Permissions.json`
+  - `<configRoot>/Doggirl/Profiles/<name>/Bookmarks.json`
+  - `<dataRoot>/Doggirl/Profiles/<name>/ContentBlocking/Lists/<identifier>.txt`
 - **Default profile name**: local development builds (`LADYBIRD_VERSION` unset) use `developer`; release builds (`LADYBIRD_VERSION` set) use `default`
 - **Custom path profile** (`--profile-path /abs/path`):
   - `<path>/config/{Settings,Permissions,Bookmarks}.json`
@@ -92,7 +92,7 @@ Add the flake input and import `doggirl.darwinModules.default`:
 
           programs.doggirl = {
             enable = true;
-            localAppPath = "/Volumes/dev/ladybird/Build/distribution/bin/Ladybird.app";
+            localAppPath = "/Applications/Doggirl.app";
             appName = "Doggirl";
             defaultProfile = "developer";
             manageMode = "merge"; # or "overwrite" / "symlink"

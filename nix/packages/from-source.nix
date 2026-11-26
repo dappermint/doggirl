@@ -110,6 +110,6 @@ stdenv.mkDerivation {
       "aarch64-linux"
       "x86_64-linux"
     ];
-    mainProgram = "Ladybird";
+    mainProgram = "Doggirl";
   };
 }
