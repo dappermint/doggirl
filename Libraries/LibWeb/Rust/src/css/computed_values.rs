@@ -3037,6 +3037,51 @@ pub(crate) fn all_transition_longhands(writing_mode: u8, direction: u8) -> &'sta
     &TABLE.longhands[usize::from(writing_mode) * crate::css::style_compute::DIRECTION_COUNT + usize::from(direction)]
 }
 
+struct AllUniqueTransitionLonghands {
+    longhands: [[u16; ALL_TRANSITION_LONGHAND_COUNT];
+        crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
+    lengths: [usize; crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
+}
+
+impl AllUniqueTransitionLonghands {
+    const fn compute() -> Self {
+        use crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID;
+        use crate::css::style_compute::{DIRECTION_COUNT, WRITING_MODE_COUNT};
+        let mut longhands = [[0; ALL_TRANSITION_LONGHAND_COUNT]; WRITING_MODE_COUNT * DIRECTION_COUNT];
+        let mut lengths = [0; WRITING_MODE_COUNT * DIRECTION_COUNT];
+        let mut slot = 0;
+        while slot < WRITING_MODE_COUNT * DIRECTION_COUNT {
+            let source = &ALL_TRANSITION_LONGHANDS.longhands[slot];
+            let target = &mut longhands[slot];
+            let mut seen = [false; LAST_LONGHAND_PROPERTY_ID as usize + 1];
+            let mut index = 0;
+            let mut written = 0;
+            while index < ALL_TRANSITION_LONGHAND_COUNT {
+                let property_id = source[index];
+                if !seen[property_id as usize] {
+                    seen[property_id as usize] = true;
+                    target[written] = property_id;
+                    written += 1;
+                }
+                index += 1;
+            }
+            lengths[slot] = written;
+            slot += 1;
+        }
+        Self { longhands, lengths }
+    }
+}
+
+const ALL_UNIQUE_TRANSITION_LONGHANDS: AllUniqueTransitionLonghands = AllUniqueTransitionLonghands::compute();
+
+/// The deduplicated physical longhands `transition-property: all` names under `writing_mode` and `direction`,
+/// preserving first-occurrence order as `transition_entries` does.
+pub(crate) fn all_unique_transition_longhands(writing_mode: u8, direction: u8) -> &'static [u16] {
+    const TABLE: &AllUniqueTransitionLonghands = &ALL_UNIQUE_TRANSITION_LONGHANDS;
+    let slot = usize::from(writing_mode) * crate::css::style_compute::DIRECTION_COUNT + usize::from(direction);
+    &TABLE.longhands[slot][..TABLE.lengths[slot]]
+}
+
 /// The computed style groups each longhand reaches, a table the compiler computes from the property metadata.
 pub(crate) struct StyleGroupMasks {
     /// Per longhand, the groups a change of its specified winner may change.
