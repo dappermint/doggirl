@@ -667,6 +667,9 @@ impl LinksHeldApartFromTheirContainingBlocks {
     }
 
     pub(super) fn remove(&mut self, node: NodeSlotId) {
+        if self.containing_block_of.is_empty() {
+            return;
+        }
         if let Some(containing_block) = self.containing_block_of.remove(&node) {
             self.remove_from(containing_block, node);
         }

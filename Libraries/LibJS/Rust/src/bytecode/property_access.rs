@@ -349,6 +349,17 @@ pub fn get_by_id(
 /// missing property.
 #[inline(always)]
 pub fn cached_property_slot(object: Gc<Object>, cache: &PropertyLookupCache, cache_key: u64) -> Option<Value> {
+    cached_property_slot_and_getter_validated(object, cache, cache_key).map(|(value, _)| value)
+}
+
+/// Like `cached_property_slot`, and also reports whether the matched entry has validated a `DirectGetterFunction`
+/// equal to the slot's accessor getter.
+#[inline(always)]
+pub fn cached_property_slot_and_getter_validated(
+    object: Gc<Object>,
+    cache: &PropertyLookupCache,
+    cache_key: u64,
+) -> Option<(Value, bool)> {
     let shape = object.shape();
     for entry in cache.entry_slots_for_shape(shape, cache_key) {
         // NB: Only the caches of keyed accesses have keys, and named accesses pass a constant 0.
@@ -371,22 +382,114 @@ pub fn cached_property_slot(object: Gc<Object>, cache: &PropertyLookupCache, cac
                 {
                     continue;
                 }
-                return Some(Value::UNDEFINED);
+                return Some((Value::UNDEFINED, false));
             }
             PropertyLookupCacheEntryType::GetOwnProperty
             | PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
-                let Some(prototype) = entry.prototype.get() else {
-                    return Some(object.get_direct(entry.property_offset.get()));
+                let value = match entry.prototype.get() {
+                    Some(prototype) => {
+                        if !prototype_chain_is_valid() {
+                            continue;
+                        }
+                        prototype.get_direct(entry.property_offset.get())
+                    }
+                    None => object.get_direct(entry.property_offset.get()),
                 };
-                if !prototype_chain_is_valid() {
-                    continue;
-                }
-                return Some(prototype.get_direct(entry.property_offset.get()));
+                let direct_getter_validated = value.is_accessor()
+                    && entry
+                        .getter
+                        .get()
+                        .is_some_and(|cached_getter| value.as_accessor().getter() == Some(cached_getter));
+                return Some((value, direct_getter_validated));
             }
             _ => continue,
         }
     }
     None
+}
+
+/// Looks up a string property in the VM's keyed property lookup cache for a megamorphic named get, remembering a hit
+/// in `site_cache` as `get_by_value_with_keyed_cache` does.
+#[inline]
+pub fn lookup_vm_keyed_cache_and_remember(
+    vm: &Vm,
+    base_object: Gc<Object>,
+    property_key: &PropertyKey,
+    site_cache: &PropertyLookupCache,
+) -> Option<Value> {
+    if !property_key.is_string() || !base_object.is_cacheable_across_realms() {
+        return None;
+    }
+    let property_name = property_key.as_string();
+    let shape = base_object.shape();
+    let keyed_property_lookup_cache = vm.keyed_property_lookup_cache();
+    let entry_index = KeyedPropertyLookupCache::entry_index_for(shape, property_name);
+    let entry = keyed_property_lookup_cache.lookup(entry_index, shape, property_name)?;
+    if entry.shape_key() != Some(ShapeKey::of(shape)) {
+        return None;
+    }
+    let prototype_chain_validity_is_valid = entry
+        .prototype_chain_validity
+        .is_some_and(|validity| validity.is_valid());
+    match entry.entry_type {
+        PropertyLookupCacheEntryType::GetOwnProperty => {
+            remember_keyed_lookup(site_cache, 0, &entry);
+            Some(base_object.get_direct(entry.property_offset))
+        }
+        PropertyLookupCacheEntryType::GetPropertyInPrototypeChain if prototype_chain_validity_is_valid => {
+            remember_keyed_lookup(site_cache, 0, &entry);
+            let prototype = entry.prototype.expect("an inherited property has a holder");
+            Some(prototype.get_direct(entry.property_offset))
+        }
+        PropertyLookupCacheEntryType::GetMissingProperty
+            if base_object.is_cacheable_for_property_absence()
+                && (shape.prototype().is_none() || prototype_chain_validity_is_valid) =>
+        {
+            remember_keyed_lookup(site_cache, 0, &entry);
+            Some(Value::UNDEFINED)
+        }
+        _ => None,
+    }
+}
+
+/// Records a validated `DirectGetterFunction` on the entry of `cache` matching `object`'s shape once it has returned
+/// for an object of that shape.
+pub fn record_validated_direct_getter(
+    object: Gc<Object>,
+    cache: &PropertyLookupCache,
+    getter: Gc<crate::layout::function_object::FunctionObject>,
+) {
+    let shape = object.shape();
+    let shape_key = Some(ShapeKey::of(shape));
+    for entry in cache.entry_slots_for_shape(shape, 0) {
+        if entry.shape_key() != shape_key {
+            continue;
+        }
+        match entry.entry_type.get() {
+            PropertyLookupCacheEntryType::GetOwnProperty
+            | PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
+                let holder = match entry.prototype.get() {
+                    Some(prototype) => {
+                        if !entry
+                            .prototype_chain_validity
+                            .get()
+                            .is_some_and(|validity| validity.is_valid())
+                        {
+                            continue;
+                        }
+                        prototype
+                    }
+                    None => object,
+                };
+                let value = holder.get_direct(entry.property_offset.get());
+                if value.is_accessor() && value.as_accessor().getter() == Some(getter) {
+                    entry.getter.set(Some(getter));
+                    return;
+                }
+            }
+            _ => continue,
+        }
+    }
 }
 
 /// Gets the property from `base_obj` through `cache`, filling the cache on a miss. `cache_key` is the key the cache's

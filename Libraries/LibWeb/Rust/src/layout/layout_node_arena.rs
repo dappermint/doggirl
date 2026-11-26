@@ -828,20 +828,35 @@ impl FreedSubtree {
     /// Destroys the freed rows' shells, then what the host holds for the rows by slot.
     pub(crate) fn destroy_shells_and_invoke_callbacks(self, main_thread: &crate::stage::MainThread) {
         if let Some(host_tables) = main_thread.host_tables() {
-            for &slot in &self.rows {
-                let shell = host_tables.shells.borrow_mut().remove(&slot);
-                if let Some(shell) = shell {
-                    crate::layout::tree_mutation::destroy_shell(main_thread, shell.as_ptr());
+            if !host_tables.shells.borrow().is_empty() {
+                for &slot in &self.rows {
+                    let shell = host_tables.shells.borrow_mut().remove(&slot);
+                    if let Some(shell) = shell {
+                        crate::layout::tree_mutation::destroy_shell(main_thread, shell.as_ptr());
+                    }
                 }
             }
-            for &slot in &self.rows {
-                host_tables.rows_with_layer_image_paint_facts.borrow_mut().remove(&slot);
-                let provider = host_tables.owned_image_providers.borrow_mut().remove(&slot);
-                if let Some(provider) = provider {
-                    crate::layout::tree_mutation::destroy_owned_image_provider(main_thread, provider);
+            if !host_tables.rows_with_layer_image_paint_facts.borrow().is_empty() {
+                let mut rows = host_tables.rows_with_layer_image_paint_facts.borrow_mut();
+                for &slot in &self.rows {
+                    rows.remove(&slot);
                 }
-                let observers = host_tables.replace_image_observers(slot, std::ptr::null_mut());
-                crate::layout::tree_mutation::destroy_image_observers(main_thread, observers);
+            }
+            if !host_tables.owned_image_providers.borrow().is_empty() {
+                for &slot in &self.rows {
+                    let provider = host_tables.owned_image_providers.borrow_mut().remove(&slot);
+                    if let Some(provider) = provider {
+                        crate::layout::tree_mutation::destroy_owned_image_provider(main_thread, provider);
+                    }
+                }
+            }
+            if !host_tables.image_observer_sets.borrow().is_empty() {
+                for &slot in &self.rows {
+                    let observers = host_tables.replace_image_observers(slot, std::ptr::null_mut());
+                    if !observers.is_null() {
+                        crate::layout::tree_mutation::destroy_image_observers(main_thread, observers);
+                    }
+                }
             }
         }
         for reset in self.paintable_row_resets {
@@ -1763,7 +1778,9 @@ impl LayoutNodeArena {
             if host_pinned_style_record != 0 {
                 arena_pinned_style_records.push(host_pinned_style_record);
             }
-            if let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot) {
+            if !self.derived_styles_shown_before_host_installs.is_empty()
+                && let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot)
+            {
                 arena_pinned_style_records.push(shown.record);
             }
             self.unlink_children_of_node_being_freed(slot);
@@ -1817,8 +1834,12 @@ impl LayoutNodeArena {
         if let Some(reset) = paintable_row_reset {
             self.paintable_row_freed(reset);
         }
-        self.inline_boxes_lifted_out_of.remove(&id);
-        self.out_of_flow_positioning_contained.remove(&id);
+        if !self.inline_boxes_lifted_out_of.is_empty() {
+            self.inline_boxes_lifted_out_of.remove(&id);
+        }
+        if !self.out_of_flow_positioning_contained.is_empty() {
+            self.out_of_flow_positioning_contained.remove(&id);
+        }
         if !self.rows_positioned_against_implicit_anchor.is_empty() {
             self.rows_positioned_against_implicit_anchor.remove(&id);
         }
@@ -1839,7 +1860,9 @@ impl LayoutNodeArena {
         self.links_held_apart_from_their_containing_blocks.remove(id);
         self.paintable_rows.reset_committed_fragment_link_slot(index);
         self.text_slots.reset(index as usize);
-        self.text_nodes_enrolled_for_content_sync.remove(&id);
+        if !self.text_nodes_enrolled_for_content_sync.is_empty() {
+            self.text_nodes_enrolled_for_content_sync.remove(&id);
+        }
         if self
             .replaced_content_facts
             .get(index as usize)
@@ -1847,32 +1870,41 @@ impl LayoutNodeArena {
         {
             self.replaced_content_facts[index as usize] = ReplacedContentFactsSlot::default();
         }
-        self.owned_image_natural_sizes.remove(&id);
-        self.owned_image_providers.remove(&id);
-        self.display_contents_text_wrappers.remove(&id);
+        if !self.owned_image_natural_sizes.is_empty() {
+            self.owned_image_natural_sizes.remove(&id);
+        }
+        if !self.owned_image_providers.is_empty() {
+            self.owned_image_providers.remove(&id);
+        }
+        if !self.display_contents_text_wrappers.is_empty() {
+            self.display_contents_text_wrappers.remove(&id);
+        }
         self.memo_invalidations.note_slot_freed(index);
         self.remove_layout_update_flag_node(id);
-        self.math_layout_kinds.remove(&id);
-        if self.replaced_paint_facts.contains_key(&id) {
+        if !self.math_layout_kinds.is_empty() {
+            self.math_layout_kinds.remove(&id);
+        }
+        if !self.replaced_paint_facts.is_empty() && self.replaced_paint_facts.contains_key(&id) {
             Arc::make_mut(&mut self.replaced_paint_facts).remove(&id);
             self.paint_fact_writes += 1;
         }
-        if self.layer_image_paint_facts.contains_key(&id) {
+        if !self.layer_image_paint_facts.is_empty() && self.layer_image_paint_facts.contains_key(&id) {
             Arc::make_mut(&mut self.layer_image_paint_facts).remove(&id);
             self.paint_fact_writes += 1;
         }
         self.svg_paint_resources.forget_slot(id);
         for highlight in crate::painting::selection::HighlightPseudoElement::ALL {
             let styles = self.paint_state.highlight_pseudo_styles_mut(highlight);
-            if styles.contains_key(&id) {
+            if !styles.is_empty() && styles.contains_key(&id) {
                 Arc::make_mut(styles).remove(&id);
             }
         }
-        if self
-            .paint_state
-            .custom_highlight_pseudo_styles
-            .values()
-            .any(|styles| styles.contains_key(&id))
+        if !self.paint_state.custom_highlight_pseudo_styles.is_empty()
+            && self
+                .paint_state
+                .custom_highlight_pseudo_styles
+                .values()
+                .any(|styles| styles.contains_key(&id))
         {
             let table = Arc::make_mut(&mut self.paint_state.custom_highlight_pseudo_styles);
             for styles in table.values_mut() {
@@ -3574,10 +3606,13 @@ impl LayoutNodeArena {
         answer
     }
 
-    pub(crate) fn svg_attribute_facts(&self, id: NodeSlotId) -> super::svg_formatting_context::FfiSvgAttributeFacts {
+    pub(crate) fn svg_attribute_facts(&self, id: NodeSlotId) -> &super::svg_formatting_context::FfiSvgAttributeFacts {
+        if self.style_node_tables.svg_attribute_facts.is_empty() {
+            return &super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT;
+        }
         match self.node_style_node(id) {
             Some(style_node) => self.style_node_svg_attribute_facts(style_node),
-            None => Default::default(),
+            None => &super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT,
         }
     }
 
@@ -3587,17 +3622,22 @@ impl LayoutNodeArena {
     pub(crate) fn style_node_svg_attribute_facts(
         &self,
         style_node: StyleNodeID,
-    ) -> super::svg_formatting_context::FfiSvgAttributeFacts {
+    ) -> &super::svg_formatting_context::FfiSvgAttributeFacts {
+        if self.style_node_tables.svg_attribute_facts.is_empty() {
+            return &super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT;
+        }
         self.style_node_tables
             .svg_attribute_facts
             .get(&style_node)
-            .copied()
-            .unwrap_or_default()
+            .unwrap_or(&super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT)
     }
 
     /// The parsed MathML attributes of the element a row is built for. A row built for no MathML element answers
     /// with the default facts, in which every attribute is absent.
     pub(crate) fn math_attribute_facts(&self, id: NodeSlotId) -> super::math_formatting_context::FfiMathAttributeFacts {
+        if self.style_node_tables.math_attribute_facts.is_empty() {
+            return Default::default();
+        }
         self.dom_node_style_node(id)
             .and_then(|style_node| self.style_node_tables.math_attribute_facts.get(&style_node).copied())
             .unwrap_or_default()
@@ -3617,6 +3657,9 @@ impl LayoutNodeArena {
         &self,
         id: NodeSlotId,
     ) -> Option<std::sync::Arc<[super::svg_formatting_context::FfiFloatPoint]>> {
+        if self.style_node_tables.svg_points.is_empty() {
+            return None;
+        }
         self.style_node_svg_points(self.node_style_node(id)?)
     }
 
@@ -3624,6 +3667,9 @@ impl LayoutNodeArena {
         &self,
         style_node: StyleNodeID,
     ) -> Option<std::sync::Arc<[super::svg_formatting_context::FfiFloatPoint]>> {
+        if self.style_node_tables.svg_points.is_empty() {
+            return None;
+        }
         self.style_node_tables.svg_points.get(&style_node).cloned()
     }
 
@@ -3631,6 +3677,9 @@ impl LayoutNodeArena {
         &self,
         id: NodeSlotId,
     ) -> Option<std::sync::Arc<[super::svg_formatting_context::FfiSvgTextPosition]>> {
+        if self.style_node_tables.svg_text_positions.is_empty() {
+            return None;
+        }
         self.style_node_tables
             .svg_text_positions
             .get(&self.node_style_node(id)?)
@@ -5082,6 +5131,9 @@ impl LayoutNodeArena {
 
     fn remove_layout_update_flag_node(&mut self, node: NodeSlotId) {
         let indices = &mut self.layout_update_flag_node_indices;
+        if indices.is_empty() {
+            return;
+        }
         let Some(index) = indices.remove(&node) else {
             return;
         };
