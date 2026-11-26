@@ -9,8 +9,8 @@
 
 use super::super::custom_property_cascade::{
     PreparedCustomFunctions, SubstitutionAttributes, SubstitutionInputs, engine_resolution_context,
-    substitute_against_stores, value_calls_custom_functions, value_reads_attributes, value_reads_conditions,
-    value_reads_inherited_values, value_reads_substitution_subject,
+    substitute_against_stores_with_token_cache, value_calls_custom_functions, value_reads_attributes,
+    value_reads_conditions, value_reads_inherited_values, value_reads_substitution_subject,
 };
 use super::super::*;
 use crate::css::cascaded_properties::resolve_declared_custom_properties;
@@ -39,9 +39,23 @@ pub(in crate::css::style) struct SubstitutionCache {
     /// references resolve to, which elements holding stores of their own still share. Every
     /// entry is made alongside one of `by_stores`, whose stores keep those values alive.
     by_references: HashMap<ReferencesKey, RetainedStyleValueData>,
+    /// Tokenized component values reused across all substitutions on this style thread.
+    token_cache: crate::css::custom_properties::CustomPropertyTokenCache,
+    /// Per-thread fly-string lookup cache to avoid global fly-string table contention on repeated custom property names.
+    fly_strings: crate::fast_hash::FastMap<Box<[u16]>, ak::Utf16FlyString>,
 }
 
 impl SubstitutionCache {
+    fn intern_name_raw(&mut self, name: &[u16]) -> usize {
+        if let Some(fly) = self.fly_strings.get(name) {
+            return fly.raw_identity();
+        }
+        let fly = ak::Utf16FlyString::from_utf16(name);
+        let raw = fly.raw_identity();
+        self.fly_strings.insert(name.into(), fly);
+        raw
+    }
+
     fn insert_by_stores(
         &mut self,
         key: (usize, u16, usize, usize),
@@ -459,10 +473,12 @@ impl RetainedState {
             .flatten()
             .filter(|(_, all_visible)| *all_visible)
             .and_then(|(names, _)| {
+                let mut substitutions = stores.substitutions.borrow_mut();
                 names
                     .map(|name| {
                         stores.own.map_or(Some(0), |store| {
-                            store.resolved_value_identity(&ak::Utf16FlyString::from_utf16(name))
+                            let raw_name = substitutions.intern_name_raw(name);
+                            store.resolved_value_identity_raw(raw_name)
                         })
                     })
                     .collect::<Option<smallvec::SmallVec<[usize; 4]>>>()
@@ -478,13 +494,16 @@ impl RetainedState {
                 .insert_by_stores(key, stores, substituted.clone());
             return substituted;
         }
-        let substituted = self.substitute_uncached(
+        let token_cache = std::mem::take(&mut stores.substitutions.borrow_mut().token_cache);
+        let (substituted, token_cache) = self.substitute_uncached(
             stores.own.map(Arc::as_ref),
             stores.inherited.map(Arc::as_ref),
             property,
             written,
+            token_cache,
         );
         let mut substitutions = stores.substitutions.borrow_mut();
+        substitutions.token_cache = token_cache;
         substitutions.insert_by_stores(key, stores, substituted.clone());
         if let Some(references) = references {
             substitutions.by_references.insert(references, substituted.clone());
@@ -498,7 +517,11 @@ impl RetainedState {
         inheritance_store: Option<&CustomPropertyStore>,
         property: u16,
         written: &RetainedStyleValueData,
-    ) -> RetainedStyleValueData {
+        token_cache: crate::css::custom_properties::CustomPropertyTokenCache,
+    ) -> (
+        RetainedStyleValueData,
+        crate::css::custom_properties::CustomPropertyTokenCache,
+    ) {
         let inputs = SubstitutionInputs {
             document: &self.document_style_computation_inputs,
             media: &self.document_media,
@@ -507,7 +530,15 @@ impl RetainedState {
             style_query_references: None,
             functions: None,
         };
-        substitute_against_stores(store, inheritance_store, &inputs, property, &[], written)
+        substitute_against_stores_with_token_cache(
+            store,
+            inheritance_store,
+            &inputs,
+            property,
+            &[],
+            written,
+            token_cache,
+        )
     }
 
     /// The engine: what a written value reading the element itself through `attr()`, `if()` or a
@@ -542,13 +573,17 @@ impl RetainedState {
             style_query_references: None,
             functions: functions.as_ref(),
         };
-        substitute_against_stores(
+        let token_cache = std::mem::take(&mut stores.substitutions.borrow_mut().token_cache);
+        let (substituted, token_cache) = substitute_against_stores_with_token_cache(
             stores.own.map(Arc::as_ref),
             stores.inherited.map(Arc::as_ref),
             &inputs,
             property,
             &[],
             written,
-        )
+            token_cache,
+        );
+        stores.substitutions.borrow_mut().token_cache = token_cache;
+        substituted
     }
 }

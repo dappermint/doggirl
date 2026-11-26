@@ -74,9 +74,8 @@ impl StyleEngine {
     fn run_style_update_with_clock(
         &mut self,
         root: StyleNodeID,
-        mut emit: impl FnMut(&[PublishedStyleDeltaRecord]),
         clock: &mut TransactionClock,
-    ) {
+    ) -> Vec<PublishedStyleDeltaRecord> {
         self.reclaim_unreachable_computed_records();
         for (node, input) in std::mem::take(&mut self.host.deferred_element_style_inputs) {
             self.host.element_inputs.note_style_input(
@@ -114,17 +113,27 @@ impl StyleEngine {
         self.own_from_the_start(root);
         let rows = self.install_restyled(root);
         self.release_transaction_and_sweep_atoms(transaction);
-        if !rows.is_empty() {
-            emit(&rows);
-        }
         clock.enter(Counter::TransactionRemainderMicroseconds, &self.retained.counters);
+        rows
     }
 }
 
 impl StyleEngine {
-    pub fn run_style_update(&mut self, root: StyleNodeID, emit: impl FnMut(&[PublishedStyleDeltaRecord])) {
+    pub(crate) fn run_style_update_collecting(&mut self, root: StyleNodeID) -> Vec<PublishedStyleDeltaRecord> {
         let mut clock = TransactionClock::new();
-        self.run_style_update_with_clock(root, emit, &mut clock);
+        let rows = self.run_style_update_with_clock(root, &mut clock);
+        // Include transaction-local destruction.
+        clock.finish(&self.retained.counters);
+        rows
+    }
+
+    #[cfg(test)]
+    pub fn run_style_update(&mut self, root: StyleNodeID, mut emit: impl FnMut(&[PublishedStyleDeltaRecord])) {
+        let mut clock = TransactionClock::new();
+        let rows = self.run_style_update_with_clock(root, &mut clock);
+        if !rows.is_empty() {
+            emit(&rows);
+        }
         // Include transaction-local destruction.
         clock.finish(&self.retained.counters);
     }

@@ -135,6 +135,16 @@ impl DocumentAnimations {
         self.associated.alive()
     }
 
+    /// Whether the document has neither associated animations nor provisional transitions.
+    pub(crate) fn has_no_animations_or_provisional_transitions(&self) -> bool {
+        self.associated.entry_count() == 0 && self.provisional_transitions.is_empty()
+    }
+
+    /// Whether the document has any provisional transitions in the current stabilization epoch.
+    pub(crate) fn has_any_provisional_transitions(&self) -> bool {
+        !self.provisional_transitions.is_empty()
+    }
+
     /// The effects whose animated style the next animated style update samples.
     pub(crate) fn needing_animated_style_update(&mut self) -> &mut WeakEffectSet {
         &mut self.needing_animated_style_update

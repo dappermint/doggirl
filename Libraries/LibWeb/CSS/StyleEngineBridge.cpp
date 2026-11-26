@@ -189,7 +189,7 @@ void StyleEngine::set_element_inline_style_properties(StyleNodeID node, Parser::
 
 void StyleEngine::set_element_presentational_hint_properties(StyleNodeID node, StyleEngineFFI::FfiElementDeclarationKind kind, ReadonlySpan<StyleProperty> properties)
 {
-    Vector<Parser::ValueParserFFI::FfiDeclaredProperty> declarations;
+    Vector<Parser::ValueParserFFI::FfiDeclaredProperty, 16> declarations;
     declarations.ensure_capacity(properties.size());
     for (auto const& property : properties) {
         declarations.unchecked_append({

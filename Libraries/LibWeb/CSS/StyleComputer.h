@@ -177,6 +177,19 @@ public:
     void record_transition_stabilization_baseline(DOM::AbstractElement, InstalledStyle const& before_change_style) const;
     // Keeps `before_change_style` that way where the element's style scope can run a later pass at all.
     void record_transition_baseline_for_later_passes(DOM::AbstractElement, InstalledStyle const& before_change_style) const;
+    struct PendingTransitionOverlay {
+        DOM::AbstractElement abstract_element;
+        NonnullRefPtr<ComputedStyleWorkingSet> new_style;
+
+        void visit_edges(GC::Cell::Visitor&) const;
+    };
+    // Runs the decision and sampling half of the transition step for an installed record, returning the new animated
+    // style if its overlay differs from the installed record and needs publication. Caller must bracket with
+    // begin_style_update() / end_style_update().
+    [[nodiscard]] RefPtr<ComputedStyleWorkingSet> prepare_transition_step_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement, InstalledStyle const& before_change_style) const;
+    // Publishes a batch of pending transition overlays in a single style-engine call, refreshing each element's
+    // computed style and layout node and writing its per-element invalidation to `invalidations_out`.
+    void publish_pending_transition_overlays(Layout::BegunRead const& read, ReadonlySpan<PendingTransitionOverlay>, Span<RequiredInvalidationAfterStyleChange> invalidations_out) const;
     // Runs the whole transition step for an installed record, against the record the element moved away from.
     // Returns what publishing a started transition's values invalidates, which the caller reacts to like to the rest
     // of the style change.

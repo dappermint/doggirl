@@ -1584,28 +1584,47 @@ pub extern "C" fn style_engine_counter(
     name.as_ptr()
 }
 
+pub(crate) struct TransitionRecordPair {
+    pub(crate) before: *const c_void,
+    pub(crate) after: *const c_void,
+}
+
 /// Decides what the transition step of the target `input` names, which holds the transitions `existing`, does to its
-/// transitions, as the target's style changes from the record `before` to the record `after` it installed, and hands
+/// transitions, as the target's style changes from `records.before` to `records.after` that it installed, and hands
 /// `on_actions` one action per property it decided over. The style update the host drains decided the step beside the
 /// row of an element whose step nothing but the engine's records decides; any other the render owner decides, reading
 /// the transform reference box of the target's element's box as it does.
 ///
 /// # Safety
 ///
-/// `before` and `after` must be records the host holds. The values the actions point at live until `on_actions`
-/// returns.
+/// `records.before` and `records.after` must be records the host holds. The values the actions point at live until
+/// `on_actions` returns.
 pub(crate) unsafe fn decide_transitions(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
-    before: *const c_void,
-    after: *const c_void,
+    records: TransitionRecordPair,
     input: &FfiTransitionInput,
     existing: &[crate::css::transition::FfiExistingTransition],
+    no_ancestor_animations: bool,
     mut on_actions: impl FnMut(&[FfiTransitionAction]),
 ) {
+    if existing.is_empty() && !records.before.is_null() && !records.after.is_null() {
+        // SAFETY: Guaranteed by the caller: `records.after` is a live host record.
+        let after_ref = unsafe { &*records.after.cast::<crate::css::style::pipeline::Record>() };
+        let after_base = after_ref
+            .sample_of_animations()
+            .map_or(after_ref, |sample| &sample.base);
+        let after_longhands = crate::css::style::ViewLonghands::of_record(after_base);
+        if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_longhands)
+            || (no_ancestor_animations && records.before == records.after && after_ref.sample_of_animations().is_none())
+        {
+            on_actions(&[]);
+            return;
+        }
+    }
     // SAFETY: Guaranteed by the caller.
-    let (Some(before), Some(after)) = (unsafe { super::bridge::retain_host_record(before) }, unsafe {
-        super::bridge::retain_host_record(after)
+    let (Some(before), Some(after)) = (unsafe { super::bridge::retain_host_record(records.before) }, unsafe {
+        super::bridge::retain_host_record(records.after)
     }) else {
         debug_assert!(false, "a transition step decides over two records");
         return;
@@ -1621,6 +1640,15 @@ pub(crate) unsafe fn decide_transitions(
         && host.answer_decided_transition_step(input.target_node, &decision, existing, &mut on_actions)
     {
         return;
+    }
+    if existing.is_empty() {
+        let after_view = crate::css::style::StyleRecordView::of_host_record(&decision.after);
+        if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_view.longhands())
+            || (no_ancestor_animations && decision.is_noop_without_engine())
+        {
+            on_actions(&[]);
+            return;
+        }
     }
     let element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,

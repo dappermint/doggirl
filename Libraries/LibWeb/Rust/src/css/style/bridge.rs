@@ -1701,13 +1701,10 @@ pub(crate) unsafe fn run_style_update(
         )
     };
     engine.document_style_computation_inputs = computation_inputs;
-    let mut output = FfiStyleUpdateOutput::default();
-    engine.run_style_update(root, |answers| {
-        assert!(output.answers.is_empty(), "a style update emitted more than one batch");
-        output.answers.extend_from_slice(answers);
-    });
-    output.reclaimed_style_atoms = std::mem::take(&mut engine.host.reclaimed_style_atoms);
-    output
+    FfiStyleUpdateOutput {
+        answers: engine.run_style_update_collecting(root),
+        reclaimed_style_atoms: std::mem::take(&mut engine.host.reclaimed_style_atoms),
+    }
 }
 
 impl FfiStyleUpdateOutput {

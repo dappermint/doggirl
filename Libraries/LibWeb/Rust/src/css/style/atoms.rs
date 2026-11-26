@@ -146,6 +146,8 @@ struct AtomIndex {
     /// The slots, by size: each is twice the one before, and the last made is the one in use.
     generations: [OnceLock<Box<[AtomIndexSlot]>>; 32],
     current: AtomicUsize,
+    /// Odd while `lay_out()` is clearing and repopulating slots; even otherwise.
+    layout_epoch: AtomicUsize,
     /// How many slots hold a key, and how many of those keys have an atom. Only the lock's holder reads these.
     used: AtomicUsize,
     live: AtomicUsize,
@@ -156,6 +158,7 @@ impl Default for AtomIndex {
         Self {
             generations: std::array::from_fn(|_| OnceLock::new()),
             current: AtomicUsize::new(usize::MAX),
+            layout_epoch: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
             live: AtomicUsize::new(0),
         }
@@ -192,6 +195,19 @@ impl AtomIndex {
             }
         }
         None
+    }
+
+    fn get_consistent(&self, key: u64) -> Result<Option<StyleAtomID>, ()> {
+        let before = self.layout_epoch.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return Err(());
+        }
+        let found = self.get(key);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.layout_epoch.load(Ordering::Relaxed) != before {
+            return Err(());
+        }
+        Ok(found)
     }
 
     /// Note the atom of `key`, which has none. Only the lock's holder calls this.
@@ -251,6 +267,7 @@ impl AtomIndex {
     /// Have the slots hold nothing but the keys with an atom, with room for `wanted` of them: in the slots in use where
     /// they fit in a quarter of those, as a reader that misses meanwhile goes on to the lock, or in twice as many.
     fn lay_out(&self, wanted: usize) {
+        self.layout_epoch.fetch_add(1, Ordering::SeqCst);
         let current = self.current.load(Ordering::Relaxed);
         let live: Vec<(u64, u32)> = self.slots().map_or_else(Vec::new, |slots| {
             slots
@@ -281,6 +298,7 @@ impl AtomIndex {
         for (key, atom) in live {
             self.insert(key, StyleAtomID(atom));
         }
+        self.layout_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -575,6 +593,19 @@ impl ProcessAtoms {
             }
         }
         self.lock().ascii_lowercase(atom)
+    }
+
+    /// The live atom of `name` qualified by `namespace`, without taking the table's lock unless the index is mid-layout.
+    pub(crate) fn lookup_qualified(&self, namespace: StyleAtomID, name: StyleAtomID) -> Option<StyleAtomID> {
+        let key = qualified_key(namespace, name);
+        if let Ok(found) = self.shared.qualified.get_consistent(key) {
+            return match found {
+                Some(atom) if self.shared.key_of(atom) == Some(AtomKey::Qualified(namespace, name)) => Some(atom),
+                Some(_) => self.lock().shared.qualified.get(key),
+                None => None,
+            };
+        }
+        self.lock().shared.qualified.get(key)
     }
 
     /// One reference to each distinct atom of `atoms`, all live, which the leases hold until they drop.
@@ -1288,6 +1319,28 @@ mod tests {
         for thread in threads {
             thread.join().expect("the thread keeps its names apart");
         }
+    }
+
+    #[test]
+    fn lock_free_qualified_lookup_matches_live_and_absent_atoms() {
+        let process = Arc::<ProcessAtoms>::default();
+        let mut atoms = DocumentAtoms::for_test(&process);
+        let namespace = atoms.intern_raw(0x1000);
+        let present = atoms.intern_raw(0x2000);
+        let absent = atoms.intern_raw(0x3000);
+        assert_eq!(process.lookup_qualified(namespace, present), None);
+        assert_eq!(process.lookup_qualified(StyleAtomID::NONE, absent), None);
+
+        let qualified = atoms.intern_qualified(namespace, present);
+        let any_ns = atoms.intern_qualified(StyleAtomID::NONE, present);
+        assert_eq!(process.lookup_qualified(namespace, present), Some(qualified));
+        assert_eq!(process.lookup_qualified(StyleAtomID::NONE, present), Some(any_ns));
+        assert_eq!(process.lookup_qualified(namespace, absent), None);
+
+        let reclaimable = prepare_sweep(&atoms, &mut HashSet::new());
+        atoms.finish_sweep(&reclaimable);
+        assert_eq!(process.lookup_qualified(namespace, present), None);
+        assert_eq!(process.lookup_qualified(StyleAtomID::NONE, present), None);
     }
 
     #[test]

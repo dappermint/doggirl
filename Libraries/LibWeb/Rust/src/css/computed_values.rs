@@ -3512,6 +3512,7 @@ impl LonghandPlace {
     }
 
     /// The offset of the payload handle holding the value, where one does.
+    #[inline(always)]
     pub(crate) fn handle_offset(self) -> Option<usize> {
         (self.handle != 0).then(|| usize::from(self.handle) - 1)
     }
@@ -3521,6 +3522,7 @@ impl LonghandPlace {
     ///
     /// # Safety
     /// `payload` must be a live payload of the place's group, holding `values`, live for `'a`.
+    #[inline(always)]
     unsafe fn value_in(self, payload: *const c_void, values: &[RetainedStyleValueData]) -> &RetainedStyleValueData {
         let Some(offset) = self.handle_offset() else {
             return &values[self.index()];
@@ -3538,6 +3540,7 @@ impl LonghandPlace {
     ///
     /// # Safety
     /// `payload` must be a live payload of the place's group, live for `'a`.
+    #[inline(always)]
     unsafe fn value_in_payload<'a>(self, payload: *const c_void, offset: usize) -> &'a RetainedStyleValueData {
         // SAFETY: As the caller guarantees: the field at the offset is of the type the group says,
         //         and a handle is a single retained pointer laid out as a `RetainedStyleValueData` is.
@@ -3591,16 +3594,19 @@ impl LonghandPlace {
     const BITS_GROUP: u8 = u8::MAX - 1;
 
     /// The field of the inherited bits holding the value, where those hold it.
+    #[inline(always)]
     pub(crate) fn bit_field(self) -> Option<StyleBitField> {
         (self.group == Self::BITS_GROUP).then(|| StyleBitField::from_index(self.index))
     }
 
     /// The group holding the value, which a place in the inherited bits has none of.
+    #[inline(always)]
     pub(crate) fn group(self) -> usize {
-        assert!(self.group != Self::BITS_GROUP, "the inherited bits are in no group");
+        debug_assert!(self.group != Self::BITS_GROUP, "the inherited bits are in no group");
         usize::from(self.group)
     }
 
+    #[inline(always)]
     pub(crate) fn index(self) -> usize {
         usize::from(self.index)
     }
@@ -4057,12 +4063,14 @@ impl GroupValueLayout {
 
     /// Where the computed value of `longhand` lives. A logical alias mapping to a physical
     /// longhand in every flow holds no value of its own: see [`Self::resolved`].
+    #[inline(always)]
     pub(crate) fn place(&self, longhand: LonghandID) -> LonghandPlace {
         self.places[longhand.index()]
     }
 
     /// Whether `longhand` holds a value of its own, which a logical alias mapping to a physical
     /// longhand in every flow does not.
+    #[inline(always)]
     pub(crate) fn holds_value(&self, longhand: LonghandID) -> bool {
         self.places[longhand.index()] != LonghandPlace::NONE
     }
@@ -4073,6 +4081,7 @@ impl GroupValueLayout {
     /// hold. https://drafts.csswg.org/css-logical/#box
     /// NB: A logical alias computes as the physical longhand it maps to, so its value is that
     ///     longhand's, held once.
+    #[inline]
     pub(crate) fn resolved<'v>(&self, property: u16, value_of: impl Fn(u16) -> &'v RetainedStyleValueData) -> u16 {
         use crate::css::property_metadata::property_id;
         if self.holds_value(LonghandID::new(property)) {
@@ -4091,6 +4100,7 @@ impl GroupValueLayout {
         crate::css::style_compute::map_logical_alias_to_physical(property, writing_mode, direction)
     }
 
+    #[inline(always)]
     fn place_of(&self, property: u16) -> LonghandPlace {
         self.place(LonghandID::new(property))
     }
@@ -4489,6 +4499,7 @@ impl Drop for HeldGroup {
 
 impl<'a> SeedGroups<'a> {
     /// The value at `place`.
+    #[inline(always)]
     fn value(&self, place: LonghandPlace) -> &RetainedStyleValueData {
         let group = place.group();
         // SAFETY: The groups are live while these are, and each holds the values of its index.
@@ -4614,9 +4625,13 @@ impl GroupValues<'_> {
     }
 
     /// The computed value of `property`.
+    #[inline]
     pub(crate) fn value(&self, property: u16) -> &RetainedStyleValueData {
-        let property = GROUP_VALUE_LAYOUT.resolved(property, |property| self.value(property));
-        let place = GROUP_VALUE_LAYOUT.place_of(property);
+        let mut place = GROUP_VALUE_LAYOUT.place_of(property);
+        if place == LonghandPlace::NONE {
+            let resolved = GROUP_VALUE_LAYOUT.resolved(property, |property| self.value(property));
+            place = GROUP_VALUE_LAYOUT.place_of(resolved);
+        }
         if let Some(field) = place.bit_field() {
             return self.bits.value(field);
         }

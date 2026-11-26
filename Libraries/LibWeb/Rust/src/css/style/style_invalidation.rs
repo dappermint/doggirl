@@ -1280,59 +1280,14 @@ fn record_move_damage(
             .filter(|_| old_writing_mode == new_writing_mode && old_direction == new_direction);
         let old_overlay = old_record.animated_overlay;
         let new_overlay = new_record.animated_overlay;
+        let has_overlays = old_overlay.is_some() || new_overlay.is_some();
         // OPTIMIZATION: An animated value only changes the longhand its overlay entry names, so the shared groups
         //               still compute the same in both records apart from the longhands either overlay holds.
-        let mut animated = [0u64; crate::css::property_metadata::LONGHAND_WORD_COUNT];
-        for entry in old_overlay
-            .into_iter()
-            .chain(new_overlay)
-            .flat_map(|overlay| overlay.entries())
-        {
-            if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
-                && usize::from(index) < NUMBER_OF_LONGHAND_PROPERTIES
-            {
-                animated[usize::from(index) / 64] |= 1 << (index % 64);
-            }
-        }
-        let is_animated = |property: u16| {
-            property
-                .checked_sub(FIRST_LONGHAND_PROPERTY_ID)
-                .is_some_and(|index| animated[usize::from(index) / 64] & (1 << (index % 64)) != 0)
-        };
-        let mut effective_changed = [false; NUMBER_OF_LONGHAND_PROPERTIES];
         let mut to_compare = shared.map_or(
             [u64::MAX; crate::css::property_metadata::LONGHAND_WORD_COUNT],
             super::computed::SharedLonghands::longhands_to_compare,
         );
-        for (word, animated_word) in to_compare.iter_mut().zip(animated) {
-            *word |= animated_word;
-        }
-        for index in longhand_indices(to_compare) {
-            let changed = &mut effective_changed[index];
-            let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
-            let old_physical = if property_metadata::longhand_is_logical_alias(property) {
-                crate::css::style_compute::map_logical_alias_to_physical(property, old_writing_mode, old_direction)
-            } else {
-                property
-            };
-            let new_physical = if property_metadata::longhand_is_logical_alias(property) {
-                crate::css::style_compute::map_logical_alias_to_physical(property, new_writing_mode, new_direction)
-            } else {
-                property
-            };
-            if shared.is_some_and(|shared| shared.holds(new_physical))
-                && !is_animated(property)
-                && !is_animated(old_physical)
-                && !is_animated(new_physical)
-            {
-                continue;
-            }
-            let old_value = effective_value(&old_record, old_table, old_physical);
-            let new_value = effective_value(&new_record, new_table, new_physical);
-            if same_value(old_value, new_value) {
-                continue;
-            }
-            *changed = true;
+        let record_property_change = |property: u16, new_physical: u16, result: &mut StyleInvalidation| {
             result.any_computed_value_changed = true;
             if property_metadata::property_is_inherited(property) {
                 match property_metadata::property_style_group_index(new_physical) {
@@ -1356,9 +1311,70 @@ fn record_move_damage(
                 invalidation.ensure_level(INVALIDATION_RELAYOUT);
             }
             result.merge(invalidation);
-        }
-        result.merge(baked_filter_color_damage(old_values, new_values));
-        if old_overlay.is_some() || new_overlay.is_some() {
+        };
+        let resolve_physical = |property: u16, writing_mode, direction| {
+            if property_metadata::longhand_is_logical_alias(property) {
+                crate::css::style_compute::map_logical_alias_to_physical(property, writing_mode, direction)
+            } else {
+                property
+            }
+        };
+        if !has_overlays {
+            for index in longhand_indices(to_compare) {
+                let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
+                let old_physical = resolve_physical(property, old_writing_mode, old_direction);
+                let new_physical = resolve_physical(property, new_writing_mode, new_direction);
+                if shared.is_some_and(|shared| shared.holds(new_physical)) {
+                    continue;
+                }
+                if same_value(old_table.value(old_physical), new_table.value(new_physical)) {
+                    continue;
+                }
+                record_property_change(property, new_physical, &mut result);
+            }
+            result.merge(baked_filter_color_damage(old_values, new_values));
+        } else {
+            let mut animated = [0u64; crate::css::property_metadata::LONGHAND_WORD_COUNT];
+            for entry in old_overlay
+                .into_iter()
+                .chain(new_overlay)
+                .flat_map(|overlay| overlay.entries())
+            {
+                if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    && usize::from(index) < NUMBER_OF_LONGHAND_PROPERTIES
+                {
+                    animated[usize::from(index) / 64] |= 1 << (index % 64);
+                }
+            }
+            let is_animated = |property: u16| {
+                property
+                    .checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    .is_some_and(|index| animated[usize::from(index) / 64] & (1 << (index % 64)) != 0)
+            };
+            let mut effective_changed = [false; NUMBER_OF_LONGHAND_PROPERTIES];
+            for (word, animated_word) in to_compare.iter_mut().zip(animated) {
+                *word |= animated_word;
+            }
+            for index in longhand_indices(to_compare) {
+                let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
+                let old_physical = resolve_physical(property, old_writing_mode, old_direction);
+                let new_physical = resolve_physical(property, new_writing_mode, new_direction);
+                if shared.is_some_and(|shared| shared.holds(new_physical))
+                    && !is_animated(property)
+                    && !is_animated(old_physical)
+                    && !is_animated(new_physical)
+                {
+                    continue;
+                }
+                let old_value = effective_value(&old_record, old_table, old_physical);
+                let new_value = effective_value(&new_record, new_table, new_physical);
+                if same_value(old_value, new_value) {
+                    continue;
+                }
+                effective_changed[index] = true;
+                record_property_change(property, new_physical, &mut result);
+            }
+            result.merge(baked_filter_color_damage(old_values, new_values));
             for index in longhand_indices(animated) {
                 if effective_changed[index] {
                     continue;
@@ -1390,6 +1406,17 @@ fn record_move_damage(
 /// `record_move` damages. What the element's box was built with is left to the host: the counter
 /// styles it resolved.
 pub(crate) fn element_record_damage_of_views(facts: ElementDamageFacts, record_move: RecordMove<'_>) -> u32 {
+    if !facts.verifies_reads
+        && record_move.old.animated_overlay.is_none()
+        && record_move.new.animated_overlay.is_none()
+        && record_move
+            .old
+            .payloads
+            .holds_equal_payloads_as(record_move.new.payloads)
+        && record_move.old.longhands().same_record_as(record_move.new.longhands())
+    {
+        return 0;
+    }
     let old_values = record_move.old.computed_values();
     let new_values = record_move.new.computed_values();
     let stroke_uses_current_color = |values: ComputedValuesView<'_>| {

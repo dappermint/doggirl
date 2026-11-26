@@ -1781,6 +1781,13 @@ fn transition_target(owner: FfiOwningElement) -> TransitionTarget {
 #[repr(C)]
 pub struct FfiTransitionStep {
     pub animations: *mut ElementAnimations,
+    pub ensure_animations: unsafe extern "C" fn(element: *mut c_void) -> *mut ElementAnimations,
+    pub enter_execution_context: unsafe extern "C" fn(
+        context: *mut c_void,
+        run: unsafe extern "C" fn(run_context: *mut c_void),
+        run_context: *mut c_void,
+    ),
+    pub execution_context: *mut c_void,
     pub owner: FfiOwningElement,
     pub pseudo_element_serialization: usize,
     pub has_slot: bool,
@@ -1796,6 +1803,7 @@ pub struct FfiTransitionStep {
     pub target_node: u32,
     pub target_pseudo_kind: u8,
     pub element_box_slot: u32,
+    pub no_ancestor_animations: bool,
     pub tree_order: FfiTreeOrder,
 }
 
@@ -1857,7 +1865,7 @@ pub unsafe extern "C" fn animations_document_animations_run_transition_step(
     perform: HostEffectPerformer,
 ) -> FfiTransitionStepOutcome {
     let target = transition_target(step.owner);
-    let animations = NonNull::new(step.animations).expect("the target's element has lists");
+    let mut animations = NonNull::new(step.animations);
     let slot = step.has_slot.then_some(step.slot);
     let t = step.style_change_event_time;
 
@@ -1871,7 +1879,10 @@ pub unsafe extern "C" fn animations_document_animations_run_transition_step(
             .as_ref()
     };
     // SAFETY: Guaranteed by the caller.
-    let held = slot.map_or(&[][..], |slot| unsafe { animations.as_ref() }.transitions(slot));
+    let held = match (slot, animations) {
+        (Some(slot), Some(animations)) => unsafe { animations.as_ref() }.transitions(slot),
+        _ => &[][..],
+    };
     let existing: SmallVec<[FfiExistingTransition; 4]> = held
         .iter()
         .map(|transition| {
@@ -1888,6 +1899,8 @@ pub unsafe extern "C" fn animations_document_animations_run_transition_step(
         })
         .collect();
 
+    // SAFETY: Guaranteed by the caller.
+    let no_document_animations = unsafe { &*document }.has_no_animations_or_provisional_transitions();
     // NB: The values of the transitions the step starts are computed values of the after-change style.
     // SAFETY: Guaranteed by the caller.
     let computed_value_zoom = unsafe { crate::css::style::ViewLonghands::of_raw_record(step.after) }.effective_zoom();
@@ -1901,88 +1914,121 @@ pub unsafe extern "C" fn animations_document_animations_run_transition_step(
         element_box_slot: step.element_box_slot,
     };
     let on_actions = |actions: &[FfiTransitionAction]| {
-        let mut decided: SmallVec<[usize; 4]> = SmallVec::new();
-        for action in actions {
-            let property = TransitionProperty {
-                property_id: action.property_id,
-                custom_name: action.custom_name,
-            };
-            // SAFETY: Guaranteed by the caller.
-            let index = unsafe {
-                (*document)
-                    .provisional_transitions
-                    .ensure(target, animations, slot, property)
-            };
-            decided.push(index);
-            // SAFETY: Guaranteed by the caller.
-            unsafe { decide_provisional_transition(document, index, action.kind, perform) };
-            if action.kind != FfiTransitionActionKind::None && action.kind != FfiTransitionActionKind::Start {
+        // SAFETY: Guaranteed by the caller.
+        let existing_indices = if no_document_animations {
+            SmallVec::new()
+        } else {
+            unsafe { &*document }.provisional_transitions.indices_of(target)
+        };
+        if actions.is_empty() && existing_indices.is_empty() {
+            return;
+        }
+        let apply_actions = || {
+            let mut decided: SmallVec<[usize; 4]> = SmallVec::new();
+            for action in actions {
+                let animations = *animations.get_or_insert_with(|| {
+                    // SAFETY: The host's ensure_animations returns the live ElementAnimations of step.owner.element.
+                    NonNull::new(unsafe { (step.ensure_animations)(step.owner.element) })
+                        .expect("the target's element has lists")
+                });
+                let property = TransitionProperty {
+                    property_id: action.property_id,
+                    custom_name: action.custom_name,
+                };
                 // SAFETY: Guaranteed by the caller.
-                let state = unsafe { &*document }.provisional_transitions.state(index);
-                let committed = state
-                    .committed
-                    .as_ref()
-                    .expect("an action on a transition has one to act on");
-                if let Some(effect) = committed.borrow().effect() {
-                    replaced.push(effect.borrow().id());
+                let index = unsafe {
+                    (*document)
+                        .provisional_transitions
+                        .ensure(target, animations, slot, property)
+                };
+                decided.push(index);
+                // SAFETY: Guaranteed by the caller.
+                unsafe { decide_provisional_transition(document, index, action.kind, perform) };
+                if action.kind != FfiTransitionActionKind::None && action.kind != FfiTransitionActionKind::Start {
+                    // SAFETY: Guaranteed by the caller.
+                    let state = unsafe { &*document }.provisional_transitions.state(index);
+                    let committed = state
+                        .committed
+                        .as_ref()
+                        .expect("an action on a transition has one to act on");
+                    if let Some(effect) = committed.borrow().effect() {
+                        replaced.push(effect.borrow().id());
+                    }
+                }
+                if action.start_value.is_null() {
+                    continue;
+                }
+                let start = TransitionStart {
+                    owner: step.owner,
+                    pseudo_element_serialization: step.pseudo_element_serialization,
+                    initial_ready_time: step.has_last_animation_frame_timestamp.then_some(t),
+                    transition: TransitionDescription {
+                        generation: step.generation,
+                        start_time: t + action.delay,
+                        reversing_shortening_factor: action.reversing_shortening_factor,
+                        custom_name: action.custom_name,
+                        start_value: action.start_value.cast(),
+                        end_value: action.end_value.cast(),
+                        reversing_adjusted_start_value: action.reversing_adjusted_start_value.cast(),
+                        property_id: action.property_id,
+                    },
+                    delay: action.delay,
+                    duration: action.active_duration,
+                    timing_function: action.timing_function.cast(),
+                    computed_value_zoom,
+                };
+                let timeline = timeline
+                    .get_or_insert_with(|| default_document_timeline(element_node_document(target.element)))
+                    .clone();
+                // SAFETY: The action names live style values and raw fly strings, and the step live host objects.
+                let transition = unsafe { start_a_provisional_transition(&start, Some(timeline), perform) };
+                started.push(transition.clone());
+                // SAFETY: Guaranteed by the caller.
+                unsafe { &mut *document }
+                    .provisional_transitions
+                    .state_mut(index)
+                    .proposed = Some(transition);
+            }
+            // NB: A property an earlier pass of the epoch decided over that this one does not leaves its transitions as
+            //     they are.
+            for index in existing_indices {
+                if !decided.contains(&index) {
+                    // SAFETY: Guaranteed by the caller.
+                    unsafe {
+                        decide_provisional_transition(document, index, FfiTransitionActionKind::None, perform);
+                    };
                 }
             }
-            if action.start_value.is_null() {
-                continue;
+        };
+        fn call_in_execution_context<F: FnOnce()>(
+            enter: unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void), *mut c_void),
+            execution_context: *mut c_void,
+            f: F,
+        ) {
+            unsafe extern "C" fn run_once<F: FnOnce()>(run_context: *mut c_void) {
+                // SAFETY: `run_context` points to `Option<F>` below for the duration of this call.
+                let slot = unsafe { &mut *run_context.cast::<Option<F>>() };
+                (slot.take().expect("the host runs the callback once"))();
             }
-            let start = TransitionStart {
-                owner: step.owner,
-                pseudo_element_serialization: step.pseudo_element_serialization,
-                initial_ready_time: step.has_last_animation_frame_timestamp.then_some(t),
-                transition: TransitionDescription {
-                    generation: step.generation,
-                    start_time: t + action.delay,
-                    reversing_shortening_factor: action.reversing_shortening_factor,
-                    custom_name: action.custom_name,
-                    start_value: action.start_value.cast(),
-                    end_value: action.end_value.cast(),
-                    reversing_adjusted_start_value: action.reversing_adjusted_start_value.cast(),
-                    property_id: action.property_id,
-                },
-                delay: action.delay,
-                duration: action.active_duration,
-                timing_function: action.timing_function.cast(),
-                computed_value_zoom,
-            };
-            let timeline = timeline
-                .get_or_insert_with(|| default_document_timeline(element_node_document(target.element)))
-                .clone();
-            // SAFETY: The action names live style values and raw fly strings, and the step live host objects.
-            let transition = unsafe { start_a_provisional_transition(&start, Some(timeline), perform) };
-            started.push(transition.clone());
-            // SAFETY: Guaranteed by the caller.
-            unsafe { &mut *document }
-                .provisional_transitions
-                .state_mut(index)
-                .proposed = Some(transition);
+            let mut slot = Some(f);
+            // SAFETY: The host opens an execution context and invokes `run_once` before returning.
+            unsafe { enter(execution_context, run_once::<F>, (&raw mut slot).cast()) };
         }
-        // NB: A property an earlier pass of the epoch decided over that this one does not leaves its transitions as
-        //     they are.
-        // SAFETY: Guaranteed by the caller.
-        let indices = unsafe { &*document }.provisional_transitions.indices_of(target);
-        for index in indices {
-            if !decided.contains(&index) {
-                // SAFETY: Guaranteed by the caller.
-                unsafe {
-                    decide_provisional_transition(document, index, FfiTransitionActionKind::None, perform);
-                };
-            }
-        }
+        // NB: Starting and discarding transitions settles their promises in the document's realm.
+        call_in_execution_context(step.enter_execution_context, step.execution_context, apply_actions);
     };
     // SAFETY: Guaranteed by the caller.
     unsafe {
         crate::css::style::engine_calls::decide_transitions(
             &*step.host,
             &*step.read,
-            step.before,
-            step.after,
+            crate::css::style::engine_calls::TransitionRecordPair {
+                before: step.before,
+                after: step.after,
+            },
             &input,
             &existing,
+            no_document_animations || step.no_ancestor_animations,
             on_actions,
         );
     }
@@ -1993,6 +2039,7 @@ pub unsafe extern "C" fn animations_document_animations_run_transition_step(
     if replaced.is_empty() && started.is_empty() {
         return outcome;
     }
+    let animations = animations.expect("a step that starts or replaces transitions has lists");
     outcome.changes_effects = true;
     outcome.started_transitions = !started.is_empty();
     // SAFETY: Guaranteed by the caller.
@@ -2116,6 +2163,22 @@ pub extern "C" fn animations_document_animations_has_provisional_transitions(
     owner: FfiOwningElement,
 ) -> bool {
     document.provisional_transitions.has_states(transition_target(owner))
+}
+
+/// Whether `document` has neither associated animations nor provisional transitions.
+#[unsafe(no_mangle)]
+pub extern "C" fn animations_document_animations_has_no_animations_or_provisional_transitions(
+    document: &DocumentAnimations,
+) -> bool {
+    document.has_no_animations_or_provisional_transitions()
+}
+
+/// Whether `document` has any provisional transitions in the current stabilization epoch.
+#[unsafe(no_mangle)]
+pub extern "C" fn animations_document_animations_has_any_provisional_transitions(
+    document: &DocumentAnimations,
+) -> bool {
+    document.has_any_provisional_transitions()
 }
 
 /// The effect of the transition at `index` among those the outermost style stabilization epoch of `document` started

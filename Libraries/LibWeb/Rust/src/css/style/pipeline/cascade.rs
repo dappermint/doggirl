@@ -164,6 +164,22 @@ impl Cascade {
         }
     }
 
+    pub(super) fn reset_for_reuse(&mut self) {
+        self.blocks.clear();
+        self.decided = [0; LONGHAND_WORDS];
+        self.offered.clear();
+        self.custom_candidates.clear();
+        self.winners.clear();
+        self.custom_winners.clear();
+        self.decided_names.clear();
+        self.reverting_names.clear();
+        self.backed_kind = u8::MAX;
+        self.pseudo_kind = u8::MAX;
+        self.animation_name_scope = DeclarationScope::Unscoped;
+        self.statistics = CascadeCounters::default();
+        self.declared_only = None;
+    }
+
     /// The cascade of `declared` alone, the own declarations of an element no rule reaches, keyed
     /// by `node`, which holds no declarations of its own.
     pub(super) fn of_declared_only(

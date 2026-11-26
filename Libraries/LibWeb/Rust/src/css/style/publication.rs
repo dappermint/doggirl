@@ -537,29 +537,62 @@ impl RetainedState {
         };
         // OPTIMIZATION: Each element of a run of many siblings asks for its place as a style pass reaches it, which
         //               counting the run every time would make quadratic: the places of a long run are kept until
-        //               the tree's DOM order changes.
-        let mut cache = self
-            .sibling_positions
-            .lock()
-            .expect("the sibling position memo is never held across a panic");
-        cache.forget_unless_at(self.tree.dom_order_version());
-        if let Some(position) = cache.position_of(parent, node) {
-            return Some(position);
+        //               the tree's DOM order changes. Use a read lock on cache hits and count outside any lock on
+        //               misses so parallel style workers never serialize on short sibling runs.
+        let dom_order_version = self.tree.dom_order_version();
+        {
+            let cache = self
+                .sibling_positions
+                .read()
+                .expect("the sibling position memo is never held across a panic");
+            if cache.is_at(dom_order_version)
+                && let Some(position) = cache.position_of(parent, node)
+            {
+                return Some(position);
+            }
         }
-        let children: Vec<StyleNodeID> = self
-            .tree
-            .dom_children(parent)
-            .filter(|child| child.text_index().is_none())
-            .collect();
-        let count = u32::try_from(children.len()).expect("sibling count space exhausted");
-        if children.len() >= SiblingPositionCache::MIN_CHILDREN {
-            cache.insert(parent, &children);
+        let mut inline_children = [StyleNodeID::from_raw(1).unwrap(); SiblingPositionCache::MIN_CHILDREN];
+        let mut overflow_children: Option<Vec<StyleNodeID>> = None;
+        let mut count = 0usize;
+        let mut index = 0u32;
+        for child in self.tree.dom_children(parent) {
+            if child.text_index().is_some() {
+                continue;
+            }
+            if child == node {
+                index = count as u32 + 1;
+            }
+            if let Some(children) = overflow_children.as_mut() {
+                children.push(child);
+            } else if count < SiblingPositionCache::MIN_CHILDREN {
+                inline_children[count] = child;
+            } else {
+                let mut children = Vec::with_capacity(SiblingPositionCache::MIN_CHILDREN * 2);
+                children.extend_from_slice(&inline_children);
+                children.push(child);
+                overflow_children = Some(children);
+            }
+            count += 1;
         }
-        let index = children
-            .iter()
-            .position(|&child| child == node)
-            .map_or(0, |index| index as u32 + 1);
-        Some(SiblingPosition { count, index })
+        let count_u32 = u32::try_from(count).expect("sibling count space exhausted");
+        if count >= SiblingPositionCache::MIN_CHILDREN {
+            let children_slice: &[StyleNodeID] = match overflow_children.as_deref() {
+                Some(children) => children,
+                None => &inline_children[..count],
+            };
+            let mut cache = self
+                .sibling_positions
+                .write()
+                .expect("the sibling position memo is never held across a panic");
+            cache.forget_unless_at(dom_order_version);
+            if !cache.contains_parent(parent) {
+                cache.insert(parent, children_slice);
+            }
+        }
+        Some(SiblingPosition {
+            count: count_u32,
+            index,
+        })
     }
 
     /// Install a record of `table`'s values, or of the initial ones where it has none, holding
@@ -822,6 +855,14 @@ impl SiblingPositionCache {
     /// How many element children a parent has before their places are kept: fewer are counted again
     /// as quickly as they are looked up.
     const MIN_CHILDREN: usize = 32;
+
+    fn is_at(&self, dom_order_version: u64) -> bool {
+        self.dom_order_version == dom_order_version
+    }
+
+    fn contains_parent(&self, parent: StyleNodeID) -> bool {
+        self.counts.contains_key(&parent)
+    }
 
     /// Forgets the places counted at a version of the DOM order other than `dom_order_version`.
     fn forget_unless_at(&mut self, dom_order_version: u64) {

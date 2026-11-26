@@ -184,7 +184,7 @@ impl RetainedState {
             parent: None,
             facts: 0,
         };
-        let store = WinnerStore::new(Vec::new());
+        let store = WinnerStore::empty();
         let inputs = self.document_style_computation_inputs;
         let mut suspended_font = None;
         // The initial values compute from nothing: from the default groups, which hold no values.
@@ -196,8 +196,20 @@ impl RetainedState {
                 crate::css::computed_longhand_table::LonghandTableFlags::empty(),
                 0,
             );
-            match self.engine_drive_with(self, subject, &mut writer, None, &store, &inputs, &mut suspended_font) {
+            match self.engine_drive_with(
+                self,
+                subject,
+                None,
+                &mut writer,
+                None,
+                true,
+                &store,
+                0,
+                &inputs,
+                &mut suspended_font,
+            ) {
                 Some(drive::DrivenValues { length, font }) => {
+                    let font = font.expect("initial style drive always resolves font");
                     let (values, flags, dependency_flags) = writer.finish(&[]);
                     let source = crate::css::table_group_builder::LonghandSource::Values {
                         values: &values,
@@ -261,7 +273,7 @@ impl RetainedState {
             parent: None,
             facts: 0,
         };
-        let store = WinnerStore::new(Vec::new());
+        let store = WinnerStore::empty();
         let inputs = self.document_style_computation_inputs;
         let mut suspended_font = None;
         let held = shared.values();
@@ -277,14 +289,18 @@ impl RetainedState {
         let Some(drive::DrivenValues { length, font }) = self.engine_drive_with(
             self,
             subject,
+            None,
             &mut writer,
             Some(&selected),
+            true,
             &store,
+            0,
             &inputs,
             &mut suspended_font,
         ) else {
             return Err(initial_drive_font_request(suspended_font));
         };
+        let font = font.expect("initial style drive always resolves font");
         let (values, _, _) = writer.finish(&[seed]);
         let source = crate::css::table_group_builder::LonghandSource::Values {
             values: &values,
@@ -841,6 +857,7 @@ impl RetainedState {
                 (false, _) => crate::css::style_compute::StyleAdjustmentTarget::Element,
             },
             parent.map(|(parent, _)| parent),
+            parent_view.as_ref(),
         );
         let is_th_element = facts & bridge::element_adjustment_fact::IS_TH != 0;
         // https://drafts.csswg.org/css-ui/#appearance-disabling-properties
@@ -886,28 +903,35 @@ impl RetainedState {
                             WinnerDeclaration::new(property, important, value, origin)
                         },
                     )
-                    .collect(),
+                    .collect::<smallvec::SmallVec<[WinnerDeclaration; 16]>>(),
             );
-            container_units = store.container_unit_mask(self);
+            let dependency_summary = store.dependency_summary(self);
+            container_units = (dependency_summary & winner_store::DEPENDENCY_CONTAINER_UNIT_MASK) as u8;
             // https://drafts.csswg.org/css-values-5/#random-caching
             // A random function computes against the base value its random caching key draws
             // once. The keys not drawn yet are drawn between passes, and the element waits.
-            let undrawn = store.undrawn_random_keys(self, node);
-            if !undrawn.is_empty() {
-                random_requests.extend(undrawn);
-                return None;
+            if dependency_summary & winner_store::DEPENDENCY_HAS_UNFIXED_RANDOM_SHARING != 0 {
+                let undrawn = store.undrawn_random_keys(self, node);
+                if !undrawn.is_empty() {
+                    random_requests.extend(undrawn);
+                    return None;
+                }
             }
             let subject = DriveSubject {
                 target: computed::ComputedStyleTarget::of_pseudo_element(node, target_pseudo_element),
                 parent: parent.map(|(parent, _)| parent),
                 facts,
             };
+            let drive_builds_font = groups & (1 << group_index::FONT) != 0 || parent_view.is_none();
             let drive::DrivenValues { length, font } = self.engine_drive_with(
                 records,
                 subject,
+                parent_view.as_ref(),
                 &mut writer,
                 (!drives_everything).then_some(&selected[..]),
+                drive_builds_font,
                 &store,
+                dependency_summary,
                 &inputs,
                 suspended_font,
             )?;
@@ -932,7 +956,7 @@ impl RetainedState {
             }
             let author_disables_native_appearance = !appearance_is_none(&writer)
                 && crate::css::style_compute::has_author_value_disabling_native_appearance(&store.view(self));
-            (length, Some(font), author_disables_native_appearance)
+            (length, font, author_disables_native_appearance)
         } else {
             // https://drafts.csswg.org/css-fonts/#font-size-prop
             // NB: The document element's font resolves against the document's initial font, as in

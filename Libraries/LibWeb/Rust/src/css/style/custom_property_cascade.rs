@@ -22,8 +22,8 @@ use crate::css::cascaded_properties::{
 };
 use crate::css::custom_properties::{
     CustomFunctionRegistry, CustomFunctionVisibility, CustomPropertyFinalization, CustomPropertyStore,
-    NativeVarResolution, PreparedCustomFunction, SubstitutionAttribute, SubstitutionFunctionVisibility,
-    VarResolutionInputs, prepare_var_resolution_environment,
+    CustomPropertyTokenCache, NativeVarResolution, PreparedCustomFunction, SubstitutionAttribute,
+    SubstitutionFunctionVisibility, VarResolutionInputs, prepare_var_resolution_environment_with_token_cache,
 };
 use crate::css::rule::CompiledFunction;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData, custom_property_references};
@@ -1227,6 +1227,27 @@ pub(super) fn substitute_against_stores(
     root_custom_property_name: &[u16],
     written: &RetainedStyleValueData,
 ) -> RetainedStyleValueData {
+    substitute_against_stores_with_token_cache(
+        store,
+        inheritance_store,
+        inputs,
+        property,
+        root_custom_property_name,
+        written,
+        CustomPropertyTokenCache::default(),
+    )
+    .0
+}
+
+pub(super) fn substitute_against_stores_with_token_cache(
+    store: Option<&CustomPropertyStore>,
+    inheritance_store: Option<&CustomPropertyStore>,
+    inputs: &SubstitutionInputs<'_>,
+    property: u16,
+    root_custom_property_name: &[u16],
+    written: &RetainedStyleValueData,
+    token_cache: CustomPropertyTokenCache,
+) -> (RetainedStyleValueData, CustomPropertyTokenCache) {
     let attributes = inputs.attributes;
     let functions = inputs.functions;
     let registry_ref = inputs.document.custom_property_registry();
@@ -1234,9 +1255,10 @@ pub(super) fn substitute_against_stores(
     let mut parse_context = registry_ref.parse_context(&random_function_index);
     parse_context.in_quirks_mode = inputs.document.in_quirks_mode;
     let media_environment = inputs.media.environment();
-    let mut resolution_environment = prepare_var_resolution_environment(
+    let mut resolution_environment = prepare_var_resolution_environment_with_token_cache(
         attributes.map_or(&[][..], |attributes| attributes.attributes.as_slice()),
         functions.map_or(&EMPTY_CUSTOM_FUNCTIONS, |functions| &functions.registry),
+        token_cache,
     );
     let mut style_query_references = inputs.style_query_references.map(std::cell::RefCell::borrow_mut);
     let resolution_inputs = VarResolutionInputs {
@@ -1253,18 +1275,19 @@ pub(super) fn substitute_against_stores(
         &resolution_inputs,
         property,
         root_custom_property_name,
-        written.data(),
+        written,
         &mut resolution_environment,
         style_query_references.as_deref_mut(),
     );
     let invalid = || RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid);
-    match resolution {
+    let result = match resolution {
         NativeVarResolution::Resolved {
             components,
             contains_attr_tainted_values,
         } => parse_substituted_value(&parse_context, property, &components, contains_attr_tainted_values),
         NativeVarResolution::Invalid | NativeVarResolution::NotHandled => invalid(),
-    }
+    };
+    (result, resolution_environment.into_token_cache())
 }
 
 #[cfg(test)]

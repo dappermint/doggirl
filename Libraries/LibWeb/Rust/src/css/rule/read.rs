@@ -554,6 +554,22 @@ impl NativeRuleList {
         parsed.visit_media_holding_rules(&mut |rule| visit(RuleRef::Shared(rule, self)))
     }
 
+    /// Visits the rules of [`Self::visit_rules`] that are, or hold, a `@layer` or `@import` rule.
+    pub(crate) fn visit_layer_holding_rules(
+        &self,
+        visit: &mut impl FnMut(RuleRef<'_>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        // A rule the CSSOM exposed or edited may hold a `@layer` or `@import` rule the parse did not.
+        if self.rules.borrow().is_some() || !self.exposed_rules.borrow().is_empty() {
+            return self.visit_rules(visit);
+        }
+        let parsed = self.parsed_source.borrow();
+        let Some(parsed) = parsed.as_ref() else {
+            return ControlFlow::Continue(());
+        };
+        parsed.visit_layer_holding_rules(&mut |rule| visit(RuleRef::Shared(rule, self)))
+    }
+
     pub(crate) fn visit_rules(&self, visit: &mut impl FnMut(RuleRef<'_>) -> ControlFlow<()>) -> ControlFlow<()> {
         if let Some(rules) = self.rules.borrow().as_ref() {
             for rule in rules {
