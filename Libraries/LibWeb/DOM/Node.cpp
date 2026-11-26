@@ -1072,6 +1072,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
     SubtreeInsertionScope subtree_insertion_scope { *this };
     bool const style_engine_may_have_waiting_children = document().style_computer().style_engine().may_have_waiting_children();
     auto* document_global_custom_element_registry = document().effective_global_custom_element_registry().ptr();
+    bool const document_global_registry_has_definitions = document_global_custom_element_registry && document_global_custom_element_registry->has_definitions();
+    bool const parent_is_connected = is_connected();
 
     for (auto& node_to_insert : nodes) {
         insert_node_into_children(*node_to_insert, child);
@@ -1086,8 +1088,28 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
         if (node_to_insert->style_arrival_pending() && !style_engine_may_have_waiting_children)
             subtree_insertion_scope.set_descendants_covered_by_subtree_arrival(true);
 
+        bool const fast_plain_text_base = parent_is_connected
+            && subtree_insertion_scope.descendants_covered_by_subtree_arrival()
+            && !subtree_insertion_scope.keyboard_scroll_tracks_document()
+            && !subtree_insertion_scope.document_may_have_blocking_wheel_event_listener();
+
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
+            if (fast_plain_text_base
+                && inclusive_descendant.is_exclusive_text()
+                && !subtree_insertion_scope.may_be_in_shadow_tree()
+                && !subtree_insertion_scope.document_has_auto_directionality()) {
+                auto& text = static_cast<Text&>(inclusive_descendant);
+                if (text.style_node_id() == 0) {
+                    text.m_is_connected = true;
+                    auto* text_parent = text.parent();
+                    text.m_in_editable_subtree = text_parent && text_parent->m_in_editable_subtree;
+                    if (auto* parent_element = as_if<Element>(text_parent); parent_element && parent_element->style_node_id() != 0 && !text.data().is_empty())
+                        CSS::record_element_emptiness_changed(*parent_element, text, false, true);
+                    return TraversalDecision::Continue;
+                }
+            }
+
             // 1. Run the insertion steps with inclusiveDescendant.
             inclusive_descendant.inserted();
             if (!any_node_has_post_connection_steps)
@@ -1106,7 +1128,7 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                     // The document global custom element registry is never scoped.
                     if (element->is_custom())
                         element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback);
-                    else if (document_global_custom_element_registry && document_global_custom_element_registry->has_definitions())
+                    else if (document_global_registry_has_definitions)
                         element->try_to_upgrade();
                 } else {
                     auto registry = element->custom_element_registry();
@@ -2737,7 +2759,8 @@ void Node::inserted()
     } else {
         recompute_editable_subtree_flag();
     }
-    derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
+    if (!subtree_insertion_scope || subtree_insertion_scope->document_may_have_blocking_wheel_event_listener())
+        derive_inside_blocking_wheel_event_handler_state_after_tree_change(*this);
 
     bool const in_shadow_tree = shadow_root
         || ((!subtree_insertion_scope || subtree_insertion_scope->may_be_in_shadow_tree()) && root().is_shadow_root());
@@ -3080,7 +3103,10 @@ void Node::remove_all_children(bool suppress_observers)
         }
     }
 
-    if (was_tracked_by_style_engine) {
+    bool const batch_disconnect_in_style_engine = was_tracked_by_style_engine && !this_is_shadow_host && !parent_root_is_shadow_root;
+    if (batch_disconnect_in_style_engine) {
+        CSS::record_all_children_disconnecting(*this, document().layout_node_arena_if_created());
+    } else if (was_tracked_by_style_engine) {
         if (auto* arena = document().layout_node_arena_if_created()) {
             Vector<u32, 64> style_nodes;
             for (auto* child = first_child(); child; child = child->next_sibling()) {
@@ -3132,7 +3158,8 @@ void Node::remove_all_children(bool suppress_observers)
                     marked_parent_needs_layout_tree_update = true;
                 }
             }
-            child->report_removal_to_style_engine(*this);
+            if (!batch_disconnect_in_style_engine)
+                child->report_removal_to_style_engine(*this);
         }
 
         // 7. Remove node from its parent’s children.

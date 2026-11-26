@@ -341,6 +341,9 @@ style_boundary! {
         unlink_style_node_from_dom_order => UnlinkStyleNodeFromDomOrder {
             node: StyleNodeID, parent: Option<StyleNodeID>
         };
+        unlink_style_nodes_from_dom_order => UnlinkStyleNodesFromDomOrder {
+            nodes: Box<[StyleNodeID]>, parent: Option<StyleNodeID>
+        } => engine.unlink_style_nodes_from_dom_order(&nodes, parent);
         set_top_layer_elements => SetTopLayerElements { members: Box<[StyleNodeID]> } =>
             engine.set_top_layer_elements(&members);
         set_text_is_ascii_whitespace => SetTextIsAsciiWhitespace { node: StyleNodeID, value: bool };

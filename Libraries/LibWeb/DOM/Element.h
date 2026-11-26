@@ -260,6 +260,7 @@ public:
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
     void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false, Utf16FlyString const* preinterned_single_class = nullptr);
+    void append_attribute_without_callbacks_from_detached_parser(QualifiedName, Utf16String value);
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
@@ -275,7 +276,7 @@ public:
 
     // The element's attributes in order, borrowed until they next change.
     ReadonlySpan<Attribute> attribute_list() const;
-    void const* attribute_list_memory() const { return m_attributes.ptr(); }
+    void const* attribute_list_memory() const { return has_heap_attributes() ? m_attribute_storage.heap : nullptr; }
 
     // A filter over the local names of the attributes and the classes of this element and its descendants: a name whose
     // bit is clear is on none of them. Bits are only ever added, so a name may keep its bit after it is last removed.
@@ -647,7 +648,7 @@ public:
     // Whether the environment `custom_property_data()` answers is the overlay of what the element's or the
     // pseudo-element's own animations sample.
     [[nodiscard]] bool custom_property_data_is_animation_overlay(Optional<CSS::PseudoElement>) const;
-    [[nodiscard]] size_t published_presentational_hint_properties_heap_size() const { return m_published_presentational_hint_properties.capacity() * sizeof(CSS::StyleProperty); }
+    [[nodiscard]] size_t published_presentational_hint_properties_heap_size() const;
 
     // Publish the environment the element's custom-property data moved to on its record, so the
     // engine reads the environment the element holds.
@@ -1064,6 +1065,31 @@ private:
     };
     static_assert(sizeof(AttributeList) % alignof(Attribute) == 0);
 
+    static constexpr size_t inline_attribute_capacity = 2;
+    static constexpr u8 attribute_mode_heap = 3;
+
+    bool has_heap_attributes() const { return m_attribute_mode == attribute_mode_heap; }
+    bool has_raw_attributes() const { return has_heap_attributes() ? !m_attribute_storage.heap->is_empty() : m_attribute_mode != 0; }
+    size_t raw_attribute_count() const { return has_heap_attributes() ? m_attribute_storage.heap->size() : m_attribute_mode; }
+    Attribute* inline_attributes() { return reinterpret_cast<Attribute*>(m_attribute_storage.inline_bytes); }
+    Attribute const* inline_attributes() const { return reinterpret_cast<Attribute const*>(m_attribute_storage.inline_bytes); }
+    Span<Attribute> raw_attribute_span()
+    {
+        if (has_heap_attributes())
+            return m_attribute_storage.heap->span();
+        return { inline_attributes(), m_attribute_mode };
+    }
+    ReadonlySpan<Attribute> raw_attribute_span() const
+    {
+        if (has_heap_attributes())
+            return m_attribute_storage.heap->span();
+        return { inline_attributes(), m_attribute_mode };
+    }
+    Attribute& raw_attribute_at(size_t index) { return raw_attribute_span()[index]; }
+    Attribute const& raw_attribute_at(size_t index) const { return raw_attribute_span()[index]; }
+    Attribute& append_raw_attribute(QualifiedName, Utf16String value);
+    void remove_raw_attribute_at(size_t index);
+
     void append_to_attribute_list(QualifiedName, Utf16String value);
 
     void install_custom_property_data(Layout::BegunRead const& read, Optional<CSS::PseudoElement>, RefPtr<CSS::CustomPropertyData const>, CSS::IsAnimationOverlay);
@@ -1111,7 +1137,12 @@ private:
     Optional<Utf16FlyString> m_id;
     Vector<Utf16FlyString, 1> m_classes;
 
-    OwnPtr<AttributeList> m_attributes;
+    // Stores up to two attributes inline to avoid heap allocations for common HTML elements; spills to a heap
+    // AttributeList once a third attribute is appended or capacity > 2 is requested.
+    union AttributeStorage {
+        AttributeList* heap;
+        alignas(Attribute) u8 inline_bytes[inline_attribute_capacity * sizeof(Attribute)];
+    } m_attribute_storage { nullptr };
     u64 m_subtree_name_filter { 0 };
     // NB: The declarations of a style attribute, until something asks for their CSSOM object (m_inline_style), which
     //     takes them over. At most one of the two is set.
@@ -1123,7 +1154,6 @@ private:
     CSS::InstalledStyle m_installed_style;
     u64 m_animation_style_generation { 0 };
     u64 m_animation_subtree_style_generation { 0 };
-    Vector<CSS::StyleProperty> m_published_presentational_hint_properties;
 
     void register_element_reference_pseudo_element(CSS::PseudoElement type, GC::Ref<Element> element);
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
@@ -1157,9 +1187,12 @@ private:
     // Whether the style attribute was set while the element was not connected, so that whether Content Security
     // Policy blocks it is decided when the element is inserted.
     bool m_style_attribute_awaits_content_security_policy_check : 1 { false };
+    mutable bool m_has_lang_value : 1 { false };
+    // 0..=2: inline attributes in m_attribute_storage.inline_bytes; 3 (attribute_mode_heap): heap AttributeList*.
+    u8 m_attribute_mode : 2 { 0 };
 
     // https://dom.spec.whatwg.org/#concept-element-custom-element-state
-    CustomElementState m_custom_element_state { CustomElementState::Undefined };
+    CustomElementState m_custom_element_state : 3 { CustomElementState::Undefined };
 
     // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
     // child list they were counted in; zero for none.
@@ -1174,7 +1207,8 @@ private:
     GC::Member<CSS::CSSStyleProperties> m_inline_style;
     GC::Member<ShadowRoot> m_shadow_root;
 
-    mutable Optional<Utf16String> m_lang_value;
+    OwnPtr<Vector<CSS::StyleProperty, 4>> m_published_presentational_hint_properties;
+    mutable Utf16String m_lang_value;
 };
 
 template<>

@@ -19,6 +19,8 @@ namespace JS {
 class JS_API HostObject : public Object {
 public:
     static GC::Ref<HostObject> create(Realm&, JSHostClass const&, GC::Ptr<Object> prototype, GC::Ptr<GC::Cell> wrappable = {}, GC::Ptr<GC::Cell> host_data = {});
+    static GC::Ref<Shape> initial_shape_for_prototype(Realm&, Object& prototype);
+    static GC::Ref<HostObject> create_with_shape(Realm&, JSHostClass const&, GC::Ref<Shape>, GC::Ptr<GC::Cell> wrappable = {}, GC::Ptr<GC::Cell> host_data = {});
 
     JSHostClass const& host_class() const { return *engine_field<JSHostClass const*>(JS_HOST_OBJECT_HOST_CLASS_OFFSET); }
     GC::Ptr<GC::Cell> wrappable() const { return engine_field<GC::Cell*>(JS_HOST_OBJECT_WRAPPABLE_OFFSET); }

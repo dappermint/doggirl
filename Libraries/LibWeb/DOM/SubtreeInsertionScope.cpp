@@ -9,6 +9,7 @@
 #include <LibWeb/DOM/SubtreeInsertionScope.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
+#include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Page/Page.h>
 
 namespace Web::DOM {
@@ -18,6 +19,10 @@ SubtreeInsertionScope::SubtreeInsertionScope(Node& parent)
     , m_document(parent.document())
     , m_enclosing_scope(m_document->subtree_insertion_scope())
     , m_keyboard_scroll_tracks_document(m_document->page().keyboard_scroll_tracks_document(m_document))
+    , m_document_may_have_blocking_wheel_event_listener(m_document->may_have_blocking_wheel_event_listener())
+    , m_document_has_auto_directionality(m_document->has_element_with_auto_directionality())
+    , m_document_has_inert_element(m_document->has_inert_element())
+    , m_content_blocker_has_cosmetic_rules(ContentBlocker::the().has_cosmetic_rules())
     , m_parent_is_in_shadow_tree(parent.root().is_shadow_root())
 {
     m_document->set_subtree_insertion_scope({}, this);

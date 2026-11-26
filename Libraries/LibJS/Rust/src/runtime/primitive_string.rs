@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, UnsafeCell};
+use core::cell::{Cell, RefCell, UnsafeCell};
 use core::hash::BuildHasher;
 
 use ak::{Utf16FlyString, Utf16String, Utf16StringUnits};
@@ -855,39 +855,118 @@ impl RopeString {
     }
 
     fn concatenate_pieces(&self) -> Utf16String {
-        // OPTIMIZATION: Most ropes have at most a few dozen pieces, which are gathered without allocating.
-        const INLINE_PIECES: usize = 32;
-        let mut pieces = [self.lhs(); INLINE_PIECES];
-        let mut piece_count = 0;
-        let mut stack = [self.lhs(); INLINE_PIECES];
-        stack[0] = self.rhs();
-        stack[1] = self.lhs();
-        let mut stack_depth = 2;
-        while stack_depth > 0 {
-            stack_depth -= 1;
-            let current = stack[stack_depth];
-            if current.deferred_kind() == DeferredKind::Rope {
-                if stack_depth + 2 > INLINE_PIECES {
-                    return self.concatenate_many_pieces();
-                }
-                let current_rope_string = current.as_rope_string();
-                stack[stack_depth] = current_rope_string.rhs();
-                stack[stack_depth + 1] = current_rope_string.lhs();
-                stack_depth += 2;
-                continue;
-            }
-            if piece_count == INLINE_PIECES {
-                return self.concatenate_many_pieces();
-            }
-            pieces[piece_count] = current;
-            piece_count += 1;
+        // OPTIMIZATION: Flatten the rope in a single DFS pass directly into an uninitialized Latin-1/ASCII buffer
+        //               of the already-known length, using a thread-local scratch stack so large ropes (e.g. template
+        //               concatenation) do zero Vec allocations/reallocations and skip extra length/view passes.
+        //               Widens to UTF-16 on the fly only if a UTF-16 leaf is encountered.
+        thread_local! {
+            static FLATTEN_STACK: RefCell<Vec<*const PrimitiveString>> = const { RefCell::new(Vec::new()) };
         }
 
-        let mut views = [Utf16View::Ascii(&[]); INLINE_PIECES];
-        for (view, piece) in views.iter_mut().zip(&pieces[..piece_count]) {
-            *view = piece.utf16_string_view();
+        #[inline(always)]
+        unsafe fn copy_bytes_fast(dst: *mut u8, src: *const u8, len: usize) {
+            // SAFETY: Caller guarantees non-overlapping valid ranges of `len` bytes.
+            unsafe {
+                if len <= 16 {
+                    if len >= 8 {
+                        core::ptr::copy_nonoverlapping(src, dst, 8);
+                        core::ptr::copy_nonoverlapping(src.add(len - 8), dst.add(len - 8), 8);
+                    } else if len >= 4 {
+                        core::ptr::copy_nonoverlapping(src, dst, 4);
+                        core::ptr::copy_nonoverlapping(src.add(len - 4), dst.add(len - 4), 4);
+                    } else if len > 0 {
+                        *dst = *src;
+                        *dst.add(len >> 1) = *src.add(len >> 1);
+                        *dst.add(len - 1) = *src.add(len - 1);
+                    }
+                } else {
+                    core::ptr::copy_nonoverlapping(src, dst, len);
+                }
+            }
         }
-        concatenate(&views[..piece_count])
+
+        fn flatten_with_stack(rope: &RopeString, stack: &mut Vec<*const PrimitiveString>) -> Utf16String {
+            let total_len = rope.base.length_in_utf16_code_units();
+            if total_len < size_of::<usize>() {
+                return rope.concatenate_many_pieces();
+            }
+            stack.clear();
+            stack.push(rope.rhs().as_ptr());
+            stack.push(rope.lhs().as_ptr());
+
+            Utf16String::try_from_latin1_with_uninit(total_len, |storage| {
+                let dst = storage.as_mut_ptr().cast::<u8>();
+                let mut offset = 0usize;
+                let mut all_ascii = true;
+
+                while let Some(ptr) = stack.pop() {
+                    // SAFETY: Flattening allocates no GC cells and triggers no GC, so every rope node pointer stays live.
+                    let current = unsafe { &*ptr };
+                    if current.deferred_kind() == DeferredKind::Rope {
+                        let current_rope = current.as_rope_string();
+                        stack.push(current_rope.rhs().as_ptr());
+                        stack.push(current_rope.lhs().as_ptr());
+                        continue;
+                    }
+                    match current.utf16_string_view() {
+                        Utf16View::Ascii(bytes) => {
+                            assert!(bytes.len() <= total_len - offset);
+                            // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                            unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                            offset += bytes.len();
+                        }
+                        Utf16View::Latin1(bytes) => {
+                            if all_ascii && !bytes.is_ascii() {
+                                all_ascii = false;
+                            }
+                            assert!(bytes.len() <= total_len - offset);
+                            // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                            unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                            offset += bytes.len();
+                        }
+                        Utf16View::Utf16(units) => {
+                            let mut utf16 = Vec::with_capacity(total_len);
+                            // SAFETY: `dst..dst + offset` has already been initialized above.
+                            let written = unsafe { ak::slice_from_raw_parts(dst.cast_const(), offset) };
+                            utf16.extend(written.iter().map(|&b| u16::from(b)));
+                            utf16.extend_from_slice(units);
+                            while let Some(rem_ptr) = stack.pop() {
+                                // SAFETY: Same live-pointer invariant as above.
+                                let rem = unsafe { &*rem_ptr };
+                                if rem.deferred_kind() == DeferredKind::Rope {
+                                    let rem_rope = rem.as_rope_string();
+                                    stack.push(rem_rope.rhs().as_ptr());
+                                    stack.push(rem_rope.lhs().as_ptr());
+                                    continue;
+                                }
+                                rem.utf16_string_view().append_to(&mut utf16);
+                            }
+                            return Err(Utf16String::from_utf16(&utf16));
+                        }
+                    }
+                }
+                assert_eq!(offset, total_len);
+                Ok(all_ascii)
+            })
+        }
+
+        struct ClearOnDrop<'a>(core::cell::RefMut<'a, Vec<*const PrimitiveString>>);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.clear();
+            }
+        }
+
+        FLATTEN_STACK.with(|cell| {
+            if let Ok(borrow) = cell.try_borrow_mut() {
+                let mut guard = ClearOnDrop(borrow);
+                flatten_with_stack(self, &mut guard.0)
+            } else {
+                // Recursive resolution (e.g. a Substring leaf whose own source is an unresolved Rope).
+                let mut local_stack = Vec::with_capacity(32);
+                flatten_with_stack(self, &mut local_stack)
+            }
+        })
     }
 
     fn concatenate_many_pieces(&self) -> Utf16String {

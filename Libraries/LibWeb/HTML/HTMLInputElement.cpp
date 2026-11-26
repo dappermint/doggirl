@@ -223,18 +223,20 @@ void HTMLInputElement::set_checked(bool checked)
         return;
 
     m_checked = checked;
-    // The accessibility tree reports this state, with nothing else about the element changing.
-    if (document().page().accessibility_interested())
-        document().invalidate_cached_accessibility_data(*this);
+    if (is_connected()) {
+        // The accessibility tree reports this state, with nothing else about the element changing.
+        if (document().page().accessibility_interested())
+            document().invalidate_cached_accessibility_data(*this);
 
-    CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
+        CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
 
-    // Checkedness decides value-missing validity: for a checkbox its own, and for a radio button
-    // that of every member of its radio button group.
-    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+        // Checkedness decides value-missing validity: for a checkbox its own, and for a radio button
+        // that of every member of its radio button group.
+        CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
-    Painting::push_form_control_paint_facts(*this);
-    set_needs_repaint(InvalidateDisplayList::PaintCommands);
+        Painting::push_form_control_paint_facts(*this);
+        set_needs_repaint(InvalidateDisplayList::PaintCommands);
+    }
 
     // NB: The registry unchecks the other members of the group and republishes their validity. The tree walks
     //     below are a fallback for radio buttons that have no registry.
@@ -2073,7 +2075,8 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     if (connected || rare_data())
         clear_element_reference_pseudo_elements();
     auto should_materialize_shadow_tree = shadow_root() || has_style();
-    set_shadow_root(nullptr);
+    if (shadow_root())
+        set_shadow_root(nullptr);
     if (m_rare_input_data) {
         m_rare_input_data->image_button_alt_text_node = nullptr;
         m_rare_input_data->date_time_fields_container = nullptr;
@@ -2086,7 +2089,8 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     signal_a_type_change();
 
     // 6. Invoke the value sanitization algorithm, if one is defined for the type attribute's new state.
-    m_value = value_sanitization_algorithm(m_value);
+    if (!m_value.is_empty() || new_state == TypeAttributeState::Range || new_state == TypeAttributeState::Color)
+        m_value = value_sanitization_algorithm(m_value);
 
     // 7. Let previouslySelectable be true if setRangeText() previously applied to the element, and false otherwise.
     auto previously_selectable = selection_or_range_applies_for_type_state(old_state);
@@ -2528,6 +2532,12 @@ static bool contains_cr_or_lf(Utf16View value)
             return true;
     }
     return false;
+}
+
+void HTMLInputElement::set_value_from_detached_fragment(Utf16String const& value)
+{
+    VERIFY(!is_connected() && !parent() && !m_dirty_value && !m_text_node);
+    m_value = value_sanitization_algorithm(value);
 }
 
 Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16String const& value) const

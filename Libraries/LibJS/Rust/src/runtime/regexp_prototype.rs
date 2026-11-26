@@ -1081,6 +1081,91 @@ impl RegExpPrototype {
         // 3. Let S be ? ToString(string).
         let string = vm.argument(0).to_primitive_string(vm)?;
 
+        // OPTIMIZATION: Fast path for str.match(regexp) on an unmodified RegExp instance: reads flag bits directly
+        //               without invoking RegExp.prototype.flags and, for global non-sticky regexes, skips allocating
+        //               intermediate RegExpBuiltinExec result arrays.
+        if Self::replace_is_fast_and_non_observable(vm, realm, &regexp_object)
+            && let Some(typed_regexp) = regexp_object.downcast::<RegExpObject>()
+        {
+            let flag_bits = typed_regexp.flag_bits();
+            if !flag_bits.has(RegExpFlags::GLOBAL) {
+                return regexp_builtin_exec(vm, typed_regexp, string);
+            }
+            if !flag_bits.has(RegExpFlags::STICKY)
+                && let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp)
+            {
+                let full_unicode = flag_bits.has(RegExpFlags::UNICODE) || flag_bits.has(RegExpFlags::UNICODE_SETS);
+                regexp_object.set_with_cache(
+                    vm,
+                    &vm.names.lastIndex,
+                    Value::from_i32(0),
+                    cache(vm, CacheSite::RegExpPrototypeSymbolMatchLastIndex),
+                )?;
+
+                let utf16_view = string.utf16_string_view();
+                let length_s = utf16_view.length_in_code_units();
+                let array = Array::create(vm, realm, 0, None).must();
+                let mut n: u32 = 0;
+                let mut last_index: usize = 0;
+                let mut last_match_start: usize = 0;
+                let mut last_match_end: usize = 0;
+                let need_legacy = typed_regexp.legacy_features_enabled() && realm == typed_regexp.realm();
+                let n_capture_groups = compiled_regex.capture_count();
+
+                while last_index <= length_s {
+                    let exec_result =
+                        exec_with_unicode_last_index(&compiled_regex, utf16_view, last_index, full_unicode, false);
+                    if exec_result.result == MatchResult::LimitExceeded {
+                        return throw_backtrack_limit_exceeded(vm);
+                    }
+                    if exec_result.result != MatchResult::Match {
+                        break;
+                    }
+                    let match_start = compiled_regex.capture_slot(0) as usize;
+                    let match_end = compiled_regex.capture_slot(1) as usize;
+                    last_match_start = match_start;
+                    last_match_end = match_end;
+                    array.indexed_put(
+                        n,
+                        substring(vm, string, match_start, match_end - match_start),
+                        DEFAULT_ATTRIBUTES,
+                    );
+                    n = n.wrapping_add(1);
+                    if match_end == match_start {
+                        last_index = advance_string_index(utf16_view, match_end as u64, full_unicode) as usize;
+                    } else {
+                        last_index = match_end;
+                    }
+                }
+
+                if n == 0 {
+                    return Ok(Value::NULL);
+                }
+
+                if need_legacy {
+                    if n_capture_groups > 0 {
+                        let re_exec = compiled_regex.exec(utf16_view, last_match_start);
+                        if re_exec == MatchResult::LimitExceeded {
+                            return throw_backtrack_limit_exceeded(vm);
+                        }
+                    }
+                    let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
+                    update_legacy_regexp_static_properties_lazy(
+                        vm,
+                        realm.intrinsics().regexp_constructor(vm),
+                        string,
+                        last_match_start,
+                        last_match_end,
+                        &legacy_captures,
+                    );
+                } else if realm == typed_regexp.realm() {
+                    invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
+                }
+
+                return Ok(Value::from_object(array));
+            }
+        }
+
         // 4. Let flags be ? ToString(? Get(rx, "flags")).
         let flags_value = regexp_object.get_with_cache(
             vm,
@@ -1953,6 +2038,47 @@ impl RegExpPrototype {
 
         // 3. Let S be ? ToString(string).
         let string = vm.argument(0).to_primitive_string(vm)?;
+
+        // OPTIMIZATION: Fast path for str.search(regexp) on an unmodified RegExp: lastIndex is restored to its exact
+        //               original value after the match, and no match array needs to be allocated.
+        let realm = vm.current_realm().expect("a builtin runs in a realm");
+        if Self::replace_is_fast_and_non_observable(vm, realm, &regexp_object)
+            && let Some(typed_regexp) = regexp_object.downcast::<RegExpObject>()
+            && let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp)
+        {
+            let flag_bits = typed_regexp.flag_bits();
+            let sticky = flag_bits.has(RegExpFlags::STICKY);
+            let utf16_view = string.utf16_string_view();
+            let exec_result = compiled_regex.exec(utf16_view, 0);
+            if exec_result == MatchResult::LimitExceeded {
+                return throw_backtrack_limit_exceeded(vm);
+            }
+            let mut matched = exec_result == MatchResult::Match;
+            let match_start = if matched { compiled_regex.capture_slot(0) } else { -1 };
+            if matched && sticky && match_start != 0 {
+                matched = false;
+            }
+            if !matched {
+                return Ok(Value::from_i32(-1));
+            }
+            let match_start = match_start as usize;
+            let match_end = compiled_regex.capture_slot(1) as usize;
+            if typed_regexp.legacy_features_enabled() && realm == typed_regexp.realm() {
+                let n_capture_groups = compiled_regex.capture_count();
+                let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
+                update_legacy_regexp_static_properties_lazy(
+                    vm,
+                    realm.intrinsics().regexp_constructor(vm),
+                    string,
+                    match_start,
+                    match_end,
+                    &legacy_captures,
+                );
+            } else if realm == typed_regexp.realm() {
+                invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
+            }
+            return Ok(index_value(match_start));
+        }
 
         // 4. Let previousLastIndex be ? Get(rx, "lastIndex").
         let previous_last_index = regexp_object.get_with_cache(

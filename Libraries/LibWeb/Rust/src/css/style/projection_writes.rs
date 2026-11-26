@@ -73,6 +73,30 @@ impl ProjectionWrites<'_> {
         }
     }
 
+    /// Stage the departure of every identified element under `parent` when all of `parent`'s children are being
+    /// removed together. Clears `parent`'s first element child once and marks every departing element disconnected
+    /// without patching sibling links between departing nodes.
+    pub(in crate::css::style) fn record_all_children_departures(
+        &mut self,
+        parent: Option<StyleNodeID>,
+        departing_elements: &[u32],
+    ) {
+        if let Some(parent) = parent {
+            self.stage_first_child(parent, None);
+        }
+        for &raw in departing_elements {
+            let Some(node) = StyleNodeID::from_raw(raw) else {
+                continue;
+            };
+            if self.projection.relations_were_written(node) && self.projection.written_relations(node).is_none() {
+                continue;
+            }
+            self.count(InputKey::TreeRelations(node));
+            self.projection.counters.bump(Counter::TreeDepartureDeltas);
+            self.projection.write_relations(node, None);
+        }
+    }
+
     /// Stage one structural delta and the neighbor rows it derives.
     fn stage_tree_delta(&mut self, node: StyleNodeID, old: Option<TreeRelations>, new: Option<TreeRelations>) {
         self.stage_tree_neighbors(node, old, new);

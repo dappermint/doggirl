@@ -540,10 +540,47 @@ impl Utf16String {
             byte_count += piece.len();
         }
         assert_eq!(byte_count, length, "the pieces add up to the length of the string");
-        // SAFETY: Every byte of the allocation is written.
-        let bytes = unsafe { crate::slice_from_raw_parts(storage.cast_const(), length) };
-        assert_eq!(bytes.is_ascii(), is_ascii, "an ASCII string holds ASCII bytes");
+        #[cfg(debug_assertions)]
+        {
+            // SAFETY: Every byte of the allocation is written.
+            let bytes = unsafe { crate::slice_from_raw_parts(storage.cast_const(), length) };
+            debug_assert_eq!(bytes.is_ascii(), is_ascii, "an ASCII string holds ASCII bytes");
+        }
         result
+    }
+
+    /// Allocates an uninitialized Latin-1/ASCII string of `length` bytes (`length >= size_of::<usize>()`) and lets
+    /// `fill` write every byte directly. When `fill` returns `Ok(is_ascii)`, every byte must have been initialized
+    /// and `is_ascii` must reflect whether all bytes are ASCII. When `fill` returns `Err(string)` (for example after
+    /// widening to UTF-16), that string is returned instead.
+    pub fn try_from_latin1_with_uninit(
+        length: usize,
+        fill: impl FnOnce(&mut [std::mem::MaybeUninit<u8>]) -> Result<bool, Self>,
+    ) -> Self {
+        assert!(length >= size_of::<usize>());
+        let result = Self::create_uninitialized(length, StorageKind::Ascii);
+        // SAFETY: The allocation has space for exactly `length` Latin-1 bytes.
+        let storage = unsafe {
+            crate::slice_from_raw_parts_mut(result.long_storage().cast::<std::mem::MaybeUninit<u8>>(), length)
+        };
+        match fill(storage) {
+            Ok(is_ascii) => {
+                if !is_ascii {
+                    // SAFETY: The new string is not shared yet and starts with Utf16StringDataHeader.
+                    let header =
+                        unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(result.raw_identity()) };
+                    header.flags.fetch_or(CONTAINS_NON_ASCII, Ordering::Relaxed);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    // SAFETY: `fill` initialized all `length` bytes.
+                    let bytes = unsafe { crate::slice_from_raw_parts(result.long_storage().cast_const(), length) };
+                    debug_assert_eq!(bytes.is_ascii(), is_ascii, "an ASCII string holds ASCII bytes");
+                }
+                result
+            }
+            Err(utf16_string) => utf16_string,
+        }
     }
 
     /// Creates a string in AK's native representation of `length` ASCII bytes, which `fill` writes into the string's

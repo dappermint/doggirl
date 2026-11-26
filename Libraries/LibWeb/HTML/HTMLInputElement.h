@@ -84,6 +84,17 @@ public:
 
     Utf16FlyString type() const;
     TypeAttributeState type_state() const { return m_type; }
+    void set_type_state_from_detached_fragment(TypeAttributeState type)
+    {
+        VERIFY(!is_connected() && !parent() && !shadow_root());
+        m_type = type;
+    }
+    void set_checked_from_detached_fragment(bool checked)
+    {
+        VERIFY(!is_connected() && !parent());
+        m_checked = checked;
+    }
+    void set_value_from_detached_fragment(Utf16String const& value);
     void set_type(Utf16View);
 
     Utf16String default_value() const { return get_attribute_value(HTML::AttributeNames::value); }

@@ -402,6 +402,13 @@ void StyleEngine::record_tree_delta(StyleEngineFFI::FfiTreeDelta const& delta)
     StyleEngineFFI::style_engine_stage_tree_delta(host(), &delta);
 }
 
+void StyleEngine::record_all_children_departures(StyleNodeID parent, ReadonlySpan<u32> departing_elements)
+{
+    flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
+    request_frame_for_first_recorded_input(*this, m_style_computer);
+    StyleEngineFFI::style_engine_stage_all_children_departures(host(), parent.value(), departing_elements);
+}
+
 void StyleEngine::record_element_arrivals(ReadonlySpan<StyleEngineFFI::FfiArrivingElement> elements)
 {
     if (elements.is_empty())

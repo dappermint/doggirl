@@ -27,6 +27,10 @@ void Intrinsics::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_constructors);
     visitor.visit(m_realm);
     visitor.visit(m_unforgeable_functions);
+    for (auto& shape : m_wrapper_shapes) {
+        if (shape)
+            visitor.visit(shape);
+    }
 }
 
 Intrinsics& host_defined_intrinsics(JS::Realm& realm)
