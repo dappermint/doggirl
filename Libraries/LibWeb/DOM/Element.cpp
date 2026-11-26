@@ -3333,11 +3333,13 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     if (m_style_node_id == style_node_id)
         return;
     m_published_presentational_hint_properties.clear();
-    forget_published_effect_descriptions();
+    if (element_animations_if_created())
+        forget_published_effect_descriptions();
     auto old_style_node_id = m_style_node_id;
     m_style_node_id = style_node_id;
     Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
-    if (auto* rare_data = element_rare_data()) {
+    auto* rare_data = element_rare_data();
+    if (rare_data) {
         if (rare_data->implicit_anchor_element)
             publish_implicit_anchor_element();
         for (auto& dependent : rare_data->implicit_anchor_dependents)
@@ -3350,22 +3352,25 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     }
     // An element keeps the random base values of its own keys for its whole life: it holds them while it has no style
     // node, and its next one takes them back.
-    auto& style_engine = document().style_computer().style_engine();
     if (style_node_id == 0) {
+        auto& style_engine = document().style_computer().style_engine();
         if (auto values = style_engine.park_element_random_base_values(old_style_node_id))
             ensure_element_rare_data().random_base_values_without_style_node = move(values);
-    } else if (auto* rare_data = element_rare_data(); rare_data && rare_data->random_base_values_without_style_node) {
+    } else if (rare_data && rare_data->random_base_values_without_style_node) {
+        auto& style_engine = document().style_computer().style_engine();
         style_engine.unpark_element_random_base_values(style_node_id, move(rare_data->random_base_values_without_style_node));
     }
     // What the element and its pseudo-elements have scrolled to is held against its identity for the rows a build
     // stamps for them, so it arrives with the identity, as the element connects or its identity changes.
     if (style_node_id != 0) {
-        if (!scroll_offset({}).is_zero())
-            Layout::publish_element_scroll_offset(*this);
-        for_each_synthetic_pseudo_element([](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
-            if (!pseudo_element.scroll_offset().is_zero())
-                pseudo_element.publish_scroll_offset();
-        });
+        if (rare_data) {
+            if (!scroll_offset({}).is_zero())
+                Layout::publish_element_scroll_offset(*this);
+            for_each_synthetic_pseudo_element([](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
+                if (!pseudo_element.scroll_offset().is_zero())
+                    pseudo_element.publish_scroll_offset();
+            });
+        }
         if (document().has_custom_highlights())
             document().set_needs_highlight_style_update(CSS::PseudoElement::Highlight);
     }

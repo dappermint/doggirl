@@ -488,6 +488,8 @@ public:
     void mark_box(Layout::RustFFI::FfiBoxMarks);
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
+    // Like publish_dom_paint_facts(), for a node whose StyleNodeID was just minted (so its render-side facts default to 0).
+    void publish_dom_paint_facts_on_arrival();
     void set_needs_layout_update(SetNeedsLayoutReason);
 
     // Does what a removal does to the layout nodes of this subtree that stay until the parent's layout is rebuilt,

@@ -218,7 +218,10 @@ EventTarget::EventTarget()
     set_wrappable_flag(WrappableFlag::IsEventTarget);
 }
 
-EventTarget::~EventTarget() = default;
+void EventTarget::destroy_data()
+{
+    m_data.clear();
+}
 
 // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
 GC::Ref<EventTarget> EventTarget::create()

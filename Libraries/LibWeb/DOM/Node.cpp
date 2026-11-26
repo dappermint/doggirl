@@ -4140,6 +4140,24 @@ void Node::publish_dom_paint_facts()
     mark_box(marks);
 }
 
+void Node::publish_dom_paint_facts_on_arrival()
+{
+    auto facts = Layout::Node::dom_paint_facts_of(this);
+    if (facts == 0)
+        return;
+    auto& document = this->document();
+    document.set_may_have_dom_paint_facts();
+    auto style_node = is_document() ? document.style_node_id() : Layout::Node::style_node_of(this);
+    if (style_node.value() != 0)
+        CSS::StyleEngineFFI::style_engine_set_node_dom_paint_facts(document.style_computer().style_engine().host(), style_node, facts);
+    if (has_layout_box()) {
+        Layout::RustFFI::FfiBoxMarks marks {};
+        marks.has_dom_paint_facts = true;
+        marks.dom_paint_facts = facts;
+        mark_box(marks);
+    }
+}
+
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
 {
     dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", to_string(reason));

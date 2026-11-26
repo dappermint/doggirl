@@ -50,7 +50,8 @@ pub struct BlockDescriptor {
     /// Whether a collection evacuated the block and could not empty it because something pinned some of its cells.
     /// Compaction leaves the block alone until one of the cells it kept dies.
     pub kept_by_pins: bool,
-    pub reserved: u8,
+    /// Lowest bitmap word index that may still contain a clear (free) cell bit.
+    pub next_free_word: u8,
     /// How many cells fit in the block, after its header.
     pub cell_count: u16,
     /// The index of the first cell of the block, see cell_index(). Its cells have the indices from this one on.
