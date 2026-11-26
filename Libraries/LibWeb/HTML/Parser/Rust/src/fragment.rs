@@ -88,6 +88,32 @@ pub struct RustFfiHtmlFragmentOperation {
     pub tag_name: usize,
 }
 
+/// Compact classification of hot attribute names scanned by the fragment fast path.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiHtmlFragmentAttributeKind {
+    None = 0,
+    Class,
+    Id,
+    Type,
+    Value,
+    Checked,
+    Href,
+    Style,
+    Name,
+    For,
+    Title,
+    Disabled,
+    Placeholder,
+    Target,
+    Rel,
+    Hidden,
+    Tabindex,
+    Autocomplete,
+    DataId,
+    OtherData,
+}
+
 /// An attribute of an element to make. The name and the value are ranges of code units of the input.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +124,7 @@ pub struct RustFfiHtmlFragmentAttribute {
     pub name_length: u32,
     pub value_start: u32,
     pub value_length: u32,
+    pub hot_kind: RustFfiHtmlFragmentAttributeKind,
     pub value_is_ascii: bool,
 }
 
@@ -378,7 +405,8 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         let first_attribute = self.tape.attributes.len();
         loop {
             self.skip_whitespace();
-            if self.peek() == u16::from(b'>') || self.peek() == u16::from(b'/') {
+            let next = self.peek();
+            if next == u16::from(b'>') || next == u16::from(b'/') {
                 break;
             }
             if !self.scan_attribute(tag, first_attribute) {
@@ -425,12 +453,14 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             return false;
         }
         // NB: The tokenizer drops an attribute whose name the tag already has, which the general parser sees to.
-        let is_duplicate = self.tape.attributes[first_attribute..].iter().any(|attribute| {
-            let start = attribute.name_start as usize;
-            input[start..start + attribute.name_length as usize] == *name
-        });
-        if is_duplicate {
-            return false;
+        if self.tape.attributes.len() > first_attribute {
+            let is_duplicate = self.tape.attributes[first_attribute..].iter().any(|attribute| {
+                let start = attribute.name_start as usize;
+                input[start..start + attribute.name_length as usize] == *name
+            });
+            if is_duplicate {
+                return false;
+            }
         }
 
         self.skip_whitespace();
@@ -456,19 +486,13 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             }
         }
 
-        let known_name = self.known_attribute_name_identity(name);
+        let (hot_kind, known_name) = self.classify_attribute_name(name);
 
         // NB: Other input types have insertion steps or children the fast path doesn't cover.
-        if tag == tag_id!("input") {
-            #[cfg(not(test))]
-            let is_type = known_name == self.hot_attributes[2];
-            #[cfg(test)]
-            let is_type = name.len() == 4 && equals_ascii(name, b"type");
-            if is_type {
-                let value_code_units = &input[value_start..value_start + value.length];
-                if !equals_ascii(value_code_units, b"text") && !equals_ascii(value_code_units, b"checkbox") {
-                    return false;
-                }
+        if tag == tag_id!("input") && hot_kind == RustFfiHtmlFragmentAttributeKind::Type {
+            let value_code_units = &input[value_start..value_start + value.length];
+            if !equals_ascii(value_code_units, b"text") && !equals_ascii(value_code_units, b"checkbox") {
+                return false;
             }
         }
 
@@ -478,6 +502,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             name_length: name.len() as u32,
             value_start: value_start as u32,
             value_length: value.length as u32,
+            hot_kind,
             value_is_ascii: value.is_ascii,
         });
         true
@@ -557,26 +582,42 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         self.offset += advance;
     }
 
-    fn known_attribute_name_identity(&self, name: &[T]) -> usize {
+    fn classify_attribute_name(&self, name: &[T]) -> (RustFfiHtmlFragmentAttributeKind, usize) {
         let mut buffer = [0; 32];
         let Some(bytes) = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer)) else {
-            return 0;
+            return (RustFfiHtmlFragmentAttributeKind::None, 0);
         };
         // No HTML known attribute starts with "data-".
         if bytes.len() >= 5 && &bytes[..5] == b"data-" {
-            return 0;
+            let kind = if bytes == b"data-id" {
+                RustFfiHtmlFragmentAttributeKind::DataId
+            } else {
+                RustFfiHtmlFragmentAttributeKind::OtherData
+            };
+            return (kind, 0);
+        }
+        if let Some(index) = hot_attribute_index(bytes) {
+            let kind = HOT_ATTRIBUTE_KINDS[index];
+            #[cfg(not(test))]
+            let identity = self.hot_attributes[index];
+            #[cfg(test)]
+            let identity = 1;
+            return (kind, identity);
         }
         #[cfg(not(test))]
         {
-            if let Some(index) = hot_attribute_index(bytes) {
-                return self.hot_attributes[index];
-            }
-            known_attribute_name(bytes).map_or(0, |name| name.raw_identity())
+            (
+                RustFfiHtmlFragmentAttributeKind::None,
+                known_attribute_name(bytes).map_or(0, |name| name.raw_identity()),
+            )
         }
         // NB: There are no fly strings in the standalone tests, which only tell known names from other names.
         #[cfg(test)]
         {
-            usize::from(hot_attribute_index(bytes).is_some() || known_attribute_name(bytes).is_some())
+            (
+                RustFfiHtmlFragmentAttributeKind::None,
+                usize::from(known_attribute_name(bytes).is_some()),
+            )
         }
     }
 }
@@ -695,6 +736,26 @@ const HOT_ATTRIBUTE_NAMES: [&[u8]; 17] = [
     b"hidden",
     b"tabindex",
     b"autocomplete",
+];
+
+const HOT_ATTRIBUTE_KINDS: [RustFfiHtmlFragmentAttributeKind; HOT_ATTRIBUTE_NAMES.len()] = [
+    RustFfiHtmlFragmentAttributeKind::Class,
+    RustFfiHtmlFragmentAttributeKind::Id,
+    RustFfiHtmlFragmentAttributeKind::Type,
+    RustFfiHtmlFragmentAttributeKind::Value,
+    RustFfiHtmlFragmentAttributeKind::Checked,
+    RustFfiHtmlFragmentAttributeKind::Href,
+    RustFfiHtmlFragmentAttributeKind::Style,
+    RustFfiHtmlFragmentAttributeKind::Name,
+    RustFfiHtmlFragmentAttributeKind::For,
+    RustFfiHtmlFragmentAttributeKind::Title,
+    RustFfiHtmlFragmentAttributeKind::Disabled,
+    RustFfiHtmlFragmentAttributeKind::Placeholder,
+    RustFfiHtmlFragmentAttributeKind::Target,
+    RustFfiHtmlFragmentAttributeKind::Rel,
+    RustFfiHtmlFragmentAttributeKind::Hidden,
+    RustFfiHtmlFragmentAttributeKind::Tabindex,
+    RustFfiHtmlFragmentAttributeKind::Autocomplete,
 ];
 
 #[cfg(not(test))]
@@ -883,7 +944,11 @@ mod tests {
                 let tag = tag_id_for_name(name.as_bytes());
                 (tag != TagId::UNKNOWN && SUPPORTED_TAGS.contains(tag)).then_some(tag)
             };
-            assert_eq!(supported_tag_for_name(name.as_bytes()).map(|(tag, _)| tag), expected, "{name}");
+            assert_eq!(
+                supported_tag_for_name(name.as_bytes()).map(|(tag, _)| tag),
+                expected,
+                "{name}"
+            );
         }
         for (expected_index, &name) in HOT_ATTRIBUTE_NAMES.iter().enumerate() {
             assert_eq!(

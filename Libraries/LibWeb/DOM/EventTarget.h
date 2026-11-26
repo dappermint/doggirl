@@ -25,7 +25,11 @@ class WEB_API EventTarget : public Bindings::GCAllocatedWrappable {
     GC_DECLARE_ALLOCATOR(EventTarget);
 
 public:
-    virtual ~EventTarget() override;
+    virtual ~EventTarget() override
+    {
+        if (m_data) [[unlikely]]
+            destroy_data();
+    }
 
     static GC::Ref<EventTarget> create();
 
@@ -102,6 +106,7 @@ private:
     };
 
     Data& ensure_data();
+    void destroy_data();
     OwnPtr<Data> m_data;
 
     WebIDL::CallbackType* get_current_value_of_event_handler(Utf16FlyString const& name);

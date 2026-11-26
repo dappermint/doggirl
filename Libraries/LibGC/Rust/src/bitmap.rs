@@ -30,49 +30,104 @@ pub fn clear(bits: &mut CellBits, index: usize) {
     bits[index / 64] &= !bit(index);
 }
 
+#[cfg(test)]
 pub fn count(bits: &CellBits) -> usize {
     bits.iter().map(|word| word.count_ones() as usize).sum()
 }
 
-/// The bits of word `word` that are within `begin..end`.
-fn word_mask(word: usize, begin: usize, end: usize) -> u64 {
-    let first = word * 64;
-    let below = |limit: usize| match limit.saturating_sub(first) {
-        0 => 0,
-        n if n >= 64 => u64::MAX,
-        n => (1 << n) - 1,
-    };
-    below(end) & !below(begin)
-}
-
 pub fn set_range(bits: &mut CellBits, begin: usize, end: usize) {
-    for (word, value) in bits.iter_mut().enumerate() {
-        *value |= word_mask(word, begin, end);
+    if begin >= end {
+        return;
     }
+    let first_word = begin / 64;
+    let last_word = (end - 1) / 64;
+    let start_mask = u64::MAX << (begin % 64);
+    let end_shift = end % 64;
+    let end_mask = if end_shift == 0 {
+        u64::MAX
+    } else {
+        (1u64 << end_shift) - 1
+    };
+    if first_word == last_word {
+        bits[first_word] |= start_mask & end_mask;
+        return;
+    }
+    bits[first_word] |= start_mask;
+    for value in &mut bits[first_word + 1..last_word] {
+        *value = u64::MAX;
+    }
+    bits[last_word] |= end_mask;
 }
 
 pub fn clear_range(bits: &mut CellBits, begin: usize, end: usize) {
-    for (word, value) in bits.iter_mut().enumerate() {
-        *value &= !word_mask(word, begin, end);
+    if begin >= end {
+        return;
     }
+    let first_word = begin / 64;
+    let last_word = (end - 1) / 64;
+    let start_mask = u64::MAX << (begin % 64);
+    let end_shift = end % 64;
+    let end_mask = if end_shift == 0 {
+        u64::MAX
+    } else {
+        (1u64 << end_shift) - 1
+    };
+    if first_word == last_word {
+        bits[first_word] &= !(start_mask & end_mask);
+        return;
+    }
+    bits[first_word] &= !start_mask;
+    for value in &mut bits[first_word + 1..last_word] {
+        *value = 0;
+    }
+    bits[last_word] &= !end_mask;
+}
+
+/// The first clear bit within `begin..end`.
+#[inline]
+pub fn first_clear(bits: &CellBits, begin: usize, end: usize) -> Option<usize> {
+    first_with::<false>(bits, begin, end)
 }
 
 /// The first run of clear bits within `begin..end`, as the range of their indices.
 pub fn first_clear_run(bits: &CellBits, begin: usize, end: usize) -> Option<(usize, usize)> {
-    let start = first_with(bits, begin, end, false)?;
-    let run_end = first_with(bits, start, end, true).unwrap_or(end);
+    let start = first_with::<false>(bits, begin, end)?;
+    let run_end = first_with::<true>(bits, start, end).unwrap_or(end);
     Some((start, run_end))
 }
 
-/// The first index within `begin..end` whose bit is `value`.
-fn first_with(bits: &CellBits, begin: usize, end: usize, value: bool) -> Option<usize> {
-    for (word, &bits) in bits.iter().enumerate().take(end.div_ceil(64)).skip(begin / 64) {
-        let candidates = if value { bits } else { !bits } & word_mask(word, begin, end);
+/// The first index within `begin..end` whose bit is `VALUE`.
+#[inline]
+fn first_with<const VALUE: bool>(bits: &CellBits, begin: usize, end: usize) -> Option<usize> {
+    if begin >= end {
+        return None;
+    }
+    let first_word = begin / 64;
+    let last_word = (end - 1) / 64;
+    let start_mask = u64::MAX << (begin % 64);
+    let end_shift = end % 64;
+    let end_mask = if end_shift == 0 {
+        u64::MAX
+    } else {
+        (1u64 << end_shift) - 1
+    };
+    let select = |w: u64| if VALUE { w } else { !w };
+    if first_word == last_word {
+        let candidates = select(bits[first_word]) & start_mask & end_mask;
+        return (candidates != 0).then(|| first_word * 64 + candidates.trailing_zeros() as usize);
+    }
+    let first_candidates = select(bits[first_word]) & start_mask;
+    if first_candidates != 0 {
+        return Some(first_word * 64 + first_candidates.trailing_zeros() as usize);
+    }
+    for (offset, &word_bits) in bits[first_word + 1..last_word].iter().enumerate() {
+        let candidates = select(word_bits);
         if candidates != 0 {
-            return Some(word * 64 + candidates.trailing_zeros() as usize);
+            return Some((first_word + 1 + offset) * 64 + candidates.trailing_zeros() as usize);
         }
     }
-    None
+    let last_candidates = select(bits[last_word]) & end_mask;
+    (last_candidates != 0).then(|| last_word * 64 + last_candidates.trailing_zeros() as usize)
 }
 
 #[cfg(test)]

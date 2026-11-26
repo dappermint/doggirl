@@ -822,6 +822,11 @@ public:
     void set_is_value(Optional<Utf16FlyString> const& is);
 
     void set_custom_element_state(CustomElementState);
+    void set_custom_element_state_for_new_element(CustomElementState state)
+    {
+        VERIFY(!is_connected() && m_style_node_id == 0);
+        m_custom_element_state = state;
+    }
     void set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition>);
     void clear_custom_element_reaction_queue();
     void setup_custom_element_from_constructor(HTML::CustomElementDefinition& custom_element_definition, Optional<Utf16FlyString> const& is_value);

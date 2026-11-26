@@ -166,7 +166,11 @@ impl Allocator {
     }
 
     fn has_free_cells(&self, block: usize) -> bool {
-        bitmap::count(self.allocated(block)) < self.cell_count
+        let (begin, end) = self.cells();
+        let descriptor = self.descriptor(block);
+        // SAFETY: Only the owner thread accesses `next_free_word` and `allocated`.
+        let scan_begin = begin.max(usize::from(unsafe { (*descriptor).next_free_word }) * 64);
+        bitmap::first_clear(self.allocated(block), scan_begin, end).is_some()
     }
 
     fn create_block(&self) -> usize {
@@ -182,6 +186,7 @@ impl Allocator {
             (*descriptor).traced_on_owner_thread_only = self.config.traced_on_owner_thread_only;
             (*descriptor).movable = self.config.movable;
             (*descriptor).kept_by_pins = false;
+            (*descriptor).next_free_word = (self.first_cell_index / 64) as u8;
             (*descriptor).cell_count = self.cell_count as u16;
             (*descriptor).first_cell_index = self.first_cell_index as u16;
             (*descriptor).pending_sweep = false;
@@ -305,10 +310,7 @@ impl Allocator {
     }
 
     /// Takes `block` off the list of usable blocks once it has no free cells left.
-    fn forget_usable_if_full(&self, block: usize) {
-        if self.has_free_cells(block) {
-            return;
-        }
+    fn remove_from_usable(&self, block: usize) {
         let descriptor = self.descriptor(block);
         // SAFETY: As in make_usable().
         unsafe {
@@ -327,18 +329,39 @@ impl Allocator {
 
     fn take_one(&self, block: usize) -> usize {
         let (begin, end) = self.cells();
-        let (index, _) = bitmap::first_clear_run(self.allocated(block), begin, end).expect("the block has a free cell");
-        bitmap::set(self.allocated(block), index);
-        self.forget_usable_if_full(block);
+        let descriptor = self.descriptor(block);
+        // SAFETY: Only the owner thread accesses `next_free_word` and `allocated`.
+        let scan_begin = begin.max(usize::from(unsafe { (*descriptor).next_free_word }) * 64);
+        let allocated = self.allocated(block);
+        let index = bitmap::first_clear(allocated, scan_begin, end).expect("the block has a free cell");
+        bitmap::set(allocated, index);
+        if let Some(next_clear) = bitmap::first_clear(allocated, index + 1, end) {
+            // SAFETY: As above.
+            unsafe { (*descriptor).next_free_word = (next_clear / 64) as u8 };
+        } else {
+            // SAFETY: As above.
+            unsafe { (*descriptor).next_free_word = self.bitmap_word_count as u8 };
+            self.remove_from_usable(block);
+        }
         self.cell_address(block, index)
     }
 
     fn take_run(&self, block: usize) -> usize {
         let (begin, end) = self.cells();
-        let (first, run_end) =
-            bitmap::first_clear_run(self.allocated(block), begin, end).expect("the block has a free cell");
-        bitmap::set_range(self.allocated(block), first, run_end);
-        self.forget_usable_if_full(block);
+        let descriptor = self.descriptor(block);
+        // SAFETY: Only the owner thread accesses `next_free_word` and `allocated`.
+        let scan_begin = begin.max(usize::from(unsafe { (*descriptor).next_free_word }) * 64);
+        let allocated = self.allocated(block);
+        let (first, run_end) = bitmap::first_clear_run(allocated, scan_begin, end).expect("the block has a free cell");
+        bitmap::set_range(allocated, first, run_end);
+        if let Some(next_clear) = bitmap::first_clear(allocated, run_end, end) {
+            // SAFETY: As above.
+            unsafe { (*descriptor).next_free_word = (next_clear / 64) as u8 };
+        } else {
+            // SAFETY: As above.
+            unsafe { (*descriptor).next_free_word = self.bitmap_word_count as u8 };
+            self.remove_from_usable(block);
+        }
         let cell = self.cell_address(block, first);
         let cell_size = self.config.cell_size as usize;
         let local = self.local();
@@ -361,6 +384,11 @@ impl Allocator {
         let cell_size = self.config.cell_size as usize;
         let first = self.cell_index(cursor);
         bitmap::clear_range(self.allocated(block), first, first + (end - cursor) / cell_size);
+        let descriptor = self.descriptor(block);
+        // SAFETY: Only the owner thread accesses `next_free_word`.
+        unsafe {
+            (*descriptor).next_free_word = (*descriptor).next_free_word.min((first / 64) as u8);
+        }
         self.make_usable(block);
     }
 
@@ -547,7 +575,10 @@ impl Allocator {
                 }
             }
             // SAFETY: As above.
-            unsafe { (*descriptor).being_swept = false };
+            unsafe {
+                (*descriptor).next_free_word = (self.first_cell_index / 64) as u8;
+                (*descriptor).being_swept = false;
+            }
             if kept_cell_died {
                 self.forget_cells_kept_by_pins(block);
             }
@@ -656,7 +687,10 @@ impl Allocator {
             }
         }
         // SAFETY: As above.
-        unsafe { (*descriptor).being_swept = false };
+        unsafe {
+            (*descriptor).next_free_word = (self.first_cell_index / 64) as u8;
+            (*descriptor).being_swept = false;
+        }
         if kept_cell_died {
             self.forget_cells_kept_by_pins(block);
         }
@@ -778,6 +812,11 @@ impl Allocator {
             unsafe { (self.config.free_cell)(self.config.context, cell as *mut c_void, false) };
         }
         bitmap::clear(self.allocated(block), index);
+        let descriptor = self.descriptor(block);
+        // SAFETY: Only the owner thread accesses `next_free_word`.
+        unsafe {
+            (*descriptor).next_free_word = (*descriptor).next_free_word.min((index / 64) as u8);
+        }
     }
 }
 
