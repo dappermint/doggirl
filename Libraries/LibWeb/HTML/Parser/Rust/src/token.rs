@@ -322,6 +322,17 @@ impl HtmlName {
         }
     }
 
+    pub fn as_latin1_bytes(&self) -> Option<&[u8]> {
+        #[cfg(test)]
+        return self.0.is_ascii().then_some(self.0.as_bytes());
+
+        #[cfg(not(test))]
+        match self.0.as_units() {
+            Utf16StringUnits::Ascii(units) | Utf16StringUnits::Latin1(units) => Some(units),
+            Utf16StringUnits::Utf16(_) => None,
+        }
+    }
+
     pub fn equals(&self, other: &str) -> bool {
         #[cfg(test)]
         return self.0 == other;

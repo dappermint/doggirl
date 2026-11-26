@@ -15,11 +15,14 @@
 use crate::code_units::RustFfiHtmlUtf16View;
 use crate::known_names::known_attribute_name;
 use crate::known_names::tag_id;
+#[cfg(test)]
 use crate::known_names::tag_id_for_name;
 use crate::scan;
 use crate::scan::CodeUnit;
 use crate::token::TagId;
+#[cfg(test)]
 use crate::token::TagSet;
+#[cfg(test)]
 use crate::token::tag_set;
 use std::cell::Cell;
 
@@ -150,7 +153,11 @@ pub unsafe extern "C" fn rust_html_fragment_tape_release(tape: *mut RustHtmlFrag
 /// since the host links children below a new element without running them.
 macro_rules! supported_tags {
     ($($name:tt),+ $(,)?) => {
+        #[cfg(test)]
         const SUPPORTED_TAGS: &TagSet = tag_set![$($name),+];
+
+        #[cfg(test)]
+        const SUPPORTED_TAG_NAMES: &[&str] = &[$($name),+];
 
         /// The identity of the `Utf16FlyString` of every supported tag, by tag id.
         #[cfg(not(test))]
@@ -202,6 +209,8 @@ fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
         offset: 0,
         #[cfg(not(test))]
         tag_names: tag_names(),
+        #[cfg(not(test))]
+        hot_attributes: hot_attribute_identities(),
         tape,
     }
     .scan()
@@ -212,6 +221,8 @@ struct Scanner<'a, T> {
     offset: usize,
     #[cfg(not(test))]
     tag_names: &'static [usize; TAG_ID_COUNT],
+    #[cfg(not(test))]
+    hot_attributes: &'static [usize; HOT_ATTRIBUTE_NAMES.len()],
     tape: &'a mut RustHtmlFragmentTape,
 }
 
@@ -389,7 +400,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         }
 
         self.tape.attributes.push(RustFfiHtmlFragmentAttribute {
-            known_name: known_attribute_name_identity(name),
+            known_name: self.known_attribute_name_identity(name),
             name_start: name_start as u32,
             name_length: name.len() as u32,
             value_start: value_start as u32,
@@ -401,8 +412,9 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
 
     fn scan_supported_tag(&mut self) -> Option<TagId> {
         let name = self.scan_name();
-        let tag = tag_id_for_name(scan::ascii_name_bytes(name, &mut [0; 32])?);
-        (tag != TagId::UNKNOWN && SUPPORTED_TAGS.contains(tag)).then_some(tag)
+        let mut buffer = [0; 16];
+        let bytes = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer))?;
+        supported_tag_for_name(bytes)
     }
 
     /// Scans a tag name or an attribute name of lowercase ASCII letters, digits and hyphens. Other names are for the
@@ -410,9 +422,14 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     fn scan_name(&mut self) -> &'a [T] {
         let input = self.input;
         let start = self.offset;
-        while matches!(self.peek(), 0x61..=0x7A | 0x30..=0x39 | 0x2D) {
-            self.offset += 1;
+        let mut advance = 0;
+        for &code_unit in &input[start..] {
+            if !matches!(code_unit.into(), 0x61..=0x7A | 0x30..=0x39 | 0x2D) {
+                break;
+            }
+            advance += 1;
         }
+        self.offset = start + advance;
         &input[start..self.offset]
     }
 
@@ -442,28 +459,163 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     }
 
     fn skip_whitespace(&mut self) {
-        while is_tag_whitespace(self.peek()) {
-            self.offset += 1;
+        let mut advance = 0;
+        for &code_unit in &self.input[self.offset..] {
+            if !is_tag_whitespace(code_unit.into()) {
+                break;
+            }
+            advance += 1;
+        }
+        self.offset += advance;
+    }
+
+    fn known_attribute_name_identity(&self, name: &[T]) -> usize {
+        let mut buffer = [0; 32];
+        let Some(bytes) = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer)) else {
+            return 0;
+        };
+        // No HTML known attribute starts with "data-".
+        if bytes.len() >= 5 && &bytes[..5] == b"data-" {
+            return 0;
+        }
+        #[cfg(not(test))]
+        {
+            if let Some(index) = hot_attribute_index(bytes) {
+                return self.hot_attributes[index];
+            }
+            known_attribute_name(bytes).map_or(0, |name| name.raw_identity())
+        }
+        // NB: There are no fly strings in the standalone tests, which only tell known names from other names.
+        #[cfg(test)]
+        {
+            usize::from(hot_attribute_index(bytes).is_some() || known_attribute_name(bytes).is_some())
         }
     }
 }
 
-fn known_attribute_name_identity<T: CodeUnit>(name: &[T]) -> usize {
-    #[cfg(not(test))]
-    {
-        scan::ascii_name_bytes(name, &mut [0; 32])
-            .and_then(known_attribute_name)
-            .map_or(0, |name| name.raw_identity())
+#[inline]
+fn hot_attribute_index(bytes: &[u8]) -> Option<usize> {
+    match bytes.len() {
+        2 => (bytes == b"id").then_some(1),
+        3 => match bytes {
+            b"for" => Some(8),
+            b"rel" => Some(13),
+            _ => None,
+        },
+        4 => match bytes {
+            b"type" => Some(2),
+            b"href" => Some(5),
+            b"name" => Some(7),
+            _ => None,
+        },
+        5 => match bytes {
+            b"class" => Some(0),
+            b"value" => Some(3),
+            b"style" => Some(6),
+            b"title" => Some(9),
+            _ => None,
+        },
+        6 => match bytes {
+            b"target" => Some(12),
+            b"hidden" => Some(14),
+            _ => None,
+        },
+        7 => (bytes == b"checked").then_some(4),
+        8 => match bytes {
+            b"disabled" => Some(10),
+            b"tabindex" => Some(15),
+            _ => None,
+        },
+        11 => (bytes == b"placeholder").then_some(11),
+        12 => (bytes == b"autocomplete").then_some(16),
+        _ => None,
     }
-    // NB: There are no fly strings in the standalone tests, which only tell known names from other names.
-    #[cfg(test)]
-    {
-        usize::from(
-            scan::ascii_name_bytes(name, &mut [0; 32])
-                .and_then(known_attribute_name)
-                .is_some(),
-        )
+}
+
+#[inline]
+fn supported_tag_for_name(name: &[u8]) -> Option<TagId> {
+    match name.len() {
+        1 => match name[0] {
+            b'a' => Some(tag_id!("a")),
+            b'b' => Some(tag_id!("b")),
+            b'i' => Some(tag_id!("i")),
+            b's' => Some(tag_id!("s")),
+            b'u' => Some(tag_id!("u")),
+            _ => None,
+        },
+        2 => match name {
+            b"li" => Some(tag_id!("li")),
+            b"ul" => Some(tag_id!("ul")),
+            b"br" => Some(tag_id!("br")),
+            b"em" => Some(tag_id!("em")),
+            b"ol" => Some(tag_id!("ol")),
+            b"tt" => Some(tag_id!("tt")),
+            _ => None,
+        },
+        3 => match name {
+            b"div" => Some(tag_id!("div")),
+            b"nav" => Some(tag_id!("nav")),
+            b"big" => Some(tag_id!("big")),
+            _ => None,
+        },
+        4 => match name {
+            b"span" => Some(tag_id!("span")),
+            b"main" => Some(tag_id!("main")),
+            b"code" => Some(tag_id!("code")),
+            _ => None,
+        },
+        5 => match name {
+            b"input" => Some(tag_id!("input")),
+            b"label" => Some(tag_id!("label")),
+            b"aside" => Some(tag_id!("aside")),
+            b"small" => Some(tag_id!("small")),
+            _ => None,
+        },
+        6 => match name {
+            b"button" => Some(tag_id!("button")),
+            b"footer" => Some(tag_id!("footer")),
+            b"header" => Some(tag_id!("header")),
+            b"strong" => Some(tag_id!("strong")),
+            b"strike" => Some(tag_id!("strike")),
+            _ => None,
+        },
+        7 => match name {
+            b"section" => Some(tag_id!("section")),
+            b"article" => Some(tag_id!("article")),
+            _ => None,
+        },
+        _ => None,
     }
+}
+
+const HOT_ATTRIBUTE_NAMES: [&[u8]; 17] = [
+    b"class",
+    b"id",
+    b"type",
+    b"value",
+    b"checked",
+    b"href",
+    b"style",
+    b"name",
+    b"for",
+    b"title",
+    b"disabled",
+    b"placeholder",
+    b"target",
+    b"rel",
+    b"hidden",
+    b"tabindex",
+    b"autocomplete",
+];
+
+#[cfg(not(test))]
+fn hot_attribute_identities() -> &'static [usize; HOT_ATTRIBUTE_NAMES.len()] {
+    static IDENTITIES: std::sync::OnceLock<[usize; HOT_ATTRIBUTE_NAMES.len()]> = std::sync::OnceLock::new();
+    IDENTITIES.get_or_init(|| {
+        std::array::from_fn(|index| {
+            known_attribute_name(HOT_ATTRIBUTE_NAMES[index]).map_or(0, |name| name.raw_identity())
+        })
+    })
 }
 
 #[cfg(test)]
@@ -618,5 +770,42 @@ mod tests {
             scan_to_text(&code_units("?", &[0xD83D, 0xDE00])).unwrap(),
             "text \"\u{1F600}\"~\n"
         );
+    }
+
+    #[test]
+    fn direct_supported_tag_match_agrees_with_tag_set() {
+        for &name in SUPPORTED_TAG_NAMES.iter().chain(&[
+            "p",
+            "table",
+            "tr",
+            "td",
+            "script",
+            "style",
+            "svg",
+            "template",
+            "form",
+            "select",
+            "textarea",
+            "img",
+            "my-element",
+            "",
+        ]) {
+            let expected = {
+                let tag = tag_id_for_name(name.as_bytes());
+                (tag != TagId::UNKNOWN && SUPPORTED_TAGS.contains(tag)).then_some(tag)
+            };
+            assert_eq!(supported_tag_for_name(name.as_bytes()), expected, "{name}");
+        }
+        for (expected_index, &name) in HOT_ATTRIBUTE_NAMES.iter().enumerate() {
+            assert_eq!(
+                hot_attribute_index(name),
+                Some(expected_index),
+                "{:?}",
+                core::str::from_utf8(name)
+            );
+            assert!(known_attribute_name(name).is_some(), "{:?}", core::str::from_utf8(name));
+        }
+        assert!(hot_attribute_index(b"data-id").is_none());
+        assert!(known_attribute_name(b"data-id").is_none());
     }
 }
