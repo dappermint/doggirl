@@ -1622,21 +1622,46 @@ pub(crate) unsafe fn decide_transitions(
     no_ancestor_animations: bool,
     mut on_actions: impl FnMut(&[FfiTransitionAction]),
 ) {
-    if existing.is_empty() && !records.before.is_null() && !records.after.is_null() {
+    if !records.before.is_null() && !records.after.is_null() {
+        let before_ptr = records.before.cast::<crate::css::style::pipeline::Record>();
+        let after_ptr = records.after.cast::<crate::css::style::pipeline::Record>();
         // SAFETY: Guaranteed by the caller: `records.before` and `records.after` are live host records.
-        let before_ref = unsafe { &*records.before.cast::<crate::css::style::pipeline::Record>() };
-        let after_ref = unsafe { &*records.after.cast::<crate::css::style::pipeline::Record>() };
-        let after_base = after_ref
-            .sample_of_animations()
-            .map_or(after_ref, |sample| &sample.base);
-        let after_longhands = crate::css::style::ViewLonghands::of_record(after_base);
-        if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_longhands)
-            || (no_ancestor_animations
-                && before_ref.sample_of_animations().is_none()
-                && after_ref.sample_of_animations().is_none()
-                && crate::css::transition::is_noop_without_engine_unoverlaid_records(before_ref, after_ref))
+        let before_ref = unsafe { &*before_ptr };
+        let after_ref = unsafe { &*after_ptr };
+        if existing.is_empty() {
+            let after_base = after_ref
+                .sample_of_animations()
+                .map_or(after_ref, |sample| &sample.base);
+            let after_longhands = crate::css::style::ViewLonghands::of_record(after_base);
+            if crate::css::style_compute::transition_delay_and_duration_are_single_zero(after_longhands)
+                || (no_ancestor_animations
+                    && before_ref.sample_of_animations().is_none()
+                    && after_ref.sample_of_animations().is_none()
+                    && crate::css::transition::is_noop_without_engine_unoverlaid_records(before_ref, after_ref))
+            {
+                on_actions(&[]);
+                return;
+            }
+        }
+        if input.target_pseudo_kind == u8::MAX
+            && StyleNodeID::from_raw(input.target_node).is_some()
+            && host.answer_decided_transition_step(
+                input.target_node,
+                before_ptr,
+                after_ptr,
+                existing,
+                no_ancestor_animations,
+                &mut on_actions,
+            )
         {
-            on_actions(&[]);
+            return;
+        }
+        if no_ancestor_animations
+            && let Some(length_inputs) = host.transition_length_inputs()
+            && let Some(actions) =
+                TransitionDecision::try_decide_without_engine(before_ref, after_ref, existing, length_inputs)
+        {
+            on_actions(&actions);
             return;
         }
     }
@@ -1654,11 +1679,6 @@ pub(crate) unsafe fn decide_transitions(
             .then(|| StyleNodeID::from_raw(input.target_node))
             .flatten(),
     };
-    if decision.element.is_some()
-        && host.answer_decided_transition_step(input.target_node, &decision, existing, &mut on_actions)
-    {
-        return;
-    }
     let element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,
     };

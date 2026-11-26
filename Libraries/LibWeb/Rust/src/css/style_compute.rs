@@ -302,6 +302,15 @@ pub(crate) fn length_unit_is_container_relative(unit: u8) -> bool {
     )
 }
 
+/// Whether a length unit depends only on absolute units or the element's own font metrics (and not on the
+/// initial containing block, root font, or query containers).
+pub(crate) fn length_unit_is_local_to_element(unit: u8) -> bool {
+    matches!(
+        length_unit_kinds().get(unit as usize),
+        Some(LengthUnitKind::Absolute { .. } | LengthUnitKind::FontRelative { root: false, .. })
+    )
+}
+
 fn select_font_metric(metrics: &FfiFontMetrics, metric: FontMetricSelector) -> f64 {
     match metric {
         FontMetricSelector::FontSize => metrics.font_size,
@@ -5394,6 +5403,162 @@ pub(crate) fn transition_values_declare_transitions(
     }
     active_transition_property_ids_of(value_list(properties), value_list(durations), value_list(delays))
         .any(names_a_property)
+}
+
+/// Compact representation of a style's `transition-*` entries that avoids heap allocation for the common
+/// `none`, single-longhand, and `transition: all` cases.
+pub(crate) enum TransitionEntries {
+    Empty,
+    Single(crate::css::transition::TransitionEntry),
+    All {
+        template: crate::css::transition::TransitionEntry,
+        writing_mode: u8,
+        direction: u8,
+    },
+    Many(Vec<crate::css::transition::TransitionEntry>),
+}
+
+impl TransitionEntries {
+    pub(crate) fn entry_for_transform(&self) -> Option<crate::css::transition::TransitionEntry> {
+        use crate::css::property_metadata::property_id as prop;
+        match self {
+            Self::Empty => None,
+            Self::Single(entry) => (entry.property_id == prop::TRANSFORM).then_some(*entry),
+            Self::All { template, .. } => Some(crate::css::transition::TransitionEntry {
+                property_id: prop::TRANSFORM,
+                ..*template
+            }),
+            Self::Many(entries) => entries
+                .iter()
+                .find(|entry| entry.property_id == prop::TRANSFORM)
+                .copied(),
+        }
+    }
+
+    pub(crate) fn contains_property(&self, property_id: u16) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Single(entry) => entry.property_id == property_id,
+            Self::All {
+                writing_mode,
+                direction,
+                ..
+            } => crate::css::computed_values::all_unique_transition_longhands(*writing_mode, *direction)
+                .contains(&property_id),
+            Self::Many(entries) => entries.iter().any(|entry| entry.property_id == property_id),
+        }
+    }
+
+    pub(crate) fn for_each_entry(
+        &self,
+        mut f: impl FnMut(&crate::css::transition::TransitionEntry) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        match self {
+            Self::Empty => std::ops::ControlFlow::Continue(()),
+            Self::Single(entry) => f(entry),
+            Self::All {
+                template,
+                writing_mode,
+                direction,
+            } => {
+                let mut entry = *template;
+                for &property_id in
+                    crate::css::computed_values::all_unique_transition_longhands(*writing_mode, *direction)
+                {
+                    entry.property_id = property_id;
+                    f(&entry)?;
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+            Self::Many(entries) => {
+                for entry in entries {
+                    f(entry)?;
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+}
+
+/// As [`transition_entries`], without allocating for `none`, single-longhand, or single-`all` declarations.
+pub(crate) fn transition_entries_compact(longhands: crate::css::style::ViewLonghands<'_>) -> TransitionEntries {
+    use crate::css::property_metadata::{longhand_is_logical_alias, property_id as prop};
+
+    let property_values = computed_value_list(longhands, prop::TRANSITION_PROPERTY);
+    if property_values.len() == 1 {
+        let transition_property = match property_values[0].data() {
+            StyleValueData::Keyword { keyword } if *keyword == keyword::NONE => return TransitionEntries::Empty,
+            StyleValueData::CustomIdent { custom_ident } => property_id_from_custom_ident(custom_ident),
+            _ => unreachable!("computed transition-property must be none or a custom identifier"),
+        };
+        let Some(transition_property) = transition_property else {
+            return TransitionEntries::Empty;
+        };
+        if transition_property == prop::CUSTOM {
+            return TransitionEntries::Empty;
+        }
+        if transition_property == prop::ALL {
+            let duration_values = computed_value_list(longhands, prop::TRANSITION_DURATION);
+            let timing_function_values = computed_value_list(longhands, prop::TRANSITION_TIMING_FUNCTION);
+            let delay_values = computed_value_list(longhands, prop::TRANSITION_DELAY);
+            let behavior_values = computed_value_list(longhands, prop::TRANSITION_BEHAVIOR);
+            let (writing_mode, direction) =
+                writing_mode_and_direction_of(longhands.handle(prop::WRITING_MODE), longhands.handle(prop::DIRECTION));
+            let delay = time_value_to_milliseconds(delay_values[0].data());
+            let duration = time_value_to_milliseconds(duration_values[0].data());
+            let timing_function = timing_function_values[0].pointer();
+            let behavior = match behavior_values[0].data() {
+                StyleValueData::Keyword { keyword } => keyword_to_transition_behavior(*keyword).unwrap(),
+                _ => unreachable!("computed transition-behavior must be a keyword"),
+            };
+            return TransitionEntries::All {
+                template: crate::css::transition::TransitionEntry {
+                    property_id: 0,
+                    delay,
+                    duration,
+                    timing_function,
+                    behavior,
+                },
+                writing_mode,
+                direction,
+            };
+        }
+        if !property_is_shorthand(transition_property) {
+            let property_id = if longhand_is_logical_alias(transition_property) {
+                let (writing_mode, direction) = writing_mode_and_direction_of(
+                    longhands.handle(prop::WRITING_MODE),
+                    longhands.handle(prop::DIRECTION),
+                );
+                map_logical_alias_to_physical(transition_property, writing_mode, direction)
+            } else {
+                transition_property
+            };
+            let duration_values = computed_value_list(longhands, prop::TRANSITION_DURATION);
+            let timing_function_values = computed_value_list(longhands, prop::TRANSITION_TIMING_FUNCTION);
+            let delay_values = computed_value_list(longhands, prop::TRANSITION_DELAY);
+            let behavior_values = computed_value_list(longhands, prop::TRANSITION_BEHAVIOR);
+            let delay = time_value_to_milliseconds(delay_values[0].data());
+            let duration = time_value_to_milliseconds(duration_values[0].data());
+            let timing_function = timing_function_values[0].pointer();
+            let behavior = match behavior_values[0].data() {
+                StyleValueData::Keyword { keyword } => keyword_to_transition_behavior(*keyword).unwrap(),
+                _ => unreachable!("computed transition-behavior must be a keyword"),
+            };
+            return TransitionEntries::Single(crate::css::transition::TransitionEntry {
+                property_id,
+                delay,
+                duration,
+                timing_function,
+                behavior,
+            });
+        }
+    }
+    let entries = transition_entries(longhands);
+    if entries.is_empty() {
+        TransitionEntries::Empty
+    } else {
+        TransitionEntries::Many(entries)
+    }
 }
 
 /// The `transition-*` values of `longhands`, per physical longhand they name: shorthands expanded,

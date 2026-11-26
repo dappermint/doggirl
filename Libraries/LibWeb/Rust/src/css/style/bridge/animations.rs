@@ -158,11 +158,13 @@ pub unsafe extern "C" fn style_engine_publish_sampled_animation_overlays(
         )
     };
     with_engine(read, host, |engine| {
+        let mut batch_cache = (inputs.len() > 1).then(OverlayBuildBatchCache::default);
         for (input, out) in inputs.iter().zip(out.iter_mut()) {
             // SAFETY: Guaranteed by the caller.
-            *out = unsafe { publish_sampled_animation_overlay(engine, input, None) }.unwrap_or_else(
-                |crate::css::style::engine_sample::NeedsHostFont| FfiAnimationOverlayPublication::missing(),
-            );
+            *out = unsafe { publish_sampled_animation_overlay_cached(engine, input, None, batch_cache.as_mut()) }
+                .unwrap_or_else(|crate::css::style::engine_sample::NeedsHostFont| {
+                    FfiAnimationOverlayPublication::missing()
+                });
         }
     });
     for (input, out) in inputs.iter().zip(out.iter_mut()) {
@@ -184,10 +186,118 @@ pub unsafe extern "C" fn style_engine_publish_sampled_animation_overlays(
             });
         }
         if !out.record.is_null() {
+            if input.is_document_element {
+                host.invalidate_transition_length_inputs();
+            }
             host.engine_memo()
                 .views
                 .set(out.publication.new_style_record, out.record);
         }
+    }
+}
+
+struct CachedOverlayBuild {
+    style_record: u64,
+    record_ptr: *const c_void,
+    used_color_scheme: u8,
+    display_before_box_type_transformation_raw: u32,
+    is_document_element: bool,
+    is_svg_graphics_element: bool,
+    overlay_ptr: *const AnimatedOverlay,
+    overlay_hash: u64,
+    groups: crate::css::computed_values::StyleGroups,
+    rebuilt_every_group: bool,
+    invalidation: FfiAnimationInvalidation,
+}
+
+#[derive(Default)]
+struct OverlayBuildBatchCache {
+    entries: Vec<CachedOverlayBuild>,
+    next_evict: usize,
+}
+
+impl OverlayBuildBatchCache {
+    const MAX_ENTRIES: usize = 8;
+
+    fn find(
+        &self,
+        input: &FfiAnimationOverlayPublicationInput,
+        is_svg_graphics_element: bool,
+        overlay: Option<&AnimatedOverlay>,
+        overlay_hash: u64,
+    ) -> Option<&CachedOverlayBuild> {
+        self.entries.iter().find(|entry| {
+            entry.style_record == input.style_record
+                && std::ptr::eq(entry.record_ptr, input.record)
+                && entry.used_color_scheme == input.used_color_scheme
+                && entry.display_before_box_type_transformation_raw == input.display_before_box_type_transformation_raw
+                && entry.is_document_element == input.is_document_element
+                && entry.is_svg_graphics_element == is_svg_graphics_element
+                && entry.overlay_hash == overlay_hash
+                // SAFETY: Every cached `overlay_ptr` came from an earlier element in the same `inputs` slice, which
+                //         stays live for the entire `style_engine_publish_sampled_animation_overlays` call.
+                && overlays_build_equal(unsafe { entry.overlay_ptr.as_ref() }, overlay)
+        })
+    }
+
+    fn insert(&mut self, entry: CachedOverlayBuild) {
+        if self.entries.len() < Self::MAX_ENTRIES {
+            self.entries.push(entry);
+        } else {
+            let slot = self.next_evict % Self::MAX_ENTRIES;
+            self.entries[slot] = entry;
+            self.next_evict = self.next_evict.wrapping_add(1);
+        }
+    }
+}
+
+fn overlay_build_hash(overlay: Option<&AnimatedOverlay>) -> u64 {
+    let Some(overlay) = overlay.filter(|overlay| !overlay.is_empty()) else {
+        return 0;
+    };
+    use std::hash::Hasher;
+    let mut hasher = crate::css::style::fast_hash::fast_hasher();
+    hasher.write_usize(overlay.entries().len());
+    for entry in overlay.entries() {
+        hasher.write_u16(entry.property);
+        hasher.write_u8(
+            u8::from(entry.inherited)
+                | (u8::from(entry.result_of_transition) << 1)
+                | (u8::from(entry.post_compute_adjustment) << 2),
+        );
+        hasher.write_u64(crate::css::style_value::style_value_content_hash(
+            entry.value_handle().optional_data(),
+        ));
+    }
+    hasher.write_usize(overlay.implicit_will_change.len());
+    for &property in &overlay.implicit_will_change {
+        hasher.write_u16(property);
+    }
+    hasher.finish()
+}
+
+fn overlays_build_equal(a: Option<&AnimatedOverlay>, b: Option<&AnimatedOverlay>) -> bool {
+    match (
+        a.filter(|overlay| !overlay.is_empty()),
+        b.filter(|overlay| !overlay.is_empty()),
+    ) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            if std::ptr::eq(a, b) {
+                return true;
+            }
+            a.implicit_will_change == b.implicit_will_change
+                && a.entries().len() == b.entries().len()
+                && a.entries().iter().zip(b.entries().iter()).all(|(ea, eb)| {
+                    ea.property == eb.property
+                        && ea.inherited == eb.inherited
+                        && ea.result_of_transition == eb.result_of_transition
+                        && ea.post_compute_adjustment == eb.post_compute_adjustment
+                        && (std::ptr::eq(ea.value, eb.value)
+                            || ea.value_handle().optional_data() == eb.value_handle().optional_data())
+                })
+        }
+        _ => false,
     }
 }
 
@@ -200,6 +310,16 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
     engine: &mut StyleEngine,
     input: &FfiAnimationOverlayPublicationInput,
     font: Option<&crate::css::table_group_builder::FfiFontGroupBuildInputs>,
+) -> Result<FfiAnimationOverlayPublication, crate::css::style::engine_sample::NeedsHostFont> {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { publish_sampled_animation_overlay_cached(engine, input, font, None) }
+}
+
+unsafe fn publish_sampled_animation_overlay_cached(
+    engine: &mut StyleEngine,
+    input: &FfiAnimationOverlayPublicationInput,
+    font: Option<&crate::css::table_group_builder::FfiFontGroupBuildInputs>,
+    batch_cache: Option<&mut OverlayBuildBatchCache>,
 ) -> Result<FfiAnimationOverlayPublication, crate::css::style::engine_sample::NeedsHostFont> {
     use crate::css::table_group_builder::group_index;
 
@@ -236,6 +356,48 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
             input.animated_overlay.cast::<AnimatedOverlay>().as_ref(),
         )
     };
+    let is_svg_graphics_element = engine.is_svg_graphics_element(node);
+    let overlay_hash = if batch_cache.is_some() && font.is_none() {
+        overlay_build_hash(overlay)
+    } else {
+        0
+    };
+    if let Some(cache) = batch_cache.as_deref()
+        && font.is_none()
+        && engine.computed_group_sets.host_record(input.style_record).is_some()
+        && let Some(cached) = cache.find(input, is_svg_graphics_element, overlay, overlay_hash)
+    {
+        let (animated_overlay, overlay_payloads) = match input.animation_overlay_identity {
+            0 => (std::ptr::null(), None),
+            _ => (input.animated_overlay, Some(&cached.groups)),
+        };
+        let publication = match engine.publish_animation_overlay_impl(
+            crate::css::style::computed::ComputedStyleTarget::new(node, pseudo_kind),
+            input.animation_overlay_identity,
+            HostShared::new(animated_overlay).cast(),
+            overlay_payloads,
+        ) {
+            Some(publication) => FfiStyleRecordDelta {
+                old_style_record: publication.previous_style_record.raw(),
+                new_style_record: publication.style_record.raw(),
+            },
+            None => return Ok(FfiAnimationOverlayPublication::missing()),
+        };
+        engine
+            .retained
+            .live_counters
+            .note_animated_sample(node, cached.rebuilt_every_group);
+        return Ok(FfiAnimationOverlayPublication {
+            invalidation: cached.invalidation,
+            publication,
+            record: engine
+                .computed_group_sets
+                .host_record(publication.new_style_record)
+                .map_or(std::ptr::null(), |record| std::sync::Arc::into_raw(record.clone())),
+            rebuilt_every_group: cached.rebuilt_every_group,
+        });
+    }
+
     let mut payloads = [std::ptr::null(); group_index::COUNT];
     let Some(old_record) = engine.computed_group_sets.host_record(input.style_record).cloned() else {
         return Ok(FfiAnimationOverlayPublication::missing());
@@ -251,18 +413,19 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
         &mut payloads,
     )?;
     // SAFETY: The rebuild wrote a live payload of each group.
-    let groups = &unsafe { crate::css::computed_values::StyleGroups::retained(&payloads, rebuilt.bits) };
+    let groups = unsafe { crate::css::computed_values::StyleGroups::retained(&payloads, rebuilt.bits) };
+    crate::css::style::engine_sample::release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
     // Compared before the publication, which may release the installed record: nothing else keeps a pseudo-element's.
     let invalidation = engine.compare_animation_overlay(
         old_view,
         input.animated_overlay.cast(),
-        groups,
+        &groups,
         input.is_document_element,
-        engine.is_svg_graphics_element(node),
+        is_svg_graphics_element,
     );
     let (animated_overlay, overlay_payloads) = match input.animation_overlay_identity {
         0 => (std::ptr::null(), None),
-        _ => (input.animated_overlay, Some(groups)),
+        _ => (input.animated_overlay, Some(&groups)),
     };
     let publication = match engine.publish_animation_overlay_impl(
         crate::css::style::computed::ComputedStyleTarget::new(node, pseudo_kind),
@@ -277,11 +440,26 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
         // NB: The engine assigns every pseudo-element it styles the record it installed, so a target it holds no
         //     assignment for has no style to compose over.
         None => {
-            crate::css::style::engine_sample::release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
             return Ok(FfiAnimationOverlayPublication::missing());
         }
     };
-    crate::css::style::engine_sample::release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
+    if let Some(cache) = batch_cache
+        && font.is_none()
+    {
+        cache.insert(CachedOverlayBuild {
+            style_record: input.style_record,
+            record_ptr: input.record,
+            used_color_scheme: input.used_color_scheme,
+            display_before_box_type_transformation_raw: input.display_before_box_type_transformation_raw,
+            is_document_element: input.is_document_element,
+            is_svg_graphics_element,
+            overlay_ptr: input.animated_overlay.cast(),
+            overlay_hash,
+            groups,
+            rebuilt_every_group: rebuilt.every_group,
+            invalidation,
+        });
+    }
     engine
         .retained
         .live_counters
