@@ -97,6 +97,7 @@ unsafe extern "C" {
     pub safe fn gc_get_layout(layout: &mut GCLayout, layout_size: usize);
     pub safe fn gc_heap_region_base() -> usize;
     pub safe fn gc_primitive_storage_cage_base() -> usize;
+    pub safe fn gc_block_descriptors() -> *const c_void;
 
     pub fn gc_heap_create(
         gather_roots: GCGatherRootsCallback,

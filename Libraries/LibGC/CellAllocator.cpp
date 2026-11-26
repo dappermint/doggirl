@@ -123,11 +123,22 @@ CellAllocator::CellAllocator(Heap& heap, CellAllocatorDescriptorBase& descriptor
         .local = reinterpret_cast<FFI::LocalFreeCells*>(&m_local),
         .cells_offset = static_cast<u32>(HeapBlock::cells_offset()),
         .cell_size = static_cast<u32>(cell_size()),
+        .cell_state_offset = static_cast<u32>(offsetof(Cell, m_state)),
+        .cell_state_live = to_underlying(Cell::State::Live),
+        .cell_state_dead = to_underlying(Cell::State::Dead),
         .traced_on_owner_thread_only = descriptor.trace_thread() == TraceThread::OwnerThreadOnly,
         .movable = descriptor.is_movable(),
+        .has_destructor = type_info().destroy != nullptr,
+#ifdef HAS_ADDRESS_SANITIZER
+        .has_address_sanitizer = true,
+#else
+        .has_address_sanitizer = false,
+#endif
         .context = this,
+        .block_sweeps_in_progress = heap.block_sweeps_in_progress_ptr({}),
         .initialize_block = initialize_block,
         .free_cell = free_cell,
+        .destroy_cell = reinterpret_cast<void (*)(void*)>(type_info().destroy),
     };
     m_allocator = FFI::rust_gc_allocator_create(&config);
 }
@@ -152,11 +163,12 @@ Cell* CellAllocator::allocate_cell_slow(Heap& heap)
     bool can_sweep = heap.is_incremental_sweep_active() && !heap.is_gc_deferred();
     FFI::SweepStats stats {};
     // NB: The time spent sweeping goes into how far the heap grows before the next collection, see
-    //     Heap::next_growth_factor().
-    auto start_ns = can_sweep ? MonotonicTime::now().nanoseconds() : 0;
+    //     Heap::next_growth_factor(). Only sample the clock when allocation will actually sweep a pending block.
+    bool will_sweep = can_sweep && FFI::rust_gc_allocator_will_sweep_on_allocate(m_allocator);
+    auto start_ns = will_sweep ? Heap::sweep_clock_now_ns() : 0;
     auto* cell = static_cast<Cell*>(FFI::rust_gc_allocator_allocate(m_allocator, can_sweep, heap.should_collect_on_every_allocation(), &stats));
     if (stats.swept_blocks)
-        heap.did_sweep_blocks_for_allocation({}, stats.swept_blocks, MonotonicTime::now().nanoseconds() - start_ns);
+        heap.did_sweep_blocks_for_allocation({}, stats.swept_blocks, will_sweep ? Heap::sweep_clock_now_ns() - start_ns : 0);
     ASAN_UNPOISON_MEMORY_REGION(cell, cell_size());
     return cell;
 }

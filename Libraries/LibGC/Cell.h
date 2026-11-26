@@ -381,6 +381,7 @@ protected:
     Cell() = default;
 
 private:
+    friend class CellAllocator;
     friend class Heap;
     friend struct CAPI;
 

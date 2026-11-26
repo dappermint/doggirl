@@ -89,6 +89,9 @@ struct Job<'a> {
     layout: MarkerLayout,
     descriptors: NonNull<BlockDescriptor>,
     heaps: &'a [*const c_void],
+    /// Whether this collection evacuates any blocks. Almost all collections do not, so skipping the
+    /// per-block evacuation pointer load on every visited edge saves work on the hot marking loop.
+    has_evacuation: bool,
     markers: Vec<Marker>,
     stealers: Vec<Stealer<u32>>,
     /// The cells that only the thread that collects may visit the edges of.
@@ -205,7 +208,9 @@ impl Marker {
         let Some((_, descriptor)) = job.descriptor_in_domain(address) else {
             return false;
         };
-        if let Some(evacuation) = descriptor.evacuation() {
+        if job.has_evacuation
+            && let Some(evacuation) = descriptor.evacuation()
+        {
             evacuation.pin(descriptor, address, reason);
         }
         self.mark_in(descriptor, address)
@@ -227,7 +232,8 @@ impl Marker {
         let Some((_, descriptor)) = job.descriptor_in_domain(address) else {
             return;
         };
-        if let Some(evacuation) = descriptor.evacuation()
+        if job.has_evacuation
+            && let Some(evacuation) = descriptor.evacuation()
             && !evacuation.is_pinned(descriptor, address)
         {
             if SLOT_IS_OWNED || job.is_in_heap_region(slot.address()) {
@@ -279,6 +285,15 @@ impl Marker {
             // SAFETY: Prefetching has no effect on memory.
             unsafe {
                 core::arch::x86_64::_mm_prefetch(address as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            }
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: Prefetching has no effect on memory or flags.
+            unsafe {
+                core::arch::asm!(
+                    "prfm pldl1keep, [{addr}]",
+                    addr = in(reg) address,
+                    options(nostack, readonly, preserves_flags),
+                );
             }
             let compressed = job.compress(address);
             if descriptor.traced_on_owner_thread_only && self.shared.get() {
@@ -413,9 +428,15 @@ impl Marker {
         let job = self.job();
         let layout = &job.layout;
         let address = job.decompress(compressed);
-        let (heap_index, descriptor) = job
-            .descriptor_in_domain(address)
-            .expect("only cells of the heaps being collected are marked");
+        let (heap_index, descriptor) = if job.heaps.len() == 1 {
+            // SAFETY: Only cells of the sole heap being collected were queued, and its descriptors stay fixed while
+            //         the heap is stopped for marking.
+            let index = (address - layout.heap_region_base) / BLOCK_SIZE;
+            (0usize, unsafe { job.descriptors.add(index).as_ref() })
+        } else {
+            job.descriptor_in_domain(address)
+                .expect("only cells of the heaps being collected are marked")
+        };
         if !self.is_owner && descriptor.traced_on_owner_thread_only {
             job.owner_queue.push(compressed);
             return;
@@ -715,6 +736,7 @@ fn mark(request: &mut MarkRequest, heaps: &[*const c_void], roots: &[*const c_vo
         layout: request.layout,
         descriptors: descriptor_table(),
         heaps,
+        has_evacuation: !request.evacuation.is_null(),
         markers: Vec::with_capacity(marker_count),
         stealers: Vec::with_capacity(marker_count),
         owner_queue: Injector::new(),

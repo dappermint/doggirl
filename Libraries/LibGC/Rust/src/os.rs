@@ -147,21 +147,10 @@ mod platform {
 
     /// # Safety
     ///
-    /// The range must be committed memory that was discarded, or that mark_reusable() was called on.
+    /// The range must be committed memory that was discarded.
     pub unsafe fn reuse(address: NonNull<u8>, size: usize) {
         #[cfg(target_os = "macos")]
         madvise(address, size, libc::MADV_FREE_REUSE, "madvise(MADV_FREE_REUSE)");
-        #[cfg(not(target_os = "macos"))]
-        let _ = (address, size);
-    }
-
-    /// # Safety
-    ///
-    /// The range must be committed memory that holds nothing yet.
-    pub unsafe fn mark_reusable(address: NonNull<u8>, size: usize) {
-        // NB: So that reuse() pairs with this when the blocks of a new chunk are handed out.
-        #[cfg(target_os = "macos")]
-        madvise(address, size, libc::MADV_FREE_REUSABLE, "madvise(MADV_FREE_REUSABLE)");
         #[cfg(not(target_os = "macos"))]
         let _ = (address, size);
     }
@@ -243,11 +232,6 @@ mod platform {
     ///
     /// The range must be committed memory.
     pub unsafe fn reuse(_address: NonNull<u8>, _size: usize) {}
-
-    /// # Safety
-    ///
-    /// The range must be committed memory.
-    pub unsafe fn mark_reusable(_address: NonNull<u8>, _size: usize) {}
 }
 
 pub fn reserve_zeroed(size: usize) -> Option<NonNull<u8>> {
@@ -317,7 +301,7 @@ pub unsafe fn return_to_system(address: NonNull<u8>, size: usize) {
     unsafe { platform::return_to_system(address, size) }
 }
 
-/// Tells the system that a range that discard() or mark_reusable() was called on is in use again.
+/// Tells the system that a range that discard() was called on is in use again.
 ///
 /// # Safety
 ///
@@ -325,14 +309,4 @@ pub unsafe fn return_to_system(address: NonNull<u8>, size: usize) {
 pub unsafe fn reuse(address: NonNull<u8>, size: usize) {
     // SAFETY: Forwarded from the caller.
     unsafe { platform::reuse(address, size) }
-}
-
-/// Marks a freshly committed range as unused, so that reuse() pairs with it as it does with discard().
-///
-/// # Safety
-///
-/// The range must be committed memory that holds nothing yet.
-pub unsafe fn mark_reusable(address: NonNull<u8>, size: usize) {
-    // SAFETY: Forwarded from the caller.
-    unsafe { platform::mark_reusable(address, size) }
 }
