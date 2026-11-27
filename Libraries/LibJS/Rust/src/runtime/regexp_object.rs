@@ -11,7 +11,7 @@ use std::rc::Rc;
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
 
-use crate::gc::class::{Finalize, GcCell, define_cell};
+use crate::gc::class::{GcCell, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::member::NullableMember;
@@ -159,19 +159,13 @@ static REGEXP_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     ..ORDINARY_OBJECT_METHODS
 };
 
-define_cell!(RegExpObject, Object, extends: [Object], methods: REGEXP_OBJECT_METHODS, finalize: finalize);
+define_cell!(RegExpObject, Object, extends: [Object], methods: REGEXP_OBJECT_METHODS);
 
 impl Deref for RegExpObject {
     type Target = Object;
 
     fn deref(&self) -> &Object {
         &self.base
-    }
-}
-
-impl Finalize for RegExpObject {
-    fn finalize(&self) {
-        drop(self.cached_regex.replace(None));
     }
 }
 
@@ -327,31 +321,10 @@ impl RegExpObject {
             Ok(flag_bits) => flag_bits,
             Err(message) => return vm.throw_completion_with_utf16_message(ErrorKind::SyntaxError, message),
         };
-        let unicode = flag_bits.has(RegExpFlags::UNICODE);
-        let unicode_sets = flag_bits.has(RegExpFlags::UNICODE_SETS);
-
-        let mut parsed_pattern = Vec::new();
-
-        // Normalize non-ASCII code units to ASCII escapes before compiling the pattern.
-        if !Utf16View::of_string(&pattern).is_empty() {
-            let mut pattern_code_units = Vec::new();
-            Utf16View::of_string(&pattern).append_to(&mut pattern_code_units);
-            match parse_regex_pattern(&pattern_code_units, unicode, unicode_sets) {
-                Ok(result) => parsed_pattern = result,
-                Err(error) => {
-                    return vm.throw_completion(ErrorKind::SyntaxError, ErrorType::RegExpCompileError, &[&error.error]);
-                }
-            }
-        }
-
         // 11. If u is true and v is true, throw a SyntaxError exception.
         // NB: Already handled by validate_flags above.
-
-        // Validate by trial-compiling the pattern.
-        let mut compile_flags = compile_flags_for(flag_bits);
-        compile_flags.has_indices = false;
-
-        let compiled = match EcmaScriptRegex::compile(Utf16View::Utf16(&parsed_pattern), compile_flags) {
+        // Validate and compile (or reuse from the VM's regex cache).
+        let compiled = match vm.regex_cache().get_or_compile(&pattern, flag_bits) {
             Ok(compiled) => compiled,
             Err(error) => {
                 return vm.throw_completion(ErrorKind::SyntaxError, ErrorType::RegExpCompileError, &[&error]);
@@ -359,19 +332,13 @@ impl RegExpObject {
         };
 
         // Pattern and flag coercion can reenter and populate this cache.
-        // NB: The trial compile is what exec would compile when the pattern does not have indices, so it is kept for
-        //     exec instead of being compiled again.
-        self.set_cached_regex(if flag_bits.has(RegExpFlags::HAS_INDICES) {
-            None
-        } else {
-            Some(Rc::new(compiled))
-        });
+        self.set_cached_regex(Some(compiled));
 
         // 16. Set obj.[[OriginalSource]] to P.
         drop(self.pattern.replace(pattern));
 
         // 17. Set obj.[[OriginalFlags]] to F.
-        self.flag_bits.set(to_flag_bits(Utf16View::of_string(&flags)));
+        self.flag_bits.set(flag_bits);
         drop(self.flags.replace(flags));
 
         // 18. Let capturingGroupsCount be CountLeftCapturingParensWithin(parseResult).

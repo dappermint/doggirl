@@ -1562,6 +1562,13 @@ pub fn compare_typed_array_elements(
     if let Some(comparefn) = comparefn {
         // a. Let v be ? ToNumber(? Call(comparefn, undefined, « x, y »)).
         let value = call_function_object(vm, comparefn, Value::UNDEFINED, &[x, y])?;
+        if value.is_int32() {
+            return Ok(f64::from(value.as_i32()));
+        }
+        if value.is_double() {
+            let number = value.as_f64();
+            return Ok(if number.is_nan() { 0.0 } else { number });
+        }
         let value_number = value.to_number(vm)?;
 
         // b. If v is NaN, return +0𝔽.

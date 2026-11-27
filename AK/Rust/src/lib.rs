@@ -44,12 +44,50 @@ use core::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Mirrors `AK::string_hash(u8 const*, size_t)` / `AK::Utf16View::hash()` for Latin-1/ASCII bytes.
+#[inline]
+pub fn ak_string_hash_bytes(bytes: &[u8]) -> u32 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut hash: u32 = 0;
+    for &b in bytes {
+        hash = hash.wrapping_add(u32::from(b));
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash = hash.wrapping_add(hash << 15);
+    hash
+}
+
+/// Mirrors `AK::string_hash(char16_t const*, size_t)` / `AK::Utf16View::hash()` for UTF-16 code units.
+#[inline]
+pub fn ak_string_hash_u16(units: &[u16]) -> u32 {
+    if units.is_empty() {
+        return 0;
+    }
+    let mut hash: u32 = 0;
+    for &u in units {
+        hash = hash.wrapping_add(u32::from(u));
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash = hash.wrapping_add(hash << 15);
+    hash
+}
+
 /// Set in the raw word of a string whose bytes are stored inline in the word itself.
 pub const SHORT_STRING_FLAG: usize = 1;
 /// The byte count of a short string is stored in its tag byte, above the flag.
 pub const SHORT_STRING_BYTE_COUNT_SHIFT: u32 = 2;
 /// Set in `Utf16StringDataHeader::flags` when the storage holds UTF-16 code units rather than Latin-1 bytes.
 pub const HAS_UTF16_STORAGE: u32 = 1;
+/// Set in `Utf16StringDataHeader::flags` when `hash` has been computed and cached.
+pub const HAS_HASH: u32 = 1 << 1;
 /// Set in `Utf16StringDataHeader::flags` when Latin-1 storage holds a byte above 0x7F. Without it, Latin-1 storage is
 /// ASCII.
 pub const CONTAINS_NON_ASCII: u32 = 1 << 3;
@@ -349,7 +387,7 @@ impl Utf16String {
     /// Returns a `u16` classifying the maximum code-unit class in `string`: `<= 0x7f` if all ASCII,
     /// `0x80..=0xff` if all Latin-1 with at least one non-ASCII code unit, and `> 0xff` otherwise.
     #[inline]
-    fn utf16_max_code_unit_bits(string: &[u16]) -> u16 {
+    pub fn utf16_max_code_unit_bits(string: &[u16]) -> u16 {
         #[cfg(target_arch = "aarch64")]
         {
             use std::arch::aarch64::*;
@@ -547,6 +585,51 @@ impl Utf16String {
             debug_assert_eq!(bytes.is_ascii(), is_ascii, "an ASCII string holds ASCII bytes");
         }
         result
+    }
+
+    /// Creates a UTF-16 string of `length` code units when the caller guarantees at least one written code unit is
+    /// above `0xFF`, writing directly into the uninitialized allocation.
+    ///
+    /// # Safety
+    ///
+    /// `fill` must initialize all `length` elements and at least one code unit must be `> 0xFF` to satisfy AK's
+    /// `StorageKind::Utf16` invariant.
+    pub unsafe fn from_utf16_known_non_latin1_with(length: usize, fill: impl FnOnce(&mut [std::mem::MaybeUninit<u16>])) -> Self {
+        let result = Self::create_uninitialized(length, StorageKind::Utf16);
+        // SAFETY: The allocation has space for `length` UTF-16 code units.
+        let storage = unsafe {
+            crate::slice_from_raw_parts_mut(result.long_storage().cast::<std::mem::MaybeUninit<u16>>(), length)
+        };
+        fill(storage);
+        result
+    }
+
+    /// Returns AK's deterministic 32-bit string hash (identical to `AK::Utf16View::hash()` / `AK::string_hash()`),
+    /// loading or populating `Utf16StringDataHeader::hash` for long strings.
+    #[inline]
+    pub fn cached_hash32(&self) -> u32 {
+        let raw = self.raw_identity();
+        if raw == 0 {
+            return 0;
+        }
+        if raw & SHORT_STRING_FLAG != 0 {
+            return match self.as_units() {
+                Utf16StringUnits::Ascii(bytes) | Utf16StringUnits::Latin1(bytes) => ak_string_hash_bytes(bytes),
+                Utf16StringUnits::Utf16(units) => ak_string_hash_u16(units),
+            };
+        }
+        // SAFETY: Long strings hold a valid pointer to `Utf16StringDataHeader`.
+        let header = unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(raw) };
+        if header.flags.load(Ordering::Acquire) & HAS_HASH != 0 {
+            return header.hash.load(Ordering::Relaxed);
+        }
+        let hash = match self.as_units() {
+            Utf16StringUnits::Ascii(bytes) | Utf16StringUnits::Latin1(bytes) => ak_string_hash_bytes(bytes),
+            Utf16StringUnits::Utf16(units) => ak_string_hash_u16(units),
+        };
+        header.hash.store(hash, Ordering::Relaxed);
+        header.flags.fetch_or(HAS_HASH, Ordering::Release);
+        hash
     }
 
     /// Allocates an uninitialized Latin-1/ASCII string of `length` bytes (`length >= size_of::<usize>()`) and lets

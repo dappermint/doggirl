@@ -221,15 +221,37 @@ impl CodeUnit for u16 {
 
     fn make_primitive_string(vm: &Vm, units: &[u16]) -> Gc<PrimitiveString> {
         const MAX_INLINE_ASCII: usize = crate::layout::primitive_string::INLINE_STRING_CAPACITY;
-        if units.len() <= MAX_INLINE_ASCII {
+        let len = units.len();
+        if len <= MAX_INLINE_ASCII {
             let mut ascii = [0u8; MAX_INLINE_ASCII];
             let mut or_bits = 0u16;
-            for (index, &unit) in units.iter().enumerate() {
+            let mut index = 0;
+            #[cfg(target_arch = "aarch64")]
+            if len >= 8 {
+                use core::arch::aarch64::*;
+                // SAFETY: NEON is always available on aarch64 and every load/store stays in bounds.
+                unsafe {
+                    let mut acc = vdupq_n_u16(0);
+                    while index + 8 <= len {
+                        let v = vld1q_u16(units.as_ptr().add(index));
+                        acc = vorrq_u16(acc, v);
+                        vst1_u8(ascii.as_mut_ptr().add(index), vmovn_u16(v));
+                        index += 8;
+                    }
+                    or_bits = vmaxvq_u16(acc);
+                }
+            }
+            while index < len {
+                let unit = units[index];
                 or_bits |= unit;
                 ascii[index] = unit as u8;
+                index += 1;
             }
             if or_bits <= 0x7f {
-                return PrimitiveString::create_from_inline_characters(vm, ascii, units.len());
+                if len < size_of::<usize>() {
+                    return PrimitiveString::create(vm, Utf16String::from_ascii(&ascii[..len]));
+                }
+                return PrimitiveString::create_from_inline_characters(vm, ascii, len);
             }
         }
         PrimitiveString::create(vm, Utf16String::from_utf16(units))
@@ -260,7 +282,7 @@ impl CodeUnit for u16 {
         let len = units.len();
         let mut index = 0;
         #[cfg(target_arch = "aarch64")]
-        if len >= 8 {
+        {
             use core::arch::aarch64::*;
             // SAFETY: NEON is always available on aarch64 and every load stays within `units` and `bytes`.
             unsafe {
@@ -271,6 +293,20 @@ impl CodeUnit for u16 {
                         return false;
                     }
                     index += 8;
+                }
+                if index + 4 <= len {
+                    let b4 = u32::from_ne_bytes([
+                        bytes[index],
+                        bytes[index + 1],
+                        bytes[index + 2],
+                        bytes[index + 3],
+                    ]);
+                    let wide_bytes = vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(b4))));
+                    let wide_units = vld1_u16(units.as_ptr().add(index));
+                    if vminv_u16(vceq_u16(wide_bytes, wide_units)) == 0 {
+                        return false;
+                    }
+                    index += 4;
                 }
             }
         }
@@ -901,59 +937,68 @@ fn make_string_from<C: CodeUnit>(vm: &Vm, units: &[C], token: &StringToken) -> T
 #[inline]
 fn parse_number_at<C: CodeUnit>(vm: &Vm, units: &[C], position: &mut usize) -> ThrowCompletionOr<Value> {
     let start = *position;
-    let peek_at = |pos: usize| units.get(pos).map(|unit| (*unit).into());
-    let is_digit = |unit: Option<u32>| unit.is_some_and(|unit| (0x30..=0x39).contains(&unit));
+    let len = units.len();
+    let mut pos = start;
+    if pos >= len {
+        return json_malformed(vm);
+    }
 
-    let is_negative = peek_at(*position) == Some(0x2D);
+    let is_negative = units[pos].into() == 0x2D;
     if is_negative {
-        *position += 1;
+        pos += 1;
+        if pos >= len {
+            return json_malformed(vm);
+        }
     }
 
     // Integer part: 0, or a digit other than 0 followed by digits.
-    let integer_start = *position;
+    let integer_start = pos;
     let mut integer_value: u64 = 0;
-    match peek_at(*position) {
-        Some(0x30) => *position += 1,
-        Some(first @ 0x31..=0x39) => {
+    match units[pos].into() {
+        0x30 => pos += 1,
+        first @ 0x31..=0x39 => {
             integer_value = u64::from(first - 0x30);
-            *position += 1;
-            while let Some(&unit) = units.get(*position) {
-                let digit = unit.into().wrapping_sub(0x30);
+            pos += 1;
+            while pos < len {
+                let digit = units[pos].into().wrapping_sub(0x30);
                 if digit >= 10 {
                     break;
                 }
                 integer_value = integer_value.wrapping_mul(10).wrapping_add(u64::from(digit));
-                *position += 1;
+                pos += 1;
             }
         }
         _ => return json_malformed(vm),
     }
-    let integer_digits = *position - integer_start;
+    let integer_digits = pos - integer_start;
 
     let mut is_integer = true;
-    if peek_at(*position) == Some(0x2E) {
+    if pos < len && units[pos].into() == 0x2E {
         is_integer = false;
-        *position += 1;
-        if !is_digit(peek_at(*position)) {
+        pos += 1;
+        if pos >= len || !(0x30..=0x39).contains(&units[pos].into()) {
             return json_malformed(vm);
         }
-        while is_digit(peek_at(*position)) {
-            *position += 1;
+        pos += 1;
+        while pos < len && (0x30..=0x39).contains(&units[pos].into()) {
+            pos += 1;
         }
     }
-    if matches!(peek_at(*position), Some(0x45 | 0x65)) {
+    if pos < len && matches!(units[pos].into(), 0x45 | 0x65) {
         is_integer = false;
-        *position += 1;
-        if matches!(peek_at(*position), Some(0x2B | 0x2D)) {
-            *position += 1;
+        pos += 1;
+        if pos < len && matches!(units[pos].into(), 0x2B | 0x2D) {
+            pos += 1;
         }
-        if !is_digit(peek_at(*position)) {
+        if pos >= len || !(0x30..=0x39).contains(&units[pos].into()) {
             return json_malformed(vm);
         }
-        while is_digit(peek_at(*position)) {
-            *position += 1;
+        pos += 1;
+        while pos < len && (0x30..=0x39).contains(&units[pos].into()) {
+            pos += 1;
         }
     }
+    *position = pos;
 
     // OPTIMIZATION: Every integer up to 15 digits is below 2^53 and converts exactly to i32 or f64 with no
     //               decimal string float parsing.
@@ -1005,10 +1050,12 @@ fn try_parse_predicted_flat_object<C: CodeUnit>(
     string_values: &[Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS],
     simple_keys: &SimpleByteKeys,
 ) -> ThrowCompletionOr<PredictedFlatOutcome> {
+    let len = units.len();
     let key_count = simple_keys.ranges.len();
+    let mut pos = *position;
     for index in 0..key_count {
-        let mut pos = *position;
-        if units.get(pos).map(|u| (*u).into()) != Some(0x22) {
+        if pos >= len || units[pos].into() != 0x22 {
+            *position = pos;
             return json_malformed(vm);
         }
         let (key_start, key_end) = simple_keys.ranges[index];
@@ -1016,29 +1063,32 @@ fn try_parse_predicted_flat_object<C: CodeUnit>(
         let key_end = key_end as usize;
         let start = pos + 1;
         let end = start + (key_end - key_start);
-        let Some(slice) = units.get(start..end) else {
-            return Ok(PredictedFlatOutcome::FallbackAtKey { matched: index });
-        };
-        if units.get(end).map(|u| (*u).into()) != Some(0x22)
-            || !C::equals_simple_key(slice, simple_keys, key_start, key_end)
-        {
+        if end >= len || units[end].into() != 0x22 || !C::equals_simple_key(&units[start..end], simple_keys, key_start, key_end) {
+            *position = pos;
             return Ok(PredictedFlatOutcome::FallbackAtKey { matched: index });
         }
 
         pos = end + 1;
-        if units.get(pos).map(|u| (*u).into()) == Some(0x3A) {
+        if pos < len && units[pos].into() == 0x3A {
             pos += 1;
         } else {
             skip_whitespace_at(units, &mut pos);
-            if units.get(pos).map(|u| (*u).into()) != Some(0x3A) {
+            if pos >= len || units[pos].into() != 0x3A {
+                *position = pos;
                 return json_malformed(vm);
             }
             pos += 1;
         }
-        skip_whitespace_at(units, &mut pos);
+        if pos < len && matches!(units[pos].into(), 0x20 | 0x09 | 0x0A | 0x0D) {
+            skip_whitespace_at(units, &mut pos);
+        }
+        if pos >= len {
+            *position = pos;
+            return json_malformed(vm);
+        }
 
-        let value = match units.get(pos).map(|u| (*u).into()) {
-            Some(0x22) => {
+        let value = match units[pos].into() {
+            0x22 => {
                 let token = scan_string_at(vm, units, &mut pos)?;
                 if !token.has_escapes {
                     Value::from_string(make_unescaped_primitive_string_from(
@@ -1050,45 +1100,59 @@ fn try_parse_predicted_flat_object<C: CodeUnit>(
                     Value::from_string(PrimitiveString::create(vm, make_string_from(vm, units, &token)?))
                 }
             }
-            Some(0x74) => {
+            0x74 => {
                 consume_literal_at(vm, units, &mut pos, b"true")?;
                 Value::TRUE
             }
-            Some(0x66) => {
+            0x66 => {
                 consume_literal_at(vm, units, &mut pos, b"false")?;
                 Value::FALSE
             }
-            Some(0x6E) => {
+            0x6E => {
                 consume_literal_at(vm, units, &mut pos, b"null")?;
                 Value::NULL
             }
-            Some(0x2D | 0x30..=0x39) => parse_number_at(vm, units, &mut pos)?,
-            Some(0x7B | 0x5B) => {
+            0x2D | 0x30..=0x39 => parse_number_at(vm, units, &mut pos)?,
+            0x7B | 0x5B => {
                 *position = pos;
                 return Ok(PredictedFlatOutcome::FallbackAtNestedValue { matched: index });
             }
-            _ => return json_malformed(vm),
+            _ => {
+                *position = pos;
+                return json_malformed(vm);
+            }
         };
         values.push(value);
 
-        skip_whitespace_at(units, &mut pos);
-        match units.get(pos).map(|u| (*u).into()) {
-            Some(0x2C) => {
+        if pos < len && matches!(units[pos].into(), 0x20 | 0x09 | 0x0A | 0x0D) {
+            skip_whitespace_at(units, &mut pos);
+        }
+        if pos >= len {
+            *position = pos;
+            return json_malformed(vm);
+        }
+        match units[pos].into() {
+            0x2C => {
                 pos += 1;
-                skip_whitespace_at(units, &mut pos);
-                *position = pos;
+                if pos < len && matches!(units[pos].into(), 0x20 | 0x09 | 0x0A | 0x0D) {
+                    skip_whitespace_at(units, &mut pos);
+                }
                 if index + 1 == key_count {
+                    *position = pos;
                     return Ok(PredictedFlatOutcome::FallbackAtKey { matched: key_count });
                 }
             }
-            Some(0x7D) => {
+            0x7D => {
                 *position = pos + 1;
                 if index + 1 == key_count {
                     return Ok(PredictedFlatOutcome::Complete);
                 }
                 return Ok(PredictedFlatOutcome::EarlyClose { matched: index + 1 });
             }
-            _ => return json_malformed(vm),
+            _ => {
+                *position = pos;
+                return json_malformed(vm);
+            }
         }
     }
     unreachable!("key_count > 0 returns from the loop above")
@@ -1291,16 +1355,17 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 && entry.generation == generation
             {
                 let start = self.position + 1;
+                let units_len = self.units.len();
                 if let Some(ref simple_keys) = entry.simple_byte_keys {
                     let (key_start, key_end) = simple_keys.ranges[predicted_matched];
                     let key_start = key_start as usize;
                     let key_end = key_end as usize;
                     let end = start + (key_end - key_start);
-                    if let Some(slice) = self.units.get(start..end)
-                        && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
-                        && C::equals_simple_key(slice, simple_keys, key_start, key_end)
+                    if end < units_len
+                        && self.units[end].into() == 0x22
+                        && C::equals_simple_key(&self.units[start..end], simple_keys, key_start, key_end)
                     {
-                        if self.units.get(end + 1).map(|u| (*u).into()) == Some(0x3A) {
+                        if end + 1 < units_len && self.units[end + 1].into() == 0x3A {
                             self.position = end + 2;
                             consumed_colon = true;
                         } else {
@@ -1312,9 +1377,9 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                     let expected = &entry.keys[predicted_matched];
                     let key_len = Utf16View::of_fly_string(expected.as_string()).length_in_code_units();
                     let end = start + key_len;
-                    if let Some(slice) = self.units.get(start..end)
-                        && self.units.get(end).map(|u| (*u).into()) == Some(0x22)
-                        && are_code_units_of(slice, expected)
+                    if end < units_len
+                        && self.units[end].into() == 0x22
+                        && are_code_units_of(&self.units[start..end], expected)
                     {
                         self.position = end + 1;
                         matched_predicted = true;

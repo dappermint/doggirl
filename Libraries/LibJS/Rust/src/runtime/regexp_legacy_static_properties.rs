@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use libjs_runtime_macros::Trace;
 
@@ -12,6 +13,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::value::Value;
 use crate::runtime::completion::ThrowCompletionOr;
+use crate::runtime::ecmascript_regex::{EcmaScriptRegex, MatchResult};
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::primitive_string::PrimitiveString;
@@ -91,6 +93,12 @@ pub struct RegExpLegacyStaticProperties {
     paren_ends: [Cell<i32>; PAREN_COUNT],
     #[gc(untraced)]
     parens_materialized: Cell<bool>,
+
+    // Deferred match from non-global, non-sticky RegExp.prototype.test():
+    // re-runs exec() on demand only if a legacy match/capture getter is actually read.
+    pending_input: Cell<Option<Gc<PrimitiveString>>>,
+    #[gc(untraced)]
+    pending_regex: RefCell<Option<Rc<EcmaScriptRegex>>>,
 }
 
 /// One of the getters of RegExpLegacyStaticProperties.
@@ -120,6 +128,8 @@ impl Default for RegExpLegacyStaticProperties {
             paren_starts: core::array::from_fn(|_| Cell::new(-1)),
             paren_ends: core::array::from_fn(|_| Cell::new(-1)),
             parens_materialized: Cell::new(true),
+            pending_input: Cell::new(None),
+            pending_regex: RefCell::new(None),
         }
     }
 }
@@ -172,6 +182,8 @@ impl RegExpLegacyStaticProperties {
     pub fn invalidate(&self) {
         self.input.set(None);
         self.match_source.set(None);
+        self.pending_input.set(None);
+        *self.pending_regex.borrow_mut() = None;
         self.last_match_start.set(0);
         self.last_match_length.set(0);
         self.last_match_string.set(None);
@@ -196,7 +208,54 @@ impl RegExpLegacyStaticProperties {
         self.parens_materialized.set(true);
     }
 
+    pub fn set_pending_test_match(&self, regex: &Rc<EcmaScriptRegex>, string: Gc<PrimitiveString>) {
+        self.input.set(Some(string));
+        if self.match_source.replace(None).is_some() {
+            self.last_match_string.set(None);
+            self.last_paren.set(None);
+            self.left_context_string.set(None);
+            self.right_context_string.set(None);
+            for paren in &self.parens {
+                paren.set(None);
+            }
+        }
+        self.pending_input.set(Some(string));
+        let mut pending_regex = self.pending_regex.borrow_mut();
+        if !pending_regex.as_ref().is_some_and(|existing| Rc::ptr_eq(existing, regex)) {
+            *pending_regex = Some(Rc::clone(regex));
+        }
+    }
+
+    fn materialize_pending_test_match(&self, vm: &Vm) {
+        if self.pending_input.get().is_none() {
+            return;
+        }
+        let Some(input) = self.pending_input.take() else {
+            return;
+        };
+        let Some(regex) = self.pending_regex.borrow_mut().take() else {
+            return;
+        };
+        let result = regex.exec(input.utf16_string_view(), 0);
+        debug_assert_eq!(result, MatchResult::Match);
+        if result != MatchResult::Match {
+            return;
+        }
+        let start = regex.capture_slot(0) as usize;
+        let end = regex.capture_slot(1) as usize;
+        let length = input.length_in_utf16_code_units();
+        let captures = LegacyCaptureSlots::new(regex.capture_count() as usize, |slot| regex.capture_slot(slot as u32));
+        // Populate match slots without overwriting `self.input`, which may have been modified by `RegExp.input = ...`.
+        self.set_match_source(input);
+        self.set_last_match(start, end - start);
+        self.set_left_context(0, start);
+        self.set_right_context(end, length - end);
+        self.set_captures_lazy(vm, &captures);
+    }
+
     pub fn set_match_source(&self, match_source: Gc<PrimitiveString>) {
+        self.pending_input.set(None);
+        *self.pending_regex.borrow_mut() = None;
         self.match_source.set(Some(match_source));
         self.last_match_string.set(None);
         self.last_paren.set(None);
@@ -239,6 +298,7 @@ impl RegExpLegacyStaticProperties {
     }
 
     pub fn last_match(&self, vm: &Vm) -> Option<Gc<PrimitiveString>> {
+        self.materialize_pending_test_match(vm);
         self.match_source.get()?;
         if self.last_match_string.get().is_none() {
             let last_match =
@@ -249,6 +309,7 @@ impl RegExpLegacyStaticProperties {
     }
 
     pub fn last_paren(&self, vm: &Vm) -> Option<Gc<PrimitiveString>> {
+        self.materialize_pending_test_match(vm);
         self.match_source.get()?;
         if self.last_paren.get().is_none() {
             let (start, end) = (self.last_paren_start.get(), self.last_paren_end.get());
@@ -263,6 +324,7 @@ impl RegExpLegacyStaticProperties {
     }
 
     pub fn left_context(&self, vm: &Vm) -> Option<Gc<PrimitiveString>> {
+        self.materialize_pending_test_match(vm);
         self.match_source.get()?;
         if self.left_context_string.get().is_none() {
             let left_context =
@@ -273,6 +335,7 @@ impl RegExpLegacyStaticProperties {
     }
 
     pub fn right_context(&self, vm: &Vm) -> Option<Gc<PrimitiveString>> {
+        self.materialize_pending_test_match(vm);
         self.match_source.get()?;
         if self.right_context_string.get().is_none() {
             let right_context =
@@ -310,6 +373,7 @@ impl RegExpLegacyStaticProperties {
 
     fn lazy_paren(&self, vm: &Vm, index: usize) -> Option<Gc<PrimitiveString>> {
         assert!(index < PAREN_COUNT);
+        self.materialize_pending_test_match(vm);
         self.match_source.get()?;
         if !self.parens_materialized.get() {
             // Materialize all lazy parens from stored indices.
@@ -418,6 +482,16 @@ pub fn update_legacy_regexp_static_properties_lazy(
     legacy_static_properties.set_right_context(end_index, length - end_index);
 
     legacy_static_properties.set_captures_lazy(vm, captures);
+}
+
+pub fn update_legacy_regexp_static_properties_pending_test(
+    constructor: Gc<RegExpConstructor>,
+    regex: &Rc<EcmaScriptRegex>,
+    string: Gc<PrimitiveString>,
+) {
+    constructor
+        .legacy_static_properties()
+        .set_pending_test_match(regex, string);
 }
 
 // InvalidateLegacyRegExpStaticProperties ( C ), https://github.com/tc39/proposal-regexp-legacy-features#invalidatelegacyregexpstaticproperties--c
