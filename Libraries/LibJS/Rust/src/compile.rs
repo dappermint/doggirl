@@ -1102,7 +1102,11 @@ pub struct ParsedBuiltinFile {
 pub fn parse_builtin_file(source: &ak::Utf16String) -> ParsedBuiltinFile {
     let mut options = ParseOptions::new(ProgramType::Script);
     options.starts_in_strict_mode = true;
-    match with_parsed_tree(source, &options, |tree, _| describe_named_functions(tree)) {
+    match with_parsed_tree(source, &options, |tree, _| {
+        tree.script.set_is_builtin_script(true);
+        tree.script.set_retains_compiled_functions(true);
+        describe_named_functions(tree)
+    }) {
         Ok(functions) => ParsedBuiltinFile { functions },
         Err(errors) => {
             let errors: Vec<String> = errors
@@ -1135,26 +1139,10 @@ fn describe_named_functions(tree: &SyntaxTree<'_>) -> Vec<SharedFunctionDescript
     descriptions
 }
 
-/// Describes the named functions that a parsed builtin file declares at its top level, in source order. Each call
-/// gives the functions payloads of their own.
+/// Describes the named functions that a parsed builtin file declares at its top level, in source order. Realms share
+/// each builtin function's payload so compiled bytecode and cross-realm JIT learning are retained across iframes.
 pub fn describe_builtin_file_functions(parsed: &ParsedBuiltinFile) -> Vec<SharedFunctionDescription> {
-    parsed
-        .functions
-        .iter()
-        .map(|description| {
-            let payload = &description.payload;
-            SharedFunctionDescription {
-                payload: Arc::new(FunctionPayload {
-                    script: payload.script.clone(),
-                    row: payload.row,
-                    enclosing_environment_scope: payload.enclosing_environment_scope.clone(),
-                    enclosing_code: payload.enclosing_code.clone(),
-                    compiled: Mutex::new(None),
-                }),
-                ..description.clone()
-            }
-        })
-        .collect()
+    parsed.functions.clone()
 }
 
 // =============================================================================
@@ -1396,7 +1384,9 @@ pub fn compile_function(
     })?;
 
     // NB: Code with builtin abstract operations is only for the builtins of the engine, whatever asked for it.
-    if payload.script.retains_compiled_functions() && !builtin_abstract_operations_enabled {
+    if payload.script.retains_compiled_functions()
+        && (payload.script.is_builtin_script() == builtin_abstract_operations_enabled)
+    {
         let mut retained = payload.compiled.lock().expect("nothing panics with the retained code");
         if retained.is_none() {
             *retained = Some(Arc::new(compiled.shared_copy()));

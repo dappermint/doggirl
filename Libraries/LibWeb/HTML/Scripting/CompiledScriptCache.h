@@ -36,6 +36,7 @@ struct CompiledScriptCacheKey {
     String url_without_fragment;
     JS::ProgramType program_type { JS::ProgramType::Script };
     size_t line_number_offset { 0 };
+    u64 inline_source_hash { 0 };
 
     bool operator==(CompiledScriptCacheKey const&) const = default;
 };
@@ -98,6 +99,7 @@ struct AK::Traits<Web::HTML::CompiledScriptCacheKey> : public AK::DefaultTraits<
     {
         auto hash = pair_int_hash(key.partition.hash(), key.url_without_fragment.hash());
         hash = pair_int_hash(hash, to_underlying(key.program_type));
-        return pair_int_hash(hash, u64_hash(key.line_number_offset));
+        hash = pair_int_hash(hash, u64_hash(key.line_number_offset));
+        return pair_int_hash(hash, u64_hash(key.inline_source_hash));
     }
 };

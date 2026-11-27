@@ -9,6 +9,7 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::ops::ControlFlow;
+use std::sync::Arc;
 
 use ak::Zone;
 use foldhash::fast::RandomState;
@@ -797,7 +798,7 @@ impl Executable {
 
     /// Frees the slot of the executable, which died, and drops its JIT code.
     pub fn free_jit_entry_slot(&self, vm: &Vm, sweep: &Sweep<'_>) {
-        if super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
+        if Arc::strong_count(self.code()) > 1 && super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
             self.code()
                 .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
         }
@@ -811,7 +812,11 @@ impl Executable {
         ) else {
             return;
         };
-        drop(code);
+        if let Some(parking) = vm.jit.parking_for_detached_code() {
+            parking.borrow_mut().push(Box::new(code));
+        } else {
+            drop(code);
+        }
     }
 
     /// The executable's attached JIT code, if any. `vm` is the VM whose heap the executable lives in.
@@ -1058,8 +1063,7 @@ impl Executable {
         }
         // NB: A collection that moves cells may still rewrite the slots that the code's trace handed it (see
         //     `JitCode::sample_slots`), so the code is only dropped once the collection is over.
-        let _deferral = sweep
-            .moves_cells()
+        let _deferral = (sweep.moves_cells() && !vm.jit.is_deferring_code_drops())
             .then(|| vm.jit.defer_code_drops_until_collection_is_over(vm));
         match self.jit_compile_state() {
             CompileState::Installed => self.discard_jit_code_without_counting(vm, UncountedDiscard::LostEmbeddedCell),

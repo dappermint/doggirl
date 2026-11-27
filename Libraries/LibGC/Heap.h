@@ -204,6 +204,7 @@ public:
 
     // Sweeps the block now if the incremental sweep has yet to, as the sweep timer would.
     void sweep_block(HeapBlock&);
+    void finish_pending_incremental_sweep();
 
     // Whether `cell` points at a cell of this heap that is allocated: one that the sweep did not free yet. Code that keeps
     // pointers to cells that may have died since uses this to tell them apart from live ones.
@@ -366,7 +367,6 @@ private:
     void did_sweep(size_t swept_blocks, i64 duration_ns);
     void start_incremental_sweep();
     void finish_incremental_sweep();
-    void finish_pending_incremental_sweep();
     void sweep_in_step_with_allocation();
     void start_incremental_sweep_timer();
     void stop_incremental_sweep_timer();

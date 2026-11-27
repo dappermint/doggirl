@@ -245,6 +245,12 @@ pub struct JitState {
     /// The call stub JIT code shares (see `libjs_jit::codegen::generate_call_stub()`), generated the first time a
     /// compile job needs it, if there is one.
     call_stub: OnceCell<Option<ExecutableMemory>>,
+    /// The call forwarding stub JIT code shares for `Op::CallForwardingArguments`.
+    call_forwarding_stub: OnceCell<Option<ExecutableMemory>>,
+    /// The accessor get stub JIT code shares for `CallSlowPath(GetById)`.
+    get_by_id_accessor_stub: OnceCell<Option<ExecutableMemory>>,
+    /// The prototype setter stub JIT code shares for `CallSlowPath(PutByValue)`.
+    put_by_value_setter_stub: OnceCell<Option<ExecutableMemory>>,
     /// The construct stub JIT code shares (see `libjs_jit::codegen::generate_construct_stub()`).
     construct_stub: OnceCell<Option<ExecutableMemory>>,
     /// The installed code that depends on things staying as they are.
@@ -302,6 +308,9 @@ impl JitState {
             snapshot_scratch: RefCell::new(None),
             entry_trampoline: OnceCell::new(),
             call_stub: OnceCell::new(),
+            call_forwarding_stub: OnceCell::new(),
+            get_by_id_accessor_stub: OnceCell::new(),
+            put_by_value_setter_stub: OnceCell::new(),
             construct_stub: OnceCell::new(),
             dependents: dependencies::Dependents::default(),
             next_code_id: Cell::new(1),
@@ -381,6 +390,10 @@ impl JitState {
         self.stress_invalidation_countdown
             .set(self.stress_random.between(1, self.options.stress_invalidate));
         true
+    }
+
+    pub(crate) fn is_deferring_code_drops(&self) -> bool {
+        self.defers_code_drops.get()
     }
 
     /// Where code that is detached from its executable now goes to be dropped once the collection in progress is
@@ -542,6 +555,63 @@ impl JitState {
                     &self.code_allocator,
                     &[&code[..]],
                     &["call stub"],
+                    self.options.perf_map,
+                )
+                .pop()
+            })
+            .as_ref()
+            .map_or(0, |memory| memory.address() as u64)
+    }
+
+    /// The address of the call forwarding stub for `Op::CallForwardingArguments`, or 0.
+    pub(crate) fn call_forwarding_stub(&self, runtime: &libjs_jit::snapshot::RuntimeInfo) -> u64 {
+        self.call_forwarding_stub
+            .get_or_init(|| {
+                let code =
+                    libjs_jit::codegen::generate_call_forwarding_stub::<libjs_jit::asm::MacroAssembler>(runtime)
+                        .expect("the call forwarding stub compiles")?;
+                ExecutableMemory::allocate(
+                    &self.code_allocator,
+                    &[&code[..]],
+                    &["call forwarding stub"],
+                    self.options.perf_map,
+                )
+                .pop()
+            })
+            .as_ref()
+            .map_or(0, |memory| memory.address() as u64)
+    }
+
+    /// The address of the accessor get stub for `CallSlowPath(GetById)`, or 0.
+    pub(crate) fn get_by_id_accessor_stub(&self, runtime: &libjs_jit::snapshot::RuntimeInfo) -> u64 {
+        self.get_by_id_accessor_stub
+            .get_or_init(|| {
+                let code =
+                    libjs_jit::codegen::generate_get_by_id_accessor_stub::<libjs_jit::asm::MacroAssembler>(runtime)
+                        .expect("the get_by_id accessor stub compiles")?;
+                ExecutableMemory::allocate(
+                    &self.code_allocator,
+                    &[&code[..]],
+                    &["get_by_id accessor stub"],
+                    self.options.perf_map,
+                )
+                .pop()
+            })
+            .as_ref()
+            .map_or(0, |memory| memory.address() as u64)
+    }
+
+    /// The address of the prototype setter stub for `CallSlowPath(PutByValue)`, or 0.
+    pub(crate) fn put_by_value_setter_stub(&self, runtime: &libjs_jit::snapshot::RuntimeInfo) -> u64 {
+        self.put_by_value_setter_stub
+            .get_or_init(|| {
+                let code =
+                    libjs_jit::codegen::generate_put_by_value_setter_stub::<libjs_jit::asm::MacroAssembler>(runtime)
+                        .expect("the put_by_value setter stub compiles")?;
+                ExecutableMemory::allocate(
+                    &self.code_allocator,
+                    &[&code[..]],
+                    &["put_by_value setter stub"],
                     self.options.perf_map,
                 )
                 .pop()

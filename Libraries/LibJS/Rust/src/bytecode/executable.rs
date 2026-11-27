@@ -211,12 +211,12 @@ impl PropertyLookupCacheEntry {
     }
 
     /// Forgets the whole entry if one of its cells died in this collection, as clear_cache_entry_if_dead does.
-    fn clear_if_it_has_a_dead_cell(&self, sweep: &Sweep<'_>) {
+    fn clear_if_it_has_a_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
         if self.entry_type.get() == PropertyLookupCacheEntryType::Empty
             && self.shape.get().is_none()
             && self.getter.get().is_none()
         {
-            return;
+            return false;
         }
         if self.get().has_dead_cell(sweep) {
             self.set(PropertyLookupCacheEntryData::default());
@@ -224,6 +224,9 @@ impl PropertyLookupCacheEntry {
         if self.getter.get().is_some_and(|getter| sweep.is_dead_or_moving(getter)) {
             self.getter.set(None);
         }
+        self.entry_type.get() != PropertyLookupCacheEntryType::Empty
+            || self.shape.get().is_some()
+            || self.getter.get().is_some()
     }
 }
 
@@ -685,10 +688,11 @@ impl PropertyLookupCache {
     }
 
     /// Forgets the entries with a cell that died in this collection.
-    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) -> bool {
         if self.is_uncacheable() {
-            return;
+            return false;
         }
+        let mut any_live = false;
         if let Some(data) = self.megamorphic_data() {
             for entry in data
                 .primary_entries
@@ -696,14 +700,15 @@ impl PropertyLookupCache {
                 .chain(&data.secondary_entries)
                 .chain(core::iter::once(&data.entry))
             {
-                entry.clear_if_it_has_a_dead_cell(sweep);
+                any_live |= entry.clear_if_it_has_a_dead_cell(sweep);
             }
-            return;
+            return any_live;
         }
 
         for entry in self.entries() {
-            entry.clear_if_it_has_a_dead_cell(sweep);
+            any_live |= entry.clear_if_it_has_a_dead_cell(sweep);
         }
+        any_live
     }
 }
 
@@ -1454,8 +1459,21 @@ impl CallCache {
     }
 }
 
+const DIRTY_PROPERTY_LOOKUP_CACHES: u8 = 1 << 0;
+const DIRTY_GLOBAL_VARIABLE_CACHES: u8 = 1 << 1;
+const DIRTY_OBJECT_SHAPE_CACHES: u8 = 1 << 2;
+
 impl Executable {
+    #[inline]
+    fn mark_caches_dirty(&self, bit: u8) {
+        let current = self.head.dirty_caches.get();
+        if current & bit == 0 {
+            self.head.dirty_caches.set(current | bit);
+        }
+    }
+
     pub fn property_lookup_cache(&self, index: usize) -> &PropertyLookupCache {
+        self.mark_caches_dirty(DIRTY_PROPERTY_LOOKUP_CACHES);
         &self.head.property_lookup_caches[index]
     }
 
@@ -1476,6 +1494,7 @@ impl Executable {
     }
 
     pub fn object_shape_cache(&self, index: u32) -> &ObjectShapeCache {
+        self.mark_caches_dirty(DIRTY_OBJECT_SHAPE_CACHES);
         &self.object_shape_caches[index as usize]
     }
 
@@ -1512,30 +1531,57 @@ impl Executable {
 
     /// Forgets the cells the inline caches remember that died in this collection.
     pub fn remove_dead_cells(&self, sweep: &Sweep<'_>, ran_since_last_gc: bool) {
-        for cache in &self.head.property_lookup_caches {
-            cache.remove_dead_entries(sweep);
+        let dirty = self.head.dirty_caches.get();
+        let mut next_dirty = 0u8;
+        if dirty & DIRTY_PROPERTY_LOOKUP_CACHES != 0 {
+            let mut any_live = false;
+            for cache in &self.head.property_lookup_caches {
+                any_live |= cache.remove_dead_entries(sweep);
+            }
+            if any_live {
+                next_dirty |= DIRTY_PROPERTY_LOOKUP_CACHES;
+            }
         }
-        let dynamic_global_variable_caches = self
-            .rare_data
-            .get()
-            .and_then(|rare_data| rare_data.dynamic_global_variable_caches.get());
-        for cache in self
-            .head
-            .global_variable_caches
-            .iter()
-            .chain(dynamic_global_variable_caches.into_iter().flatten())
-        {
-            cache.entry.clear_if_it_has_a_dead_cell(sweep);
+        if dirty & DIRTY_GLOBAL_VARIABLE_CACHES != 0 {
+            let dynamic_global_variable_caches = self
+                .rare_data
+                .get()
+                .and_then(|rare_data| rare_data.dynamic_global_variable_caches.get());
+            let mut any_live = false;
+            for cache in self
+                .head
+                .global_variable_caches
+                .iter()
+                .chain(dynamic_global_variable_caches.into_iter().flatten())
+            {
+                any_live |= cache.entry.clear_if_it_has_a_dead_cell(sweep);
+            }
+            if any_live {
+                next_dirty |= DIRTY_GLOBAL_VARIABLE_CACHES;
+            }
         }
         for cache in self.call_caches() {
             if cache.has_dead_cell(sweep) {
                 cache.clear();
             }
         }
-        for cache in &self.object_shape_caches {
-            if cache.shape.get().is_some_and(|shape| sweep.is_dead_or_moving(shape)) {
-                cache.shape.set(None);
+        if dirty & DIRTY_OBJECT_SHAPE_CACHES != 0 {
+            let mut any_live = false;
+            for cache in &self.object_shape_caches {
+                if let Some(shape) = cache.shape.get() {
+                    if sweep.is_dead_or_moving(shape) {
+                        cache.shape.set(None);
+                    } else {
+                        any_live = true;
+                    }
+                }
             }
+            if any_live {
+                next_dirty |= DIRTY_OBJECT_SHAPE_CACHES;
+            }
+        }
+        if next_dirty != dirty {
+            self.head.dirty_caches.set(next_dirty);
         }
         if let Some(feedback) = self.feedback() {
             feedback.remove_dead_cells(sweep, ran_since_last_gc);
@@ -1578,6 +1624,7 @@ impl Executable {
             jit_entry_slot: Cell::new(0),
             jit_compile_state: Cell::new(0),
             idle_collection_count: Cell::new(0),
+            dirty_caches: Cell::new(0),
             feedback: ExecutableFeedbackHead::empty(),
             constants,
             property_lookup_caches,
@@ -2060,6 +2107,7 @@ impl Executable {
     }
 
     pub fn global_variable_cache(&self, index: u32) -> &GlobalVariableCache {
+        self.mark_caches_dirty(DIRTY_GLOBAL_VARIABLE_CACHES);
         &self.head.global_variable_caches[index as usize]
     }
 
@@ -2069,6 +2117,7 @@ impl Executable {
 
     /// The global variable cache of the dynamic binding access with the environment coordinate cache `index`.
     pub fn dynamic_global_variable_cache(&self, index: u32) -> &GlobalVariableCache {
+        self.mark_caches_dirty(DIRTY_GLOBAL_VARIABLE_CACHES);
         let caches = self.rare_data().dynamic_global_variable_caches.get_or_init(|| {
             (0..self.head.environment_coordinate_caches.len())
                 .map(|_| GlobalVariableCache::default())
@@ -2096,6 +2145,8 @@ impl Executable {
     pub fn set_interpreter_tier(&self, tier: InterpreterTier) {
         match tier {
             InterpreterTier::Plain => {}
+            #[cfg(feature = "jit")]
+            InterpreterTier::Unprofiled => {}
             #[cfg(feature = "jit")]
             InterpreterTier::Profiling => {
                 self.ensure_feedback();
