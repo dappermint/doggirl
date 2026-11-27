@@ -1738,6 +1738,7 @@ impl Vm {
                 cache_slot.set(None);
             }
         }
+        self.json_parse_cache.remove_dead_strings(sweep);
         for entry in self.string_to_atom_cache.borrow_mut().iter_mut() {
             if entry.string.is_some_and(is_dead) {
                 *entry = StringToAtomCacheEntry::default();

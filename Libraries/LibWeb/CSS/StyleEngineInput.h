@@ -61,6 +61,10 @@ void move_style_hover(DOM::Document&, GC::Ptr<DOM::Node> node);
 // elements, text nodes and shadow roots in it that have no style node identity yet take one, and
 // the elements record their arrival, only once something observes the style engine.
 WEB_API void record_subtree_connecting(DOM::Node& root);
+// Batch-friendly variant for inserting multiple children under the same `parent`: marks `parent`'s ancestors once.
+WEB_API void record_subtree_connecting_under_parent(DOM::Node& parent, DOM::Node& root, bool& parent_ancestors_marked);
+// Whether `parent` or an ancestor with a style node identity is holding waiting children in a display:none subtree.
+WEB_API bool node_has_waiting_style_arrival_holder(DOM::Node& parent);
 
 // Called once a node has been linked into a connected tree. Marks the element as waiting to arrive
 // if it has no style node identity yet and no subtree waiting to arrive covers it.

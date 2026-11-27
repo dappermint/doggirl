@@ -134,6 +134,7 @@
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
@@ -525,6 +526,28 @@ void Element::synchronize_all_attributes() const
     synchronize_style_attribute();
 }
 
+Optional<size_t> Element::find_attribute_index_normalized(Utf16FlyString const& normalized_qualified_name, bool has_colon) const
+{
+    if (!has_raw_attributes() && !m_style_attribute_is_dirty)
+        return {};
+
+    // Qualified names without a colon have no prefix, so as_string() equals local_name(), whose bits are always in m_subtree_attribute_filter.
+    if (!has_colon) {
+        auto attr_bits = attribute_filter_bits(normalized_qualified_name);
+        if ((m_subtree_attribute_filter & attr_bits) != attr_bits)
+            return {};
+    }
+
+    synchronize_attribute(normalized_qualified_name);
+
+    auto attrs = raw_attribute_span();
+    for (size_t index = 0; index < attrs.size(); ++index) {
+        if (attrs[index].name.as_string() == normalized_qualified_name)
+            return index;
+    }
+    return {};
+}
+
 Optional<size_t> Element::find_attribute_index(Utf16FlyString const& qualified_name) const
 {
     if (!has_raw_attributes() && !m_style_attribute_is_dirty)
@@ -557,21 +580,7 @@ Optional<size_t> Element::find_attribute_index(Utf16FlyString const& qualified_n
             : any_of(view.utf16_span(), [](char16_t unit) { return unit == ':'; });
     }
 
-    // Qualified names without a colon have no prefix, so as_string() equals local_name(), whose bits are always in m_subtree_attribute_filter.
-    if (!has_colon) {
-        auto attr_bits = attribute_filter_bits(*effective_name);
-        if ((m_subtree_attribute_filter & attr_bits) != attr_bits)
-            return {};
-    }
-
-    synchronize_attribute(*effective_name);
-
-    auto attrs = raw_attribute_span();
-    for (size_t index = 0; index < attrs.size(); ++index) {
-        if (attrs[index].name.as_string() == *effective_name)
-            return index;
-    }
-    return {};
+    return find_attribute_index_normalized(*effective_name, has_colon);
 }
 
 Optional<size_t> Element::find_attribute_index_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name) const
@@ -1052,6 +1061,23 @@ void Element::set_attribute(Utf16FlyString const& utf16_qualified_name, Utf16Str
     append_attribute(QualifiedName { utf16_qualified_name, {}, {} }, verified_value);
 }
 
+void Element::set_attribute_normalized(Utf16FlyString const& normalized_qualified_name, Utf16String const& verified_value, bool has_colon)
+{
+    auto index = find_attribute_index_normalized(normalized_qualified_name, has_colon);
+
+    if (index.has_value()) {
+        auto& attribute = raw_attribute_at(*index);
+        auto old_value = move(attribute.value);
+        attribute.value = verified_value;
+        auto name = attribute.name;
+        auto new_value = attribute.value;
+        handle_attribute_changes(move(name), move(old_value), move(new_value));
+        return;
+    }
+
+    append_attribute(QualifiedName { normalized_qualified_name, {}, {} }, verified_value);
+}
+
 // https://dom.spec.whatwg.org/#valid-namespace-prefix
 bool is_valid_namespace_prefix(Utf16View prefix)
 {
@@ -1246,6 +1272,16 @@ void Element::append_attribute_without_callbacks_from_detached_parser(QualifiedN
     m_subtree_name_filter |= name_filter_bit(name.local_name());
     m_subtree_attribute_filter |= attribute_filter_bits(name.local_name());
     (void)append_raw_attribute(move(name), move(value));
+}
+
+void Element::append_single_class_attribute_from_detached_parser(QualifiedName name, Utf16String value, Utf16FlyString const& single_class, u64 single_class_filter_bit)
+{
+    VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
+        && (!rare_data() || (!rare_data()->registered_observer_list && !element_rare_data()->class_list)));
+    m_subtree_name_filter |= name_filter_bit(name.local_name()) | single_class_filter_bit;
+    m_subtree_attribute_filter |= attribute_filter_bits(name.local_name());
+    (void)append_raw_attribute(move(name), move(value));
+    m_classes.append(single_class);
 }
 
 void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16String value, bool skip_observer_checks, Utf16FlyString const* preinterned_single_class)
@@ -3209,7 +3245,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
 
     // https://html.spec.whatwg.org/multipage/dom.html#render-blocking-mechanism
     // Whenever a render-blocking element el becomes browsing-context disconnected, unblock rendering on el.
-    if (old_root.is_connected() && document().is_render_blocking_element(*this))
+    if (old_root.is_connected() && document().has_render_blocking_elements() && document().is_render_blocking_element(*this))
         unblock_rendering();
 
     if (m_id.has_value() && is<ShadowRoot>(old_root))
@@ -3220,7 +3256,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
             document().element_with_id_was_removed({}, *this);
         if (m_has_name)
             document().element_with_name_was_removed({}, *this);
-        if (has_style()) {
+        if (has_style() && document().has_anchor_names()) {
             if (auto const* anchor_values = style_group<CSS::ComputedValues::AnchorValues>(); anchor_values && !anchor_values->anchor_names_span().is_empty()) {
                 // A shadow root leaves with its host, so an element in a shadow tree registered its names
                 // with the shadow root it still has, not with the root its host left.
@@ -3241,8 +3277,13 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
         exit_fullscreen_on_element_removal();
 
     if (has_style()) {
-        Layout::ForcedReadScope read { document() };
-        replace_installed_style(read, {});
+        if (auto* removal_scope = document().subtree_removal_scope()) {
+            Layout::ForcedReadScope read { removal_scope->render_document() };
+            replace_installed_style(read, {});
+        } else {
+            Layout::ForcedReadScope read { document() };
+            replace_installed_style(read, {});
+        }
     }
     if (rare_data()) {
         for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
@@ -5576,7 +5617,8 @@ void Element::replace_installed_style(Layout::BegunRead const& read, CSS::Instal
         layout_node->set_style_record_identity(m_installed_style);
     bool const was_display_none = !held_before || held_before.display_is_none();
     // https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
-    bool const timeline_declarations_changed = timeline_declarations_differ(held_before, m_installed_style);
+    bool const timeline_declarations_changed = (!!m_installed_style || document().timeline_declarations_generation() != 0)
+        && timeline_declarations_differ(held_before, m_installed_style);
     if (style_node_id() != 0)
         CSS::StyleEngineFFI::style_engine_set_held_style_record(document().style_computer().style_engine().host(), style_node_id(), m_installed_style.record_pointer());
     // Children that wait to arrive in a display:none subtree may be revealed as the subtree's root, or an element
@@ -7735,18 +7777,65 @@ WebIDL::ExceptionOr<void> insert_adjacent_html(DOM::Element& element, Utf16Strin
     return element.insert_adjacent_html(position.to_utf8(), compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options);
 }
 
+static bool validate_attribute_local_name_and_scan(Utf16View local_name, bool& has_upper, bool& has_colon)
+{
+    if (local_name.is_empty())
+        return false;
+    has_upper = false;
+    has_colon = false;
+    auto is_invalid = [](u32 ch) {
+        return ch <= '>' && ((ch == ' ') || (ch == '\0') || (ch == '/') || (ch == '=') || (ch == '>') || (ch >= '\t' && ch <= '\r' && ch != '\v'));
+    };
+    if (local_name.has_latin1_storage()) {
+        for (u8 byte : local_name.latin1_span()) {
+            if (is_invalid(byte))
+                return false;
+            has_upper |= is_ascii_upper_alpha(byte);
+            has_colon |= byte == ':';
+        }
+        return true;
+    }
+    for (char16_t unit : local_name.utf16_span()) {
+        if (is_invalid(unit))
+            return false;
+        has_upper |= is_ascii_upper_alpha(unit);
+        has_colon |= unit == ':';
+    }
+    return true;
+}
+
 WebIDL::ExceptionOr<void> set_attribute(DOM::Element& element, Utf16String const& qualified_name, Variant<GC::Ref<TrustedTypes::TrustedHTML>, GC::Ref<TrustedTypes::TrustedScript>, GC::Ref<TrustedTypes::TrustedScriptURL>, Utf16String> const& value)
 {
     auto qualified_name_view = qualified_name.utf16_view();
-    if (!DOM::is_valid_attribute_local_name(qualified_name_view))
+    bool has_upper = false;
+    bool has_colon = false;
+    if (!validate_attribute_local_name_and_scan(qualified_name_view, has_upper, has_colon))
         return WebIDL::InvalidCharacterError::create("Attribute name must not be empty or contain invalid characters"_utf16);
 
-    auto utf16_qualified_name = Utf16FlyString::from_utf16(qualified_name_view);
-    if (element.namespace_uri() == Namespace::HTML && element.document().document_type() == DOM::Document::Type::HTML)
-        utf16_qualified_name = utf16_qualified_name.to_ascii_lowercase();
+    Utf16FlyString utf16_qualified_name;
+    if (has_upper && element.namespace_uri() == Namespace::HTML && element.document().document_type() == DOM::Document::Type::HTML)
+        utf16_qualified_name = qualified_name_view.to_ascii_lowercase();
+    else
+        utf16_qualified_name = Utf16FlyString::from_utf16(qualified_name_view);
+
+    if (auto const* string_value = value.get_pointer<Utf16String>()) {
+        auto& document = element.document();
+        bool trusted_types_required = false;
+        if (auto window = document.window(); window && &window->associated_document() == &document) {
+            auto const* policy_container = document.policy_container_if_exists();
+            if (policy_container && !policy_container->csp_list.policies().is_empty())
+                trusted_types_required = TrustedTypes::does_sink_require_trusted_types(HTML::relevant_global_object(document), TrustedTypes::Script.view(), TrustedTypes::IncludeReportOnlyPolicies::Yes);
+        } else {
+            trusted_types_required = TrustedTypes::does_sink_require_trusted_types(HTML::relevant_global_object(document), TrustedTypes::Script.view(), TrustedTypes::IncludeReportOnlyPolicies::Yes);
+        }
+        if (!trusted_types_required) {
+            element.set_attribute_normalized(utf16_qualified_name, *string_value, has_colon);
+            return {};
+        }
+    }
 
     auto const verified_value = TRY(TrustedTypes::get_trusted_types_compliant_attribute_value(utf16_qualified_name, {}, element, value));
-    element.set_attribute(utf16_qualified_name, verified_value);
+    element.set_attribute_normalized(utf16_qualified_name, verified_value, has_colon);
     return {};
 }
 

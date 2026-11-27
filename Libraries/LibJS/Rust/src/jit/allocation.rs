@@ -232,8 +232,8 @@ pub struct AllocationInfos<'d> {
     pub array: ArrayAllocationInfo,
     pub rope: RopeAllocationInfo,
     pub function: FunctionAllocationInfo,
-    /// The cells the templates refer to that code embeds (the shape of new arrays).
-    pub cells: Deferred<'d, Vec<Gc<CellHeader>>>,
+    /// The cell the templates refer to that code embeds (the shape of new arrays).
+    pub array_shape: Deferred<'d, Gc<CellHeader>>,
 }
 
 pub fn allocation_infos<'d>(
@@ -281,7 +281,7 @@ pub fn allocation_infos<'d>(
         array,
         rope,
         function: cached.function,
-        cells: defer_gc.cover(vec![header_of(array_shape)]),
+        array_shape: defer_gc.cover(header_of(array_shape)),
     }
 }
 

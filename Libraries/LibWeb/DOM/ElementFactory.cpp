@@ -680,7 +680,7 @@ GC::Ref<Element> create_builtin_html_element_by_raw_local_name(Document& documen
     return element;
 }
 
-GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, u8 tag_kind, bool uses_document_global_registry, GC::Ptr<HTML::CustomElementRegistry> registry)
+GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, GC::Heap& heap, u8 tag_kind, bool uses_document_global_registry, GC::Ptr<HTML::CustomElementRegistry> registry)
 {
     struct FragmentQualifiedNames {
         QualifiedName a { HTML::TagNames::a, {}, Namespace::HTML };
@@ -718,7 +718,7 @@ GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, u8
     // NB: None of the built-in tags handled by the fragment scanner override `Element::initialize_element()`,
     //     so allocating directly skips an indirect no-op virtual call on every node.
     auto make_element = [&]<typename ElementType>(QualifiedName const& qualified_name) -> GC::Ref<Element> {
-        auto element = GC::Heap::the().allocate<ElementType>(document, qualified_name);
+        auto element = heap.allocate<ElementType>(document, qualified_name);
         if (uses_document_global_registry)
             element->set_uses_document_global_custom_element_registry_for_new_element();
         else

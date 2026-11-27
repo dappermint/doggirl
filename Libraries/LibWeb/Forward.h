@@ -503,6 +503,7 @@ class SlottableMixin;
 class StaticNodeList;
 class StaticRange;
 class SubtreeInsertionScope;
+class SubtreeRemovalScope;
 class SyntheticPseudoElement;
 class Text;
 class TreeWalker;

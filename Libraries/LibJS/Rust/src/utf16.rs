@@ -743,7 +743,15 @@ impl Utf16StringBuilder {
                 self.append_code_unit(u16::from(b'"'));
             }
             Utf16View::Utf16(units) => {
-                self.utf16_code_units(units.len() + 2).push(u16::from(b'"'));
+                let code_units = self.utf16_code_units(units.len() + 2);
+                code_units.reserve(units.len() + 2);
+                if utf16_json_special_or_surrogate_position(units).is_none() {
+                    code_units.push(u16::from(b'"'));
+                    code_units.extend_from_slice(units);
+                    code_units.push(u16::from(b'"'));
+                    return;
+                }
+                code_units.push(u16::from(b'"'));
                 let mut index = 0;
                 while index < units.len() {
                     let clean_end = index

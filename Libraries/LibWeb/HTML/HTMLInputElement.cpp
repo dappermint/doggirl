@@ -2861,13 +2861,16 @@ void HTMLInputElement::form_associated_element_was_inserted()
     // - The element becomes connected.
     // NB: Registering the element with its radio button group sets the checkedness of the other elements in the
     //     group to false.
-    update_radio_button_group_registration();
+    if (type_state() == TypeAttributeState::RadioButton || (m_rare_input_data && m_rare_input_data->radio_button_group_registry))
+        update_radio_button_group_registration();
 }
 
 void HTMLInputElement::form_associated_element_was_removed(DOM::Node* old_parent)
 {
-    FormAssociatedElement::form_associated_element_was_removed(old_parent);
-    update_radio_button_group_registration();
+    if (is_custom())
+        FormAssociatedElement::form_associated_element_was_removed(old_parent);
+    if (type_state() == TypeAttributeState::RadioButton || (m_rare_input_data && m_rare_input_data->radio_button_group_registry))
+        update_radio_button_group_registration();
 }
 
 void HTMLInputElement::form_associated_element_was_moved(GC::Ptr<DOM::Node> old_parent)

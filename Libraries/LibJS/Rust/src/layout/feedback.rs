@@ -89,6 +89,7 @@ pub mod value_feedback {
     pub const EMPTY_VALUE_BUCKET_TAG: u16 = 0x7ffc;
 
     /// The bit for a value with the raw `bits`.
+    #[inline(always)]
     pub const fn for_bits(bits: u64) -> u16 {
         // NB: Boxed values have all of the 0x7ff8 tag bits set.
         let tag = bits >> 48;

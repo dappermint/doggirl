@@ -1070,22 +1070,28 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
     // 7. For each node in nodes, in tree order:
     // FIXME: In tree order
     SubtreeInsertionScope subtree_insertion_scope { *this };
-    bool const style_engine_may_have_waiting_children = document().style_computer().style_engine().may_have_waiting_children();
+    bool const parent_has_waiting_style_arrival_holder = document().style_computer().style_engine().may_have_waiting_children()
+        && CSS::node_has_waiting_style_arrival_holder(*this);
     auto* document_global_custom_element_registry = document().effective_global_custom_element_registry().ptr();
     bool const document_global_registry_has_definitions = document_global_custom_element_registry && document_global_custom_element_registry->has_definitions();
     bool const parent_is_connected = is_connected();
+    auto* focused_area = document().focused_area().ptr();
+    bool const focused_area_may_be_in_detached_node = focused_area && !focused_area->is_connected();
+    bool parent_style_arrival_ancestors_marked = false;
 
     for (auto& node_to_insert : nodes) {
+        bool const node_was_connected = node_to_insert->is_connected();
         insert_node_into_children(*node_to_insert, child);
 
         // And a subtree holding the focused or hovered node brings `:focus-within` and `:hover` to
         // the chain it lands under.
-        CSS::Invalidation::invalidate_style_after_subtree_place_changed(*node_to_insert, nullptr);
+        if (focused_area && (focused_area_may_be_in_detached_node || node_was_connected))
+            CSS::Invalidation::invalidate_style_after_subtree_place_changed(*node_to_insert, nullptr);
 
-        CSS::record_subtree_connecting(*node_to_insert);
+        CSS::record_subtree_connecting_under_parent(*this, *node_to_insert, parent_style_arrival_ancestors_marked);
 
         subtree_insertion_scope.reset_for_next_child();
-        if (node_to_insert->style_arrival_pending() && !style_engine_may_have_waiting_children)
+        if (node_to_insert->style_arrival_pending() && !parent_has_waiting_style_arrival_holder)
             subtree_insertion_scope.set_descendants_covered_by_subtree_arrival(true);
 
         bool const fast_plain_text_base = parent_is_connected
@@ -1558,12 +1564,24 @@ void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_
 
     bool is_parent_connected = parent.is_connected();
 
-    if (auto* element = as_if<DOM::Element>(*this)) {
-        if (element->is_custom() && is_parent_connected)
-            element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
-    }
+    auto* root_element = as_if<DOM::Element>(*this);
+    if (root_element && root_element->is_custom() && is_parent_connected)
+        root_element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
+
+    if (!has_children() && (!root_element || !root_element->is_shadow_host()))
+        return;
+
+    auto& doc = document();
+    bool const doc_has_auto_dir = doc.has_element_with_auto_directionality();
+    Node const* focused_area = doc.focused_area().ptr();
 
     for_each_shadow_including_descendant([&](Node& descendant) {
+        if (descendant.is_exclusive_text() && !doc_has_auto_dir && focused_area != &descendant) {
+            descendant.m_is_connected = false;
+            descendant.m_in_editable_subtree = false;
+            return TraversalDecision::Continue;
+        }
+
         if (was_tracked_by_style_engine) {
             if (auto* element = as_if<Element>(descendant); element && element->element_animations_if_created())
                 element->cancel_css_animations_and_transitions();
@@ -3123,6 +3141,8 @@ void Node::remove_all_children(bool suppress_observers)
 
     if (first_child() != last_child())
         begin_child_index_generation();
+
+    SubtreeRemovalScope subtree_removal_scope { *this };
 
     while (GC::Ptr<Node> child = first_child()) {
         if (tracks_keyboard_scroll)

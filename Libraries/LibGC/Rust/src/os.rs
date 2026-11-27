@@ -72,9 +72,19 @@ mod platform {
         assert!(mapped != libc::MAP_FAILED, "commit a chunk of the heap region");
     }
 
+    fn page_size() -> usize {
+        static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            // SAFETY: Reading a system configuration value has no preconditions.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            usize::try_from(page_size).expect("the page size is known")
+        })
+    }
+
     /// # Safety
     ///
-    /// The range must be committed memory.
+    /// The range must be committed memory. On macOS, callers must also ensure no other thread reads or writes the
+    /// range concurrently while pages are faulted in.
     pub unsafe fn populate(address: NonNull<u8>, size: usize) {
         // NB: This only fails if the kernel is too old to know it, which leaves the faults to the first touches.
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -82,19 +92,24 @@ mod platform {
         unsafe {
             libc::madvise(address.as_ptr().cast(), size, libc::MADV_POPULATE_WRITE);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(target_os = "macos")]
+        {
+            let step = page_size();
+            let mut offset = 0;
+            while offset < size {
+                // SAFETY: The caller guarantees the range is freshly committed, exclusively owned memory.
+                unsafe { core::ptr::write_volatile(address.as_ptr().add(offset), 0u8) };
+                offset += step;
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let _ = (address, size);
     }
 
     /// Whether the range is made of whole pages. Advice applies to whole pages, and where a page is larger than a
     /// block, as on systems with 64 KiB pages, it also holds other blocks, which may be in use.
     fn is_whole_pages(address: NonNull<u8>, size: usize) -> bool {
-        static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let page_size = *PAGE_SIZE.get_or_init(|| {
-            // SAFETY: Reading a system configuration value has no preconditions.
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            usize::try_from(page_size).expect("the page size is known")
-        });
+        let page_size = page_size();
         address.as_ptr().addr().is_multiple_of(page_size) && size.is_multiple_of(page_size)
     }
 
