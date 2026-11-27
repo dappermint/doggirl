@@ -31,6 +31,7 @@ use crate::runtime::property_attributes::{Attribute, DEFAULT_ATTRIBUTES, Propert
 use crate::runtime::property_descriptor::{from_property_descriptor, to_property_descriptor};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
+use crate::runtime::shape::{ASSIGN_PLAN_MAX_PROPERTIES, AssignPlan};
 use crate::runtime::value::same_value;
 use crate::utf16::utf16_formatted;
 
@@ -38,6 +39,8 @@ use crate::utf16::utf16_formatted;
 pub(crate) static IS_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectConstructor::is);
 /// %Object.keys%, which JIT code calls through a runtime helper.
 pub(crate) static KEYS_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectConstructor::keys);
+/// %Object.assign%, which JIT code calls through a runtime helper.
+pub(crate) static ASSIGN_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectConstructor::assign);
 
 #[repr(C)]
 #[derive(Trace)]
@@ -138,7 +141,7 @@ impl ObjectConstructor {
         define_native_function(&names.entries, raw_native!(ObjectConstructor::entries), 1);
         define_native_function(&names.create, raw_native!(ObjectConstructor::object_create), 2);
         define_native_function(&names.hasOwn, raw_native!(ObjectConstructor::has_own), 2);
-        define_native_function(&names.assign, raw_native!(ObjectConstructor::assign), 2);
+        define_native_function(&names.assign, ASSIGN_FUNCTION, 2);
 
         object.define_direct_property(
             vm,
@@ -808,16 +811,230 @@ fn get_own_property_keys(
     Ok(name_list)
 }
 
+fn source_eligible_for_shape_assign(source: &Object) -> bool {
+    source.eligible_for_own_property_enumeration_fast_path()
+        && !source.has_intrinsic_accessors()
+        && !source.may_interfere_with_indexed_property_access()
+        && !source.has_parameter_map()
+        && !source.is_ecmascript_function_object()
+        && source.indexed_storage_kind() == IndexedStorageKind::None
+        && !source.shape().is_dictionary()
+}
+
+/// Applies `plan` from `source` onto `target` if no copied source slot or overwritten target slot holds an accessor.
+/// Returns `true` if applied, or `false` having performed no mutations.
+#[inline]
+fn try_apply_assign_plan(
+    vm: &Vm,
+    target: &Object,
+    source: &Object,
+    target_shape: crate::layout::cell::Gc<crate::runtime::shape::Shape>,
+    plan: &AssignPlan,
+) -> bool {
+    let Some(result_shape) = plan.result_shape else {
+        return false;
+    };
+    let adds_properties = result_shape != target_shape;
+    if adds_properties {
+        if target_shape.is_non_extensible()
+            || target.requires_slow_add_own_property()
+            || result_shape.has_watched_slots()
+            || result_shape.is_prototype_shape()
+        {
+            return false;
+        }
+        if target_shape.prototype().is_some()
+            && !plan.prototype_validity.is_some_and(|validity| validity.is_valid())
+        {
+            return false;
+        }
+    }
+    let count = plan.copy_count as usize;
+    let existing_count = plan.target_property_count;
+    for &(src_off, dst_off) in &plan.copies[..count] {
+        if source.get_direct(u32::from(src_off)).is_accessor() {
+            return false;
+        }
+        if dst_off < existing_count && target.get_direct(u32::from(dst_off)).is_accessor() {
+            return false;
+        }
+    }
+    if adds_properties {
+        target.prepare_for_shape_transition(result_shape.property_count());
+        target_shape.mark_unstable(vm);
+    }
+    for &(src_off, dst_off) in &plan.copies[..count] {
+        target.write_direct_from_assign(u32::from(dst_off), source.get_direct(u32::from(src_off)));
+    }
+    if adds_properties {
+        target.finish_shape_transition(result_shape);
+    }
+    true
+}
+
+/// Fast `Object.assign(target, src1, src2, src3)` helper for JIT code. Runs no JS code and allocates no GC cells;
+/// returns `None` having done nothing observable if any source needs the slow path or misses shape caches.
+pub(crate) fn object_assign_running_no_code(
+    vm: &Vm,
+    target_val: Value,
+    src1: Value,
+    src2: Value,
+    src3: Value,
+) -> Option<Value> {
+    if !target_val.is_object() {
+        return None;
+    }
+    let target = target_val.as_object();
+    let realm = vm.current_realm()?;
+    let initial_shape = target.shape();
+    if !target.has_ordinary_named_property_lookup_and_set()
+        || target.has_intrinsic_accessors()
+        || initial_shape.is_dictionary()
+        || initial_shape.has_watched_slots()
+        || initial_shape.is_prototype_shape()
+        || target.has_global_object_flag()
+        || initial_shape.realm() != realm
+    {
+        return None;
+    }
+
+    let raw_sources = [src1, src2, src3];
+    let mut sources: [Option<Gc<Object>>; 3] = [None; 3];
+    let mut source_count = 0usize;
+    for src in raw_sources {
+        if src.is_nullish() {
+            continue;
+        }
+        if !src.is_object() {
+            return None;
+        }
+        let source = src.as_object();
+        if source == target || !source_eligible_for_shape_assign(&source) {
+            return None;
+        }
+        if source.shape().property_count() == 0 {
+            continue;
+        }
+        sources[source_count] = Some(source);
+        source_count += 1;
+    }
+    if source_count == 0 {
+        return Some(target_val);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Step {
+        Identical { source: Gc<Object>, count: usize },
+        Plan { source: Gc<Object>, plan: AssignPlan },
+    }
+
+    let new_object_shape = realm.new_object_shape();
+    let obj_proto = new_object_shape.prototype();
+    let obj_proto_validity = obj_proto.and_then(|proto| proto.shape().prototype_chain_validity());
+    let target_can_use_identical = target.indexed_storage_kind() == IndexedStorageKind::None
+        && target.eligible_for_own_property_enumeration_fast_path()
+        && !target.may_interfere_with_indexed_property_access()
+        && !target.requires_slow_add_own_property();
+    let initial_property_count = initial_shape.property_count();
+
+    let mut steps: [Option<Step>; 3] = [None; 3];
+    let mut cur_shape = initial_shape;
+
+    for (step_idx, source_slot) in sources[..source_count].iter().enumerate() {
+        let source = source_slot.expect("source slot is populated");
+        let source_shape = source.shape();
+
+        // First try the identical-layout fast copy when the target is still an empty new object.
+        if cur_shape == new_object_shape
+            && target_can_use_identical
+            && source_shape.realm() == realm
+            && let Some(proto) = obj_proto
+            && let Some(proto_validity) = obj_proto_validity
+            && let Some(assign_copy) = source_shape.cached_assign_copy()
+            && assign_copy.identical_layout
+            && assign_copy.prototype_validity == proto_validity
+            && proto_validity.is_valid()
+            && assign_copy.copy_shape.prototype() == Some(proto)
+            && !assign_copy.copy_shape.has_watched_slots()
+            && !assign_copy.copy_shape.is_prototype_shape()
+        {
+            let count = source_shape.property_count() as usize;
+            if source
+                .named_properties_prefix(count)
+                .iter()
+                .any(|value| value.is_accessor())
+            {
+                return None;
+            }
+            steps[step_idx] = Some(Step::Identical { source, count });
+            cur_shape = assign_copy.copy_shape;
+            continue;
+        }
+
+        // Otherwise consult the VM's cached (cur_shape, source_shape) AssignPlan.
+        let plan = vm.assign_plan_cache().get(cur_shape, source_shape)?;
+        let result_shape = plan.result_shape?;
+        if result_shape != cur_shape {
+            if initial_shape.is_non_extensible()
+                || target.requires_slow_add_own_property()
+                || result_shape.has_watched_slots()
+                || result_shape.is_prototype_shape()
+            {
+                return None;
+            }
+            if cur_shape.prototype().is_some()
+                && !plan.prototype_validity.is_some_and(|validity| validity.is_valid())
+            {
+                return None;
+            }
+        }
+        let count = plan.copy_count as usize;
+        for &(src_off, dst_off) in &plan.copies[..count] {
+            if source.get_direct(u32::from(src_off)).is_accessor() {
+                return None;
+            }
+            // Only slots that existed on `target` before this call could hold accessors;
+            // slots added by earlier steps in this call came from verified non-accessor values.
+            if u32::from(dst_off) < initial_property_count
+                && target.get_direct(u32::from(dst_off)).is_accessor()
+            {
+                return None;
+            }
+        }
+        steps[step_idx] = Some(Step::Plan { source, plan });
+        cur_shape = result_shape;
+    }
+
+    // All steps validated with zero mutations and zero GC allocations. Apply in a single batch.
+    if cur_shape != initial_shape {
+        target.prepare_for_shape_transition(cur_shape.property_count());
+        initial_shape.mark_unstable(vm);
+    }
+    for step in steps[..source_count].iter().flatten() {
+        match *step {
+            Step::Identical { source, count } => {
+                // SAFETY: `prepare_for_shape_transition` ensured capacity >= `count`, `source != target`,
+                //         and `count <= source.named_storage_capacity()`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(source.named_properties_ptr(), target.named_properties_ptr(), count);
+                }
+            }
+            Step::Plan { source, ref plan } => {
+                for &(src_off, dst_off) in &plan.copies[..plan.copy_count as usize] {
+                    target.write_direct_from_assign(u32::from(dst_off), source.get_direct(u32::from(src_off)));
+                }
+            }
+        }
+    }
+    if cur_shape != initial_shape {
+        target.finish_shape_transition(cur_shape);
+    }
+    Some(target_val)
+}
+
 fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowCompletionOr<bool> {
     let source_shape = source.shape();
-    if !source.eligible_for_own_property_enumeration_fast_path()
-        || source.has_intrinsic_accessors()
-        || source.may_interfere_with_indexed_property_access()
-        || source.has_parameter_map()
-        || source.is_ecmascript_function_object()
-        || source.indexed_storage_kind() != IndexedStorageKind::None
-        || source_shape.is_dictionary()
-    {
+    if !source_eligible_for_shape_assign(source) {
         return Ok(false);
     }
 
@@ -833,43 +1050,95 @@ fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowComp
         && !target_shape.is_prototype_shape()
         && !target.has_global_object_flag();
 
-    // OPTIMIZATION: When target already owns every enumerable source property as a writable non-accessor data property
-    //               and source has no accessors or symbols, overwrite the slots directly without allocating a MarkedVec.
+    // OPTIMIZATION: Consult or build a cached `(target_shape, source_shape) -> AssignPlan` that handles both
+    //               overwriting existing writable own properties and appending new default data properties in one
+    //               shape transition, without allocating a MarkedVec or repeating Shape::lookup calls.
     if target_ordinary_unwatched && !target_shape.is_dictionary() {
+        if !core::ptr::eq(target, source)
+            && target_shape.realm() == source_shape.realm()
+            && let Some(plan) = vm.assign_plan_cache().get(target_shape, source_shape)
+            && try_apply_assign_plan(vm, target, source, target_shape, &plan)
+        {
+            return Ok(true);
+        }
+
         if target_shape == source_shape {
             let mut fast_ok = true;
+            let can_cache = !core::ptr::eq(target, source)
+                && (source_property_count as usize) <= ASSIGN_PLAN_MAX_PROPERTIES
+                && target_shape.property_count() <= u16::MAX as u32;
+            let mut copies = [(0u16, 0u16); ASSIGN_PLAN_MAX_PROPERTIES];
+            let mut copy_count = 0usize;
             source_shape.for_each_property_in_insertion_order(|property_key, metadata| {
                 if !property_key.is_string() {
                     fast_ok = false;
                     return ControlFlow::Break(());
                 }
-                if metadata.attributes.is_enumerable()
-                    && (!metadata.attributes.is_writable()
+                if metadata.attributes.is_enumerable() {
+                    if !metadata.attributes.is_writable()
                         || source.get_direct(metadata.offset).is_accessor()
-                        || target.get_direct(metadata.offset).is_accessor())
-                {
-                    fast_ok = false;
-                    return ControlFlow::Break(());
+                        || target.get_direct(metadata.offset).is_accessor()
+                    {
+                        fast_ok = false;
+                        return ControlFlow::Break(());
+                    }
+                    if can_cache && metadata.offset <= u16::MAX as u32 {
+                        copies[copy_count] = (metadata.offset as u16, metadata.offset as u16);
+                        copy_count += 1;
+                    }
                 }
                 ControlFlow::Continue(())
             });
             if fast_ok {
-                if !core::ptr::eq(target, source) {
-                    source_shape.for_each_property_in_insertion_order(|_, metadata| {
-                        if metadata.attributes.is_enumerable() {
-                            target.put_direct_from_cache(metadata.offset, source.get_direct(metadata.offset));
-                        }
-                        ControlFlow::Continue(())
+                if can_cache {
+                    vm.assign_plan_cache().set(AssignPlan {
+                        target_shape: Some(target_shape),
+                        source_shape: Some(source_shape),
+                        result_shape: Some(target_shape),
+                        prototype_validity: None,
+                        target_property_count: target_shape.property_count() as u16,
+                        copy_count: copy_count as u8,
+                        copies,
                     });
+                }
+                if !core::ptr::eq(target, source) {
+                    if can_cache {
+                        for &(src_off, dst_off) in &copies[..copy_count] {
+                            target.write_direct_from_assign(u32::from(dst_off), source.get_direct(u32::from(src_off)));
+                        }
+                    } else {
+                        source_shape.for_each_property_in_insertion_order(|_, metadata| {
+                            if metadata.attributes.is_enumerable() {
+                                target.put_direct_from_cache(metadata.offset, source.get_direct(metadata.offset));
+                            }
+                            ControlFlow::Continue(())
+                        });
+                    }
                 }
                 return Ok(true);
             }
-        } else if source_property_count <= 32 {
-            let mut copy_pairs = [(0u32, 0u32); 32];
-            let mut pair_count = 0usize;
+        } else if !core::ptr::eq(target, source)
+            && target_shape.realm() == source_shape.realm()
+            && (source_property_count as usize) <= ASSIGN_PLAN_MAX_PROPERTIES
+            && target_shape.property_count() <= u16::MAX as u32
+        {
+            let target_property_count = target_shape.property_count();
+            let mut copies = [(0u16, 0u16); ASSIGN_PLAN_MAX_PROPERTIES];
+            let mut copy_count = 0usize;
+            #[cfg_attr(
+                ladybird_gc_lints,
+                expect(
+                    gc_container_on_stack,
+                    reason = "only string property keys from source_shape are pushed"
+                )
+            )]
+            let mut new_keys: Vec<PropertyKey> = Vec::new();
+            let mut next_new_offset = target_property_count;
             let mut fast_ok = true;
+            let mut can_cache_plan = true;
+
             source_shape.for_each_property_in_insertion_order(|property_key, metadata| {
-                if !property_key.is_string() {
+                if !property_key.is_string() || metadata.offset > u16::MAX as u32 {
                     fast_ok = false;
                     return ControlFlow::Break(());
                 }
@@ -880,24 +1149,91 @@ fn try_assign_from_shape(vm: &Vm, target: &Object, source: &Object) -> ThrowComp
                     fast_ok = false;
                     return ControlFlow::Break(());
                 }
-                let Some(target_metadata) = target_shape.lookup(property_key) else {
-                    fast_ok = false;
-                    return ControlFlow::Break(());
-                };
-                if !target_metadata.attributes.is_writable() || target.get_direct(target_metadata.offset).is_accessor()
-                {
-                    fast_ok = false;
-                    return ControlFlow::Break(());
+                if let Some(target_metadata) = target_shape.lookup(property_key) {
+                    if !target_metadata.attributes.is_writable()
+                        || target_metadata.offset > u16::MAX as u32
+                        || target.get_direct(target_metadata.offset).is_accessor()
+                    {
+                        fast_ok = false;
+                        return ControlFlow::Break(());
+                    }
+                    copies[copy_count] = (metadata.offset as u16, target_metadata.offset as u16);
+                    copy_count += 1;
+                } else {
+                    if next_new_offset > u16::MAX as u32 {
+                        fast_ok = false;
+                        return ControlFlow::Break(());
+                    }
+                    copies[copy_count] = (metadata.offset as u16, next_new_offset as u16);
+                    copy_count += 1;
+                    next_new_offset += 1;
+                    new_keys.push(property_key.clone());
                 }
-                copy_pairs[pair_count] = (metadata.offset, target_metadata.offset);
-                pair_count += 1;
                 ControlFlow::Continue(())
             });
+
             if fast_ok {
-                for &(src_offset, dst_offset) in &copy_pairs[..pair_count] {
-                    target.put_direct_from_cache(dst_offset, source.get_direct(src_offset));
+                if new_keys.is_empty() {
+                    let plan = AssignPlan {
+                        target_shape: Some(target_shape),
+                        source_shape: Some(source_shape),
+                        result_shape: Some(target_shape),
+                        prototype_validity: None,
+                        target_property_count: target_property_count as u16,
+                        copy_count: copy_count as u8,
+                        copies,
+                    };
+                    vm.assign_plan_cache().set(plan);
+                    for &(src_off, dst_off) in &copies[..copy_count] {
+                        target.write_direct_from_assign(u32::from(dst_off), source.get_direct(u32::from(src_off)));
+                    }
+                    return Ok(true);
+                } else if !target_shape.is_non_extensible() && !target.requires_slow_add_own_property() {
+                    let proto = target_shape.prototype();
+                    let current_realm = vm.current_realm();
+                    let prototype_validity = match proto {
+                        None => None,
+                        Some(prototype) => {
+                            let is_object_proto = current_realm
+                                .is_some_and(|realm| prototype == realm.object_prototype());
+                            let validity = prototype.shape().prototype_chain_validity();
+                            if !is_object_proto || !validity.is_some_and(|v| v.is_valid()) {
+                                can_cache_plan = false;
+                            }
+                            validity
+                        }
+                    };
+                    if target.set_of_keys_create_them(vm, &new_keys) {
+                        let mut result_shape = target_shape;
+                        for property_key in &new_keys {
+                            result_shape = result_shape.create_put_transition(vm, property_key, DEFAULT_ATTRIBUTES);
+                        }
+                        if !result_shape.has_watched_slots() && !result_shape.is_prototype_shape() {
+                            if can_cache_plan {
+                                let plan = AssignPlan {
+                                    target_shape: Some(target_shape),
+                                    source_shape: Some(source_shape),
+                                    result_shape: Some(result_shape),
+                                    prototype_validity,
+                                    target_property_count: target_property_count as u16,
+                                    copy_count: copy_count as u8,
+                                    copies,
+                                };
+                                vm.assign_plan_cache().set(plan);
+                            }
+                            target.prepare_for_shape_transition(result_shape.property_count());
+                            target_shape.mark_unstable(vm);
+                            for &(src_off, dst_off) in &copies[..copy_count] {
+                                target.write_direct_from_assign(
+                                    u32::from(dst_off),
+                                    source.get_direct(u32::from(src_off)),
+                                );
+                            }
+                            target.finish_shape_transition(result_shape);
+                            return Ok(true);
+                        }
+                    }
                 }
-                return Ok(true);
             }
         }
     }

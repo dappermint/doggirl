@@ -70,6 +70,8 @@ pub struct KeyedPropertyLookupCacheEntryLayout {
     pub new_shape: Option<Gc<Shape>>,
     /// The identity of the name of the property, the word of a fly string, or 0.
     pub property_name: u64,
+    /// A validated DirectGetterFunction for an accessor property, or None.
+    pub getter: Option<Gc<FunctionObject>>,
 }
 
 const _: () = assert!(size_of::<KeyedPropertyLookupCacheEntryLayout>() == 64);

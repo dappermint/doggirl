@@ -66,6 +66,7 @@ use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::realm_watchpoints;
+use crate::runtime::regexp_prototype;
 use crate::runtime::set_prototype;
 use crate::runtime::shape::{Shape, ShapeKey};
 use crate::runtime::shared_function_instance_data::ClosureCount;
@@ -305,7 +306,7 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
-static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 29] = [
+static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 31] = [
     (&function_prototype::APPLY_FUNCTION, Intrinsic::FunctionPrototypeApply),
     (&function_prototype::CALL_FUNCTION, Intrinsic::FunctionPrototypeCall),
     (&array_prototype::PUSH_FUNCTION, Intrinsic::ArrayPrototypePush),
@@ -317,6 +318,8 @@ static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 29] = [
     ),
     (&object_constructor::IS_FUNCTION, Intrinsic::ObjectIs),
     (&object_constructor::KEYS_FUNCTION, Intrinsic::ObjectKeys),
+    (&object_constructor::ASSIGN_FUNCTION, Intrinsic::ObjectAssign),
+    (&regexp_prototype::TEST_FUNCTION, Intrinsic::RegExpPrototypeTest),
     (
         &typed_array_prototype::LENGTH_GETTER,
         Intrinsic::TypedArrayPrototypeLength,

@@ -939,6 +939,7 @@ impl Default for KeyedPropertyLookup {
 pub struct KeyedPropertyLookupCacheEntry {
     lookup: KeyedPropertyLookup,
     property_name: Option<Utf16FlyString>,
+    getter: Option<Gc<FunctionObject>>,
 }
 
 const _: () = assert!(size_of::<KeyedPropertyLookupCacheEntry>() == 64);
@@ -969,6 +970,7 @@ const _: () = {
     );
     assert!(lookup + offset_of!(KeyedPropertyLookup, shape) == offset_of!(Layout, shape));
     assert!(offset_of!(KeyedPropertyLookupCacheEntry, property_name) == offset_of!(Layout, property_name));
+    assert!(offset_of!(KeyedPropertyLookupCacheEntry, getter) == offset_of!(Layout, getter));
 };
 // NB: The interpreter compares the name of an entry with the identity of a string, a word.
 const _: () = assert!(size_of::<Option<Utf16FlyString>>() == size_of::<u64>());
@@ -1049,15 +1051,30 @@ impl KeyedPropertyLookupCache {
         shape: Gc<Shape>,
         property_name: &Utf16FlyString,
     ) -> Option<KeyedPropertyLookup> {
+        self.lookup_with_getter(index, shape, property_name)
+            .map(|(lookup, _)| lookup)
+    }
+
+    /// Like `lookup`, also returning any validated DirectGetterFunction recorded on the entry.
+    pub fn lookup_with_getter(
+        &self,
+        index: usize,
+        shape: Gc<Shape>,
+        property_name: &Utf16FlyString,
+    ) -> Option<(KeyedPropertyLookup, Option<Gc<FunctionObject>>)> {
         let entries = self.entries.borrow();
         let entry = &entries[index];
         (entry.lookup.shape == Some(shape) && entry.property_name.as_ref() == Some(property_name))
-            .then_some(entry.lookup)
+            .then_some((entry.lookup, entry.getter))
     }
 
     /// The entry for `shape` and the name whose identity (see Utf16FlyString::raw_identity()) is `name_identity`, as
     /// JIT code finds it.
-    pub fn lookup_by_name_identity(&self, shape: Gc<Shape>, name_identity: usize) -> Option<KeyedPropertyLookup> {
+    pub fn lookup_by_name_identity_with_getter(
+        &self,
+        shape: Gc<Shape>,
+        name_identity: usize,
+    ) -> Option<(KeyedPropertyLookup, Option<Gc<FunctionObject>>)> {
         let entries = self.entries.borrow();
         let entry = &entries[Self::entry_index_for_name_identity(shape, name_identity)];
         (entry.lookup.shape == Some(shape)
@@ -1065,15 +1082,39 @@ impl KeyedPropertyLookupCache {
                 .property_name
                 .as_ref()
                 .is_some_and(|name| name.raw_identity() == name_identity))
-        .then_some(entry.lookup)
+        .then_some((entry.lookup, entry.getter))
     }
 
     pub fn set_entry(&self, index: usize, lookup: KeyedPropertyLookup, property_name: &Utf16FlyString) {
+        self.set_entry_with_getter(index, lookup, property_name, None);
+    }
+
+    pub fn set_entry_with_getter(
+        &self,
+        index: usize,
+        lookup: KeyedPropertyLookup,
+        property_name: &Utf16FlyString,
+        getter: Option<Gc<FunctionObject>>,
+    ) {
         let mut entries = self.entries.borrow_mut();
         let entry = &mut entries[index];
         entry.lookup = lookup;
+        entry.getter = getter;
         if entry.property_name.as_ref() != Some(property_name) {
             entry.property_name = Some(property_name.clone());
+        }
+    }
+
+    /// Records a validated DirectGetterFunction on the cached entry for `shape` and `property_name`, if present.
+    pub fn set_getter(&self, shape: Gc<Shape>, property_name: &Utf16FlyString, getter: Gc<FunctionObject>) {
+        let index = Self::entry_index_for(shape, property_name);
+        let mut entries = self.entries.borrow_mut();
+        let entry = &mut entries[index];
+        if entry.lookup.shape == Some(shape)
+            && entry.lookup.shape_dictionary_generation == shape.dictionary_generation()
+            && entry.property_name.as_ref() == Some(property_name)
+        {
+            entry.getter = Some(getter);
         }
     }
 
@@ -1092,6 +1133,8 @@ impl KeyedPropertyLookupCache {
                 || lookup.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
             {
                 *entry = KeyedPropertyLookupCacheEntry::default();
+            } else if entry.getter.is_some_and(|getter| sweep.is_dead_or_moving(getter)) {
+                entry.getter = None;
             }
         }
     }
