@@ -18,7 +18,7 @@ let
     if unwrapped != null && unwrapped ? version then
       unwrapped.version
     else
-      "0.2.1";
+      "0.3.0";
 
   passthroughDarwinApp =
     stdenv.hostPlatform.isDarwin
