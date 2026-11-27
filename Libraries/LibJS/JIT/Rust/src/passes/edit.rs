@@ -87,7 +87,7 @@ impl<'w> Replacements<'w> {
 /// the value it refines, once the passes no longer move or share nodes:
 /// `Refine` nodes go away, and checks no longer have a value, so that
 /// refining costs no register.
-pub fn remove_refinements(graph: &mut Graph, work: &Zone) {
+pub fn remove_refinements(graph: &mut Graph, work: &Zone) -> bool {
     let mut replacements = Replacements::new(graph, work);
     let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
     let mut checks = ZoneVec::new_in(work);
@@ -106,11 +106,16 @@ pub fn remove_refinements(graph: &mut Graph, work: &Zone) {
             }
         }
     }
+    let changed = !replacements.is_empty() || !removed.is_empty() || !checks.is_empty();
+    if !changed {
+        return false;
+    }
     replacements.apply(graph);
     remove_nodes(graph, &removed);
     for check in checks {
         graph.nodes[check.index()].repr = None;
     }
+    true
 }
 
 /// Removes the nodes in `removed` from the blocks they are in. Nodes added

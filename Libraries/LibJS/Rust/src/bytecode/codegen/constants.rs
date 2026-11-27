@@ -250,6 +250,11 @@ impl ConstantTable {
         match found {
             Ok(index) => Operand::constant(index),
             Err(slot) => {
+                let value = if value.length_in_code_units() <= MAXIMUM_INTERNED_CONSTANT_LENGTH {
+                    Utf16String::from(&crate::utf16::to_utf16_fly_string(&value))
+                } else {
+                    value
+                };
                 let index = self.append(ConstantValue::String(value));
                 self.strings.insert_at(slot, key, index);
                 Operand::constant(index)

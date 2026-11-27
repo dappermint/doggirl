@@ -224,8 +224,15 @@ impl Vm {
         // SAFETY: A frame's caller outlives it.
         let caller = unsafe { &*caller_frame };
         caller.program_counter.set(frame.caller_return_pc.get());
-        caller.slots()[frame.caller_dst_raw.get() as usize].set(return_value);
-        self.set_running_frame_in_current_realm(caller_frame);
+        let dst_raw = frame.caller_dst_raw.get();
+        if dst_raw != crate::bytecode::operand::Operand::INVALID {
+            caller.slots()[dst_raw as usize].set(return_value);
+        }
+        if frame.returns_to_native_caller.get() {
+            self.set_running_execution_context(caller_frame);
+        } else {
+            self.set_running_frame_in_current_realm(caller_frame);
+        }
         self.interpreter_stack().deallocate(frame_pointer.as_ptr().cast());
         self.head.finish_execution_generation();
     }

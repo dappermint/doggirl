@@ -220,10 +220,51 @@ impl ExecutableFeedback {
         }
     }
 
+    /// Whether any feedback slot holds non-empty data that `SharedJitLearning::merge_feedback` would record.
+    #[cfg(all(not(test), feature = "jit"))]
+    pub fn has_any_shared_learning(&self) -> bool {
+        if self.arith().iter().any(|b| b.get() != 0)
+            || self.value().iter().any(|v| v.get() != 0)
+            || self.cache_value().iter().any(|v| v.get() != 0)
+            || self.keyed().iter().any(|k| k.bits.get() != 0)
+            || self.call().iter().any(|c| {
+                (c.flags.get() & crate::bytecode::executable_data::SHARED_CALL_FLAGS_MASK) != 0
+                    || c.value.get() != 0
+                    || c.value_bucket.get() != value_feedback::EMPTY_VALUE_BUCKET_TAG
+            })
+        {
+            return true;
+        }
+        if let Some(bucket_storage) = self.value_bucket_storage.get() {
+            let value_count = self.counts.value as usize;
+            if value_count != 0 {
+                let buckets: &[Cell<u64>] = array_in(Some(bucket_storage), self.value_buckets_offset(), value_count);
+                if buckets.iter().any(|b| b.get() != value_feedback::EMPTY_VALUE_BUCKET) {
+                    return true;
+                }
+            }
+            let cache_count = self.property_lookup_cache_count as usize;
+            if cache_count != 0 {
+                let cache_buckets: &[Cell<u64>] = array_in(Some(bucket_storage), 0, cache_count);
+                if cache_buckets
+                    .iter()
+                    .any(|b| b.get() != value_feedback::EMPTY_VALUE_BUCKET)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Folds the value buckets, the call sites' too, into the value feedback bits. The buckets are not references, so
     /// this runs when the feedback is about to be used and at every garbage collection.
     pub fn update_value_feedback(&self) {
-        if let Some(bucket_storage) = self.value_bucket_storage.get() {
+        let bucket_storage = self.value_bucket_storage.get();
+        if bucket_storage.is_none() && self.counts.call == 0 {
+            return;
+        }
+        if let Some(bucket_storage) = bucket_storage {
             let value_count = self.counts.value as usize;
             if value_count != 0 {
                 let buckets: &[Cell<u64>] = array_in(Some(bucket_storage), self.value_buckets_offset(), value_count);

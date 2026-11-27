@@ -885,6 +885,10 @@ impl Heap {
         capi::gc_heap_set_should_collect_on_every_allocation(self.handle(), should_collect);
     }
 
+    pub fn finish_pending_incremental_sweep(&self) {
+        capi::gc_heap_finish_pending_incremental_sweep(self.handle());
+    }
+
     /// Heap::uproot_cell(): has the next collection leave `cell` out of its roots, so that copies of it on the stack or
     /// in the registers of a running frame no longer keep it alive. A cell that something on the heap still points at
     /// stays alive.

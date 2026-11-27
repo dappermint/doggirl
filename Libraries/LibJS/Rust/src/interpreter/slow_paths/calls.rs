@@ -658,16 +658,12 @@ pub fn call_construct(
 ) -> SlowPathControl {
     let callee = values.callee;
     // NB: Class constructors cannot be called, so their code is no inline call executable, but a construct of a base
-    //     class without fields runs it in an inline frame all the same.
+    //     class runs it in an inline frame all the same (initializing any class fields after entering the frame).
     if let Some(function) = value_as_ecmascript_function_object(callee)
         && (function.can_inline_call() || function.is_class_constructor())
         && callee.is_constructor()
         && vm.is_in_current_realm(function.as_function_object_gc())
         && function.constructor_kind() == ConstructorKind::Base
-        && !function.has_class_data()
-        // NB: Taken before anything allocates: a collection could flush the code of the function otherwise, which this
-        //     local keeps from happening (see `bytecode::flushing`).
-        && let Some(executable) = function.bytecode_executable()
     {
         // NB: With room for the properties the constructor is known to add.
         let this_object = asm_try!(
@@ -675,6 +671,8 @@ pub fn call_construct(
             pc,
             Object::create_from_constructor_for_construct(vm, function.as_function_object_gc(), function.shared_data())
         );
+        // NB: Compiled after prototype lookup so a collection during prototype lookup cannot flush it before push.
+        let executable = asm_try!(vm, pc, function.compiled_executable(vm));
         let Some(context) = vm.push_inline_frame(
             function,
             executable,
@@ -692,6 +690,12 @@ pub fn call_construct(
         unsafe { context.as_ref() }
             .this_value
             .set(Value::from_object(this_object));
+        if function.has_class_data()
+            && let Err(throw) = this_object.initialize_instance_elements(vm, function)
+        {
+            vm.unwind_inline_frame_for_exception();
+            return handle_asm_exception(vm, pc, throw.value());
+        }
         return SlowPathControl::dispatch_at(0);
     }
     asm_try!(

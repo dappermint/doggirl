@@ -5,7 +5,7 @@
  */
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -43,6 +43,7 @@ use crate::runtime::realm_watchpoints;
 use crate::runtime::regexp_constructor::is_raw_native_function_running;
 use crate::runtime::regexp_legacy_static_properties::{
     LegacyCaptureSlots, invalidate_legacy_regexp_static_properties, update_legacy_regexp_static_properties_lazy,
+    update_legacy_regexp_static_properties_pending_test,
 };
 use crate::runtime::regexp_object::NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET;
 use crate::runtime::regexp_object::{
@@ -215,6 +216,30 @@ fn increment_last_index(
     )
 }
 
+#[inline]
+fn hash_regex_cache_key<H: Hasher>(pattern: Utf16View<'_>, flags: RegExpFlags, state: &mut H) {
+    match pattern {
+        Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+            let mut chunk = [0u16; 64];
+            for slice in bytes.chunks(64) {
+                for (dst, &src) in chunk.iter_mut().zip(slice) {
+                    *dst = u16::from(src);
+                }
+                // SAFETY: `u16` has no padding bytes and `slice.len() <= 64`.
+                let raw = unsafe { ak::slice_from_raw_parts(chunk.as_ptr().cast::<u8>(), slice.len() * 2) };
+                state.write(raw);
+            }
+        }
+        Utf16View::Utf16(units) => {
+            // SAFETY: `u16` has no padding bytes.
+            let raw = unsafe { ak::slice_from_raw_parts(units.as_ptr().cast::<u8>(), core::mem::size_of_val(units)) };
+            state.write(raw);
+        }
+    }
+    state.write_usize(pattern.length_in_code_units());
+    state.write_u8(flags.bits());
+}
+
 struct RegexCacheKey {
     pattern: Utf16String,
     flags: RegExpFlags,
@@ -230,10 +255,24 @@ impl Eq for RegexCacheKey {}
 
 impl Hash for RegexCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        for code_unit in Utf16View::of_string(&self.pattern).code_units() {
-            state.write_u16(code_unit);
-        }
-        state.write_u8(self.flags.bits());
+        hash_regex_cache_key(Utf16View::of_string(&self.pattern), self.flags, state);
+    }
+}
+
+struct RegexCacheLookup<'a> {
+    pattern: Utf16View<'a>,
+    flags: RegExpFlags,
+}
+
+impl Hash for RegexCacheLookup<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_regex_cache_key(self.pattern, self.flags, state);
+    }
+}
+
+impl hashbrown::Equivalent<RegexCacheKey> for RegexCacheLookup<'_> {
+    fn equivalent(&self, key: &RegexCacheKey) -> bool {
+        self.flags == key.flags && self.pattern == Utf16View::of_string(&key.pattern)
     }
 }
 
@@ -241,7 +280,7 @@ impl Hash for RegexCacheKey {
 /// regexes hold no cells. A regex stays for as long as a RegExp object holds it, and one collection longer.
 #[derive(Default)]
 pub struct RegexCache {
-    regexes: RefCell<HashMap<RegexCacheKey, Rc<EcmaScriptRegex>, foldhash::fast::RandomState>>,
+    regexes: RefCell<hashbrown::HashMap<RegexCacheKey, Rc<EcmaScriptRegex>, foldhash::fast::RandomState>>,
 }
 
 impl RegexCache {
@@ -257,6 +296,45 @@ impl RegexCache {
     pub(crate) fn remove_unused(&self) {
         self.regexes.borrow_mut().retain(|_, regex| Rc::strong_count(regex) > 1);
     }
+
+    pub(crate) fn get_or_compile(
+        &self,
+        pattern: &Utf16String,
+        flag_bits: RegExpFlags,
+    ) -> Result<Rc<EcmaScriptRegex>, String> {
+        let pattern_view = Utf16View::of_string(pattern);
+        let lookup = RegexCacheLookup {
+            pattern: pattern_view,
+            flags: flag_bits,
+        };
+        if let Some(cached) = self.regexes.borrow().get(&lookup).cloned() {
+            return Ok(cached);
+        }
+
+        let unicode = flag_bits.has(RegExpFlags::UNICODE);
+        let unicode_sets = flag_bits.has(RegExpFlags::UNICODE_SETS);
+
+        // Normalize non-ASCII code units to ASCII escapes before compiling the pattern.
+        let mut normalized_pattern = Vec::new();
+        if !pattern_view.is_empty() {
+            let mut pattern_code_units = Vec::with_capacity(pattern_view.length_in_code_units());
+            pattern_view.append_to(&mut pattern_code_units);
+            normalized_pattern =
+                parse_regex_pattern(&pattern_code_units, unicode, unicode_sets).map_err(|error| error.error)?;
+        }
+
+        let compiled =
+            EcmaScriptRegex::compile(Utf16View::Utf16(&normalized_pattern), compile_flags_for(flag_bits))?;
+        let compiled = Rc::new(compiled);
+        self.regexes.borrow_mut().insert(
+            RegexCacheKey {
+                pattern: pattern.clone(),
+                flags: flag_bits,
+            },
+            Rc::clone(&compiled),
+        );
+        Ok(compiled)
+    }
 }
 
 /// get_or_compile_regex(): the compiled regex of a RegExp object, which is compiled the first time it is asked for.
@@ -269,34 +347,7 @@ fn get_or_compile_regex(vm: &Vm, regexp_object: &RegExpObject) -> Option<Rc<Ecma
 
     let pattern = regexp_object.pattern();
     let flag_bits = regexp_object.flag_bits();
-
-    let cache_key = RegexCacheKey {
-        pattern,
-        flags: flag_bits,
-    };
-
-    if let Some(cached) = vm.regex_cache().regexes.borrow().get(&cache_key).cloned() {
-        regexp_object.set_cached_regex(Some(Rc::clone(&cached)));
-        return Some(cached);
-    }
-    let pattern = &cache_key.pattern;
-
-    let unicode = flag_bits.has(RegExpFlags::UNICODE);
-    let unicode_sets = flag_bits.has(RegExpFlags::UNICODE_SETS);
-
-    // Normalize non-ASCII code units to ASCII escapes before compiling the pattern.
-    let mut pattern_code_units = Vec::new();
-    Utf16View::of_string(pattern).append_to(&mut pattern_code_units);
-    let normalized_pattern = parse_regex_pattern(&pattern_code_units, unicode, unicode_sets).ok()?;
-
-    let compiled =
-        EcmaScriptRegex::compile(Utf16View::Utf16(&normalized_pattern), compile_flags_for(flag_bits)).ok()?;
-
-    let compiled = Rc::new(compiled);
-    vm.regex_cache()
-        .regexes
-        .borrow_mut()
-        .insert(cache_key, Rc::clone(&compiled));
+    let compiled = vm.regex_cache().get_or_compile(&pattern, flag_bits).ok()?;
     regexp_object.set_cached_regex(Some(Rc::clone(&compiled)));
     Some(compiled)
 }
@@ -454,34 +505,18 @@ pub(crate) fn regexp_builtin_test_running_no_code(
 
     let utf16_view = string.utf16_string_view();
     if !global && !sticky {
-        if !typed_regexp.legacy_features_enabled() {
-            let test_result = compiled_regex.test(utf16_view, 0);
-            if test_result == MatchResult::LimitExceeded {
-                return None;
-            }
-            if test_result == MatchResult::Match && realm == typed_regexp.realm() {
-                invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
-            }
-            return Some(Value::from_bool(test_result == MatchResult::Match));
-        }
-        let test_exec_result = compiled_regex.exec(utf16_view, 0);
-        if test_exec_result == MatchResult::LimitExceeded {
+        let test_result = compiled_regex.test(utf16_view, 0);
+        if test_result == MatchResult::LimitExceeded {
             return None;
         }
-        let matched = test_exec_result == MatchResult::Match;
+        let matched = test_result == MatchResult::Match;
         if matched && realm == typed_regexp.realm() {
-            let n_capture_groups = compiled_regex.capture_count();
-            let match_start = compiled_regex.capture_slot(0) as usize;
-            let match_end = compiled_regex.capture_slot(1) as usize;
-            let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
-            update_legacy_regexp_static_properties_lazy(
-                vm,
-                realm.intrinsics().regexp_constructor(vm),
-                string,
-                match_start,
-                match_end,
-                &legacy_captures,
-            );
+            let constructor = realm.intrinsics().regexp_constructor(vm);
+            if typed_regexp.legacy_features_enabled() {
+                update_legacy_regexp_static_properties_pending_test(constructor, &compiled_regex, string);
+            } else {
+                invalidate_legacy_regexp_static_properties(constructor);
+            }
         }
         return Some(Value::from_bool(matched));
     }
@@ -2351,13 +2386,10 @@ impl RegExpPrototype {
             return Ok(Some(Value::from_object(array)));
         }
 
-        let string_data = string.utf16_string();
-        let utf16_view = Utf16View::of_string(&string_data);
-        let size = utf16_view.length_in_code_units();
-
         // Empty string case.
+        let size = string.length_in_utf16_code_units();
         if size == 0 {
-            let empty_result = compiled_regex.exec(utf16_view, 0);
+            let empty_result = compiled_regex.exec(string.utf16_string_view(), 0);
             if empty_result == MatchResult::LimitExceeded {
                 return throw_backtrack_limit_exceeded(vm);
             }
@@ -2367,119 +2399,123 @@ impl RegExpPrototype {
             return Ok(Some(Value::from_object(array)));
         }
 
-        let mut array_length: u32 = 0;
-        let mut last_match_end: usize = 0;
-        let mut next_search_from: usize = 0;
         let n_capture_groups = compiled_regex.capture_count();
         let total_groups = compiled_regex.total_groups();
-
         let need_legacy = typed_regexp.legacy_features_enabled() && realm == typed_regexp.realm();
 
-        while next_search_from < size {
-            // The spec's split algorithm uses sticky semantics: match must
-            // start at exactly next_search_from. We do a forward search and
-            // then handle the case where the match starts later.
-            let split_exec_result = compiled_regex.exec(utf16_view, next_search_from);
-            if split_exec_result == MatchResult::LimitExceeded {
-                return throw_backtrack_limit_exceeded(vm);
-            }
-            let matched = split_exec_result == MatchResult::Match;
+        // Collect (start, len) spans while borrowing `string.utf16_string_view()` with zero GC allocations,
+        // using `(u32::MAX, 0)` as a sentinel for unmatched capture groups (`Value::UNDEFINED`).
+        const UNDEFINED_SPAN: (u32, u32) = (u32::MAX, 0);
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut last_legacy_match: Option<(usize, usize, LegacyCaptureSlots)> = None;
+        let mut limit_reached = false;
+        let mut last_match_end: usize = 0;
 
-            if !matched {
-                break;
-            }
+        {
+            let utf16_view = string.utf16_string_view();
+            let mut next_search_from: usize = 0;
 
-            let match_start = compiled_regex.capture_slot(0) as usize;
-            let match_end = compiled_regex.capture_slot(1) as usize;
-            let last_index = match_end.min(size);
-
-            // If the match starts at or past the end of string, it's not
-            // a valid split point (spec's while q < size would have exited).
-            if match_start >= size {
-                break;
-            }
-
-            // Update legacy properties before split decides whether to
-            // ignore this successful match.
-            if need_legacy {
-                let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
-                update_legacy_regexp_static_properties_lazy(
-                    vm,
-                    realm.intrinsics().regexp_constructor(vm),
-                    string,
-                    match_start,
-                    match_end,
-                    &legacy_captures,
-                );
-            }
-
-            // If the match doesn't start at next_search_from, skip to
-            // where it does start.
-            if match_start > next_search_from {
-                next_search_from = match_start;
-            }
-
-            // If match is zero-width at same position as last split, advance.
-            if last_index == last_match_end {
-                next_search_from = advance_string_index(utf16_view, next_search_from as u64, unicode_matching) as usize;
-                continue;
-            }
-
-            // Add substring before this match.
-            array.indexed_put(
-                array_length,
-                substring(vm, string, last_match_end, next_search_from - last_match_end),
-                DEFAULT_ATTRIBUTES,
-            );
-            array_length += 1;
-            if array_length == limit {
-                return Ok(Some(Value::from_object(array)));
-            }
-
-            last_match_end = last_index;
-
-            // Add captures.
-            for i in 1..=n_capture_groups {
-                let capture_start = if i < total_groups {
-                    compiled_regex.capture_slot(i * 2)
-                } else {
-                    -1
-                };
-                let capture_end = if i < total_groups {
-                    compiled_regex.capture_slot(i * 2 + 1)
-                } else {
-                    -1
-                };
-
-                if capture_start >= 0 && capture_end >= 0 {
-                    array.indexed_put(
-                        array_length,
-                        substring(
-                            vm,
-                            string,
-                            capture_start as usize,
-                            (capture_end - capture_start) as usize,
-                        ),
-                        DEFAULT_ATTRIBUTES,
-                    );
-                } else {
-                    array.indexed_put(array_length, Value::UNDEFINED, DEFAULT_ATTRIBUTES);
+            while next_search_from < size {
+                let split_exec_result = compiled_regex.exec(utf16_view, next_search_from);
+                if split_exec_result == MatchResult::LimitExceeded {
+                    return throw_backtrack_limit_exceeded(vm);
                 }
-                array_length += 1;
-                if array_length == limit {
-                    return Ok(Some(Value::from_object(array)));
+                if split_exec_result != MatchResult::Match {
+                    break;
                 }
-            }
 
-            next_search_from = last_match_end;
+                let match_start = compiled_regex.capture_slot(0) as usize;
+                let match_end = compiled_regex.capture_slot(1) as usize;
+                let last_index = match_end.min(size);
+
+                // If the match starts at or past the end of string, it's not
+                // a valid split point (spec's while q < size would have exited).
+                if match_start >= size {
+                    break;
+                }
+
+                // Remember the last valid match for legacy static properties (applied once after the loop).
+                if need_legacy {
+                    let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
+                    last_legacy_match = Some((match_start, match_end, legacy_captures));
+                }
+
+                if match_start > next_search_from {
+                    next_search_from = match_start;
+                }
+
+                // If match is zero-width at same position as last split, advance.
+                if last_index == last_match_end {
+                    next_search_from =
+                        advance_string_index(utf16_view, next_search_from as u64, unicode_matching) as usize;
+                    continue;
+                }
+
+                // Record substring before this match.
+                spans.push((last_match_end as u32, (next_search_from - last_match_end) as u32));
+                if spans.len() as u32 == limit {
+                    limit_reached = true;
+                    break;
+                }
+
+                last_match_end = last_index;
+
+                // Record captures.
+                for i in 1..=n_capture_groups {
+                    let capture_start = if i < total_groups {
+                        compiled_regex.capture_slot(i * 2)
+                    } else {
+                        -1
+                    };
+                    let capture_end = if i < total_groups {
+                        compiled_regex.capture_slot(i * 2 + 1)
+                    } else {
+                        -1
+                    };
+
+                    if capture_start >= 0 && capture_end >= 0 {
+                        spans.push((capture_start as u32, (capture_end - capture_start) as u32));
+                    } else {
+                        spans.push(UNDEFINED_SPAN);
+                    }
+                    if spans.len() as u32 == limit {
+                        limit_reached = true;
+                        break;
+                    }
+                }
+                if limit_reached {
+                    break;
+                }
+
+                next_search_from = last_match_end;
+            }
         }
 
-        // Add trailing substring.
-        array.indexed_put(
-            array_length,
-            substring(vm, string, last_match_end, size - last_match_end),
-            DEFAULT_ATTRIBUTES,
-        );
+        if let Some((match_start, match_end, legacy_captures)) = last_legacy_match {
+            update_legacy_regexp_static_properties_lazy(
+                vm,
+                realm.intrinsics().regexp_constructor(vm),
+                string,
+                match_start,
+                match_end,
+                &legacy_captures,
+            );
+        }
+
+        if !limit_reached {
+            spans.push((last_match_end as u32, (size - last_match_end) as u32));
+        }
+
+        let values = MarkedVec::with_capacity(vm, spans.len());
+        for (start, len) in spans {
+            let value = if start == u32::MAX {
+                Value::UNDEFINED
+            } else {
+                substring(vm, string, start as usize, len as usize)
+            };
+            values.push(value);
+        }
+        array.set_indexed_property_elements(&values.values());
 
         Ok(Some(Value::from_object(array)))
     }

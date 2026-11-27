@@ -235,17 +235,21 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
     if executable.jit_compile_state() == CompileState::Queued {
         let jit_state = executable.jit_state();
         let job_id = jit_state.queued_job_id.get();
-        let ready_job_id = if is_loop || vm.jit.options.stress_install {
+        let ready_job_id = if vm.jit.options.stress_install {
             Some(job_id)
         } else if let Some(queue) = vm.jit.started_compile_queue()
             && queue.is_job_ready(job_id)
         {
-            let polls = jit_state.queued_ready_polls.get().saturating_add(1);
-            jit_state.queued_ready_polls.set(polls);
-            if polls >= 2 || queue.finished_count() >= 4 {
+            if is_loop {
                 Some(job_id)
             } else {
-                None
+                let polls = jit_state.queued_ready_polls.get().saturating_add(1);
+                jit_state.queued_ready_polls.set(polls);
+                if polls >= 2 || queue.finished_count() >= 4 {
+                    Some(job_id)
+                } else {
+                    None
+                }
             }
         } else {
             None

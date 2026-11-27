@@ -1436,6 +1436,7 @@ fn fake_object_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_get_own_property: 3,
         property_lookup_cache_entry_type_change_own_property: 2,
         property_lookup_cache_entry_type_get_property_in_prototype_chain: 5,
+        property_lookup_cache_entry_type_change_property_in_prototype_chain: 4,
         // NB: Fake cells keep their class in their first word: the mask
         //     keeps every bit, so the block of a fake cell is the cell.
         cell_block_mask: u64::MAX,

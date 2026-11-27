@@ -122,6 +122,7 @@ private:
 
     mutable GC::Weak<Document const> m_cached_document;
     mutable u64 m_cached_invalidation_version { 0 };
+    mutable u32 m_last_cached_size { 0 };
     mutable GC::WeakVector<Element> m_cached_elements;
     mutable OwnPtr<OrderedHashMap<Utf16FlyString, GC::Weak<Element>>> m_cached_name_to_element_mappings;
 

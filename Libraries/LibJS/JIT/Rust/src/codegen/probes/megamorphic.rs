@@ -20,7 +20,7 @@ use crate::asm::Scale;
 
 /// What the entries of a megamorphic cache are for.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum MegamorphicKey {
+pub(in crate::codegen) enum MegamorphicKey {
     /// A named access: entries have no key.
     Named,
     /// A keyed access with the encoded key `Value` in `key`: entries have
@@ -31,7 +31,7 @@ pub(super) enum MegamorphicKey {
 impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Branches to `found` if cache entry `candidate` applies to objects of
     /// the shape in `shape`.
-    pub(super) fn branch_if_entry_shape(&mut self, candidate: Gpr, shape: Gpr, found: Label) {
+    pub(in crate::codegen) fn branch_if_entry_shape(&mut self, candidate: Gpr, shape: Gpr, found: Label) {
         let candidate_shape = Address::new(candidate, self.runtime.layout.property_lookup_cache_entry_shape as i32);
         self.masm
             .branch64_memory(Condition::Equal, &candidate_shape, shape, found);
@@ -41,7 +41,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// in the megamorphic cache data that `entry` points to, and branches to
     /// `found` with the entry in `entry`, or to `miss`. Clobbers the scratch
     /// register.
-    pub(super) fn emit_megamorphic_cache_lookup(
+    pub(in crate::codegen) fn emit_megamorphic_cache_lookup(
         &mut self,
         shape: Gpr,
         entry: Gpr,

@@ -598,8 +598,10 @@ pub struct Vm {
     /// The fly strings of short ASCII strings that became property keys before they had storage, found by a hash of
     /// their characters. Every collection empties this cache, so that it keeps no fly string alive for long.
     characters_to_atom_cache: RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>>,
+    characters_to_atom_cache_dirty: Cell<bool>,
     /// The strings in this cache are weak: every collection empties it.
     key_concatenation_cache: Box<[KeyConcatenationCacheEntry; KEY_CONCATENATION_CACHE_SIZE]>,
+    key_concatenation_cache_dirty: Cell<bool>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -787,6 +789,7 @@ impl Vm {
             characters_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| {
                 CharactersToAtomCacheEntry::default()
             }))),
+            characters_to_atom_cache_dirty: Cell::new(false),
             key_concatenation_cache: Box::new(
                 [const {
                     KeyConcatenationCacheEntry {
@@ -796,6 +799,7 @@ impl Vm {
                     }
                 }; KEY_CONCATENATION_CACHE_SIZE],
             ),
+            key_concatenation_cache_dirty: Cell::new(false),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
             large_numeric_string_cache: Box::new(
@@ -1755,18 +1759,28 @@ impl Vm {
             }
         }
         drop(interned_strings);
-        self.characters_to_atom_cache
-            .borrow_mut()
-            .fill_with(CharactersToAtomCacheEntry::default);
-        for entry in self.key_concatenation_cache.iter() {
-            entry.lhs.set(0);
-            entry.rhs.set(0);
-            entry.string.set(0);
+        if self.characters_to_atom_cache_dirty.replace(false) {
+            self.characters_to_atom_cache
+                .borrow_mut()
+                .fill_with(CharactersToAtomCacheEntry::default);
+        }
+        if self.key_concatenation_cache_dirty.replace(false) {
+            for entry in self.key_concatenation_cache.iter() {
+                entry.lhs.set(0);
+                entry.rhs.set(0);
+                entry.string.set(0);
+            }
         }
     }
 
     /// Forgets the cells that died in this collection from the inline caches of executables and static call sites.
     fn remove_dead_cells_from_property_lookup_caches(&self, sweep: &Sweep<'_>) {
+        #[cfg(feature = "jit")]
+        let _code_drop_deferral = self
+            .heap
+            .get()
+            .is_some()
+            .then(|| self.jit.defer_code_drops_until_collection_is_over(self));
         self.executables.borrow_mut().retain(|executable| {
             if sweep.is_dead(*executable) {
                 executable.free_jit_entry_slot(self, sweep);
@@ -2158,6 +2172,7 @@ impl Vm {
     pub fn characters_to_atom_cache(
         &self,
     ) -> &RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>> {
+        self.characters_to_atom_cache_dirty.set(true);
         &self.characters_to_atom_cache
     }
 
@@ -2172,6 +2187,7 @@ impl Vm {
         rhs: Gc<PrimitiveString>,
         string: Gc<PrimitiveString>,
     ) {
+        self.key_concatenation_cache_dirty.set(true);
         let (lhs, rhs) = (Value::from_string(lhs).0, Value::from_string(rhs).0);
         let entry = &self.key_concatenation_cache[key_concatenation_cache_index(lhs, rhs)];
         entry.lhs.set(lhs);

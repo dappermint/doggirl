@@ -18,7 +18,7 @@ use libjs_runtime_macros::Trace;
 use num_bigint::BigInt as NumBigInt;
 
 use crate::gc::capi::{GC_PRIMITIVE_STORAGE_NULL_HANDLE, GCPrimitiveStorageHandle, gc_cell_type_info};
-use crate::gc::class::{ExternalMemorySize, Finalize, GcCell, define_cell};
+use crate::gc::class::{ExternalMemorySize, GcCell, define_cell};
 use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::heap::Heap;
@@ -688,6 +688,7 @@ fn allocate_or_retry_after_gc<T>(heap: &Heap, allocate: impl Fn() -> Result<T, O
     let result = allocate();
     if result.is_err() {
         heap.collect_garbage();
+        heap.finish_pending_incremental_sweep();
         return allocate();
     }
     result
@@ -712,7 +713,6 @@ define_cell!(
     ArrayBuffer,
     Object,
     extends: [Object],
-    finalize: finalize,
     external_memory_size: external_memory_size
 );
 
@@ -721,13 +721,6 @@ impl Deref for ArrayBuffer {
 
     fn deref(&self) -> &Object {
         &self.base
-    }
-}
-
-impl Finalize for ArrayBuffer {
-    fn finalize(&self) {
-        let is_shared = self.data_block.borrow().is_shared;
-        drop(self.data_block.replace(DataBlock::empty(is_shared)));
     }
 }
 

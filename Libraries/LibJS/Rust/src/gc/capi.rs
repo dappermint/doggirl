@@ -124,6 +124,7 @@ unsafe extern "C" {
     pub safe fn gc_heap_should_collect_on_every_allocation(heap: &GCHeap) -> bool;
     pub safe fn gc_heap_set_should_collect_on_every_allocation(heap: &GCHeap, should_collect: bool);
     pub safe fn gc_heap_set_incremental_sweep_enabled(heap: &GCHeap, enabled: bool);
+    pub safe fn gc_heap_finish_pending_incremental_sweep(heap: &GCHeap);
     pub fn gc_heap_uproot_cell(heap: *mut GCHeap, cell: *mut c_void);
     pub safe fn gc_heap_stack_bounds(heap: &GCHeap, base: &mut usize, top: &mut usize);
     pub fn gc_heap_enqueue_post_gc_task(heap: *mut GCHeap, callback: GCCallback, context: *mut c_void);

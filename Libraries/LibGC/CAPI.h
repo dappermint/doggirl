@@ -143,6 +143,7 @@ GC_API void gc_heap_deferral_state(GCHeap*, size_t** deferrals, bool** collect_w
 GC_API bool gc_heap_should_collect_on_every_allocation(GCHeap const*);
 GC_API void gc_heap_set_should_collect_on_every_allocation(GCHeap*, bool);
 GC_API void gc_heap_set_incremental_sweep_enabled(GCHeap*, bool);
+GC_API void gc_heap_finish_pending_incremental_sweep(GCHeap*);
 GC_API void gc_heap_uproot_cell(GCHeap*, GCCell*);
 // The bounds of the stack of the thread that created the heap; base is the lowest address.
 GC_API void gc_heap_stack_bounds(GCHeap const*, uintptr_t* base, uintptr_t* top);

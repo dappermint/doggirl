@@ -165,7 +165,7 @@ pub fn run(graph: &mut Graph, work: &Zone) {
     run_with_dominators(graph, work, &mut dominators);
 }
 
-pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) -> bool {
     // NB: Loops have a back edge from a later block or the block itself.
     let has_loops = graph.blocks.iter().enumerate().any(|(index, block)| {
         block
@@ -174,7 +174,7 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
             .any(|predecessor| predecessor.index() >= index)
     });
     if !has_loops {
-        return;
+        return false;
     }
     let added_preheaders = {
         let dom = dominators.get_or_compute(graph);
@@ -191,8 +191,9 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
     };
     let loops = find_loops(graph, dominators, work);
     if loops.is_empty() {
-        return;
+        return added_preheaders;
     }
+    let mut changed = added_preheaders;
     let mut block_of = ZoneVec::from_elem_in(None, graph.nodes.len(), work);
     let mut hoisted = ZoneVec::new_in(work);
     let mut body = ZoneVec::new_in(work);
@@ -281,6 +282,10 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
                 hoisted.push(node);
             }
         }
-        graph.blocks[loop_.preheader.index()].body.extend_from_slice(&hoisted);
+        if !hoisted.is_empty() {
+            changed = true;
+            graph.blocks[loop_.preheader.index()].body.extend_from_slice(&hoisted);
+        }
     }
+    changed
 }

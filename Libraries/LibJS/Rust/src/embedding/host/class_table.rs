@@ -218,6 +218,7 @@ impl JSHostClass {
 }
 
 /// Gives a host object the flags of its class that the engine keeps in every object.
+#[inline(always)]
 pub fn copy_host_class_flags_into_object(vm: &Vm, table: &JSHostClass, object: &Object) {
     if table.has_flag(JS_HOST_CLASS_IS_PLATFORM_OBJECT) {
         object.set_is_platform_object();

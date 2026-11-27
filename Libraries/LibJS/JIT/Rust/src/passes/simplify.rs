@@ -319,8 +319,13 @@ fn constant_number(graph: &Graph, node: NodeId) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
 pub fn run(graph: &mut Graph, work: &Zone) {
     simplify(graph, true, work);
+}
+
+pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
+    simplify(graph, true, work)
 }
 
 /// Simplification after check elimination, which keeps every int32 check of
