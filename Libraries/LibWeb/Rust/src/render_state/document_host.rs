@@ -1181,6 +1181,16 @@ impl DocumentHost {
     /// it, taking the frame in flight in first with `wait`. A job that `writes` leaves the paint and hit testing
     /// properties prepared from the state stale. Nothing the job calls runs another job on the same state.
     pub(crate) fn run<R>(&self, wait: impl RenderWait, writes: bool, job: impl FnOnce(&mut RenderState) -> R) -> R {
+        self.run_inner(wait, writes, true, job)
+    }
+
+    fn run_inner<R>(
+        &self,
+        wait: impl RenderWait,
+        writes: bool,
+        may_recurse_tree: bool,
+        job: impl FnOnce(&mut RenderState) -> R,
+    ) -> R {
         assert!(
             wait.reaches(self),
             "a begun read reaches only the render state of its own document"
@@ -1201,7 +1211,20 @@ impl DocumentHost {
                     .as_slice()
                     .iter()
                     .any(|change| !change.keeps_the_presented_frame());
-            let tree_depth = self.tree_depth_bound(changes.as_slice());
+            let tree_depth = if may_recurse_tree
+                || changes.as_slice().iter().any(|change| {
+                    matches!(
+                        change,
+                        ArenaChange::DetachForRemoval(_)
+                            | ArenaChange::ReinheritAnonymousDescendants(_)
+                            | ArenaChange::ReinheritDisplayContentsText(_)
+                            | ArenaChange::RefreshFirstLetterStyles
+                    )
+                }) {
+                self.tree_depth_bound(changes.as_slice())
+            } else {
+                0
+            };
             let answer = on_render_side(tree_depth, move || {
                 if moves_state {
                     super::clock::note_host_write(document);
@@ -1228,24 +1251,25 @@ impl DocumentHost {
         answer
     }
 
-    /// How deep the document's style tree may be once a job applies `changes`: as deep as its deepest element ever was,
-    /// and a level deeper for each element whose links the engine wrote since it last released a transaction, and for
-    /// each tree delta of `changes`.
+    /// How deep the document's style tree may be once a job applies `changes`: at most the deeper
+    /// of its deepest committed element and any newly linked leaves, plus any additive bound from
+    /// reparented subtrees.
     pub(super) fn tree_depth_bound(&self, changes: &[ArenaChange]) -> u32 {
-        let queued_tree_deltas = changes
-            .iter()
-            .map(|change| match change {
-                ArenaChange::Engine(crate::css::style::engine_calls::EngineWrite::Publish(publication)) => {
-                    publication.link_rows_written()
-                }
-                _ => 0,
-            })
-            .sum::<usize>();
+        let mut queued_leaf_max: u32 = 0;
+        let mut queued_reparented: u32 = 0;
+        for change in changes {
+            if let ArenaChange::Engine(crate::css::style::engine_calls::EngineWrite::Publish(publication)) = change {
+                let (leaf_max, reparented) = publication.link_depth_bounds();
+                queued_leaf_max = queued_leaf_max.max(leaf_max);
+                queued_reparented = queued_reparented.saturating_add(reparented);
+            }
+        }
         self.shared
             .deepest_element
             .load(Ordering::Relaxed)
+            .max(queued_leaf_max)
             .saturating_add(self.shared.link_rows_written.load(Ordering::Relaxed))
-            .saturating_add(u32::try_from(queued_tree_deltas).unwrap_or(u32::MAX))
+            .saturating_add(queued_reparented)
     }
 
     /// Answers `read` of the document's render state, spending `wait`, as of every write the host queued. A read leaves
@@ -1254,6 +1278,21 @@ impl DocumentHost {
     /// change what the preparation answers, and so writes the render state.
     pub(crate) fn ask<R>(&self, wait: impl RenderWait, read: impl FnOnce(&mut RenderState) -> R) -> R {
         let (answer, measured_for_preparation) = self.run(wait, false, |state| {
+            let awaited = state.arena_mut().scrollable_overflow.change_awaits_preparation();
+            let answer = read(state);
+            let awaits = state.arena_mut().scrollable_overflow.change_awaits_preparation();
+            (answer, !awaited && awaits)
+        });
+        if measured_for_preparation {
+            self.note_render_state_write();
+        }
+        answer
+    }
+
+    /// Like [`Self::ask`], for O(1) non-recursive queries that do not walk the style or layout
+    /// tree and therefore do not need per-tree-level stack headroom on the main thread.
+    pub(crate) fn ask_shallow<R>(&self, wait: impl RenderWait, read: impl FnOnce(&mut RenderState) -> R) -> R {
+        let (answer, measured_for_preparation) = self.run_inner(wait, false, false, |state| {
             let awaited = state.arena_mut().scrollable_overflow.change_awaits_preparation();
             let answer = read(state);
             let awaits = state.arena_mut().scrollable_overflow.change_awaits_preparation();

@@ -116,16 +116,23 @@ pub(in crate::css::style) struct ProjectionPublication {
     pub(super) disabled: crate::cow_map::CowSet<StyleNodeID>,
     pub(super) written: Vec<StyleNodeID>,
     pub(super) links_written: Vec<StyleNodeID>,
+    /// Maximum depth in the published tree among newly linked leaf nodes, which does not stack
+    /// additively across flat siblings.
+    pub(super) leaf_link_max_depth: u32,
+    /// Additive depth bound for linked nodes that already have children or a shadow root, whose
+    /// subtrees could deepen an existing chain.
+    pub(super) reparented_link_depth_bound: u32,
     pub(super) relations_written: Vec<StyleNodeID>,
     /// What the writes counted.
     pub(in crate::css::style) counts: SmallVec<[(Counter, u64); 4]>,
 }
 
 impl ProjectionPublication {
-    /// How many elements' links the publication wrote, each of which may deepen the tree by a level.
+    /// Upper-bound tree depth contributions from this publication's link writes:
+    /// `(leaf_max_depth, reparented_depth_bound)`.
     #[must_use]
-    pub(in crate::css::style) fn link_rows_written(&self) -> usize {
-        self.links_written.len()
+    pub(in crate::css::style) fn link_depth_bounds(&self) -> (u32, u32) {
+        (self.leaf_link_max_depth, self.reparented_link_depth_bound)
     }
 
     /// Whether the publication moves elements in the tree, or their shadow relations.
@@ -214,6 +221,7 @@ impl ProjectionWriter {
                 (count != 0).then_some((counter, count))
             })
             .collect();
+        let (leaf_link_max_depth, reparented_link_depth_bound) = self.compute_link_depth_bounds();
         let publication = ProjectionPublication {
             rows: rows.clone(),
             shadows: self.shadows.publish(),
@@ -225,11 +233,69 @@ impl ProjectionWriter {
             disabled: self.disabled.clone(),
             written: self.written.take(),
             links_written: self.links_written.take(),
+            leaf_link_max_depth,
+            reparented_link_depth_bound,
             relations_written: self.relations_written.take(),
             counts,
         };
         self.published = rows;
         publication
+    }
+
+    /// Computes a sound upper bound on how deep the tree may become from `self.links_written`
+    /// without counting flat sibling insertions as additive depth levels.
+    fn compute_link_depth_bounds(&self) -> (u32, u32) {
+        let count = self.links_written.nodes.len();
+        if count <= 16 {
+            return (0, count as u32);
+        }
+        const MAX_DEPTH_WALK: usize = 4096;
+        let mut memo = crate::fast_hash::FastMap::<StyleNodeID, u32>::with_capacity_and_hasher(
+            count.min(256),
+            Default::default(),
+        );
+        let mut path = Vec::<StyleNodeID>::with_capacity(32);
+        let mut leaf_max: u32 = 0;
+        let mut reparented_bound: u32 = 0;
+        for &node in &self.links_written.nodes {
+            let Some(row) = self.row(node).filter(|row| row.live()) else {
+                continue;
+            };
+            let has_subtree = row.links.first_element_child.is_some() || self.shadow_root_of(node).is_some();
+            path.clear();
+            let mut current = Some(node);
+            let mut base_depth: u32 = 0;
+            let mut overflowed = false;
+            while let Some(cur) = current {
+                if let Some(&cached) = memo.get(&cur) {
+                    base_depth = cached;
+                    break;
+                }
+                if path.len() >= MAX_DEPTH_WALK {
+                    overflowed = true;
+                    break;
+                }
+                path.push(cur);
+                current = self
+                    .row(cur)
+                    .and_then(|r| r.links.parent)
+                    .or_else(|| self.host_of(cur));
+            }
+            if overflowed {
+                return (0, u32::try_from(count).unwrap_or(u32::MAX));
+            }
+            let mut depth = base_depth;
+            for &visited in path.iter().rev() {
+                depth = depth.saturating_add(1);
+                memo.insert(visited, depth);
+            }
+            if has_subtree {
+                reparented_bound = reparented_bound.saturating_add(depth);
+            } else {
+                leaf_max = leaf_max.max(depth);
+            }
+        }
+        (leaf_max, reparented_bound)
     }
 
     /// Bring the summaries of the keys below each element up to date with the rows written. A summary changes only as

@@ -117,7 +117,13 @@ fn record_display_list_impl<O: Observer>(
     let window_spaces = window
         .clone()
         .zip(paint_state.visual_context_tree.as_deref())
-        .map(|(window, tree)| WindowSpaces::new(window, tree));
+        .map(|(window, tree)| {
+            let spaces = WindowSpaces::new(window, tree);
+            if let Some(world) = spaces.unscrolled_world() {
+                paint_state.seed_unscrolled_world_transforms(world);
+            }
+            spaces
+        });
     let mut recorder = PaintRecorder {
         source,
         paint_state,

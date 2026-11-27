@@ -245,3 +245,19 @@ pub unsafe extern "C" fn render_state_drop_subtree(
     // SAFETY: Guaranteed by the caller.
     unsafe { write_and_pay(host, read, LayoutWrite::DropSubtree { root }) }
 }
+
+/// Prepares every row of the subtree `root` heads for leaving the layout tree, detaches it from its
+/// parent, and frees it in one render-owner turn. Answers whether the subtree was attached.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on the document's thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_prepare_and_drop_subtree(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+    root: NodeSlotId,
+) -> bool {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { write_and_pay(host, read, LayoutWrite::PrepareAndDropSubtree { root }) }
+}

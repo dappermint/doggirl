@@ -34,7 +34,7 @@ pub const MINIMUM_PROJECTION_W: f32 = 0.0001;
 ///
 /// Scroll, sticky and anchor scroll shift translations under no transform but identities round to whole device pixels
 /// of the layout viewport, so scrolled content never lands on subpixel positions. Under a transform they stay exact.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WorldTransforms {
     pub local: Vec<FloatMatrix4x4>,
     pub to_root: Vec<FloatMatrix4x4>,

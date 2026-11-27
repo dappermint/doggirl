@@ -799,6 +799,81 @@ impl LayoutNodeArena {
         contained
     }
 
+    /// Visits each unique child `NodeSlotId` that has a committed fragment in `node`'s
+    /// `fragment_index`, borrowing committed links in place and reusing `met` with zero heap
+    /// allocations on the common path.
+    pub(crate) fn for_each_child_node_in_containing_block_fragment(
+        &self,
+        node: NodeSlotId,
+        link: &FragmentLink,
+        fragment_index: u32,
+        met: &mut crate::fast_hash::FastSet<NodeSlotId>,
+        mut visit: impl FnMut(NodeSlotId),
+    ) {
+        let holder = self
+            .committed_link_holder(node)
+            .map(|(holder, _)| holder)
+            .filter(|&holder| self.slot_is_live(holder));
+        let has_holder_outer = holder.is_some_and(|holder| {
+            self.with_committed_fragment_link(holder, |holder_link| {
+                holder_link.is_some_and(|holder_link| holder_link.fragment.outer_links != OuterLinks::None)
+            })
+        });
+        let held_apart = self
+            .links_held_apart_from_their_containing_blocks
+            .held_apart_from(node);
+        let check_candidate = |candidate: NodeSlotId, visit: &mut dyn FnMut(NodeSlotId)| {
+            if !self.slot_is_live(candidate)
+                || !self.paintable_row_is_populated(candidate)
+                || self.paintable_data(candidate).containing_block != node
+            {
+                return;
+            }
+            let side_data = self.committed_side_data(candidate);
+            let has_in_fragment = (side_data.containing_block_fragment == fragment_index
+                && self.with_committed_fragment_link(candidate, |link| link.is_some()))
+                || side_data
+                    .box_fragments()
+                    .iter()
+                    .any(|fragment| fragment.containing_block_fragment == fragment_index);
+            if has_in_fragment {
+                visit(candidate);
+            }
+        };
+        if !has_holder_outer && held_apart.is_empty() && link.fragment.children.len() <= 1 {
+            for contained in contained_links(&link.fragment) {
+                check_candidate(contained.fragment.node, &mut visit);
+            }
+            return;
+        }
+        met.clear();
+        for contained in contained_links(&link.fragment) {
+            let candidate = contained.fragment.node;
+            if met.insert(candidate) {
+                check_candidate(candidate, &mut visit);
+            }
+        }
+        if has_holder_outer && let Some(holder) = holder {
+            self.with_committed_fragment_link(holder, |holder_link| {
+                if let Some(holder_link) = holder_link {
+                    for held in &holder_link.fragment.children {
+                        if held.placement.containing_block == node {
+                            let candidate = held.fragment.node;
+                            if met.insert(candidate) {
+                                check_candidate(candidate, &mut visit);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for &candidate in held_apart {
+            if met.insert(candidate) {
+                check_candidate(candidate, &mut visit);
+            }
+        }
+    }
+
     fn recalculated_fragment_overflow(
         &self,
         node: NodeSlotId,

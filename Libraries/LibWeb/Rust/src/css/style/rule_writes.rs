@@ -226,6 +226,22 @@ pub(crate) enum RuleWrite {
 }
 
 impl RuleWrite {
+    /// Whether this rule write can add, replace, or remove compiled selectors, and therefore move the
+    /// engine's selector requirements or relational arrival keys.
+    pub(crate) fn may_change_selectors(&self) -> bool {
+        match self {
+            Self::AddSheet { .. }
+            | Self::BeginSheetRulesReplacement(_)
+            | Self::RuleDeclarations { .. }
+            | Self::RuleConditions(_)
+            | Self::LayerOrder { .. } => false,
+            Self::PublishRules { rules, .. } => rules
+                .iter()
+                .any(|rule| matches!(rule.kind, CompiledRuleKind::Style { .. })),
+            Self::AddUserAgentSheet { .. } | Self::ReplaceSelectors { .. } | Self::RemoveRules(_) => true,
+        }
+    }
+
     pub(crate) fn apply(self, engine: &mut StyleEngine) {
         match self {
             Self::AddSheet { sheet, origin } => {

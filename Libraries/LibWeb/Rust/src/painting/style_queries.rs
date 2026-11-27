@@ -411,6 +411,9 @@ pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, 
     let Some(style) = row.style() else {
         return (false, false);
     };
+    if !style_may_establish_positioning_containing_blocks(style) {
+        return (kind == NodeKind::Viewport, false);
+    }
     if style_establishes_fixed_positioning_containing_block(arena, node, style) {
         return (true, true);
     }

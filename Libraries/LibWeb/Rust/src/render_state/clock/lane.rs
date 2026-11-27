@@ -272,16 +272,20 @@ pub(in crate::render_state) fn note_host_write(document: DocumentId) {
             return;
         }
         // A lane that follows the pointer hovers beside the next task, which may begin as soon as this job is done,
-        // whether or not its animations run beside the idle event loop.
-        let needs_state = match &slot.lanes {
-            Lanes::Newest(lane) => lane.needs_render_state(),
-            Lanes::Coming { pieces, .. } => match &pieces.plan {
-                FramePlan::Sealed(plan) => plan.needs_render_state(),
-                _ => true,
-            },
-            Lanes::None => false,
-        };
-        let wants_fork = needs_state && (slot.ticks.wants_fork() || slot.lanes.newest_follows_pointer());
+        // whether or not its animations run beside the idle event loop. Only fork for hover when a pointer has entered
+        // this document, and only fork for animations when the lane animates or already holds sampled state.
+        let wants_animation_fork = slot.ticks.wants_fork()
+            && match &slot.lanes {
+                Lanes::Newest(lane) => lane.plan.animates() || !lane.samples_nothing(),
+                Lanes::Coming { pieces, .. } => match &pieces.plan {
+                    FramePlan::Sealed(plan) => plan.animates(),
+                    FramePlan::Unsealed => slot.ticks.plan_animates(),
+                    FramePlan::None => false,
+                },
+                Lanes::None => false,
+            };
+        let wants_hover_fork = slot.ticks.has_pointer() && slot.lanes.newest_follows_pointer();
+        let wants_fork = wants_animation_fork || wants_hover_fork;
         if let Some(state) = slot.lanes.newest_state() {
             if wants_fork {
                 state.fork(document);

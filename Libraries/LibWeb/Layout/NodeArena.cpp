@@ -29,6 +29,11 @@ void NodeArena::free_subtree(Layout::BegunRead const& read, Compositing::RustFFI
     RustFFI::render_state_drop_subtree(host(), &read, root);
 }
 
+void NodeArena::prepare_and_free_subtree(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId root)
+{
+    RustFFI::render_state_prepare_and_drop_subtree(host(), &read, root);
+}
+
 Node* NodeArena::node_if_live(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId slot) const
 {
     return static_cast<Node*>(RustFFI::render_state_node_shell_if_live(host(), &read, slot));
