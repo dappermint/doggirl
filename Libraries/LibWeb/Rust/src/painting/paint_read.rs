@@ -249,6 +249,11 @@ pub(crate) trait PaintRead: GeometryRead {
     }
     fn stacking_context_entries(&self, root: NodeSlotId) -> Option<impl Deref<Target = StackingContextEntries> + '_>;
 
+    /// Whether any row in the document has ever carried a non-normal `mix-blend-mode`.
+    fn may_have_non_normal_mix_blend_mode(&self) -> bool {
+        true
+    }
+
     /// The box whose content box supplies a node's layout coordinate space. An in-flow node uses the nearest ancestor
     /// that forms a containing block for its children. An absolutely positioned node uses its positioning containing
     /// block, or that inline's in-flow containing block when the positioning containing block is inline. A fixed-position
@@ -528,6 +533,10 @@ impl<Live: AsRef<LayoutNodeArena> + LiveAbsoluteRects> PaintRead for Live {
 
     fn stacking_context_entries(&self, root: NodeSlotId) -> Option<impl Deref<Target = StackingContextEntries> + '_> {
         self.as_ref().stacking_context_entries(root)
+    }
+
+    fn may_have_non_normal_mix_blend_mode(&self) -> bool {
+        self.as_ref().may_have_non_normal_mix_blend_mode()
     }
 }
 

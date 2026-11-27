@@ -231,6 +231,7 @@ impl ExecutableFeedback {
                 for (bucket, value) in buckets.iter().zip(values) {
                     let bits = bucket.get();
                     if bits != value_feedback::EMPTY_VALUE_BUCKET {
+                        bucket.set(value_feedback::EMPTY_VALUE_BUCKET);
                         let old = value.get();
                         let updated = old | value_feedback::for_bits(bits);
                         if updated != old {
@@ -246,6 +247,7 @@ impl ExecutableFeedback {
                 for (bucket, value) in cache_buckets.iter().rev().zip(cache_values) {
                     let bits = bucket.get();
                     if bits != value_feedback::EMPTY_VALUE_BUCKET {
+                        bucket.set(value_feedback::EMPTY_VALUE_BUCKET);
                         let old = value.get();
                         let updated = old | value_feedback::for_bits(bits);
                         if updated != old {
@@ -258,6 +260,7 @@ impl ExecutableFeedback {
         for call in self.call() {
             let tag = call.value_bucket.get();
             if tag != value_feedback::EMPTY_VALUE_BUCKET_TAG {
+                call.value_bucket.set(value_feedback::EMPTY_VALUE_BUCKET_TAG);
                 let old = call.value.get();
                 let updated = old | value_feedback::for_bits(u64::from(tag) << 48);
                 if updated != old {

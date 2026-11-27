@@ -2933,6 +2933,8 @@ void Document::note_animations_that_can_skip_per_frame_style_updates()
     if (!m_needs_throttled_animation_style_update_check || m_has_throttled_animation_style_update || !layout_is_up_to_date())
         return;
     m_needs_throttled_animation_style_update_check = false;
+    if (associated_animation_count_in_subtree() == 0)
+        return;
     if (Animations::RustFFI::animations_document_animations_query(m_animations, Animations::RustFFI::DocumentAnimationsQuery::AnyCanSkipPerFrameStyleUpdate))
         note_throttled_animation_style_update();
 }
@@ -2953,6 +2955,9 @@ void Document::flush_throttled_animation_style_update()
 
 void Document::flush_throttled_animation_style_update_for_node(Node const& node)
 {
+    if (!m_has_throttled_animation_style_update
+        && (!m_needs_throttled_animation_style_update_check || associated_animation_count_in_subtree() == 0))
+        return;
     Layout::ForcedReadScope read { *this };
     // Only an animation that can skip a per-frame style update has anything for this read to catch
     // up on. Sampling and painting record whether any can, as do reads after a visibility or layout
@@ -3041,7 +3046,8 @@ bool Document::compositor_animation_observation_timer_is_active() const
 void Document::throttled_animation_visibility_changed()
 {
     if (!m_has_throttled_animation_style_update) {
-        m_needs_throttled_animation_style_update_check = true;
+        if (associated_animation_count_in_subtree() != 0)
+            m_needs_throttled_animation_style_update_check = true;
         return;
     }
     flush_throttled_animation_style_update();

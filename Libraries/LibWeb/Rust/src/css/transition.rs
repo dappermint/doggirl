@@ -206,25 +206,6 @@ fn decide_transition(
     // https://drafts.csswg.org/css-transitions/#transition-combined-duration
     // Define the combined duration of the transition as the sum of max(matching transition duration, 0s) and the matching transition delay.
     let combined_duration = input.duration.max(0.0) + input.delay;
-    let before_after_transitionable = input.has_matching_transition
-        && before_change_value_differs
-        && property_values_are_transitionable(
-            context,
-            input.property_id,
-            input.before_change_value,
-            input.after_change_value,
-            input.allow_discrete,
-        );
-    let current_after_transitionable = current_value_equals_after
-        || input.has_running_transition
-            && existing_end_value_differs
-            && property_values_are_transitionable(
-                context,
-                input.property_id,
-                input.current_value,
-                input.after_change_value,
-                input.allow_discrete,
-            );
     let mut action = FfiTransitionAction {
         property_id: input.property_id,
         custom_name: 0,
@@ -251,9 +232,15 @@ fn decide_transition(
     if !input.has_running_transition
         && input.has_matching_transition
         && before_change_value_differs
-        && before_after_transitionable
         && (!input.has_completed_transition || existing_end_value_differs)
         && combined_duration > 0.0
+        && property_values_are_transitionable(
+            context,
+            input.property_id,
+            input.before_change_value,
+            input.after_change_value,
+            input.allow_discrete,
+        )
     {
         // then implementations must remove the completed transition (if present) from the set of completed transitions
         // and start a transition whose:
@@ -296,14 +283,18 @@ fn decide_transition(
     if input.has_running_transition && existing_end_value_differs {
         // 1. If the current value of the property in the running transition is equal to the value of the property in the after-change style, or if
         //    these two values are not transitionable, then implementations must cancel the running transition.
-        if current_value_equals_after || !current_after_transitionable {
-            action.kind = FfiTransitionActionKind::Cancel;
-            return action;
-        }
-
         // 2. Otherwise, if the combined duration is less than or equal to 0s, or if the current value of the property in the running transition is
         //    not transitionable with the value of the property in the after-change style, then implementations must cancel the running transition.
-        if combined_duration <= 0.0 || !current_after_transitionable {
+        if current_value_equals_after
+            || combined_duration <= 0.0
+            || !property_values_are_transitionable(
+                context,
+                input.property_id,
+                input.current_value,
+                input.after_change_value,
+                input.allow_discrete,
+            )
+        {
             action.kind = FfiTransitionActionKind::Cancel;
             return action;
         }

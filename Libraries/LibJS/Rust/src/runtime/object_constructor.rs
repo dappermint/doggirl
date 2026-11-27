@@ -925,7 +925,7 @@ pub(crate) fn object_assign_running_no_code(
     #[derive(Clone, Copy)]
     enum Step {
         Identical { source: Gc<Object>, count: usize },
-        Plan { source: Gc<Object>, plan: AssignPlan },
+        Plan { source: Gc<Object>, plan_index: usize },
     }
 
     let new_object_shape = realm.new_object_shape();
@@ -936,6 +936,8 @@ pub(crate) fn object_assign_running_no_code(
         && !target.may_interfere_with_indexed_property_access()
         && !target.requires_slow_add_own_property();
     let initial_property_count = initial_shape.property_count();
+    let initial_target_ptr = target.named_properties_ptr();
+    let mut plan_entries: Option<core::cell::Ref<'_, [AssignPlan]>> = None;
 
     let mut steps: [Option<Step>; 3] = [None; 3];
     let mut cur_shape = initial_shape;
@@ -971,8 +973,10 @@ pub(crate) fn object_assign_running_no_code(
             continue;
         }
 
-        // Otherwise consult the VM's cached (cur_shape, source_shape) AssignPlan.
-        let plan = vm.assign_plan_cache().get(cur_shape, source_shape)?;
+        // Otherwise consult the VM's cached (cur_shape, source_shape) AssignPlan by index without copying it.
+        let entries = plan_entries.get_or_insert_with(|| vm.assign_plan_cache().borrow_entries());
+        let plan_index = crate::runtime::shape::AssignPlanCache::find_index(entries, cur_shape, source_shape)?;
+        let plan = &entries[plan_index];
         let result_shape = plan.result_shape?;
         if result_shape != cur_shape {
             if initial_shape.is_non_extensible()
@@ -989,19 +993,22 @@ pub(crate) fn object_assign_running_no_code(
             }
         }
         let count = plan.copy_count as usize;
+        let src_ptr = source.named_properties_ptr();
         for &(src_off, dst_off) in &plan.copies[..count] {
-            if source.get_direct(u32::from(src_off)).is_accessor() {
+            // SAFETY: `src_off` is a valid own property offset of `source_shape`.
+            if unsafe { *src_ptr.add(usize::from(src_off)) }.is_accessor() {
                 return None;
             }
             // Only slots that existed on `target` before this call could hold accessors;
             // slots added by earlier steps in this call came from verified non-accessor values.
-            if u32::from(dst_off) < initial_property_count
-                && target.get_direct(u32::from(dst_off)).is_accessor()
-            {
-                return None;
+            if u32::from(dst_off) < initial_property_count {
+                // SAFETY: `dst_off < initial_property_count <= target.named_storage_capacity()`.
+                if unsafe { *initial_target_ptr.add(usize::from(dst_off)) }.is_accessor() {
+                    return None;
+                }
             }
         }
-        steps[step_idx] = Some(Step::Plan { source, plan });
+        steps[step_idx] = Some(Step::Plan { source, plan_index });
         cur_shape = result_shape;
     }
 
@@ -1010,18 +1017,25 @@ pub(crate) fn object_assign_running_no_code(
         target.prepare_for_shape_transition(cur_shape.property_count());
         initial_shape.mark_unstable(vm);
     }
+    let dst_ptr = target.named_properties_ptr();
     for step in steps[..source_count].iter().flatten() {
         match *step {
             Step::Identical { source, count } => {
                 // SAFETY: `prepare_for_shape_transition` ensured capacity >= `count`, `source != target`,
                 //         and `count <= source.named_storage_capacity()`.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(source.named_properties_ptr(), target.named_properties_ptr(), count);
+                    core::ptr::copy_nonoverlapping(source.named_properties_ptr(), dst_ptr, count);
                 }
             }
-            Step::Plan { source, ref plan } => {
+            Step::Plan { source, plan_index } => {
+                let plan = &plan_entries.as_deref().expect("plan entries borrowed for Plan step")[plan_index];
+                let src_ptr = source.named_properties_ptr();
                 for &(src_off, dst_off) in &plan.copies[..plan.copy_count as usize] {
-                    target.write_direct_from_assign(u32::from(dst_off), source.get_direct(u32::from(src_off)));
+                    // SAFETY: `prepare_for_shape_transition` ensured target capacity >= `cur_shape.property_count()`,
+                    //         `src_off` and `dst_off` are validated own offsets, and `target` is unwatched non-global.
+                    unsafe {
+                        *dst_ptr.add(usize::from(dst_off)) = *src_ptr.add(usize::from(src_off));
+                    }
                 }
             }
         }

@@ -216,7 +216,7 @@ private:
         KeyframeReflection,
     };
     struct AnimationSample;
-    [[nodiscard]] NonnullOwnPtr<AnimationSample> begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<Animations::EffectRef>, ComputedStyleWorkingSet&, AnimationSamplePurpose = AnimationSamplePurpose::Rendering) const;
+    void initialize_animation_sample(AnimationSample&, Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<Animations::EffectRef>, ComputedStyleWorkingSet&, AnimationSamplePurpose = AnimationSamplePurpose::Rendering) const;
     void finish_animation_sample(AnimationSample&, ComputedValuesFFI::FfiHostAnimationSampleResult const&) const;
     void finish_animation_refresh(Layout::BegunRead const& read, DOM::AbstractElement, ComputedStyleWorkingSet&) const;
     void publish_animated_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;

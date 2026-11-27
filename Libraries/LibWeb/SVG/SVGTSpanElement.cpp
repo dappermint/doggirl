@@ -11,7 +11,7 @@
 
 namespace Web::SVG {
 
-GC_DEFINE_ALLOCATOR(SVGTSpanElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(SVGTSpanElement);
 
 SVGTSpanElement::SVGTSpanElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGTextPositioningElement(document, move(qualified_name))
