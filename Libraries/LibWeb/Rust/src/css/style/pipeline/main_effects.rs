@@ -398,6 +398,9 @@ impl RetainedState {
 
     /// Whether `node` holds a record for a pseudo-element of one of `kinds`.
     fn holds_pseudo_element_records_of(&self, node: StyleNodeID, kinds: &[u8]) -> bool {
+        if self.computed_group_sets.has_no_pseudo_rows(node) {
+            return false;
+        }
         kinds
             .iter()
             .any(|&kind| self.computed_group_sets.pseudo_style_record(node, kind).is_some())

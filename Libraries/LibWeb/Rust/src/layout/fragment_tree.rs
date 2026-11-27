@@ -164,6 +164,10 @@ pub(crate) struct SvgPayload {
     /// The cells of the characters of a <text> or <tspan>'s own text nodes, without those of the elements inside it,
     /// which it's hit-tested by.
     pub(crate) text_own_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
+    /// Whether this SVG element's committed fragment subtree depends only on its own subtree and the
+    /// enclosing SVG viewport, so it can be reused directly when its committed fragment link is still
+    /// current and the enclosing viewport has not changed.
+    pub(crate) subtree_is_reusable_in_same_viewport: bool,
 }
 
 pub(crate) struct CommittedSvgPath {

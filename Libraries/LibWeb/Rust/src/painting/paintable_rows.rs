@@ -857,13 +857,16 @@ impl LayoutNodeArena {
         store.population_writes += 1;
         store.rows.set(index, PaintableData::default());
         store.side_data[index] = PaintableSideData::default();
-        store.committed_side_data.set(index, CommittedSideData::default());
+        // Readers only consult `committed_side_data` and `paint_change_stamps` for populated rows,
+        // and `populate_paintable_row` overwrites both when the slot is reused. Only clear
+        // `committed_side_data` when it holds heap-allocated `Arc` payloads so resetting plain
+        // boxes does not fork shared `CowColumn` chunks.
         if store
-            .paint_change_stamps
+            .committed_side_data
             .get(index)
-            .is_some_and(|stamps| *stamps != PaintChangeStamps::default())
+            .is_some_and(CommittedSideData::has_heap_payloads)
         {
-            store.paint_change_stamps.set(index, PaintChangeStamps::default());
+            store.committed_side_data.set(index, CommittedSideData::default());
         }
         if store.visual_context_records.get(index).is_some_and(Option::is_some) {
             store.visual_context_records.set(index, None);
