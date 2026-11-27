@@ -4687,6 +4687,21 @@ fn longhand_computes_directly(property_id: u16) -> bool {
     if is_line_width(property_id) {
         return true;
     }
+    // These dedicated rules depend only on the element's own length context and specified value,
+    // so the direct path handles them without invoking the full longhand drive.
+    if matches!(
+        property_id,
+        prop::STROKE_WIDTH
+            | prop::STROKE_DASHOFFSET
+            | prop::STROKE_DASHARRAY
+            | prop::LETTER_SPACING
+            | prop::WORD_SPACING
+            | prop::CONTAIN
+            | prop::TRANSFORM_ORIGIN
+            | prop::BORDER_SPACING
+    ) {
+        return true;
+    }
     if property_has_dedicated_compute_rule(property_id) || computes_in_font_phases(property_id) {
         return false;
     }
@@ -4694,10 +4709,6 @@ fn longhand_computes_directly(property_id: u16) -> bool {
         property_id,
         // The drive computes these with rules of their own.
         prop::TEXT_EMPHASIS_POSITION
-            | prop::STROKE_DASHOFFSET
-            | prop::STROKE_WIDTH
-            | prop::STROKE_DASHARRAY
-            | prop::BORDER_SPACING
             | prop::BORDER_SHAPE
             | prop::OFFSET_ROTATE
             | prop::ANIMATION_RANGE_START
@@ -4750,7 +4761,7 @@ pub(crate) type AbsolutizedValues = crate::fast_hash::FastMap<
 /// absolutize.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_declared_values<'a>(
-    values: &mut GroupValuesWriter<'_>,
+    values: &mut GroupValuesWriter<'a>,
     winners: impl Iterator<
         Item = (
             u16,
@@ -4926,6 +4937,72 @@ pub(crate) fn compute_declared_values<'a>(
                     },
                 )));
             }
+        } else {
+            match property_id {
+                prop::STROKE_WIDTH | prop::STROKE_DASHOFFSET => {
+                    if let Some(StyleValueData::Number { value }) = computed.optional_data() {
+                        let px_value = StyleValueData::Length {
+                            value: *value,
+                            unit: px_length_unit(),
+                        };
+                        if values.value(property_id).optional_data() == Some(&px_value) {
+                            computed = std::borrow::Cow::Owned(values.value(property_id).clone());
+                        } else {
+                            computed = std::borrow::Cow::Owned(retained_new(px_value));
+                        }
+                    }
+                }
+                prop::STROKE_DASHARRAY => {
+                    if let Some(data) = computed.optional_data()
+                        && matches!(data, StyleValueData::ValueList { .. })
+                        && let Some(converted) = stroke_dasharray_numbers_as_lengths(data)
+                    {
+                        computed = std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(converted));
+                    }
+                }
+                prop::LETTER_SPACING | prop::WORD_SPACING => {
+                    if matches!(
+                        computed.optional_data(),
+                        Some(StyleValueData::Keyword {
+                            keyword: keyword::NORMAL
+                        })
+                    ) {
+                        let zero_px = StyleValueData::Length {
+                            value: 0.0,
+                            unit: px_length_unit(),
+                        };
+                        if values.value(property_id).optional_data() == Some(&zero_px) {
+                            computed = std::borrow::Cow::Owned(values.value(property_id).clone());
+                        } else {
+                            computed = std::borrow::Cow::Owned(retained_new(zero_px));
+                        }
+                    }
+                }
+                prop::CONTAIN => {
+                    if let Some(data) = computed.optional_data()
+                        && let Some(collapsed) = collapse_containment_list(data)
+                    {
+                        computed = std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(collapsed));
+                    }
+                }
+                prop::TRANSFORM_ORIGIN => {
+                    if let Some(data) = computed.optional_data()
+                        && let Some(converted) = compute_transform_origin(data)
+                    {
+                        computed = std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(converted));
+                    }
+                }
+                prop::BORDER_SPACING => {
+                    if let Some(data) = computed.optional_data()
+                        && !matches!(data, StyleValueData::ValueList { .. })
+                    {
+                        computed = std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(border_spacing_pair(
+                            data.clone(),
+                        )));
+                    }
+                }
+                _ => {}
+            }
         }
         // https://drafts.csswg.org/css-logical/#box
         // The computed value of both properties of a logical pair derives from the specified value
@@ -4955,7 +5032,7 @@ pub(crate) fn compute_declared_values<'a>(
         }
         let (word, bit) = longhand_bit(property_id);
         decided[word] |= bit;
-        values.set_borrowed(property_id, &computed);
+        values.set_cow(property_id, computed);
         values.set_inheritance_dependent_value(property_id, inheritance_dependent.then(|| value.clone()));
     }
     // The overflow keywords as declared, which the box adjustments read.

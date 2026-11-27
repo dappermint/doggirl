@@ -127,6 +127,7 @@ impl RetainedState {
                     own: substituted.as_ref(),
                     inherited: None,
                     substitutions: &substitutions,
+                    shared_substitutions: None,
                     subject: &subject,
                 },
                 &mut groups,
