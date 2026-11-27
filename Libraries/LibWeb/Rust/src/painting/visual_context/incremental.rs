@@ -116,35 +116,38 @@ fn expand_dirty_entries(
     // Only style and tree changes can change a stacking context's blending descendants.
     // A dirty box is already rebuilt. Start at its parent since the box's own blend, or a change in whether it
     // establishes a stacking context, can change its enclosing group's isolation too.
-    let mut changed: Vec<NodeSlotId> = Vec::new();
-    for (slot, bits) in &work {
-        if bits.contains(VisualContextBoxDirtyKind::NewRow)
-            || bits.contains(VisualContextBoxDirtyKind::RecommittedInPlace)
-            || bits.contains(VisualContextBoxDirtyKind::ReattachedInLayoutTree)
-            || bits.contains(VisualContextBoxDirtyKind::StyleValueChange)
-            || bits.contains(VisualContextBoxDirtyKind::StyleStructuralChange)
-        {
-            if let Some(parent) = layout_arena.node_parent_if_live(*slot) {
-                changed.push(parent);
+    // When no box in the document has ever carried a non-normal `mix-blend-mode`, no stacking context needs isolation.
+    if layout_arena.may_have_non_normal_mix_blend_mode() {
+        let mut changed: Vec<NodeSlotId> = Vec::new();
+        for (slot, bits) in &work {
+            if bits.contains(VisualContextBoxDirtyKind::NewRow)
+                || bits.contains(VisualContextBoxDirtyKind::RecommittedInPlace)
+                || bits.contains(VisualContextBoxDirtyKind::ReattachedInLayoutTree)
+                || bits.contains(VisualContextBoxDirtyKind::StyleValueChange)
+                || bits.contains(VisualContextBoxDirtyKind::StyleStructuralChange)
+            {
+                if let Some(parent) = layout_arena.node_parent_if_live(*slot) {
+                    changed.push(parent);
+                }
             }
         }
-    }
-    changed.extend(revalidate_children_of.iter().copied());
-    if !changed.is_empty() {
-        let mut visited = HashSet::default();
-        for slot in changed {
-            let mut ancestor = Some(slot);
-            while let Some(parent) = ancestor {
-                if !visited.insert(parent) {
-                    break;
+        changed.extend(revalidate_children_of.iter().copied());
+        if !changed.is_empty() {
+            let mut visited = HashSet::default();
+            for slot in changed {
+                let mut ancestor = Some(slot);
+                while let Some(parent) = ancestor {
+                    if !visited.insert(parent) {
+                        break;
+                    }
+                    if crate::painting::style_queries::establishes_stacking_context(layout_arena, parent) {
+                        work.entry(parent)
+                            .or_default()
+                            .insert(VisualContextBoxDirtyKind::StyleValueChange);
+                        break;
+                    }
+                    ancestor = layout_arena.node_parent_if_live(parent);
                 }
-                if crate::painting::style_queries::establishes_stacking_context(layout_arena, parent) {
-                    work.entry(parent)
-                        .or_default()
-                        .insert(VisualContextBoxDirtyKind::StyleValueChange);
-                    break;
-                }
-                ancestor = layout_arena.node_parent_if_live(parent);
             }
         }
     }
@@ -444,6 +447,9 @@ pub(crate) fn box_owns_geometry_dependent_nodes(
 /// Whether the box owns no node, and its style and kind have its geometry give it none: a box like that keeps its
 /// record and its contexts however its geometry changes.
 fn box_keeps_no_node_whatever_its_geometry(layout_arena: &impl PaintableRowsRead, slot: NodeSlotId) -> bool {
+    use crate::css::css_enums::{content_visibility, overflow};
+    use crate::layout::node_facts::{self, NodeShape};
+    use crate::painting::paint_read::PaintRow;
     use crate::painting::style_queries;
     let owns_a_node = layout_arena
         .paintable_visual_context_node_handles(slot)
@@ -461,18 +467,39 @@ fn box_keeps_no_node_whatever_its_geometry(layout_arena: &impl PaintableRowsRead
     if !layout_arena.default_scroll_shift_anchor(slot).is_invalid() {
         return false;
     }
-    let Some(kind) = layout_arena.node_kind_if_live(slot) else {
+    let Some(row) = layout_arena.node(slot) else {
         return false;
     };
-    // NB: An SVG box takes transforms, masks and a viewport from its layout.
-    if style_queries::kind_is_svg_element_box(kind) || crate::painting::node_painting::supports_svg_masking(kind) {
+    let kind = row.kind();
+    // NB: Viewport-establishing, foreign-object and resource SVG boxes carry extra nodes or masks from layout.
+    if matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox) || node_facts::kind_is_svg_resource_box(kind)
+    {
         return false;
     }
-    let Some(style) = layout_arena.node_style_if_live(slot) else {
+    if crate::painting::node_painting::supports_svg_masking(kind) && !row.first_child().is_invalid() {
+        let mut child = Some(row.first_child());
+        while let Some(current) = child {
+            let Some(child_row) = layout_arena.node(current) else {
+                break;
+            };
+            if matches!(child_row.kind(), NodeKind::SVGMaskBox | NodeKind::SVGClipBox) {
+                return false;
+            }
+            let next = child_row.next_sibling();
+            child = (!next.is_invalid()).then_some(next);
+        }
+    }
+    let Some(style) = row.style() else {
         return false;
     };
     let transform = style.transform();
     let effects = style.effects();
+    let mask = style.mask();
+    let box_values = style.box_values();
+    let may_have_clip = style.overflow_x() != overflow::VISIBLE
+        || style.overflow_y() != overflow::VISIBLE
+        || box_values.paint_containment
+        || style.content_visibility() == content_visibility::AUTO;
     // NB: Each of these has a node whose existence the geometry of the box decides, like the backdrop filter of a box
     //     with an empty border box, or a clip only a box with scrollable overflow has.
     if transform.resolved_transforms.length != 0
@@ -481,16 +508,19 @@ fn box_keeps_no_node_whatever_its_geometry(layout_arena: &impl PaintableRowsRead
         || effects.filter.operations.length != 0
         || effects.backdrop_filter.operations.length != 0
         || effects.clip_is_rect
-        || style_queries::clip_path_has_value(style.mask())
-        || style_queries::has_css_mask_image(style.mask())
-        || super::node_values::may_have_clip(layout_arena, slot)
+        || style_queries::clip_path_has_value(mask)
+        || style_queries::has_css_mask_image(mask)
+        || may_have_clip
         || crate::painting::paintable_geometry::has_scrollable_overflow(layout_arena, slot)
     {
         return false;
     }
     layout_arena.with_committed_fragment_link(slot, |link| {
         link.is_some_and(|link| {
-            link.placement.shown_as.facts.clip_decided_by_parent.is_none() && link.fragment.svg().is_none()
+            link.placement.shown_as.facts.clip_decided_by_parent.is_none()
+                && link.fragment.svg().is_none_or(|svg| {
+                    svg.facts.additional_element_transform.is_none() && svg.facts.viewport_transform.is_none()
+                })
         })
     })
 }

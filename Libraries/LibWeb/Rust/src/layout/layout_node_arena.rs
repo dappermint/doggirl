@@ -1345,6 +1345,8 @@ pub(crate) struct LayoutNodeArena {
     may_have_auto_content_visibility: bool,
     /// Whether a row has ever been given a style with a scroll snap type.
     may_have_scroll_snap_areas: bool,
+    /// Whether a row has ever been given a style with a non-normal `mix-blend-mode`.
+    may_have_non_normal_mix_blend_mode: bool,
     /// The rows whose replaced content facts each layout derives again, each once, which a row leaves as it dies: see
     /// [`Self::enroll_node_for_replaced_content_facts_sync`].
     nodes_enrolled_for_replaced_content_facts_sync: Vec<NodeSlotId>,
@@ -1457,6 +1459,7 @@ impl LayoutNodeArena {
             display_contents_text_wrappers: Default::default(),
             may_have_auto_content_visibility: false,
             may_have_scroll_snap_areas: false,
+            may_have_non_normal_mix_blend_mode: false,
             nodes_enrolled_for_replaced_content_facts_sync: Vec::new(),
             owned_image_natural_sizes: Default::default(),
             document_svg_root_natural_size: None,
@@ -6201,7 +6204,10 @@ impl LayoutNodeArena {
     /// every layout commit from then on collects the boxes with it, and with a scroll snap type,
     /// so that the scroll containers builds make from then on go to the document.
     fn note_row_style(&mut self, slot: NodeSlotId) {
-        if self.may_have_auto_content_visibility && self.may_have_scroll_snap_areas {
+        if self.may_have_auto_content_visibility
+            && self.may_have_scroll_snap_areas
+            && self.may_have_non_normal_mix_blend_mode
+        {
             return;
         }
         let Some(style) = self.style_view(slot) else {
@@ -6210,8 +6216,11 @@ impl LayoutNodeArena {
         let has_auto_content_visibility = style.content_visibility() == crate::css::css_enums::content_visibility::AUTO;
         let has_scroll_snap_area =
             style.misc_interaction().scroll_snap_strictness != crate::css::css_enums::scroll_snap_strictness::NONE;
+        let has_non_normal_mix_blend_mode =
+            style.effects().mix_blend_mode != crate::css::css_enums::mix_blend_mode::NORMAL;
         self.may_have_auto_content_visibility |= has_auto_content_visibility;
         self.may_have_scroll_snap_areas |= has_scroll_snap_area;
+        self.may_have_non_normal_mix_blend_mode |= has_non_normal_mix_blend_mode;
     }
 
     /// Whether a row has ever been given a style with `content-visibility: auto`.
@@ -6221,6 +6230,10 @@ impl LayoutNodeArena {
 
     pub(crate) fn may_have_scroll_snap_areas(&self) -> bool {
         self.may_have_scroll_snap_areas
+    }
+
+    pub(crate) fn may_have_non_normal_mix_blend_mode(&self) -> bool {
+        self.may_have_non_normal_mix_blend_mode
     }
 
     #[inline]
@@ -7632,6 +7645,7 @@ mod tests {
         // The rows' styles hold no group, so the arena is told up front what it would read from them.
         arena.may_have_auto_content_visibility = true;
         arena.may_have_scroll_snap_areas = true;
+        arena.may_have_non_normal_mix_blend_mode = true;
         let slot = arena.allocate_unbound();
         arena.stamp_anonymous_box(
             slot,

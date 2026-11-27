@@ -579,6 +579,18 @@ impl AssignPlanCache {
     }
 
     #[inline]
+    pub fn borrow_entries(&self) -> core::cell::Ref<'_, [AssignPlan]> {
+        core::cell::Ref::map(self.entries.borrow(), |entries| &**entries)
+    }
+
+    #[inline]
+    pub fn find_index(entries: &[AssignPlan], target_shape: Gc<Shape>, source_shape: Gc<Shape>) -> Option<usize> {
+        let index = Self::entry_index(target_shape, source_shape);
+        let entry = &entries[index];
+        (entry.target_shape == Some(target_shape) && entry.source_shape == Some(source_shape)).then_some(index)
+    }
+
+    #[inline]
     pub fn get(&self, target_shape: Gc<Shape>, source_shape: Gc<Shape>) -> Option<AssignPlan> {
         let entries = self.entries.borrow();
         let entry = &entries[Self::entry_index(target_shape, source_shape)];

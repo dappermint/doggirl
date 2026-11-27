@@ -143,6 +143,7 @@ public:
     bool is_on_owner_thread() const { return pthread_equal(m_owner_thread, pthread_self()); }
 
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
+    bool is_collecting() const { return m_collecting_garbage; }
     // This is true for any CollectEverything cycle, not only heap teardown.
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
     // Whether a collection that marks the live cells runs, as opposed to one that only sweeps or a graph dump.

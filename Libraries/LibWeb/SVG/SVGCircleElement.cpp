@@ -13,7 +13,7 @@
 
 namespace Web::SVG {
 
-GC_DEFINE_ALLOCATOR(SVGCircleElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(SVGCircleElement);
 
 SVGCircleElement::SVGCircleElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGeometryElement(document, qualified_name)
