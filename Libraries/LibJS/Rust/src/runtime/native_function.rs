@@ -806,19 +806,27 @@ impl RawNativeFunction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DirectGetterValueKind {
+    #[default]
+    Pointer = 0,
+    CompressedPointer = 1,
+    UnsignedShort = 2,
+    Boolean = 3,
+}
+
 /// Where a DirectGetterFunction finds the value it returns in a platform object.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectGetterConfiguration {
-    // These are byte offsets to fields read directly by the interpreter. The bindings generator obtains them from
-    // PlatformObject::wrapped_implementation_offset(), the implementation field's generated offset helper,
-    // Wrappable::main_world_wrapper_offset(), and GC::WeakImpl::value_offset(), respectively. They are pointer-sized,
-    // but for the implementation value, which is a compressed cell pointer if implementation_value_is_compressed is set.
-    // DirectGetterFunction validates their alignment and converts all but the implementation value to word offsets.
+    // These are byte offsets to fields read directly by the interpreter and JIT. The bindings generator obtains them
+    // from HostObject::wrappable_offset(), the implementation field's generated offset helper,
+    // Wrappable::main_world_wrapper_offset(), and GC::WeakImpl::value_offset(), respectively.
     pub wrapper_implementation_offset: usize,
     pub implementation_value_offset: usize,
     pub main_world_wrapper_offset: usize,
     pub weak_impl_value_offset: usize,
-    pub implementation_value_is_compressed: bool,
+    pub implementation_value_kind: DirectGetterValueKind,
 }
 
 define_cell!(
@@ -871,10 +879,11 @@ impl DirectGetterFunction {
     ) -> DirectGetterFunction {
         let base = RawNativeFunction::new_with_realm(vm, Self::CLASS, native_function, Some(prototype), realm, None);
         let word_size = size_of::<usize>();
-        let value_size = if configuration.implementation_value_is_compressed {
-            size_of::<u32>()
-        } else {
-            word_size
+        let value_size = match configuration.implementation_value_kind {
+            DirectGetterValueKind::Pointer => word_size,
+            DirectGetterValueKind::CompressedPointer => size_of::<u32>(),
+            DirectGetterValueKind::UnsignedShort => size_of::<u16>(),
+            DirectGetterValueKind::Boolean => size_of::<u8>(),
         };
         assert!(configuration.wrapper_implementation_offset.is_multiple_of(word_size));
         assert!(configuration.implementation_value_offset.is_multiple_of(value_size));
@@ -890,7 +899,7 @@ impl DirectGetterFunction {
             ),
             main_world_wrapper_word_offset: Cell::new(word_offset(configuration.main_world_wrapper_offset)),
             weak_impl_value_word_offset: Cell::new(word_offset(configuration.weak_impl_value_offset)),
-            implementation_value_is_compressed: Cell::new(u32::from(configuration.implementation_value_is_compressed)),
+            implementation_value_is_compressed: Cell::new(u32::from(configuration.implementation_value_kind as u8)),
         };
         function.set_is_direct_getter_function();
         function

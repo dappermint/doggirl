@@ -622,27 +622,86 @@ impl TransitionDecision {
             }
         };
 
-        let _ = entries.for_each_entry(|entry| {
-            let property_id = entry.property_id;
-            let existing_item = if existing.is_empty() {
-                None
-            } else {
-                existing_for(property_id)
-            };
-            if existing_item.is_none() {
-                if entry.duration.max(0.0) + entry.delay <= 0.0 {
-                    return std::ops::ControlFlow::Continue(());
+        // OPTIMIZATION: For `transition-property: all` with no existing transitions and a changed-longhand bitmask,
+        //               visit only the changed physical longhands instead of iterating all ~400 CSS properties.
+        let mut handled_all_via_bitset = false;
+        if existing.is_empty()
+            && let crate::css::style_compute::TransitionEntries::All {
+                template,
+                writing_mode,
+                direction,
+            } = &entries
+        {
+            if template.duration.max(0.0) + template.delay <= 0.0 {
+                handled_all_via_bitset = true;
+            } else if let Some(words) = to_compare {
+                let (mask, ranks) =
+                    crate::css::computed_values::all_unique_transition_longhands_mask_and_ranks(*writing_mode, *direction);
+                let mut changed = [(0u16, 0u16); 16];
+                let mut changed_count = 0usize;
+                let mut overflowed = false;
+                for (word_index, (&diff_word, &mask_word)) in words.iter().zip(mask.iter()).enumerate() {
+                    let mut bits = diff_word & mask_word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if changed_count == changed.len() {
+                            overflowed = true;
+                            break;
+                        }
+                        let longhand_index = word_index * 64 + bit;
+                        let property_id = FIRST_LONGHAND_PROPERTY_ID + longhand_index as u16;
+                        changed[changed_count] = (ranks[longhand_index], property_id);
+                        changed_count += 1;
+                    }
+                    if overflowed {
+                        break;
+                    }
                 }
-                if let Some(to_compare) = to_compare
-                    && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
-                    && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
-                {
-                    return std::ops::ControlFlow::Continue(());
+                if !overflowed {
+                    handled_all_via_bitset = true;
+                    // Preserve first-occurrence order of `all_unique_transition_longhands` via insertion sort.
+                    for i in 1..changed_count {
+                        let key = changed[i];
+                        let mut j = i;
+                        while j > 0 && changed[j - 1].0 > key.0 {
+                            changed[j] = changed[j - 1];
+                            j -= 1;
+                        }
+                        changed[j] = key;
+                    }
+                    let mut entry = *template;
+                    for &(_, property_id) in &changed[..changed_count] {
+                        entry.property_id = property_id;
+                        decide_property(property_id, Some(&entry), None);
+                    }
                 }
             }
-            decide_property(property_id, Some(entry), existing_item);
-            std::ops::ControlFlow::Continue(())
-        });
+        }
+
+        if !handled_all_via_bitset {
+            let _ = entries.for_each_entry(|entry| {
+                let property_id = entry.property_id;
+                let existing_item = if existing.is_empty() {
+                    None
+                } else {
+                    existing_for(property_id)
+                };
+                if existing_item.is_none() {
+                    if entry.duration.max(0.0) + entry.delay <= 0.0 {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    if let Some(to_compare) = to_compare
+                        && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                        && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
+                    {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                }
+                decide_property(property_id, Some(entry), existing_item);
+                std::ops::ControlFlow::Continue(())
+            });
+        }
 
         for existing_item in existing {
             if existing_item.custom_name != 0 || entries.contains_property(existing_item.property_id) {

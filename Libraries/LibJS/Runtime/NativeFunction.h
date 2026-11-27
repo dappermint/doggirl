@@ -35,8 +35,15 @@ public:
     static bool is_engine_class_of(Object const& object) { return object.has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION); }
 };
 
-// The byte offset of the field of an implementation that a direct getter returns, which holds either a full-width
-// pointer or a member (GC::Member, a compressed pointer).
+enum class DirectGetterValueKind : u8 {
+    Pointer = 0,
+    CompressedPointer = 1,
+    UnsignedShort = 2,
+    Boolean = 3,
+};
+
+// The byte offset of the field of an implementation that a direct getter returns, which holds a full-width pointer,
+// a compressed pointer (GC::Member), an unsigned short (u16), or a bool.
 struct DirectGetterValueOffset {
     constexpr DirectGetterValueOffset(size_t offset)
         : offset(offset)
@@ -45,12 +52,29 @@ struct DirectGetterValueOffset {
 
     constexpr DirectGetterValueOffset(GC::MemberOffset member_offset)
         : offset(member_offset.value)
-        , is_compressed(true)
+        , kind(DirectGetterValueKind::CompressedPointer)
     {
     }
 
+    static constexpr DirectGetterValueOffset unsigned_short(size_t offset)
+    {
+        return DirectGetterValueOffset(offset, DirectGetterValueKind::UnsignedShort);
+    }
+
+    static constexpr DirectGetterValueOffset boolean(size_t offset)
+    {
+        return DirectGetterValueOffset(offset, DirectGetterValueKind::Boolean);
+    }
+
     size_t offset { 0 };
-    bool is_compressed { false };
+    DirectGetterValueKind kind { DirectGetterValueKind::Pointer };
+
+private:
+    constexpr DirectGetterValueOffset(size_t offset, DirectGetterValueKind kind)
+        : offset(offset)
+        , kind(kind)
+    {
+    }
 };
 
 struct DirectGetterConfiguration {

@@ -2856,15 +2856,18 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
                 unlinked_top_level.append(identity);
         }
         child->for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
-            if (layout_arena) {
-                if (auto style_node = Layout::Node::style_node_of(&node).value())
-                    layout_style_nodes.append(style_node);
-            }
-            if (!style_engine)
+            if (!style_engine) {
+                if (layout_arena) {
+                    if (auto style_node = Layout::Node::style_node_of(&node).value())
+                        layout_style_nodes.append(style_node);
+                }
                 return TraversalDecision::Continue;
+            }
             if (auto* element = as_if<DOM::Element>(node)) {
                 element->set_child_style_arrivals_wait(false);
                 if (auto id = element->style_node_id(); id != no_style_node) {
+                    if (layout_arena)
+                        layout_style_nodes.append(id.value());
                     if (auto* slot = as_if<HTML::HTMLSlotElement>(*element)) {
                         slot->assign_slottables_if_needed();
                         for (auto const& slottable : slot->assigned_nodes_internal()) {
@@ -2877,16 +2880,22 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
                             record_element_relinked(*style_engine, (*assigned_element)->style_node_id(), old_relations, new_relations);
                         }
                     }
-                    element->set_initial_style_features_pending(false);
-                    style_engine->cancel_deferred_element_initial_features_for_style_node(id);
+                    if (element->initial_style_features_pending()) {
+                        element->set_initial_style_features_pending(false);
+                        style_engine->cancel_deferred_element_initial_features_for_style_node(id);
+                    }
                     departing_element_ids.append(id.value());
                     departing_elements.append(element);
                 }
+            } else if (auto* text = as_if<DOM::Text>(node)) {
+                if (auto id = text->style_node_id(); id != no_style_node) {
+                    if (layout_arena)
+                        layout_style_nodes.append(id.value());
+                    departing_text_ids.append(id);
+                    departing_texts.append(text);
+                }
             } else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node)) {
                 shadow_roots.append(shadow_root);
-            } else if (auto* text = as_if<DOM::Text>(node); text && text->style_node_id() != no_style_node) {
-                departing_text_ids.append(text->style_node_id());
-                departing_texts.append(text);
             }
             return TraversalDecision::Continue;
         });

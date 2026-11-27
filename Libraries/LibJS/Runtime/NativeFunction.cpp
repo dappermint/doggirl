@@ -64,7 +64,7 @@ GC::Ref<DirectGetterFunction> DirectGetterFunction::create(Realm& realm, NativeF
         .implementation_value_offset = configuration.implementation_value_offset.offset,
         .main_world_wrapper_offset = configuration.main_world_wrapper_offset,
         .weak_impl_value_offset = configuration.weak_impl_value_offset,
-        .implementation_value_is_compressed = configuration.implementation_value_offset.is_compressed,
+        .implementation_value_kind = to_underlying(configuration.implementation_value_offset.kind),
     };
     PrefixForABI abi_prefix { prefix };
     auto* function = js_function_create_direct_getter(vm_to_abi(realm.vm()), cell_to_abi<JSRealm>(realm), native_function_to_abi(behaviour), length, property_key_to_abi(name), &abi_configuration, abi_prefix.characters, abi_prefix.length);

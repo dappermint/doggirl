@@ -1883,6 +1883,7 @@ public:
     Optional<CSS::CustomPropertyRegistration const&> get_registered_custom_property(Utf16FlyString const& name) const;
     void for_each_registered_custom_property(Function<void(CSS::CustomPropertyRegistration const&)> const&) const;
     size_t custom_property_registration_generation() const { return m_custom_property_registration_generation; }
+    bool has_non_inherited_registered_custom_properties() const { return m_has_non_inherited_registered_custom_properties; }
     void const* rust_custom_property_registry() const { return m_rust_custom_property_registry; }
     void did_change_custom_property_registrations();
 
@@ -2682,6 +2683,7 @@ private:
     void const* m_rust_custom_property_registry { nullptr };
     bool m_rust_custom_property_registry_synced { false };
     bool m_custom_property_environments_need_republishing { false };
+    bool m_has_non_inherited_registered_custom_properties { false };
 
     CSS::StyleScope m_style_scope;
 

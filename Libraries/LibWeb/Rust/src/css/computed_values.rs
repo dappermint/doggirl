@@ -3044,18 +3044,26 @@ pub(crate) fn all_transition_longhands(writing_mode: u8, direction: u8) -> &'sta
     &TABLE.longhands[usize::from(writing_mode) * crate::css::style_compute::DIRECTION_COUNT + usize::from(direction)]
 }
 
+const ALL_UNIQUE_TRANSITION_MASK_WORDS: usize = LONGHAND_COUNT.div_ceil(64);
+
 struct AllUniqueTransitionLonghands {
     longhands: [[u16; ALL_TRANSITION_LONGHAND_COUNT];
         crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
     lengths: [usize; crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
+    masks: [[u64; ALL_UNIQUE_TRANSITION_MASK_WORDS];
+        crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
+    ranks: [[u16; LONGHAND_COUNT];
+        crate::css::style_compute::WRITING_MODE_COUNT * crate::css::style_compute::DIRECTION_COUNT],
 }
 
 impl AllUniqueTransitionLonghands {
     const fn compute() -> Self {
-        use crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID;
+        use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID};
         use crate::css::style_compute::{DIRECTION_COUNT, WRITING_MODE_COUNT};
         let mut longhands = [[0; ALL_TRANSITION_LONGHAND_COUNT]; WRITING_MODE_COUNT * DIRECTION_COUNT];
         let mut lengths = [0; WRITING_MODE_COUNT * DIRECTION_COUNT];
+        let mut masks = [[0u64; ALL_UNIQUE_TRANSITION_MASK_WORDS]; WRITING_MODE_COUNT * DIRECTION_COUNT];
+        let mut ranks = [[u16::MAX; LONGHAND_COUNT]; WRITING_MODE_COUNT * DIRECTION_COUNT];
         let mut slot = 0;
         while slot < WRITING_MODE_COUNT * DIRECTION_COUNT {
             let source = &ALL_TRANSITION_LONGHANDS.longhands[slot];
@@ -3068,6 +3076,11 @@ impl AllUniqueTransitionLonghands {
                 if !seen[property_id as usize] {
                     seen[property_id as usize] = true;
                     target[written] = property_id;
+                    if property_id >= FIRST_LONGHAND_PROPERTY_ID && property_id <= LAST_LONGHAND_PROPERTY_ID {
+                        let longhand_index = (property_id - FIRST_LONGHAND_PROPERTY_ID) as usize;
+                        masks[slot][longhand_index / 64] |= 1u64 << (longhand_index % 64);
+                        ranks[slot][longhand_index] = written as u16;
+                    }
                     written += 1;
                 }
                 index += 1;
@@ -3075,7 +3088,12 @@ impl AllUniqueTransitionLonghands {
             lengths[slot] = written;
             slot += 1;
         }
-        Self { longhands, lengths }
+        Self {
+            longhands,
+            lengths,
+            masks,
+            ranks,
+        }
     }
 }
 
@@ -3087,6 +3105,17 @@ pub(crate) fn all_unique_transition_longhands(writing_mode: u8, direction: u8) -
     const TABLE: &AllUniqueTransitionLonghands = &ALL_UNIQUE_TRANSITION_LONGHANDS;
     let slot = usize::from(writing_mode) * crate::css::style_compute::DIRECTION_COUNT + usize::from(direction);
     &TABLE.longhands[slot][..TABLE.lengths[slot]]
+}
+
+/// Bitmask (indexed by `property_id - FIRST_LONGHAND_PROPERTY_ID`) and first-occurrence rank table for
+/// `all_unique_transition_longhands(writing_mode, direction)`.
+pub(crate) fn all_unique_transition_longhands_mask_and_ranks(
+    writing_mode: u8,
+    direction: u8,
+) -> (&'static [u64], &'static [u16]) {
+    const TABLE: &AllUniqueTransitionLonghands = &ALL_UNIQUE_TRANSITION_LONGHANDS;
+    let slot = usize::from(writing_mode) * crate::css::style_compute::DIRECTION_COUNT + usize::from(direction);
+    (&TABLE.masks[slot], &TABLE.ranks[slot])
 }
 
 /// The computed style groups each longhand reaches, a table the compiler computes from the property metadata.
