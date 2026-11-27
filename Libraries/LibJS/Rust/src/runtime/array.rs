@@ -131,10 +131,24 @@ impl Array {
         Ok(array)
     }
 
+    /// Fast empty array creation in `realm` with the default `%Array.prototype%`, skipping length validation and
+    /// prototype lookup when the realm's premade array shape already exists.
+    #[inline]
+    pub fn create_empty(vm: &Vm, realm: Gc<Realm>) -> Gc<Array> {
+        if let Some(shape) = realm.intrinsics().new_array_shape_if_created() {
+            return allocate_object(vm, |_| {
+                let base = Object::new_with_shape(Self::CLASS, shape, MayInterfereWithIndexedPropertyAccess::No);
+                base.set_has_magical_length_property();
+                Self { base }
+            });
+        }
+        Self::create(vm, realm, 0, None).must()
+    }
+
     // 7.3.18 CreateArrayFromList ( elements ), https://tc39.es/ecma262/#sec-createarrayfromlist
     pub fn create_from(vm: &Vm, realm: Gc<Realm>, elements: &[Value]) -> Gc<Array> {
         // 1. Let array be ! ArrayCreate(0).
-        let array = Self::create(vm, realm, 0, None).must();
+        let array = Self::create_empty(vm, realm);
 
         // 2. Let n be 0.
         // 3. For each element e of elements, do
@@ -150,7 +164,7 @@ impl Array {
 
     /// CreateArrayFromList for a list that is kept alive while the array is allocated.
     pub fn create_from_list(vm: &Vm, realm: Gc<Realm>, elements: &MarkedVec<'_, Value>) -> Gc<Array> {
-        let array = Self::create(vm, realm, 0, None).must();
+        let array = Self::create_empty(vm, realm);
         array.set_indexed_property_elements(&elements.values());
         array
     }

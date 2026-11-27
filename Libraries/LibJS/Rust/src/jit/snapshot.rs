@@ -60,12 +60,13 @@ use crate::runtime::function_prototype::{self, FunctionPrototype};
 use crate::runtime::map_prototype;
 use crate::runtime::math_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object_constructor::ObjectConstructor;
+use crate::runtime::object_constructor::{self, ObjectConstructor};
 use crate::runtime::object_prototype;
 use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::realm_watchpoints;
+use crate::runtime::set_prototype;
 use crate::runtime::shape::{Shape, ShapeKey};
 use crate::runtime::shared_function_instance_data::ClosureCount;
 use crate::runtime::shared_function_instance_data::ConstructorKind;
@@ -304,7 +305,7 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
-static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 24] = [
+static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 29] = [
     (&function_prototype::APPLY_FUNCTION, Intrinsic::FunctionPrototypeApply),
     (&function_prototype::CALL_FUNCTION, Intrinsic::FunctionPrototypeCall),
     (&array_prototype::PUSH_FUNCTION, Intrinsic::ArrayPrototypePush),
@@ -314,6 +315,8 @@ static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 24] = [
         &object_prototype::HAS_OWN_PROPERTY_FUNCTION,
         Intrinsic::ObjectPrototypeHasOwnProperty,
     ),
+    (&object_constructor::IS_FUNCTION, Intrinsic::ObjectIs),
+    (&object_constructor::KEYS_FUNCTION, Intrinsic::ObjectKeys),
     (
         &typed_array_prototype::LENGTH_GETTER,
         Intrinsic::TypedArrayPrototypeLength,
@@ -356,6 +359,9 @@ static NATIVE_INTRINSICS: [(&RawNativeFunctionPointer, Intrinsic); 24] = [
     (&string_prototype::TRIM_END_FUNCTION, Intrinsic::StringPrototypeTrimEnd),
     (&map_prototype::GET_FUNCTION, Intrinsic::MapPrototypeGet),
     (&map_prototype::HAS_FUNCTION, Intrinsic::MapPrototypeHas),
+    (&map_prototype::SET_FUNCTION, Intrinsic::MapPrototypeSet),
+    (&set_prototype::HAS_FUNCTION, Intrinsic::SetPrototypeHas),
+    (&set_prototype::ADD_FUNCTION, Intrinsic::SetPrototypeAdd),
 ];
 
 const NATIVE_INTRINSIC_TABLE_SIZE: usize = 64;

@@ -553,12 +553,7 @@ impl Regex {
             }
             return true;
         }
-        let mut pos = start;
-        while pos < end {
-            let Some(candidate_pos) = matcher.find_next_candidate(input, pos, end) else {
-                return false;
-            };
-            pos = candidate_pos;
+        let check_at = |pos: usize| -> Option<usize> {
             let first_ch = input.code_unit(pos);
             let bucket = matcher.bucket_for_first(first_ch);
             if let Some(ref latin1) = matcher.alt_latin1 {
@@ -580,11 +575,7 @@ impl Regex {
                         }
                     };
                     if matched {
-                        if out.len() >= 2 {
-                            out[0] = pos as i32;
-                            out[1] = (pos + alt_len) as i32;
-                        }
-                        return true;
+                        return Some(alt_len);
                     }
                 }
             } else {
@@ -600,13 +591,35 @@ impl Regex {
                     if alt_len == 1
                         || input.matches_u16_at(pos + 1, &matcher.alt_units[alt_start + 1..alt_start + alt_len])
                     {
-                        if out.len() >= 2 {
-                            out[0] = pos as i32;
-                            out[1] = (pos + alt_len) as i32;
-                        }
-                        return true;
+                        return Some(alt_len);
                     }
                 }
+            }
+            None
+        };
+        #[cfg(target_arch = "aarch64")]
+        if let FirstUnitScan::AsciiLut { ref lut, ref bits } = matcher.first_scan {
+            if let Some((pos, alt_len)) = input.find_ascii_lut_match(start, end, lut, bits, check_at) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
+            }
+            return false;
+        }
+        let mut pos = start;
+        while pos < end {
+            let Some(candidate_pos) = matcher.find_next_candidate(input, pos, end) else {
+                return false;
+            };
+            pos = candidate_pos;
+            if let Some(alt_len) = check_at(pos) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
             }
             pos += 1;
         }
@@ -638,13 +651,7 @@ impl Regex {
             .alt_latin1
             .as_deref()
             .expect("ascii ignore-case literal alternatives are always ASCII");
-        let mut pos = start;
-        while pos < end {
-            let Some(candidate_pos) = matcher.find_next_candidate(input, pos, end) else {
-                return false;
-            };
-            pos = candidate_pos;
-
+        let check_at = |pos: usize| -> Option<usize> {
             let folded_first = fold_ascii_for_compare(input.code_unit(pos));
             if folded_first < 128 {
                 let (bucket_start, bucket_count) = matcher.ascii_buckets[folded_first as usize];
@@ -668,13 +675,35 @@ impl Regex {
                         }
                     };
                     if matched {
-                        if out.len() >= 2 {
-                            out[0] = pos as i32;
-                            out[1] = (pos + alt_len) as i32;
-                        }
-                        return true;
+                        return Some(alt_len);
                     }
                 }
+            }
+            None
+        };
+        #[cfg(target_arch = "aarch64")]
+        if let FirstUnitScan::AsciiLut { ref lut, ref bits } = matcher.first_scan {
+            if let Some((pos, alt_len)) = input.find_ascii_lut_match(start, end, lut, bits, check_at) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
+            }
+            return false;
+        }
+        let mut pos = start;
+        while pos < end {
+            let Some(candidate_pos) = matcher.find_next_candidate(input, pos, end) else {
+                return false;
+            };
+            pos = candidate_pos;
+            if let Some(alt_len) = check_at(pos) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
             }
             pos += 1;
         }
@@ -953,6 +982,31 @@ mod tests {
             (VmResult::Match, [4, 7])
         );
         assert_eq!(exec_both("foo|bar", icase, "zzz BAR"), (VmResult::Match, [4, 7]));
+
+        // Multiple false-positive first-unit hits inside the same 16-byte NEON chunk and across chunk boundaries.
+        let dense = "a_b_c_d_e_f_g_h_a1b2c3d4e5f6g7h8_delta_tail_padding_here";
+        assert_eq!(
+            exec_both("alpha|beta|gamma|delta|epsilon|zeta", flags, dense),
+            (VmResult::Match, [33, 38])
+        );
+        let dense_icase = "A_B_C_D_E_F_G_H_a1b2c3d4e5f6g7h8_DeLtA_tail_padding_here";
+        assert_eq!(
+            exec_both("alpha|beta|gamma|delta|epsilon|zeta", icase, dense_icase),
+            (VmResult::Match, [33, 38])
+        );
+        let dense_tail = "a_b_c_d_e_f_g_h_a1b2c3d4e5f6g7h8_no_hit_here_delta";
+        assert_eq!(
+            exec_both("alpha|beta|gamma|delta|epsilon|zeta", flags, dense_tail),
+            (VmResult::Match, [45, 50])
+        );
+        assert_eq!(
+            exec_both(
+                "alpha|beta|gamma|delta|epsilon|zeta",
+                flags,
+                "a_b_c_d_e_f_g_h_a1b2c3d4e5f6g7h8_nope"
+            ),
+            (VmResult::NoMatch, [-1, -1])
+        );
     }
 
     #[test]
