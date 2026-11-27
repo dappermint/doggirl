@@ -80,6 +80,11 @@ impl HostTables {
         self.paint_preparation_host.set(None);
     }
 
+    /// The layout node already made for the row `id`, if any, without invoking the shell factory.
+    pub(crate) fn existing_shell(&self, id: NodeSlotId) -> Option<*mut c_void> {
+        self.shells.borrow().get(&id).map(|shell| shell.as_ptr())
+    }
+
     /// The layout node of the row `facts` describes, made by the shell factory the first time
     /// something asks for it.
     pub(crate) fn shell_of(&self, facts: ShellFacts) -> *mut c_void {

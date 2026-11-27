@@ -166,6 +166,56 @@ pub extern "C" fn layout_row_bound_shell(host: &DocumentHost, read: &BegunRead, 
     bound_shell(host, read, |identities| identities.bound_row(style_node))
 }
 
+/// The live row slot bound to `style_node`, or [`NodeSlotId::INVALID`], without making a C++ shell.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_row_bound_slot_id(host: &DocumentHost, read: &BegunRead, style_node: u32) -> NodeSlotId {
+    let Some(style_node) = StyleNodeID::from_raw(style_node) else {
+        return NodeSlotId::INVALID;
+    };
+    identities(host, read)
+        .bound_row(style_node)
+        .unwrap_or(NodeSlotId::INVALID)
+}
+
+/// The layout node of the row bound to `style_node` (and `generated_for`, or 0 for the node itself) for swapping in
+/// `style_record`. Where `skip_if_render_installed` holds, no shell exists yet for the row, and the render side
+/// already installed `style_record` in the row, returns null without making a shell.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_row_bound_shell_for_style_swap(
+    host: &DocumentHost,
+    read: &BegunRead,
+    style_node: u32,
+    generated_for: u8,
+    style_record: u64,
+    skip_if_render_installed: bool,
+) -> *mut c_void {
+    let Some(style_node) = StyleNodeID::from_raw(style_node) else {
+        return std::ptr::null_mut();
+    };
+    let facts = {
+        let identities = identities(host, read);
+        let row = if generated_for == 0 {
+            identities.bound_row(style_node)
+        } else {
+            identities.bound_pseudo_element_row(style_node, generated_for)
+        };
+        row.and_then(|id| identities.shell_facts(id))
+    };
+    let Some(facts) = facts else {
+        return std::ptr::null_mut();
+    };
+    if let Some(shell) = host.host_tables().existing_shell(facts.id) {
+        return shell;
+    }
+    if skip_if_render_installed
+        && style_record != 0
+        && host.render_state_installed_box_record(facts.id) == Some(style_record)
+    {
+        return std::ptr::null_mut();
+    }
+    host.host_tables().shell_of(facts)
+}
+
 /// Whether a row of `host`'s document may make an element contentful, as paint timing defines it: by holding text that
 /// is not all white space or replaced content, or by observing an image its style holds. It errs towards yes, as the
 /// rows do not say whether an image is available, and it makes no layout node. It follows `is_contentful()` of

@@ -1516,6 +1516,7 @@ impl LayoutNodeArena {
     }
 
     /// What writes did to the boxes the layout stage's run memos hold entries of since the stage last took it.
+    #[cfg(test)]
     pub(crate) fn take_memo_invalidations(&mut self) -> super::memo_invalidations::MemoInvalidations {
         for state in self.text_slots.released_states.take_rows() {
             self.memo_invalidations.note_text_state_dropped(state);
@@ -1523,6 +1524,20 @@ impl LayoutNodeArena {
         self.slots_when_memo_invalidations_were_taken =
             u32::try_from(self.slot_metadata.len()).expect("layout node arena exhausted its slot ID space");
         std::mem::take(&mut self.memo_invalidations)
+    }
+
+    /// Passes the accumulated memo invalidations to `f` for in-place application so backing pages stay allocated
+    /// across layout rounds.
+    pub(crate) fn drain_memo_invalidations<R>(
+        &mut self,
+        f: impl FnOnce(&mut super::memo_invalidations::MemoInvalidations) -> R,
+    ) -> R {
+        for state in self.text_slots.released_states.take_rows() {
+            self.memo_invalidations.note_text_state_dropped(state);
+        }
+        self.slots_when_memo_invalidations_were_taken =
+            u32::try_from(self.slot_metadata.len()).expect("layout node arena exhausted its slot ID space");
+        f(&mut self.memo_invalidations)
     }
 
     /// Drops the entries of `store` whose slot or epoch no longer matches, keeps the entry whose fragments each box
@@ -1770,21 +1785,42 @@ impl LayoutNodeArena {
 
         let mut paintable_row_resets = Vec::new();
         let mut arena_pinned_style_records = Vec::new();
+        let has_derived_styles_shown = !self.derived_styles_shown_before_host_installs.is_empty();
+        let has_any_highlight_pseudo_styles = crate::painting::selection::HighlightPseudoElement::ALL
+            .iter()
+            .any(|&highlight| !self.paint_state.highlight_pseudo_styles_mut(highlight).is_empty());
+        let has_custom_highlight_pseudo_styles = !self.paint_state.custom_highlight_pseudo_styles.is_empty();
         for &slot in &rows {
-            if self.style_record_pins[slot.slot_index() as usize] != ArenaStylePin::None {
-                arena_pinned_style_records.push(self.style_records[slot.slot_index() as usize]);
+            let slot_index = slot.slot_index() as usize;
+            if self.style_record_pins[slot_index] != ArenaStylePin::None {
+                arena_pinned_style_records.push(self.style_records[slot_index]);
             }
-            let host_pinned_style_record = self.style_records_pinned_by_host[slot.slot_index() as usize];
+            let host_pinned_style_record = self.style_records_pinned_by_host[slot_index];
             if host_pinned_style_record != 0 {
                 arena_pinned_style_records.push(host_pinned_style_record);
             }
-            if !self.derived_styles_shown_before_host_installs.is_empty()
+            if has_derived_styles_shown
+                && !self.derived_styles_shown_before_host_installs.is_empty()
                 && let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot)
             {
                 arena_pinned_style_records.push(shown.record);
             }
-            self.unlink_children_of_node_being_freed(slot);
-            if let Some(reset) = self.free_unlinked_slot(slot) {
+            // Every node in `rows` is in `root`'s unlinked subtree and is freed in this loop, so clearing `slot`'s
+            // own tree links directly gives `free_unlinked_slot` an unlinked slot without per-child `unlink_child`
+            // writes to sibling and parent rows.
+            {
+                let mut shape = self.write_shape(slot);
+                shape.set_parent(NodeSlotId::INVALID);
+                shape.set_first_child(NodeSlotId::INVALID);
+                shape.set_last_child(NodeSlotId::INVALID);
+                shape.set_previous_sibling(NodeSlotId::INVALID);
+                shape.set_next_sibling(NodeSlotId::INVALID);
+            }
+            if let Some(reset) = self.free_unlinked_slot(
+                slot,
+                has_any_highlight_pseudo_styles,
+                has_custom_highlight_pseudo_styles,
+            ) {
                 paintable_row_resets.push(reset);
             }
         }
@@ -1806,17 +1842,12 @@ impl LayoutNodeArena {
         );
     }
 
-    fn unlink_children_of_node_being_freed(&mut self, id: NodeSlotId) {
-        loop {
-            let child = self.data(id).first_child.get();
-            if child.is_invalid() {
-                break;
-            }
-            self.unlink_child(id, child);
-        }
-    }
-
-    fn free_unlinked_slot(&mut self, id: NodeSlotId) -> Option<crate::painting::paintable_rows::PaintableRowReset> {
+    fn free_unlinked_slot(
+        &mut self,
+        id: NodeSlotId,
+        has_any_highlight_pseudo_styles: bool,
+        has_custom_highlight_pseudo_styles: bool,
+    ) -> Option<crate::painting::paintable_rows::PaintableRowReset> {
         *self.searchable_text = None;
         let index = id.slot_index();
         let id_generation = id.generation();
@@ -1893,13 +1924,16 @@ impl LayoutNodeArena {
             self.paint_fact_writes += 1;
         }
         self.svg_paint_resources.forget_slot(id);
-        for highlight in crate::painting::selection::HighlightPseudoElement::ALL {
-            let styles = self.paint_state.highlight_pseudo_styles_mut(highlight);
-            if !styles.is_empty() && styles.contains_key(&id) {
-                Arc::make_mut(styles).remove(&id);
+        if has_any_highlight_pseudo_styles {
+            for highlight in crate::painting::selection::HighlightPseudoElement::ALL {
+                let styles = self.paint_state.highlight_pseudo_styles_mut(highlight);
+                if !styles.is_empty() && styles.contains_key(&id) {
+                    Arc::make_mut(styles).remove(&id);
+                }
             }
         }
-        if !self.paint_state.custom_highlight_pseudo_styles.is_empty()
+        if has_custom_highlight_pseudo_styles
+            && !self.paint_state.custom_highlight_pseudo_styles.is_empty()
             && self
                 .paint_state
                 .custom_highlight_pseudo_styles

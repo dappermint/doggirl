@@ -645,11 +645,11 @@ void NodeWithStyle::release_pinned_style_record()
     m_style_record_pinned_for_cxx_consumers = false;
 }
 
-static Node const* scroll_snap_container_of(NodeWithStyle const& node)
+static Node const* scroll_snap_container_of(NodeWithStyle const& node, DOM::Node const* dom_node)
 {
     auto const& read = node.held_read();
     // The scroll snap properties specified on the root element apply to the viewport rather than to its own box.
-    if (node.is_viewport() || (node.dom_node() && node.dom_node() == node.document().document_element()))
+    if (node.is_viewport() || (dom_node && dom_node == node.document().document_element()))
         return node.document().unsafe_layout_node(read);
     if (!node.is_scroll_container())
         return nullptr;
@@ -682,15 +682,23 @@ void NodeWithStyle::adopt_style_record_installed_by_render_state(CSS::InstalledS
 
 void NodeWithStyle::did_update_style_record()
 {
-    if (auto const* element = as_if<DOM::Element>(dom_node()); element && (element->has_style(CSS::PseudoElement::Selection) || element->has_style(CSS::PseudoElement::SearchText) || element->has_style(CSS::PseudoElement::SearchTextCurrent) || element->has_style(CSS::PseudoElement::SpellingError) || element->custom_highlight_styles()))
+    auto const* node = dom_node();
+    if (auto const* element = as_if<DOM::Element>(node); element && (element->has_style(CSS::PseudoElement::Selection) || element->has_style(CSS::PseudoElement::SearchText) || element->has_style(CSS::PseudoElement::SearchTextCurrent) || element->has_style(CSS::PseudoElement::SpellingError) || element->custom_highlight_styles()))
         Painting::push_highlight_pseudo_styles(*element);
 
-    if (style_group<CSS::ComputedValues::MiscInteractionValues>().scroll_snap_strictness_value() != CSS::ScrollSnapStrictness::None)
+    auto const scroll_snap_strictness = style_group<CSS::ComputedValues::MiscInteractionValues>().scroll_snap_strictness_value();
+    if (scroll_snap_strictness != CSS::ScrollSnapStrictness::None)
         document().set_may_have_scroll_snap_areas();
+
+    // Non-root elements without scroll-snap strictness can neither register as a snap container nor need forgetting
+    // when the document tracks no snapped areas.
+    if (!is_viewport() && node != document().document_element()
+        && scroll_snap_strictness == CSS::ScrollSnapStrictness::None && document().has_no_snapped_areas())
+        return;
 
     // NB: The root element's style can be published before the layout tree gives the document a viewport to snap
     //     with, and is published again once building the layout tree binds this node's style record.
-    auto const* snap_container = scroll_snap_container_of(*this);
+    auto const* snap_container = scroll_snap_container_of(*this, node);
     if (!snap_container)
         return;
 

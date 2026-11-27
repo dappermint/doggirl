@@ -1026,15 +1026,30 @@ impl Projection {
         self.changes.clear();
         if note_changes == NoteChanges::Yes {
             written.sort_unstable();
-            for pass in ChangePass::ALL {
-                for &node in &written {
-                    let slot = node.element_slot();
-                    let before = self.before.get(slot);
-                    let after = self.committed.get(slot);
-                    let hovered = (self.hover.before.contains(node), self.hover.committed.contains(node));
-                    self::note_changes(pass, node, (before, after), hovered, &mut self.changes);
+            let any_hover = !self.hover.before.facts.is_empty() || !self.hover.committed.facts.is_empty();
+            let mut facts_changes: Vec<(StyleNodeID, ElementChange)> = Vec::new();
+            let mut state_changes: Vec<(StyleNodeID, ElementChange)> = Vec::new();
+            for &node in &written {
+                let slot = node.element_slot();
+                let before = self.before.get(slot);
+                let after = self.committed.get(slot);
+                let hovered = if any_hover {
+                    (self.hover.before.contains(node), self.hover.committed.contains(node))
+                } else {
+                    (false, false)
+                };
+                if let (Some(b), Some(a)) = (before, after)
+                    && std::ptr::eq(b, a)
+                    && hovered.0 == hovered.1
+                {
+                    continue;
                 }
+                self::note_changes(ChangePass::Relations, node, (before, after), hovered, &mut self.changes);
+                self::note_changes(ChangePass::Facts, node, (before, after), hovered, &mut facts_changes);
+                self::note_changes(ChangePass::States, node, (before, after), hovered, &mut state_changes);
             }
+            self.changes.extend(facts_changes);
+            self.changes.extend(state_changes);
         }
         self.note_watched_key_writes(&written);
         self.written.reuse(written);
@@ -2154,60 +2169,68 @@ fn note_changes(
             if was.tag != is.tag {
                 note(ElementChange::Feature(LocalFeatureKey::TagName));
             }
-            if was.folded_tag() != is.folded_tag() {
-                note(ElementChange::Feature(LocalFeatureKey::FoldedTagName));
-            }
-            if was.id() != is.id() {
-                note(ElementChange::Id(was.id(), is.id()));
-            }
-            for_each_difference(was.classes(), is.classes(), |class| {
-                note(ElementChange::Feature(LocalFeatureKey::Class(class)));
-            });
-            let mut parts: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(was.parts());
-            parts.sort_unstable();
-            let mut now: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(is.parts());
-            now.sort_unstable();
-            for_each_difference(&parts, &now, |part| {
-                note(ElementChange::Feature(LocalFeatureKey::Part(part)));
-            });
-            parts.clear();
-            parts.extend_from_slice(was.custom_states());
-            parts.sort_unstable();
-            now.clear();
-            now.extend_from_slice(is.custom_states());
-            now.sort_unstable();
-            for_each_difference(&parts, &now, |state| {
-                note(ElementChange::Feature(LocalFeatureKey::CustomState(state)));
-            });
             if was.has_text_content() != is.has_text_content() {
                 note(ElementChange::Feature(LocalFeatureKey::Emptiness));
-            }
-            // An attribute whose value moved is one change, as one that came or went is.
-            let names = |attributes: &[AttributeFact]| -> SmallVec<[StyleAtomID; 8]> {
-                attributes.iter().map(|attribute| attribute.name).collect()
-            };
-            let (old_names, new_names) = (names(was.attributes()), names(is.attributes()));
-            for_each_difference(&old_names, &new_names, |name| {
-                note(ElementChange::Feature(LocalFeatureKey::Attribute(name)));
-            });
-            for attribute in was.attributes() {
-                if let Ok(index) = new_names.binary_search(&attribute.name)
-                    && is.attributes()[index].value != attribute.value
-                {
-                    note(ElementChange::Feature(LocalFeatureKey::Attribute(attribute.name)));
-                }
-            }
-            if was.language() != is.language() {
-                note(ElementChange::Feature(LocalFeatureKey::Language));
-            }
-            if was.directionality() != is.directionality() {
-                note(ElementChange::Feature(LocalFeatureKey::Directionality));
             }
             if was.heading_level() != is.heading_level() {
                 note(ElementChange::Feature(LocalFeatureKey::HeadingLevel));
             }
-            if was.part_exposure() != is.part_exposure() {
-                note(ElementChange::Feature(LocalFeatureKey::PartExposure));
+            if was.lists_identity() != is.lists_identity() {
+                if was.folded_tag() != is.folded_tag() {
+                    note(ElementChange::Feature(LocalFeatureKey::FoldedTagName));
+                }
+                if was.id() != is.id() {
+                    note(ElementChange::Id(was.id(), is.id()));
+                }
+                if was.classes() != is.classes() {
+                    for_each_difference(was.classes(), is.classes(), |class| {
+                        note(ElementChange::Feature(LocalFeatureKey::Class(class)));
+                    });
+                }
+                if was.parts() != is.parts() {
+                    let mut parts: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(was.parts());
+                    parts.sort_unstable();
+                    let mut now: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(is.parts());
+                    now.sort_unstable();
+                    for_each_difference(&parts, &now, |part| {
+                        note(ElementChange::Feature(LocalFeatureKey::Part(part)));
+                    });
+                }
+                if was.custom_states() != is.custom_states() {
+                    let mut states: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(was.custom_states());
+                    states.sort_unstable();
+                    let mut now: SmallVec<[StyleAtomID; 4]> = SmallVec::from_slice(is.custom_states());
+                    now.sort_unstable();
+                    for_each_difference(&states, &now, |state| {
+                        note(ElementChange::Feature(LocalFeatureKey::CustomState(state)));
+                    });
+                }
+                if was.attributes() != is.attributes() {
+                    // An attribute whose value moved is one change, as one that came or went is.
+                    let names = |attributes: &[AttributeFact]| -> SmallVec<[StyleAtomID; 8]> {
+                        attributes.iter().map(|attribute| attribute.name).collect()
+                    };
+                    let (old_names, new_names) = (names(was.attributes()), names(is.attributes()));
+                    for_each_difference(&old_names, &new_names, |name| {
+                        note(ElementChange::Feature(LocalFeatureKey::Attribute(name)));
+                    });
+                    for attribute in was.attributes() {
+                        if let Ok(index) = new_names.binary_search(&attribute.name)
+                            && is.attributes()[index].value != attribute.value
+                        {
+                            note(ElementChange::Feature(LocalFeatureKey::Attribute(attribute.name)));
+                        }
+                    }
+                }
+                if was.language() != is.language() {
+                    note(ElementChange::Feature(LocalFeatureKey::Language));
+                }
+                if was.directionality() != is.directionality() {
+                    note(ElementChange::Feature(LocalFeatureKey::Directionality));
+                }
+                if was.part_exposure() != is.part_exposure() {
+                    note(ElementChange::Feature(LocalFeatureKey::PartExposure));
+                }
             }
         }
         ChangePass::States => {

@@ -705,8 +705,13 @@ impl FcRunCacheStore {
         self.forget_inline_layout_damage(slot);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_inline_layout_damage(&mut self, box_: Node) {
-        if !self.slot_holds_entries(box_.slot_index()) {
+        self.note_inline_layout_damage_count(box_, 1);
+    }
+
+    pub(crate) fn note_inline_layout_damage_count(&mut self, box_: Node, count: u32) {
+        if count == 0 || !self.slot_holds_entries(box_.slot_index()) {
             return;
         }
         let damage = &mut self.inline_layout_damage;
@@ -717,10 +722,10 @@ impl FcRunCacheStore {
         if entry.generation != box_.generation() {
             *entry = InlineLayoutDamage {
                 generation: box_.generation(),
-                structural_epoch_bumps: 1,
+                structural_epoch_bumps: count,
             };
         } else {
-            entry.structural_epoch_bumps = entry.structural_epoch_bumps.wrapping_add(1);
+            entry.structural_epoch_bumps = entry.structural_epoch_bumps.wrapping_add(count);
         }
     }
 

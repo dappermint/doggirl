@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::style::fast_hash::FastMap;
 use crate::layout::used_transform;
 use libgfx_rust::{FloatPoint, FloatRect, FloatSize};
 
@@ -1208,19 +1209,18 @@ pub(super) struct SvgFormattingContext<'pass> {
     /// How far 'text-anchor' moved the chunk in user units, independent of its glyph scale.
     text_anchor_shift: f32,
     /// Each explicitly sized text content element's adjustment and the extent and advance of its adjusted subtree.
-    text_length_adjustments: RefCell<std::collections::HashMap<Node, SvgResolvedTextLength>>,
-    text_positions: RefCell<std::collections::HashMap<Node, Vec<SvgTextPosition>>>,
-    text_chunks: RefCell<std::collections::HashMap<(Node, usize), SvgTextChunkMeasurement>>,
-    first_text_runs: RefCell<std::collections::HashMap<Node, Option<Node>>>,
+    text_length_adjustments: RefCell<FastMap<Node, SvgResolvedTextLength>>,
+    text_positions: RefCell<FastMap<Node, Vec<SvgTextPosition>>>,
+    text_chunks: RefCell<FastMap<(Node, usize), SvgTextChunkMeasurement>>,
+    first_text_runs: RefCell<FastMap<Node, Option<Node>>>,
     /// The characters each text node of the text content elements laid out so far renders.
-    processed_svg_text: RefCell<std::collections::HashMap<Node, std::sync::Arc<[u16]>>>,
+    processed_svg_text: RefCell<FastMap<Node, std::sync::Arc<[u16]>>>,
     /// Where text-transform changed the characters of a text node in `processed_svg_text`, how its characters map to
     /// those it had before the transform.
-    svg_text_transform_edits: RefCell<std::collections::HashMap<Node, Vec<super::rendered_text::RenderedTextEdit>>>,
+    svg_text_transform_edits: RefCell<FastMap<Node, Vec<super::rendered_text::RenderedTextEdit>>>,
     /// The glyph outlines, laid along the path, and the character cells of each text content element inside the
     /// <textPath> laid out last, which that element paints in its own style.
-    text_on_path_glyphs:
-        RefCell<std::collections::HashMap<Node, (libgfx_rust::path::Path, Vec<FfiSvgTextCharacterCell>)>>,
+    text_on_path_glyphs: RefCell<FastMap<Node, (libgfx_rust::path::Path, Vec<FfiSvgTextCharacterCell>)>>,
     /// The glyph cells of the text content element laid out last: those of its whole subtree, in document order.
     last_text_subtree_cells: Option<std::sync::Arc<Vec<FfiSvgTextCharacterCell>>>,
     /// The stretches of text in the subtree of the <text>, <tspan>, or <a> laid out last, in document order.
@@ -1265,13 +1265,13 @@ impl<'pass> SvgFormattingContext<'pass> {
             percentage_block_insets_of_run_root_children_have_definite_basis,
             current_text_position: FfiFloatPoint::default(),
             text_anchor_shift: 0.0,
-            text_length_adjustments: RefCell::new(std::collections::HashMap::new()),
-            text_positions: RefCell::new(std::collections::HashMap::new()),
-            text_chunks: RefCell::new(std::collections::HashMap::new()),
-            first_text_runs: RefCell::new(std::collections::HashMap::new()),
-            processed_svg_text: RefCell::new(std::collections::HashMap::new()),
-            svg_text_transform_edits: RefCell::new(std::collections::HashMap::new()),
-            text_on_path_glyphs: RefCell::new(std::collections::HashMap::new()),
+            text_length_adjustments: RefCell::new(FastMap::default()),
+            text_positions: RefCell::new(FastMap::default()),
+            text_chunks: RefCell::new(FastMap::default()),
+            first_text_runs: RefCell::new(FastMap::default()),
+            processed_svg_text: RefCell::new(FastMap::default()),
+            svg_text_transform_edits: RefCell::new(FastMap::default()),
+            text_on_path_glyphs: RefCell::new(FastMap::default()),
             last_text_subtree_cells: None,
             last_text_subtree_spans: Vec::new(),
             inside_text_box: false,
@@ -2015,7 +2015,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             .map(|(source, white_space_collapse)| (source.as_slice(), *white_space_collapse))
             .collect();
         let mut processed_text = self.processed_svg_text.borrow_mut();
-        let mut element_offsets = std::collections::HashMap::<Node, usize>::new();
+        let mut element_offsets = FastMap::<Node, usize>::default();
         for (node, text) in text_nodes.iter().zip(process_svg_text_white_space(&borrowed_sources)) {
             let mut positions = vec![SvgTextPosition::default(); text.len()];
             let mut element = self.parent(*node);
@@ -2630,7 +2630,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
         // The root entry marks that even characters which don't start a chunk have been considered.
         if !self.text_chunks.borrow().contains_key(&(root, 0)) {
-            let mut chunks = std::collections::HashMap::new();
+            let mut chunks = FastMap::default();
             let mut chunk_start = None;
             let mut chunk = SvgTextChunkMeasurement::default();
             let mut glyph_scale = 1.0;
@@ -3251,8 +3251,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         let mut character_cells = Vec::new();
         // NB: Each text content element inside the <textPath> paints its own text, in its own style.
         let mut runs_of_elements: Vec<(Node, Vec<libgfx_rust::path::GlyphRun>)> = Vec::new();
-        let mut cells_of_elements: std::collections::HashMap<Node, Vec<FfiSvgTextCharacterCell>> =
-            std::collections::HashMap::new();
+        let mut cells_of_elements: FastMap<Node, Vec<FfiSvgTextCharacterCell>> = FastMap::default();
         let mut advance = 0.0f32;
         // https://svgwg.org/svg2-draft/text.html#TextLayoutPath
         // Align the glyph vertically relative to the midpoint-on-the-path based on property alignment-baseline and any

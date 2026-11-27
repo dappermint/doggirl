@@ -119,9 +119,15 @@ static void apply_element_style_invalidation_after_style_change(Layout::BegunRea
     bool const installed_by_render_state = StyleEngineFFI::style_engine_render_state_installed(element.document().style_computer().style_engine().host(), element.style_node_id().value(), element.style_record_identity().value());
     // NB: A read of the style of an element below one that is not displayed installs it with no box to move, and leaves
     //     layout as it was for what reads it next.
-    if (auto parent = element.element_to_inherit_style_from({}); !installed_by_render_state && parent && has_flag(parent->installed_style().dependency_flags(), StyleRecordDependencyFlag::InDisplayNoneSubtree) && !element.unsafe_layout_node(read))
-        return;
-    if (auto* arena = element.document().layout_node_arena_if_created(); arena && invalidation.needs_relayout() && !installed_by_render_state) {
+    auto* arena = element.document().layout_node_arena_if_created();
+    if (auto parent = element.element_to_inherit_style_from({}); !installed_by_render_state && parent && has_flag(parent->installed_style().dependency_flags(), StyleRecordDependencyFlag::InDisplayNoneSubtree)) {
+        auto const style_node = element.style_node_id().value();
+        bool const has_bound_box = arena && style_node != 0
+            && Layout::RustFFI::layout_row_bound_slot_id(arena->host(), &read, style_node).index != Compositing::RustFFI::NodeSlotId_INVALID.index;
+        if (!has_bound_box)
+            return;
+    }
+    if (arena && invalidation.needs_relayout() && !installed_by_render_state) {
         dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", DOM::to_string(DOM::SetNeedsLayoutReason::StyleChange));
         Layout::RustFFI::render_state_relayout_element_after_style_change(arena->host(), element.style_node_id().value(), invalidation.needs_layout_tree_rebuild());
         Painting::request_document_repaint(element.document(), InvalidateDisplayList::No);
