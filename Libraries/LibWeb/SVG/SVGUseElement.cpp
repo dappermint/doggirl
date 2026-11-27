@@ -121,7 +121,7 @@ void SVGUseElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancest
     //     shadow tree that is being discarded. inserted() processes the URL again.
     if (!is_connected() && m_load_event_delayer.has_value()) {
         stop_using_resource_document();
-        m_href = {};
+        set_href({});
     }
 }
 
@@ -164,13 +164,40 @@ void SVGUseElement::register_for_referenced_element_changes()
     if (m_list_node.is_in_list())
         return;
     document().register_svg_use_element({}, *this);
+    if (m_cached_fragment_id.has_value()) {
+        document().register_svg_use_element_fragment_id({}, *m_cached_fragment_id, *this);
+        m_registered_in_fragment_id_map = true;
+    }
 }
 
 void SVGUseElement::unregister_for_referenced_element_changes()
 {
+    if (m_registered_in_fragment_id_map) {
+        if (m_cached_fragment_id.has_value())
+            document().unregister_svg_use_element_fragment_id({}, *m_cached_fragment_id, *this);
+        m_registered_in_fragment_id_map = false;
+    }
     if (!m_list_node.is_in_list())
         return;
     document().unregister_svg_use_element({}, *this);
+}
+
+void SVGUseElement::set_href(Optional<URL::URL> href)
+{
+    if (m_registered_in_fragment_id_map) {
+        if (m_cached_fragment_id.has_value())
+            document().unregister_svg_use_element_fragment_id({}, *m_cached_fragment_id, *this);
+        m_registered_in_fragment_id_map = false;
+    }
+    m_href = move(href);
+    if (m_href.has_value() && m_href->fragment().has_value())
+        m_cached_fragment_id = decode_fragment_identifier(*m_href->fragment());
+    else
+        m_cached_fragment_id = {};
+    if (m_list_node.is_in_list() && m_cached_fragment_id.has_value()) {
+        document().register_svg_use_element_fragment_id({}, *m_cached_fragment_id, *this);
+        m_registered_in_fragment_id_map = true;
+    }
 }
 
 void SVGUseElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -215,7 +242,7 @@ void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
     // it with the document base URL. If all parts other than the target fragment are equal, this is
     // a same-document URL reference, and processing the URL must continue as indicated in Identifying
     // the target element with the current document as the referenced document.
-    m_href = document_containing_reference().encoding_parse_url(href.value_or({}));
+    set_href(document_containing_reference().encoding_parse_url(href.value_or({})));
     if (m_href.has_value() && is_referenced_element_same_document()) {
         clone_element_tree_as_our_shadow_tree(referenced_element());
         return;
@@ -288,12 +315,11 @@ void SVGUseElement::svg_element_changed_before_parsing_complete(SVGElement& svg_
 
 void SVGUseElement::svg_element_removed(SVGElement& svg_element)
 {
-    if (!m_href.has_value() || !m_href->fragment().has_value() || !is_referenced_element_same_document()) {
+    if (!m_cached_fragment_id.has_value() || !m_href.has_value() || !is_referenced_element_same_document()) {
         return;
     }
 
-    auto id = decode_fragment_identifier(*m_href->fragment());
-    if (svg_element.get_attribute_value("id"_utf16_fly_string) == id) {
+    if (svg_element.id() == m_cached_fragment_id) {
         shadow_root()->remove_all_children();
     }
 }
@@ -301,28 +327,23 @@ void SVGUseElement::svg_element_removed(SVGElement& svg_element)
 // https://svgwg.org/svg2-draft/linking.html#processingURL-target
 GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
 {
-    if (!m_href.has_value())
+    if (!m_href.has_value() || !m_cached_fragment_id.has_value())
         return nullptr;
 
-    if (!m_href->fragment().has_value())
-        return nullptr;
-
-    if (is_referenced_element_same_document()) {
-        auto id = decode_fragment_identifier(*m_href->fragment());
-        return document_containing_reference().get_element_by_id(id);
-    }
+    if (is_referenced_element_same_document())
+        return document_containing_reference().get_element_by_id(*m_cached_fragment_id);
 
     if (!m_resource_document || !m_resource_document->document())
         return nullptr;
 
-    return m_resource_document->document()->get_element_by_id(decode_fragment_identifier(*m_href->fragment()));
+    return m_resource_document->document()->get_element_by_id(*m_cached_fragment_id);
 }
 
 void SVGUseElement::discard_the_url()
 {
     clone_element_tree_as_our_shadow_tree(nullptr);
     stop_using_resource_document();
-    m_href = {};
+    set_href({});
 }
 
 void SVGUseElement::stop_using_resource_document()

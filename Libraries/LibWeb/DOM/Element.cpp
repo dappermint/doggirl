@@ -1265,23 +1265,34 @@ void Element::append_attribute(QualifiedName name, Utf16String value)
     handle_attribute_changes(move(attribute_name), move(old_value), move(new_value));
 }
 
-void Element::append_attribute_without_callbacks_from_detached_parser(QualifiedName name, Utf16String value)
+void Element::append_attribute_without_callbacks_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits)
 {
     VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
         && (!rare_data() || (!rare_data()->registered_observer_list && !element_rare_data()->class_list)));
-    m_subtree_name_filter |= name_filter_bit(name.local_name());
-    m_subtree_attribute_filter |= attribute_filter_bits(name.local_name());
-    (void)append_raw_attribute(move(name), move(value));
+    m_subtree_name_filter |= name_filter_bit;
+    m_subtree_attribute_filter |= attribute_filter_bits;
+    (void)append_raw_attribute(name, move(value));
 }
 
-void Element::append_single_class_attribute_from_detached_parser(QualifiedName name, Utf16String value, Utf16FlyString const& single_class, u64 single_class_filter_bit)
+void Element::append_single_class_attribute_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits, Utf16FlyString const& single_class, u64 single_class_filter_bit)
 {
     VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
         && (!rare_data() || (!rare_data()->registered_observer_list && !element_rare_data()->class_list)));
-    m_subtree_name_filter |= name_filter_bit(name.local_name()) | single_class_filter_bit;
-    m_subtree_attribute_filter |= attribute_filter_bits(name.local_name());
-    (void)append_raw_attribute(move(name), move(value));
+    m_subtree_name_filter |= name_filter_bit | single_class_filter_bit;
+    m_subtree_attribute_filter |= attribute_filter_bits;
+    (void)append_raw_attribute(name, move(value));
     m_classes.append(single_class);
+}
+
+void Element::append_id_attribute_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits)
+{
+    VERIFY(!is_connected() && !parent() && !is_custom() && is_html_element()
+        && (!rare_data() || (!rare_data()->registered_observer_list && !element_rare_data()->class_list)));
+    m_subtree_name_filter |= name_filter_bit;
+    m_subtree_attribute_filter |= attribute_filter_bits;
+    auto& attribute = append_raw_attribute(name, move(value));
+    if (!attribute.value.is_empty())
+        m_id = Utf16FlyString { attribute.value };
 }
 
 void Element::append_attribute_from_detached_parser(QualifiedName name, Utf16String value, bool skip_observer_checks, Utf16FlyString const* preinterned_single_class)
@@ -3291,7 +3302,9 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
         exit_fullscreen_on_element_removal();
 
     if (has_style()) {
-        if (auto* removal_scope = document().subtree_removal_scope()) {
+        if (style_node_id() == 0 && !document().page().accessibility_interested() && document().timeline_declarations_generation() == 0) {
+            m_installed_style = {};
+        } else if (auto* removal_scope = document().subtree_removal_scope()) {
             Layout::ForcedReadScope read { removal_scope->render_document() };
             replace_installed_style(read, {});
         } else {

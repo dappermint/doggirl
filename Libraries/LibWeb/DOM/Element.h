@@ -261,8 +261,9 @@ public:
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
     void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false, Utf16FlyString const* preinterned_single_class = nullptr);
-    void append_single_class_attribute_from_detached_parser(QualifiedName, Utf16String value, Utf16FlyString const& single_class, u64 single_class_filter_bit);
-    void append_attribute_without_callbacks_from_detached_parser(QualifiedName, Utf16String value);
+    void append_single_class_attribute_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits, Utf16FlyString const& single_class, u64 single_class_filter_bit);
+    void append_attribute_without_callbacks_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits);
+    void append_id_attribute_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits);
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
@@ -1201,6 +1202,26 @@ private:
 
     // https://dom.spec.whatwg.org/#concept-element-custom-element-state
     CustomElementState m_custom_element_state : 3 { CustomElementState::Undefined };
+
+    // Built-in HTML elements that share the default HTMLElement insertion/removal steps (and have no post-connection
+    // steps) opt into a fast path during bulk DOM insertion and removal. Packed into the existing bitfield padding.
+public:
+    enum class TreeMutationFastPath : u8 {
+        None = 0,
+        PlainHTML = 1,
+        Button = 2,
+        Input = 3,
+    };
+
+    TreeMutationFastPath tree_mutation_fast_path() const { return m_tree_mutation_fast_path; }
+    void set_tree_mutation_fast_path(TreeMutationFastPath kind) { m_tree_mutation_fast_path = kind; }
+    bool has_no_raw_attributes() const { return !has_raw_attributes(); }
+    bool has_name_attribute() const { return m_has_name; }
+    bool has_style_attribute_pending_work() const { return m_style_attribute_is_dirty || m_style_attribute_awaits_content_security_policy_check; }
+    void clear_installed_style_for_disconnected_element() { m_installed_style = {}; }
+
+private:
+    TreeMutationFastPath m_tree_mutation_fast_path : 2 { TreeMutationFastPath::None };
 
     // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
     // child list they were counted in; zero for none.
