@@ -33,6 +33,40 @@ pub trait CodeUnit: Copy + Default + Eq + Into<u16> + From<u8> {
     /// `BLOCK_SIZE` code units must be readable at `code_units`.
     unsafe fn surrogates_in_block(code_units: *const Self) -> block::Mask;
 
+    /// Scans one `BLOCK_SIZE` block for any byte in `stops` (or a UTF-16 surrogate for `u16`), returning
+    /// `(stop_word, non_ascii_word)` encoded with `block`'s mask-word layout.
+    ///
+    /// # Safety
+    /// `BLOCK_SIZE` code units must be readable at `code_units`.
+    unsafe fn scan_block<const N: usize>(code_units: *const Self, stops: [u8; N]) -> (u64, u64) {
+        let bytes = unsafe { Self::load_block(code_units) };
+        let mut stop_mask = if Self::CAN_HAVE_SURROGATES {
+            unsafe { Self::surrogates_in_block(code_units) }
+        } else {
+            block::equal_mask(bytes, stops[0])
+        };
+        let rest = if Self::CAN_HAVE_SURROGATES {
+            &stops[..]
+        } else {
+            &stops[1..]
+        };
+        for &stop in rest {
+            stop_mask = block::or_mask(stop_mask, block::equal_mask(bytes, stop));
+        }
+        (block::mask_word(stop_mask), block::non_ascii_mask_word(bytes))
+    }
+
+    /// Fast 8-unit prefix probe for short all-ASCII runs (typical of HTML attribute values and indentation).
+    /// Returns `Some(stop_offset)` if a stop was found in the first 8 all-ASCII code units, or `None` if the caller
+    /// should continue scanning (updating `*advance` to 8 when all 8 units were verified ASCII non-stops).
+    ///
+    /// # Safety
+    /// At least 8 code units must be readable at `code_units`. Every byte in `stops` must be `< 0x80`.
+    #[inline(always)]
+    unsafe fn probe_ascii_8<const N: usize>(_code_units: *const Self, _stops: [u8; N], _advance: &mut usize) -> Option<usize> {
+        None
+    }
+
     fn view(code_units: &[Self]) -> Utf16View<'_>;
 
     /// Returns the underlying byte slice when this code unit is stored as `u8`.
@@ -53,6 +87,27 @@ impl CodeUnit for u8 {
     #[inline(always)]
     unsafe fn surrogates_in_block(_: *const u8) -> block::Mask {
         block::zero_mask()
+    }
+
+    #[inline(always)]
+    unsafe fn probe_ascii_8<const N: usize>(code_units: *const u8, stops: [u8; N], advance: &mut usize) -> Option<usize> {
+        #[cfg(target_endian = "little")]
+        {
+            debug_assert!(stops.iter().all(|&stop| stop < 0x80));
+            let word = unsafe { core::ptr::read_unaligned(code_units.cast::<u64>()) };
+            if word & 0x8080_8080_8080_8080 == 0 {
+                let mut mask = 0u64;
+                for &stop in &stops {
+                    let x = word ^ (0x0101_0101_0101_0101u64 * u64::from(stop));
+                    mask |= x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+                }
+                if mask != 0 {
+                    return Some((mask.trailing_zeros() >> 3) as usize);
+                }
+                *advance = 8;
+            }
+        }
+        None
     }
 
     #[inline(always)]
@@ -77,6 +132,18 @@ impl CodeUnit for u16 {
     #[inline(always)]
     unsafe fn surrogates_in_block(code_units: *const u16) -> block::Mask {
         unsafe { block::surrogates(code_units) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn scan_block<const N: usize>(code_units: *const u16, stops: [u8; N]) -> (u64, u64) {
+        unsafe { block::scan_wide_block(code_units, stops) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn probe_ascii_8<const N: usize>(code_units: *const u16, stops: [u8; N], advance: &mut usize) -> Option<usize> {
+        unsafe { block::probe_wide_ascii_8(code_units, stops, advance) }
     }
 
     #[inline(always)]
@@ -157,13 +224,13 @@ mod block {
     }
 
     #[inline(always)]
-    pub fn any_non_ascii(block: Block) -> bool {
-        non_ascii_word(block) != 0
+    pub fn non_ascii_mask_word(block: Block) -> u64 {
+        non_ascii_word(block)
     }
 
     #[inline(always)]
-    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
-        non_ascii_word(block) & ((1u64 << stop) - 1) != 0
+    pub fn non_ascii_before_word(word: u64, stop: u32) -> bool {
+        word & ((1u64 << stop) - 1) != 0
     }
 
     /// One bit for each code unit of a block: whether it is above U+007F.
@@ -244,14 +311,62 @@ mod block {
     }
 
     #[inline(always)]
-    pub fn any_non_ascii(block: Block) -> bool {
-        unsafe { vmaxvq_u8(block) >= 0x80 }
+    pub fn non_ascii_mask_word(block: Block) -> u64 {
+        unsafe { nibble_mask(vcgeq_u8(block, vdupq_n_u8(0x80))) }
     }
 
     #[inline(always)]
-    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
-        let non_ascii = unsafe { nibble_mask(vcgeq_u8(block, vdupq_n_u8(0x80))) };
-        non_ascii & ((1u64 << (stop * 4)) - 1) != 0
+    pub fn non_ascii_before_word(word: u64, stop: u32) -> bool {
+        word & ((1u64 << (stop * 4)) - 1) != 0
+    }
+
+    /// Scans 16 UTF-16 code units with a single load pass, skipping surrogate checks whenever the block is pure ASCII.
+    #[inline(always)]
+    pub unsafe fn scan_wide_block<const N: usize>(code_units: *const u16, stops: [u8; N]) -> (u64, u64) {
+        unsafe {
+            let low = vld1q_u16(code_units);
+            let high = vld1q_u16(code_units.add(8));
+            let bytes = vcombine_u8(vqmovn_u16(low), vqmovn_u16(high));
+            let non_ascii_word = non_ascii_mask_word(bytes);
+            let mut stop_mask = equal_mask(bytes, stops[0]);
+            for &stop in &stops[1..] {
+                stop_mask = or_mask(stop_mask, equal_mask(bytes, stop));
+            }
+            if non_ascii_word != 0 {
+                let top_bits = vdupq_n_u16(0xF800);
+                let surrogate = vdupq_n_u16(0xD800);
+                let low_sur = vceqq_u16(vandq_u16(low, top_bits), surrogate);
+                let high_sur = vceqq_u16(vandq_u16(high, top_bits), surrogate);
+                stop_mask = or_mask(stop_mask, vcombine_u8(vmovn_u16(low_sur), vmovn_u16(high_sur)));
+            }
+            (nibble_mask(stop_mask), non_ascii_word)
+        }
+    }
+
+    /// Fast 8-unit UTF-16 probe: a single 128-bit load proves ASCII + no surrogates and locates any stop in ~7 ops.
+    #[inline(always)]
+    pub unsafe fn probe_wide_ascii_8<const N: usize>(
+        code_units: *const u16,
+        stops: [u8; N],
+        advance: &mut usize,
+    ) -> Option<usize> {
+        unsafe {
+            let wide8 = vld1q_u16(code_units);
+            let bytes8 = vqmovn_u16(wide8);
+            let raw_u64 = vget_lane_u64(vreinterpret_u64_u8(bytes8), 0);
+            if raw_u64 & 0x8080_8080_8080_8080 == 0 {
+                let mut stop_vec = vceq_u8(bytes8, vdup_n_u8(stops[0]));
+                for &stop in &stops[1..] {
+                    stop_vec = vorr_u8(stop_vec, vceq_u8(bytes8, vdup_n_u8(stop)));
+                }
+                let stop_u64 = vget_lane_u64(vreinterpret_u64_u8(stop_vec), 0);
+                if stop_u64 != 0 {
+                    return Some((stop_u64.trailing_zeros() >> 3) as usize);
+                }
+                *advance = 8;
+            }
+            None
+        }
     }
 }
 
@@ -318,13 +433,13 @@ mod block {
     }
 
     #[inline(always)]
-    pub fn any_non_ascii(block: Block) -> bool {
-        non_ascii_word(block) != 0
+    pub fn non_ascii_mask_word(block: Block) -> u64 {
+        non_ascii_word(block)
     }
 
     #[inline(always)]
-    pub fn non_ascii_before(block: Block, stop: u32) -> bool {
-        non_ascii_word(block) & ((1u64 << stop) - 1) != 0
+    pub fn non_ascii_before_word(word: u64, stop: u32) -> bool {
+        word & ((1u64 << stop) - 1) != 0
     }
 
     /// One bit for each code unit of a block: whether it is above U+007F.
@@ -340,37 +455,29 @@ const CHUNK_SIZE: usize = 32;
 /// none. `seen_non_ascii` is set if a code unit before it is above U+007F.
 #[inline(always)]
 fn find_first<T: CodeUnit, const N: usize>(code_units: &[T], stops: [u8; N], seen_non_ascii: &mut bool) -> usize {
-    let scan_block = |block: *const T| {
-        // SAFETY: Both callers pass a pointer to `BLOCK_SIZE` code units.
-        let bytes = unsafe { T::load_block(block) };
-        let mut stop_mask = if T::CAN_HAVE_SURROGATES {
-            // SAFETY: Both callers pass a pointer to `BLOCK_SIZE` code units.
-            unsafe { T::surrogates_in_block(block) }
-        } else {
-            block::equal_mask(bytes, stops[0])
-        };
-        let rest = if T::CAN_HAVE_SURROGATES {
-            &stops[..]
-        } else {
-            &stops[1..]
-        };
-        for &stop in rest {
-            stop_mask = block::or_mask(stop_mask, block::equal_mask(bytes, stop));
-        }
-        (bytes, block::mask_word(stop_mask))
-    };
-
     let mut offset = 0;
+    if code_units.len() >= 8 {
+        // SAFETY: `code_units.len() >= 8` guarantees 8 code units are readable at `code_units.as_ptr()`.
+        if let Some(stop) = unsafe { T::probe_ascii_8(code_units.as_ptr(), stops, &mut offset) } {
+            return stop;
+        }
+    }
+
     while offset + BLOCK_SIZE <= code_units.len() {
-        let (bytes, stop_word) = scan_block(code_units[offset..].as_ptr());
+        // SAFETY: `offset + BLOCK_SIZE <= code_units.len()` guarantees `BLOCK_SIZE` code units are readable.
+        let (stop_word, non_ascii_word) = unsafe { T::scan_block(code_units.as_ptr().add(offset), stops) };
         if stop_word != 0 {
             let stop = block::first_in_word(stop_word);
-            if !*seen_non_ascii && stop > 0 && block::any_non_ascii(bytes) {
-                *seen_non_ascii |= block::non_ascii_before(bytes, stop);
+            if !*seen_non_ascii
+                && stop > 0
+                && non_ascii_word != 0
+                && block::non_ascii_before_word(non_ascii_word, stop)
+            {
+                *seen_non_ascii = true;
             }
             return offset + stop as usize;
         }
-        if !*seen_non_ascii && block::any_non_ascii(bytes) {
+        if non_ascii_word != 0 {
             *seen_non_ascii = true;
         }
         offset += BLOCK_SIZE;
@@ -383,10 +490,15 @@ fn find_first<T: CodeUnit, const N: usize>(code_units: &[T], stops: [u8; N], see
     // NB: What is left is less than a block, and is looked at as the start of one that ends the scan after it.
     let mut last_block = [T::default(); BLOCK_SIZE];
     last_block[..remaining].copy_from_slice(&code_units[offset..]);
-    let (bytes, stop_word) = scan_block(last_block.as_ptr());
+    // SAFETY: `last_block` holds `BLOCK_SIZE` initialized code units.
+    let (stop_word, non_ascii_word) = unsafe { T::scan_block(last_block.as_ptr(), stops) };
     let stop = block::first_in_word(stop_word | block::end_sentinel(remaining));
-    if !*seen_non_ascii && stop > 0 && block::any_non_ascii(bytes) {
-        *seen_non_ascii |= block::non_ascii_before(bytes, stop);
+    if !*seen_non_ascii
+        && stop > 0
+        && non_ascii_word != 0
+        && block::non_ascii_before_word(non_ascii_word, stop)
+    {
+        *seen_non_ascii = true;
     }
     offset + stop as usize
 }
@@ -410,12 +522,14 @@ pub struct Run {
 
 /// The run of code units at the start of `code_units` that the data and RCDATA states emit as they are: everything
 /// up to the first U+003C (<), U+0026 (&), U+0000 NULL, U+000D CR, or surrogate that isn't half of a pair.
+#[inline]
 pub fn data_run<T: CodeUnit>(code_units: &[T]) -> Run {
     text_run(code_units, [b'<', b'&', 0, b'\r'])
 }
 
 /// The run of code units at the start of `code_units` that the RAWTEXT and script data states emit as they are:
 /// everything up to the first U+003C (<), U+0000 NULL, U+000D CR, or surrogate that isn't half of a pair.
+#[inline]
 pub fn raw_text_run<T: CodeUnit>(code_units: &[T]) -> Run {
     text_run(code_units, [b'<', 0, b'\r'])
 }
@@ -423,6 +537,7 @@ pub fn raw_text_run<T: CodeUnit>(code_units: &[T]) -> Run {
 /// The number of code units at the start of `code_units` that a quoted attribute value takes as they are, and whether
 /// they are all ASCII: everything up to the first `quote`, U+0026 (&), U+0000 NULL, U+000D CR, or surrogate that isn't
 /// half of a pair.
+#[inline]
 pub fn quoted_attribute_value_run<T: CodeUnit>(code_units: &[T], quote: u8) -> Run {
     text_run(code_units, [quote, b'&', 0, b'\r'])
 }
