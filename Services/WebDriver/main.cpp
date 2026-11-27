@@ -126,7 +126,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
     args_parser.add_option(force_cpu_painting, "Launch browser with GPU painting disabled", "force-cpu-painting");
     args_parser.add_option(disable_sandbox, "Launch browser with helper process sandboxing disabled", "disable-sandbox");
-    args_parser.add_option(debug_process, "Wait for a debugger to attach to the given process name (WebContent, RequestServer, etc.)", "debug-process", 0, "process-name");
+    args_parser.add_option(debug_process, "Wait for a debugger to attach to the given process name (ladybird-render, ladybird-net, etc.)", "debug-process", 0, "process-name");
     args_parser.add_option(headless, "Launch browser without a graphical interface", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
     args_parser.add_option(profile_name, "Select or create a named browser profile", "profile", 0, "name");
@@ -135,7 +135,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(resource_substitution_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
     args_parser.parse(arguments);
 
-    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "WebDriver"sv));
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "ladybird-driver"sv));
 
     auto profile_selector_count = static_cast<unsigned>(profile_name.has_value())
         + static_cast<unsigned>(profile_path.has_value())
