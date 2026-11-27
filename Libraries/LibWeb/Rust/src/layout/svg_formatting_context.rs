@@ -110,6 +110,18 @@ struct ShapedSvgText {
 }
 
 impl ShapedSvgText {
+    fn shift_glyphs_uniform(&mut self, shift: FfiFloatPoint) {
+        if shift.x == 0.0 && shift.y == 0.0 {
+            return;
+        }
+        for run in &mut self.runs {
+            run.glyphs.update_positions(|_, x, y| {
+                *x += shift.x;
+                *y += shift.y;
+            });
+        }
+    }
+
     fn shift_glyphs(&mut self, shifts: &[FfiFloatPoint]) {
         let mut run_offset = 0;
         for run in &mut self.runs {
@@ -398,6 +410,98 @@ pub const SVG_GEOMETRY_KIND_ELLIPSE: u8 = 4;
 pub const SVG_GEOMETRY_KIND_LINE: u8 = 5;
 pub const SVG_GEOMETRY_KIND_POLYLINE: u8 = 6;
 pub const SVG_GEOMETRY_KIND_POLYGON: u8 = 7;
+
+impl FfiSvgAttributeFacts {
+    pub(crate) const DEFAULT: Self = Self {
+        is_graphics_element: false,
+        is_use_element: false,
+        is_text_element: false,
+        is_fit_to_view_box: false,
+        has_active_view_box: false,
+        active_view_box: FfiSvgViewBox {
+            min_x: 0.0,
+            min_y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        },
+        preserve_aspect_ratio_align: 0,
+        preserve_aspect_ratio_meet_or_slice: 0,
+        content_units: 0,
+        pattern_units: 0,
+        pattern_width: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        pattern_height: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        mask_units: 0,
+        mask_x: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        mask_y: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        mask_width: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        mask_height: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        geometry_kind: 0,
+        line_x1: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        line_y1: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        line_x2: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        line_y2: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        has_path_length: false,
+        path_length: 0.0,
+        text_length: FfiSvgLengthValue {
+            value: 0.0,
+            kind: 0,
+            unit: 0,
+        },
+        text_length_adjusts_glyphs: false,
+        reference_fragment_atom: 0,
+        mask_reference_atom: 0,
+        clip_path_reference_atom: 0,
+        fill_reference_atom: 0,
+        stroke_reference_atom: 0,
+        text_path_start_offset: FfiSvgNumberPercentage {
+            value: 0.0,
+            is_percentage: false,
+        },
+        natural_width: FfiSvgLengthValue {
+            value: 0.0,
+            kind: 0,
+            unit: 0,
+        },
+        natural_height: FfiSvgLengthValue {
+            value: 0.0,
+            kind: 0,
+            unit: 0,
+        },
+        has_view_box_aspect_ratio: false,
+        view_box_aspect_ratio_numerator: CssPixels::from_raw(0),
+        view_box_aspect_ratio_denominator: CssPixels::from_raw(0),
+    };
+}
 
 impl FfiSvgNumberPercentage {
     pub(crate) fn resolve_relative_to(self, length: f32) -> f32 {
@@ -1513,7 +1617,7 @@ impl SvgShapeGeometry {
         path
     }
 
-    fn svg_line_path(&self, attributes: FfiSvgAttributeFacts) -> libgfx_rust::path::Path {
+    fn svg_line_path(&self, attributes: &FfiSvgAttributeFacts) -> libgfx_rust::path::Path {
         let mut path = libgfx_rust::path::Path::new();
         let viewport_width = self.viewport_width.to_float();
         let viewport_height = self.viewport_height.to_float();
@@ -1556,7 +1660,7 @@ impl SvgShapeGeometry {
     /// attributes name and its computed style.
     fn path(
         &self,
-        attributes: FfiSvgAttributeFacts,
+        attributes: &FfiSvgAttributeFacts,
         style: StyleValues<'_>,
         points: Option<&[FfiFloatPoint]>,
     ) -> libgfx_rust::path::Path {
@@ -1623,7 +1727,7 @@ impl FfiSvgGeometryElementShape {
         };
         // SAFETY: Guaranteed by the caller.
         let style = StyleValues::new(unsafe { style.view() });
-        measure(&shape_geometry.path(self.geometry, style, Some(points)), style)
+        measure(&shape_geometry.path(&self.geometry, style, Some(points)), style)
     }
 }
 
@@ -1816,9 +1920,15 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     /// The geometry a shape element draws, in the user units of the viewport it sits in.
     fn svg_geometry_path(&self, node: Node) -> libgfx_rust::path::Path {
-        let points = self.run.pass.arena().svg_points(node);
+        let attributes = self.svg_attributes(node);
+        let points = matches!(
+            attributes.geometry_kind,
+            SVG_GEOMETRY_KIND_POLYLINE | SVG_GEOMETRY_KIND_POLYGON
+        )
+        .then(|| self.run.pass.arena().svg_points(node))
+        .flatten();
         self.shape_geometry()
-            .path(self.svg_attributes(node), self.style(node), points.as_deref())
+            .path(attributes, self.style(node), points.as_deref())
     }
 
     /// The pixel value one of the text positioning attributes resolves to. A relative length is
@@ -2153,12 +2263,26 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     /// Positions typographic characters without separating the glyphs that shaping assigned to one character.
-    fn position_svg_text_run(&mut self, node: Node, shaped: &mut ShapedSvgText) {
+    fn position_svg_text_run(&mut self, node: Node, shaped: &mut ShapedSvgText, text_length_spacing: f32) {
         let (positions, trailing_shift) = self.svg_text_character_positions(node, &shaped.character_cells);
-        let glyph_scale = self.svg_text_glyph_scale(self.parent(node));
+        let text_box = self.parent(node);
+        let glyph_scale = self.svg_text_glyph_scale(text_box);
+        // Fast path: a standalone <text> element with a single text node child and a single chunk avoids
+        // re-shaping the run or allocating a HashMap for `self.text_chunks`.
+        let single_chunk = self.prepare_svg_text_chunks_for_run(
+            node,
+            text_box,
+            &shaped.character_cells,
+            &positions,
+            trailing_shift,
+            text_length_spacing,
+            glyph_scale,
+        );
         let origin = self.current_text_position;
         let mut shift = FfiFloatPoint::default();
-        let mut shifts = Vec::with_capacity(shaped.character_cells.len());
+        let mut first_shift: Option<FfiFloatPoint> = None;
+        let mut shifts: Option<Vec<FfiFloatPoint>> = None;
+        let cell_count = shaped.character_cells.len();
         shaped.glyph_cells = SvgCssPixelRect::default();
         for (index, cell) in shaped.character_cells.iter_mut().enumerate() {
             if cell.starts_typographic_character {
@@ -2178,7 +2302,11 @@ impl<'pass> SvgFormattingContext<'pass> {
                         dx * self.svg_text_dx_scale(node, index, position.x.is_some()) / glyph_scale;
                 }
                 self.current_text_position.y += position.dy.unwrap_or(0.0);
-                if let Some(chunk) = self.svg_text_chunk(node, index) {
+                let chunk = match single_chunk {
+                    Some((chunk_index, measurement)) => (index == chunk_index).then_some(measurement),
+                    None => self.text_chunks.borrow().get(&(node, index)).copied(),
+                };
+                if let Some(chunk) = chunk {
                     // NB: 'text-anchor' shifts the characters of one chunk only, so a chunk that starts without an
                     //     'x' continues from where the characters before it end without the shift of their chunk.
                     if position.x.is_none() {
@@ -2196,7 +2324,18 @@ impl<'pass> SvgFormattingContext<'pass> {
                 shift.x = self.current_text_position.x - cell.x;
                 shift.y = self.current_text_position.y - origin.y;
             }
-            shifts.push(shift);
+            if let Some(shifts) = &mut shifts {
+                shifts.push(shift);
+            } else if let Some(first) = first_shift {
+                if shift != first {
+                    let mut per_cell = Vec::with_capacity(cell_count);
+                    per_cell.resize(index, first);
+                    per_cell.push(shift);
+                    shifts = Some(per_cell);
+                }
+            } else {
+                first_shift = Some(shift);
+            }
             cell.x += shift.x;
             cell.y += shift.y;
             cell.alignment_point_y = origin.y + shift.y;
@@ -2207,7 +2346,11 @@ impl<'pass> SvgFormattingContext<'pass> {
                 cell.height,
             )));
         }
-        shaped.shift_glyphs(&shifts);
+        if let Some(shifts) = shifts {
+            shaped.shift_glyphs(&shifts);
+        } else if let Some(shift) = first_shift {
+            shaped.shift_glyphs_uniform(shift);
+        }
         if trailing_shift.x != 0.0 {
             shift.x += trailing_shift.x * self.svg_text_dx_scale(node, positions.len(), false) / glyph_scale;
         }
@@ -2436,11 +2579,54 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.shape_svg_text(self.style(self.parent(node)), text, baseline_start, spacing)
     }
 
-    /// Measures every chunk once, using the same character boundaries and adjustments as glyph placement.
-    fn svg_text_chunk(&self, node: Node, offset: usize) -> Option<SvgTextChunkMeasurement> {
-        let mut root = self.parent(node);
+    /// Ensures every chunk under `node`'s enclosing `<text>` root is measured, reusing `precomputed_*` for `node` so
+    /// the current run is never shaped twice. Returns `Some((chunk_index, measurement))` directly without populating
+    /// `self.text_chunks` when `node` is the sole child of its root and forms a single chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_svg_text_chunks_for_run(
+        &self,
+        node: Node,
+        text_box: Node,
+        precomputed_cells: &[FfiSvgTextCharacterCell],
+        precomputed_positions: &[SvgTextPosition],
+        precomputed_trailing_shift: FfiFloatPoint,
+        precomputed_spacing: f32,
+        precomputed_scale: f32,
+    ) -> Option<(usize, SvgTextChunkMeasurement)> {
+        let mut root = text_box;
         while !self.parent(root).is_invalid() && self.node_kind(self.parent(root)) == NodeKind::SVGTextBox {
             root = self.parent(root);
+        }
+        if root == text_box
+            && self.first_child(root) == node
+            && self.next_sibling(node).is_invalid()
+            && !self.text_chunks.borrow().contains_key(&(root, 0))
+            && let Some(first_index) = precomputed_cells.iter().position(|c| c.starts_typographic_character)
+            && !precomputed_positions[first_index + 1..]
+                .iter()
+                .zip(&precomputed_cells[first_index + 1..])
+                .any(|(position, cell)| cell.starts_typographic_character && position.starts_chunk())
+        {
+            let mut chunk = SvgTextChunkMeasurement {
+                anchor: self.style(text_box).inherited_svg().text_anchor,
+                ..SvgTextChunkMeasurement::default()
+            };
+            let mut position = 0.0f32;
+            for (index, cell) in precomputed_cells.iter().enumerate().skip(first_index) {
+                if !cell.starts_typographic_character {
+                    continue;
+                }
+                if index > first_index
+                    && let Some(dx) = precomputed_positions[index].dx
+                {
+                    position += dx * self.svg_text_dx_scale(node, index, false) / precomputed_scale;
+                }
+                let end = position + cell.width;
+                chunk.start = chunk.start.min(position).min(end);
+                chunk.end = chunk.end.max(position).max(end);
+                position = end + precomputed_spacing;
+            }
+            return Some((first_index, chunk));
         }
         // The root entry marks that even characters which don't start a chunk have been considered.
         if !self.text_chunks.borrow().contains_key(&(root, 0)) {
@@ -2452,43 +2638,78 @@ impl<'pass> SvgFormattingContext<'pass> {
             let mut current = root;
             'walk: loop {
                 let kind = self.node_kind(current);
-                if node_facts::kind_is_text(kind)
-                    && let Some(text) = self.svg_text_run_starting_at(current)
-                    && !text.is_empty()
-                {
-                    let text_box = self.parent(current);
-                    let spacing = self.svg_text_length_adjustment_for(text_box).spacing();
-                    let shaped = self.shape_svg_text_run(current, &text, FfiFloatPoint::default(), spacing);
-                    let (positions, trailing_shift) =
-                        self.svg_text_character_positions(current, &shaped.character_cells);
-                    let run_scale = self.svg_text_glyph_scale(text_box);
-                    for (index, cell) in shaped.character_cells.iter().enumerate() {
-                        if !cell.starts_typographic_character {
-                            continue;
-                        }
-                        let adjustment = positions[index];
-                        if chunk_start.is_none() || adjustment.starts_chunk() {
-                            if let Some(start) = chunk_start {
-                                chunks.insert(start, chunk);
+                if node_facts::kind_is_text(kind) {
+                    if current == node {
+                        if !precomputed_cells.is_empty() {
+                            let spacing = precomputed_spacing;
+                            let run_scale = precomputed_scale;
+                            for (index, cell) in precomputed_cells.iter().enumerate() {
+                                if !cell.starts_typographic_character {
+                                    continue;
+                                }
+                                let adjustment = precomputed_positions[index];
+                                if chunk_start.is_none() || adjustment.starts_chunk() {
+                                    if let Some(start) = chunk_start {
+                                        chunks.insert(start, chunk);
+                                    }
+                                    chunk_start = Some((current, index));
+                                    chunk = SvgTextChunkMeasurement {
+                                        anchor: self.style(text_box).inherited_svg().text_anchor,
+                                        ..SvgTextChunkMeasurement::default()
+                                    };
+                                    glyph_scale = run_scale;
+                                    position = 0.0;
+                                } else if let Some(dx) = adjustment.dx {
+                                    position += dx * self.svg_text_dx_scale(current, index, false) / glyph_scale;
+                                }
+                                let end = position + cell.width * run_scale / glyph_scale;
+                                chunk.start = chunk.start.min(position).min(end);
+                                chunk.end = chunk.end.max(position).max(end);
+                                position = end + spacing * run_scale / glyph_scale;
                             }
-                            chunk_start = Some((current, index));
-                            chunk = SvgTextChunkMeasurement {
-                                anchor: self.style(text_box).inherited_svg().text_anchor,
-                                ..SvgTextChunkMeasurement::default()
-                            };
-                            glyph_scale = run_scale;
-                            position = 0.0;
-                        } else if let Some(dx) = adjustment.dx {
-                            position += dx * self.svg_text_dx_scale(current, index, false) / glyph_scale;
+                            if precomputed_trailing_shift.x != 0.0 {
+                                position += precomputed_trailing_shift.x
+                                    * self.svg_text_dx_scale(current, precomputed_positions.len(), false)
+                                    / glyph_scale;
+                            }
                         }
-                        let end = position + cell.width * run_scale / glyph_scale;
-                        chunk.start = chunk.start.min(position).min(end);
-                        chunk.end = chunk.end.max(position).max(end);
-                        position = end + spacing * run_scale / glyph_scale;
-                    }
-                    if trailing_shift.x != 0.0 {
-                        position +=
-                            trailing_shift.x * self.svg_text_dx_scale(current, positions.len(), false) / glyph_scale;
+                    } else if let Some(text) = self.svg_text_run_starting_at(current)
+                        && !text.is_empty()
+                    {
+                        let current_text_box = self.parent(current);
+                        let spacing = self.svg_text_length_adjustment_for(current_text_box).spacing();
+                        let shaped = self.shape_svg_text_run(current, &text, FfiFloatPoint::default(), spacing);
+                        let (positions, trailing_shift) =
+                            self.svg_text_character_positions(current, &shaped.character_cells);
+                        let run_scale = self.svg_text_glyph_scale(current_text_box);
+                        for (index, cell) in shaped.character_cells.iter().enumerate() {
+                            if !cell.starts_typographic_character {
+                                continue;
+                            }
+                            let adjustment = positions[index];
+                            if chunk_start.is_none() || adjustment.starts_chunk() {
+                                if let Some(start) = chunk_start {
+                                    chunks.insert(start, chunk);
+                                }
+                                chunk_start = Some((current, index));
+                                chunk = SvgTextChunkMeasurement {
+                                    anchor: self.style(current_text_box).inherited_svg().text_anchor,
+                                    ..SvgTextChunkMeasurement::default()
+                                };
+                                glyph_scale = run_scale;
+                                position = 0.0;
+                            } else if let Some(dx) = adjustment.dx {
+                                position += dx * self.svg_text_dx_scale(current, index, false) / glyph_scale;
+                            }
+                            let end = position + cell.width * run_scale / glyph_scale;
+                            chunk.start = chunk.start.min(position).min(end);
+                            chunk.end = chunk.end.max(position).max(end);
+                            position = end + spacing * run_scale / glyph_scale;
+                        }
+                        if trailing_shift.x != 0.0 {
+                            position += trailing_shift.x * self.svg_text_dx_scale(current, positions.len(), false)
+                                / glyph_scale;
+                        }
                     }
                 }
                 // AD-HOC: Text on a path is laid out independently; see svg_text_path_box_path().
@@ -2520,7 +2741,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             chunks.insert((root, 0), SvgTextChunkMeasurement::default());
             self.text_chunks.borrow_mut().extend(chunks);
         }
-        self.text_chunks.borrow().get(&(node, offset)).copied()
+        None
     }
 
     /// Lays out what a <text>, a <tspan>, or an <a> inside one renders, in document order: its text nodes, which it
@@ -2530,7 +2751,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         text_box: Node,
     ) -> SvgTextBoxContents {
-        let attributes = self.svg_attributes(text_box);
+        let is_text_element = self.svg_attributes(text_box).is_text_element;
         // https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
         // the starting X (Y) coordinate for rendering the glyphs corresponding to the given
         // character is the X (Y) coordinate of the resulting current text position from the most
@@ -2538,19 +2759,21 @@ impl<'pass> SvgFormattingContext<'pass> {
         // NB: The initial value of 'x' and 'y' is "0 for 'text'; (none) for 'tspan'": a <text>
         //     element starts at (0, 0) regardless of the current text position, while a <tspan>
         //     without 'x'/'y' continues at the current text position.
-        if attributes.is_text_element {
+        if is_text_element {
             self.current_text_position = FfiFloatPoint::default();
             self.text_anchor_shift = 0.0;
             self.text_length_adjustments.borrow_mut().clear();
             self.text_chunks.borrow_mut().clear();
             self.first_text_runs.borrow_mut().clear();
         }
-        let parent_scale = if attributes.is_text_element {
+        let parent_scale = if is_text_element {
             1.0
         } else {
             self.svg_text_glyph_scale(self.parent(text_box))
         };
-        let glyph_scale = self.svg_text_glyph_scale(text_box);
+        let text_length_adjustment = self.svg_text_length_adjustment_for(text_box);
+        let text_length_spacing = text_length_adjustment.spacing();
+        let glyph_scale = text_length_adjustment.glyph_scale();
         // Each box shapes before its glyph scale is applied. Keep the physical cursor at the same position across
         // element boundaries, even when the parent and child scale their glyphs differently.
         self.current_text_position.x *= parent_scale / glyph_scale;
@@ -2568,12 +2791,15 @@ impl<'pass> SvgFormattingContext<'pass> {
         // the text decoration is declared
         // NB: So, the element that declares a line draws it along all of the text in its subtree.
         let decoration_lines = self.svg_text_decoration_lines(text_box);
-        let (font_ascent, font_size) = {
+        let need_spans = decoration_lines.is_some() || self.inside_text_box;
+        let (font_ascent, font_size) = if need_spans {
             let style = self.style(text_box);
             (
                 style.font().first_available_font_metrics().ascent,
                 style.font_size().to_double() as f32,
             )
+        } else {
+            (0.0, 0.0)
         };
         let mut spans: Vec<SvgTextRunSpan> = Vec::new();
         // Text that follows a child element paints after that child, so it's kept apart from the text before it.
@@ -2590,13 +2816,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                     x: self.current_text_position.x,
                     y: self.current_text_position.y + dominant_baseline_offset,
                 };
-                let mut shaped = self.shape_svg_text_run(
-                    child,
-                    &text,
-                    text_offset,
-                    self.svg_text_length_adjustment_for(text_box).spacing(),
-                );
-                self.position_svg_text_run(child, &mut shaped);
+                let mut shaped = self.shape_svg_text_run(child, &text, text_offset, text_length_spacing);
+                self.position_svg_text_run(child, &mut shaped, text_length_spacing);
                 if let Some(first) = shaped.character_cells.first() {
                     text_offset.x = first.x;
                     text_offset.y = first.alignment_point_y + dominant_baseline_offset;
@@ -2616,54 +2837,58 @@ impl<'pass> SvgFormattingContext<'pass> {
                 }
 
                 // NB: Decoration spans follow character cells so gaps, overlaps, and baseline changes stay separate.
-                let mut run_spans: Vec<SvgTextRunSpan> = if text.is_empty() {
-                    Vec::new()
-                } else if self.svg_text_length_adjustment_for(text_box).spacing() != 0.0
-                    || self
-                        .svg_text_run_positions(child)
-                        .iter()
-                        .skip(1)
-                        .any(|position| position.is_specified())
-                {
-                    shaped
-                        .character_cells
-                        .iter()
-                        .filter(|cell| cell.starts_typographic_character)
-                        .map(|cell| SvgTextRunSpan {
-                            x: cell.x / glyph_scale,
-                            advance: cell.width / glyph_scale,
-                            baseline: cell.alignment_point_y + dominant_baseline_offset,
+                let mut lines_over = None;
+                if need_spans {
+                    let mut run_spans: Vec<SvgTextRunSpan> = if text.is_empty() {
+                        Vec::new()
+                    } else if text_length_spacing != 0.0
+                        || self
+                            .svg_text_run_positions(child)
+                            .iter()
+                            .skip(1)
+                            .any(|position| position.is_specified())
+                    {
+                        shaped
+                            .character_cells
+                            .iter()
+                            .filter(|cell| cell.starts_typographic_character)
+                            .map(|cell| SvgTextRunSpan {
+                                x: cell.x / glyph_scale,
+                                advance: cell.width / glyph_scale,
+                                baseline: cell.alignment_point_y + dominant_baseline_offset,
+                                ascent: font_ascent,
+                                font_size,
+                            })
+                            .collect()
+                    } else {
+                        vec![SvgTextRunSpan {
+                            x: text_offset.x,
+                            advance: shaped.advance,
+                            baseline: text_offset.y,
                             ascent: font_ascent,
                             font_size,
-                        })
-                        .collect()
-                } else {
-                    vec![SvgTextRunSpan {
-                        x: text_offset.x,
-                        advance: shaped.advance,
-                        baseline: text_offset.y,
-                        ascent: font_ascent,
-                        font_size,
-                    }]
-                };
-                run_spans.dedup_by(|span, previous| {
-                    if previous.baseline == span.baseline && previous.x + previous.advance == span.x {
-                        previous.advance += span.advance;
-                        true
-                    } else {
-                        false
+                        }]
+                    };
+                    run_spans.dedup_by(|span, previous| {
+                        if previous.baseline == span.baseline && previous.x + previous.advance == span.x {
+                            previous.advance += span.advance;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if let Some(lines) = &decoration_lines {
+                        let mut lines_under = libgfx_rust::path::Path::new();
+                        let mut over = libgfx_rust::path::Path::new();
+                        for span in &run_spans {
+                            lines.add_lines_under_text(span, &mut lines_under);
+                            lines.add_lines_over_text(span, &mut over);
+                        }
+                        paint_parts.add_decoration_lines(after_child, lines_under);
+                        lines_over = Some(over);
                     }
-                });
-                let mut lines_under = libgfx_rust::path::Path::new();
-                let mut lines_over = libgfx_rust::path::Path::new();
-                if let Some(lines) = &decoration_lines {
-                    for span in &run_spans {
-                        lines.add_lines_under_text(span, &mut lines_under);
-                        lines.add_lines_over_text(span, &mut lines_over);
-                    }
+                    spans.extend(run_spans);
                 }
-                spans.extend(run_spans);
-                paint_parts.add_decoration_lines(after_child, lines_under);
                 for run in shaped.runs {
                     if !run.font.is_emoji_font() {
                         paint_parts.add_glyphs(after_child, vec![run]);
@@ -2697,7 +2922,9 @@ impl<'pass> SvgFormattingContext<'pass> {
                         },
                     );
                 }
-                paint_parts.add_decoration_lines(after_child, lines_over);
+                if let Some(lines_over) = lines_over {
+                    paint_parts.add_decoration_lines(after_child, lines_over);
+                }
 
                 contents.glyph_cells.unite(shaped.glyph_cells);
                 let first_own_cell = contents.character_cells.len();
@@ -2782,7 +3009,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             span.x *= glyph_scale / parent_scale;
             span.advance *= glyph_scale / parent_scale;
         }
-        if attributes.is_text_element {
+        if is_text_element {
             self.text_length_adjustments.borrow_mut().clear();
             self.text_chunks.borrow_mut().clear();
             self.first_text_runs.borrow_mut().clear();
@@ -3216,11 +3443,11 @@ impl<'pass> SvgFormattingContext<'pass> {
         Some(path.copy_transformed(transform.values))
     }
 
-    fn svg_attributes(&self, node: Node) -> FfiSvgAttributeFacts {
+    fn svg_attributes(&self, node: Node) -> &FfiSvgAttributeFacts {
         self.run.pass.arena().svg_attribute_facts(node)
     }
 
-    fn svg_facts(&self, node: Node) -> SvgElementFacts {
+    fn svg_facts_with(&self, node: Node, attributes: &FfiSvgAttributeFacts) -> SvgElementFacts {
         let data = self.run.pass.node_data(node);
         let mut facts = SvgElementFacts {
             is_document_element: node_facts::has_flag(data, NodeFlag::IsDocumentElement),
@@ -3229,8 +3456,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         };
         // Everything below is a graphics element's business; a <mask> or <clipPath> box answers
         // the defaults.
-        if self.svg_attributes(node).is_graphics_element {
-            facts.additional_element_transform = self.svg_additional_element_transform(node);
+        if attributes.is_graphics_element {
+            facts.additional_element_transform = self.svg_additional_element_transform_with(node, attributes);
             facts.visible_stroke_width = self.visible_stroke_width(node);
         }
         facts
@@ -3240,8 +3467,12 @@ impl<'pass> SvgFormattingContext<'pass> {
     // The x and y properties define an additional transformation (translate(x,y), where x and y
     // represent the computed value of the corresponding property) to be applied to the 'use'
     // element, after any transformations specified with other properties.
-    fn svg_additional_element_transform(&self, node: Node) -> FfiAffineTransform {
-        if !self.svg_attributes(node).is_use_element {
+    fn svg_additional_element_transform_with(
+        &self,
+        node: Node,
+        attributes: &FfiSvgAttributeFacts,
+    ) -> FfiAffineTransform {
+        if !attributes.is_use_element {
             return FfiAffineTransform::default();
         }
         let style = self.style(node);
@@ -3298,7 +3529,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.update_svg_payload_of(node, |svg| svg.facts.viewport_transform = Some(transform));
     }
 
-    fn commit_svg_element_facts(&self, node: Node, facts: SvgElementFacts, attributes: FfiSvgAttributeFacts) {
+    fn commit_svg_element_facts(&self, node: Node, facts: SvgElementFacts, attributes: &FfiSvgAttributeFacts) {
         self.update_svg_payload_of(node, |svg| {
             let svg = &mut svg.facts;
             svg.additional_element_transform =
@@ -3374,11 +3605,12 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// The transform of `node` about its transform origin, against the boxes of `geometry`, with a <use> element's
     /// translation.
     fn local_transform(&self, node: Node, geometry: &SvgGeometry) -> FfiAffineTransform {
-        if !self.svg_attributes(node).is_graphics_element {
+        let attributes = self.svg_attributes(node);
+        if !attributes.is_graphics_element {
             return FfiAffineTransform::default();
         }
         let style = self.style(node);
-        let additional_transform = self.svg_additional_element_transform(node);
+        let additional_transform = self.svg_additional_element_transform_with(node, attributes);
         if style.transform().resolved_transforms.length == 0 && additional_transform.is_identity() {
             return FfiAffineTransform::default();
         }
@@ -3482,9 +3714,26 @@ impl<'pass> SvgFormattingContext<'pass> {
         // NOTE: SVG doesn't have a "formatting context" in the spec, but this is the most
         //       obvious way to drive SVG layout in our engine at the moment.
         let kind = self.node_kind(self.run.box_);
-        let facts = self.svg_facts(self.run.box_);
-        let attributes = self.svg_attributes(self.run.box_);
-        self.commit_svg_element_facts(self.run.box_, facts, attributes);
+        let (
+            facts,
+            is_fit_to_view_box,
+            has_active_view_box,
+            raw_active_view_box,
+            preserve_aspect_ratio_align,
+            preserve_aspect_ratio_meet_or_slice,
+        ) = {
+            let attributes = self.svg_attributes(self.run.box_);
+            let facts = self.svg_facts_with(self.run.box_, attributes);
+            self.commit_svg_element_facts(self.run.box_, facts, attributes);
+            (
+                facts,
+                attributes.is_fit_to_view_box,
+                attributes.has_active_view_box,
+                attributes.active_view_box,
+                attributes.preserve_aspect_ratio_align,
+                attributes.preserve_aspect_ratio_meet_or_slice,
+            )
+        };
 
         // NOTE: We consider all SVG root elements to have definite size in both axes.
         //       I'm not sure if this is good or bad, but our viewport transform logic depends on it.
@@ -3509,10 +3758,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         // pattern's used size is its tile size, so the same computation maps its viewBox onto the
         // tile.
         let box_establishes_viewport = kind == NodeKind::SVGSVGBox
-            || (kind_is_svg_graphics_box(kind) && attributes.is_fit_to_view_box)
-            || (kind == NodeKind::SVGPatternBox && attributes.is_fit_to_view_box);
+            || (kind_is_svg_graphics_box(kind) && is_fit_to_view_box)
+            || (kind == NodeKind::SVGPatternBox && is_fit_to_view_box);
 
-        let mut active_view_box = attributes.has_active_view_box.then_some(attributes.active_view_box);
+        let mut active_view_box = has_active_view_box.then_some(raw_active_view_box);
         // https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute
         if let Some(view_box) = active_view_box {
             if view_box.width < 0.0 || view_box.height < 0.0 {
@@ -3533,8 +3782,8 @@ impl<'pass> SvgFormattingContext<'pass> {
             // The initial value for preserveAspectRatio is xMidYMid meet.
             let viewport_transform = active_view_box.map_or_else(FfiAffineTransform::default, |view_box| {
                 view_box_transform(
-                    attributes.preserve_aspect_ratio_align,
-                    attributes.preserve_aspect_ratio_meet_or_slice,
+                    preserve_aspect_ratio_align,
+                    preserve_aspect_ratio_meet_or_slice,
                     view_box,
                     (cells.content_inline_size(), cells.content_block_size()),
                 )
@@ -3721,41 +3970,61 @@ impl<'pass> SvgFormattingContext<'pass> {
         if let Some(geometry) = self.place_unchanged_committed_shape(graphics_box, &graphics_box_cells) {
             return geometry;
         }
-        let facts = self.svg_facts(graphics_box);
-        let attributes = self.svg_attributes(graphics_box);
-        self.commit_svg_element_facts(graphics_box, facts, attributes);
         let kind = self.node_kind(graphics_box);
-        // NB: A mask box laid out as a group is the mask of the resource box it is a child of, whose object bounding
-        //     box is the viewport that box gives its content.
-        if kind == NodeKind::SVGMaskBox {
-            self.commit_resource_facts_for_target(graphics_box, &attributes, self.viewport_user_rect);
-        }
+        let facts = {
+            let attributes = self.svg_attributes(graphics_box);
+            let facts = self.svg_facts_with(graphics_box, attributes);
+            self.commit_svg_element_facts(graphics_box, facts, attributes);
+            // NB: A mask box laid out as a group is the mask of the resource box it is a child of, whose object bounding
+            //     box is the viewport that box gives its content.
+            if kind == NodeKind::SVGMaskBox {
+                self.commit_resource_facts_for_target(graphics_box, attributes, self.viewport_user_rect);
+            }
+            facts
+        };
 
         // https://svgwg.org/svg2-draft/struct.html#GroupsOverview
         // container element
         // An element which can have graphics elements and other container elements as child elements.
         // Specifically: ‘a’, ‘clipPath’, ‘defs’, ‘g’, ‘marker’, ‘mask’, ‘pattern’, ‘svg’, ‘switch’ and ‘symbol’.
-        let geometry = if kind_is_svg_container_element(kind) {
+        let (geometry, may_have_resource_children) = if kind_is_svg_container_element(kind) {
             // https://svgwg.org/svg2-draft/struct.html#Groups
             // 5.2. Grouping: the ‘g’ element
             // The ‘g’ element is a container element for grouping together related graphics elements.
             self.layout_container_element(run, graphics_box, &graphics_box_cells)
         } else if kind == NodeKind::SVGImageBox {
-            self.layout_image_element(graphics_box, &graphics_box_cells)
+            (
+                self.layout_image_element(graphics_box, &graphics_box_cells),
+                !self.first_child(graphics_box).is_invalid(),
+            )
         } else {
             // Assume this is a path-like element.
-            self.layout_path_like_element(run, graphics_box, &graphics_box_cells, facts)
+            (
+                self.layout_path_like_element(run, graphics_box, &graphics_box_cells, facts),
+                !self.first_child(graphics_box).is_invalid(),
+            )
         };
 
-        if let Some(mask) = self.first_child_of_kind(graphics_box, NodeKind::SVGMaskBox) {
-            self.layout_mask_or_clip(run, mask, geometry.object_bounding_box);
-        }
-        if let Some(clip) = self.first_child_of_kind(graphics_box, NodeKind::SVGClipBox) {
-            self.layout_mask_or_clip(run, clip, geometry.object_bounding_box);
-        }
-        for child in self.run.pass.children(graphics_box) {
-            if self.node_kind(child) == NodeKind::SVGPatternBox {
-                self.layout_mask_or_clip(run, child, geometry.object_bounding_box);
+        if may_have_resource_children {
+            let mut first_mask = None;
+            let mut first_clip = None;
+            let mut patterns: smallvec::SmallVec<[Node; 4]> = smallvec::SmallVec::new();
+            for child in self.run.pass.children(graphics_box) {
+                match self.node_kind(child) {
+                    NodeKind::SVGMaskBox if first_mask.is_none() => first_mask = Some(child),
+                    NodeKind::SVGClipBox if first_clip.is_none() => first_clip = Some(child),
+                    NodeKind::SVGPatternBox => patterns.push(child),
+                    _ => {}
+                }
+            }
+            if let Some(mask) = first_mask {
+                self.layout_mask_or_clip(run, mask, geometry.object_bounding_box);
+            }
+            if let Some(clip) = first_clip {
+                self.layout_mask_or_clip(run, clip, geometry.object_bounding_box);
+            }
+            for pattern in patterns {
+                self.layout_mask_or_clip(run, pattern, geometry.object_bounding_box);
             }
         }
         geometry
@@ -4013,45 +4282,47 @@ impl<'pass> SvgFormattingContext<'pass> {
         target_bounding_box: FloatRect,
     ) {
         let kind = self.node_kind(resource);
-        let facts = self.svg_facts(resource);
-        let attributes = self.svg_attributes(resource);
         assert!(node_facts::kind_is_svg_resource_box(kind));
         // FIXME: Somehow limit <clipPath> contents to: shape elements, <text>, and <use>.
         let resource_cells = self.cells_of_svg_box(resource);
-        self.commit_svg_element_facts(resource, facts, attributes);
-        self.commit_resource_facts_for_target(resource, &attributes, target_bounding_box);
+        let (width, height) = {
+            let attributes = self.svg_attributes(resource);
+            let facts = self.svg_facts_with(resource, attributes);
+            self.commit_svg_element_facts(resource, facts, attributes);
+            self.commit_resource_facts_for_target(resource, attributes, target_bounding_box);
 
-        let (width, height) = if kind == NodeKind::SVGPatternBox && attributes.has_active_view_box {
-            if attributes.pattern_units == SVG_UNITS_USER_SPACE_ON_USE {
-                (
-                    CssPixels::nearest_value_for_f32(
-                        attributes
-                            .pattern_width
-                            .resolve_relative_to(self.viewport_width.to_float()),
-                    ),
-                    CssPixels::nearest_value_for_f32(
-                        attributes
-                            .pattern_height
-                            .resolve_relative_to(self.viewport_height.to_float()),
-                    ),
-                )
-            } else {
+            if kind == NodeKind::SVGPatternBox && attributes.has_active_view_box {
+                if attributes.pattern_units == SVG_UNITS_USER_SPACE_ON_USE {
+                    (
+                        CssPixels::nearest_value_for_f32(
+                            attributes
+                                .pattern_width
+                                .resolve_relative_to(self.viewport_width.to_float()),
+                        ),
+                        CssPixels::nearest_value_for_f32(
+                            attributes
+                                .pattern_height
+                                .resolve_relative_to(self.viewport_height.to_float()),
+                        ),
+                    )
+                } else {
+                    let parent = self.parent(resource);
+                    assert!(!parent.is_invalid());
+                    (
+                        CssPixels::nearest_value_for_f32(attributes.pattern_width.value * target_bounding_box.width),
+                        CssPixels::nearest_value_for_f32(attributes.pattern_height.value * target_bounding_box.height),
+                    )
+                }
+            } else if attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX {
                 let parent = self.parent(resource);
                 assert!(!parent.is_invalid());
                 (
-                    CssPixels::nearest_value_for_f32(attributes.pattern_width.value * target_bounding_box.width),
-                    CssPixels::nearest_value_for_f32(attributes.pattern_height.value * target_bounding_box.height),
+                    CssPixels::nearest_value_for_f32(target_bounding_box.width),
+                    CssPixels::nearest_value_for_f32(target_bounding_box.height),
                 )
+            } else {
+                (self.viewport_width, self.viewport_height)
             }
-        } else if attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX {
-            let parent = self.parent(resource);
-            assert!(!parent.is_invalid());
-            (
-                CssPixels::nearest_value_for_f32(target_bounding_box.width),
-                CssPixels::nearest_value_for_f32(target_bounding_box.height),
-            )
-        } else {
-            (self.viewport_width, self.viewport_height)
         };
         Self::set_definite_content_size(&resource_cells, width, height);
         // Resource content lays out in its own user space; objectBoundingBox content scaling is a
@@ -4077,14 +4348,17 @@ impl<'pass> SvgFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         container: Node,
         cells: &Cell<used_values::RootInputCells>,
-    ) -> SvgGeometry {
+    ) -> (SvgGeometry, bool) {
         let mut object_bounding_box = None;
         let mut stroke_bounding_box = None;
+        let mut has_resource_child = false;
         for child in self.run.pass.children(container) {
             // Masks/clips/patterns do not change the bounding box of their parents.
-            if NodeFacts::new(&self.run.pass, child).is_box()
-                && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
-            {
+            if node_facts::kind_is_svg_resource_box(self.node_kind(child)) {
+                has_resource_child = true;
+                continue;
+            }
+            if NodeFacts::new(&self.run.pass, child).is_box() {
                 let child_geometry = self
                     .layout_svg_element(run, child)
                     .expect("a box below an SVG container element is laid out");
@@ -4102,11 +4376,14 @@ impl<'pass> SvgFormattingContext<'pass> {
                 ));
             }
         }
-        self.set_content_rect(
-            container,
-            cells,
-            float_rect_to_css_pixels(stroke_bounding_box.unwrap_or_default()),
-            object_bounding_box.unwrap_or_default(),
+        (
+            self.set_content_rect(
+                container,
+                cells,
+                float_rect_to_css_pixels(stroke_bounding_box.unwrap_or_default()),
+                object_bounding_box.unwrap_or_default(),
+            ),
+            has_resource_child,
         )
     }
 }

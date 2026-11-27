@@ -106,9 +106,14 @@ static struct MimallocConfiguration {
 #        ifdef AK_OS_MACOS
         // Keep mimalloc allocations separate from IOAccelerator, which uses mimalloc's default tag of 100.
         mi_option_set_default(mi_option_os_tag, VM_MEMORY_APPLICATION_SPECIFIC_1);
-#        else
-        // mimalloc otherwise purges with MADV_DONTNEED, and every later reuse of a purged page takes a page fault.
+#        endif
+        // mimalloc otherwise purges with MADV_DONTNEED / mprotect(PROT_NONE), forcing re-commit traps and page
+        // faults on reuse.
         mi_option_set_default(mi_option_purge_decommits, 0);
+#        ifdef AK_OS_MACOS
+        // Delay automatic background purging during active workloads; idle cleanup still purges explicitly via
+        // ak_kmalloc_collect().
+        mi_option_set_default(mi_option_purge_delay, 2000);
 #        endif
     }
 } s_mimalloc_configuration;

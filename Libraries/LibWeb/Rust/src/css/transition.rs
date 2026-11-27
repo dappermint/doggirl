@@ -2323,6 +2323,7 @@ mod tests {
                 running,
                 host_seen_before: HostTransitionsSeen::default(),
                 after_overlay: None,
+                needs_no_ancestor_animations: false,
             };
             let (effects, runs) = hover_transition_effects(&decision).unwrap();
             let published_timing = effects[0].timing.as_ref().unwrap();
