@@ -2939,9 +2939,13 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
 
 void Application::initialize_page_options()
 {
-    m_user_agent_string = MUST(String::from_utf8(m_web_content_options.user_agent_preset.has_value()
-            ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
-            : Web::default_user_agent));
+    if (m_web_content_options.user_agent_preset.has_value()) {
+        m_user_agent_string = MUST(String::from_utf8(*WebView::user_agents.get(*m_web_content_options.user_agent_preset)));
+        m_navigator_compatibility_mode = navigator_compatibility_mode_for_user_agent_preset(*m_web_content_options.user_agent_preset);
+    } else {
+        m_user_agent_string = MUST(String::from_utf8(Web::default_user_agent));
+        m_navigator_compatibility_mode = Web::default_navigator_compatibility_mode;
+    }
     m_scripting_enabled = m_browser_options.disable_scripting == DisableScripting::No;
     m_blocks_pop_ups = m_browser_options.allow_popups == AllowPopups::No;
     update_website_color_scheme();

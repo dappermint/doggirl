@@ -29,6 +29,15 @@ Optional<StringView> normalize_user_agent_name(StringView name)
     return {};
 }
 
+Web::NavigatorCompatibilityMode navigator_compatibility_mode_for_user_agent_preset(StringView name)
+{
+    if (name.starts_with("Safari "sv, CaseSensitivity::CaseInsensitive))
+        return Web::NavigatorCompatibilityMode::WebKit;
+    if (name.starts_with("Firefox "sv, CaseSensitivity::CaseInsensitive))
+        return Web::NavigatorCompatibilityMode::Gecko;
+    return Web::NavigatorCompatibilityMode::Chrome;
+}
+
 StringView navigator_compatibility_mode_to_string(Web::NavigatorCompatibilityMode mode)
 {
     switch (mode) {
