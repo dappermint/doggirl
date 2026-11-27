@@ -133,8 +133,23 @@ pub struct TimeZoneTransitionOptions {
     pub transition_rule: TransitionRule,
 }
 
-fn code_units_of(time_zone: Utf16View<'_>) -> Vec<u16> {
-    time_zone.code_units().collect()
+#[inline]
+fn with_code_units<R>(time_zone: Utf16View<'_>, callback: impl FnOnce(&[u16]) -> R) -> R {
+    match time_zone {
+        Utf16View::Utf16(units) => callback(units),
+        Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+            if bytes.len() <= 64 {
+                let mut stack = [0u16; 64];
+                for (dst, &byte) in stack.iter_mut().zip(bytes) {
+                    *dst = u16::from(byte);
+                }
+                callback(&stack[..bytes.len()])
+            } else {
+                let heap: Vec<u16> = bytes.iter().map(|&byte| u16::from(byte)).collect();
+                callback(&heap)
+            }
+        }
+    }
 }
 
 /// Unicode::current_time_zone: the host's time zone, which LibUnicode caches.
@@ -147,9 +162,10 @@ pub fn current_time_zone() -> Utf16String {
 /// Unicode::set_current_time_zone: makes `time_zone` ICU's default time zone and the one current_time_zone() returns.
 /// Returns false if LibUnicode does not know the time zone.
 pub fn set_current_time_zone(time_zone: Utf16View<'_>) -> bool {
-    let time_zone = code_units_of(time_zone);
-    // SAFETY: The time zone buffer is valid for its length.
-    unsafe { unicode_set_current_time_zone(time_zone.as_ptr(), time_zone.len()) }
+    with_code_units(time_zone, |units| {
+        // SAFETY: The time zone buffer is valid for its length.
+        unsafe { unicode_set_current_time_zone(units.as_ptr(), units.len()) }
+    })
 }
 
 unsafe extern "C" fn append_time_zone(context: *mut c_void, time_zone: *const u16, length: usize) {
@@ -172,10 +188,11 @@ pub fn available_time_zones() -> &'static [Vec<u16>] {
 
 /// Unicode::resolve_primary_time_zone: the IANA zone that `time_zone` resolves to.
 pub fn resolve_primary_time_zone(time_zone: Utf16View<'_>) -> Option<Utf16String> {
-    let time_zone = code_units_of(time_zone);
-    let (resolved, primary) = collect_text(|output| {
-        // SAFETY: The time zone buffer is valid for its length, and the output writes into a Vec.
-        unsafe { unicode_resolve_primary_time_zone(time_zone.as_ptr(), time_zone.len(), output) }
+    let (resolved, primary) = with_code_units(time_zone, |units| {
+        collect_text(|output| {
+            // SAFETY: The time zone buffer is valid for its length, and the output writes into a Vec.
+            unsafe { unicode_resolve_primary_time_zone(units.as_ptr(), units.len(), output) }
+        })
     });
     resolved.then(|| Utf16String::from_utf16(&primary))
 }
@@ -191,21 +208,22 @@ pub fn time_zone_offset(
     time: UnixDateTime,
     time_type: TimeZoneTime,
 ) -> Option<TimeZoneOffset> {
-    let time_zone = code_units_of(time_zone);
     let mut offset_nanoseconds = 0;
     let mut in_dst = false;
-    // SAFETY: The time zone buffer is valid for its length, and the offset and DST flag are written into locals.
-    let found = unsafe {
-        unicode_time_zone_offset(
-            time_zone.as_ptr(),
-            time_zone.len(),
-            time.seconds,
-            time.nanoseconds,
-            matches!(time_type, TimeZoneTime::Local),
-            &raw mut offset_nanoseconds,
-            &raw mut in_dst,
-        )
-    };
+    let found = with_code_units(time_zone, |units| {
+        // SAFETY: The time zone buffer is valid for its length, and the offset and DST flag are written into locals.
+        unsafe {
+            unicode_time_zone_offset(
+                units.as_ptr(),
+                units.len(),
+                time.seconds,
+                time.nanoseconds,
+                matches!(time_type, TimeZoneTime::Local),
+                &raw mut offset_nanoseconds,
+                &raw mut in_dst,
+            )
+        }
+    });
     found.then(|| TimeZoneOffset {
         offset_nanoseconds,
         in_dst: InDST::from_bool(in_dst),
@@ -217,22 +235,23 @@ pub fn time_zone_offset(
 pub fn disambiguated_time_zone_offsets(time_zone: Utf16View<'_>, time: UnixDateTime) -> Vec<TimeZoneOffset> {
     const CAPACITY: usize = 2;
 
-    let time_zone = code_units_of(time_zone);
     let mut offset_nanoseconds = [0_i64; CAPACITY];
     let mut in_dst = [false; CAPACITY];
-    // SAFETY: The time zone buffer is valid for its length, and the offsets and DST flags are written into arrays of
-    //         CAPACITY elements, which LibUnicode verifies it does not exceed.
-    let count = unsafe {
-        unicode_disambiguated_time_zone_offsets(
-            time_zone.as_ptr(),
-            time_zone.len(),
-            time.seconds,
-            time.nanoseconds,
-            offset_nanoseconds.as_mut_ptr(),
-            in_dst.as_mut_ptr(),
-            CAPACITY,
-        )
-    };
+    let count = with_code_units(time_zone, |units| {
+        // SAFETY: The time zone buffer is valid for its length, and the offsets and DST flags are written into arrays of
+        //         CAPACITY elements, which LibUnicode verifies it does not exceed.
+        unsafe {
+            unicode_disambiguated_time_zone_offsets(
+                units.as_ptr(),
+                units.len(),
+                time.seconds,
+                time.nanoseconds,
+                offset_nanoseconds.as_mut_ptr(),
+                in_dst.as_mut_ptr(),
+                CAPACITY,
+            )
+        }
+    });
     (0..count)
         .map(|index| TimeZoneOffset {
             offset_nanoseconds: offset_nanoseconds[index],
@@ -248,20 +267,21 @@ pub fn get_time_zone_transition(
     time: UnixDateTime,
     options: TimeZoneTransitionOptions,
 ) -> Option<i64> {
-    let time_zone = code_units_of(time_zone);
     let mut transition_milliseconds = 0;
-    // SAFETY: The time zone buffer is valid for its length, and the transition is written into a local.
-    let found = unsafe {
-        unicode_time_zone_transition(
-            time_zone.as_ptr(),
-            time_zone.len(),
-            time.seconds,
-            time.nanoseconds,
-            options.direction as u8,
-            options.include_given_time == IncludeGivenTime::Yes,
-            options.transition_rule as u8,
-            &raw mut transition_milliseconds,
-        )
-    };
+    let found = with_code_units(time_zone, |units| {
+        // SAFETY: The time zone buffer is valid for its length, and the transition is written into a local.
+        unsafe {
+            unicode_time_zone_transition(
+                units.as_ptr(),
+                units.len(),
+                time.seconds,
+                time.nanoseconds,
+                options.direction as u8,
+                options.include_given_time == IncludeGivenTime::Yes,
+                options.transition_rule as u8,
+                &raw mut transition_milliseconds,
+            )
+        }
+    });
     found.then_some(transition_milliseconds)
 }

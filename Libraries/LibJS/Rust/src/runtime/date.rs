@@ -36,7 +36,8 @@ use crate::runtime::temporal::iso8601::{SubMinutePrecision, TimeZoneOffset, pars
 use crate::runtime::temporal::time_zone::parse_time_zone_identifier;
 use crate::runtime::value_conversions::to_integer_or_infinity;
 use crate::unicode::time_zone::{
-    self as unicode_time_zone, TimeZoneOffset as UnicodeTimeZoneOffset, TimeZoneTime, UnixDateTime,
+    self as unicode_time_zone, IncludeGivenTime, TimeZoneOffset as UnicodeTimeZoneOffset, TimeZoneTime,
+    TimeZoneTransitionOptions, TransitionDirection, TransitionRule, UnixDateTime,
 };
 use crate::utf16::Utf16View;
 
@@ -578,14 +579,111 @@ pub fn clear_system_time_zone_cache() {
     SYSTEM_TIME_ZONE_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Conservative UTC epoch second bounds for cached transition intervals (wider than ECMAScript's valid time range
+/// `±8.64e12 s`, well inside exact `f64` millisecond range).
+const TIME_ZONE_CACHE_MIN_SEC: i64 = -9_000_000_000_000;
+const TIME_ZONE_CACHE_MAX_SEC: i64 = 9_000_000_000_000;
+/// 48-hour safety margin from transition boundaries before answering `UTC(local_time)` from a UTC offset interval.
+const TIME_ZONE_LOCAL_MARGIN_SEC: i64 = 172_800;
+const TIME_ZONE_INTERVAL_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy)]
+struct TimeZoneInterval {
+    /// Inclusive UTC start second strictly after the preceding UTC-offset transition.
+    start_sec: i64,
+    /// Exclusive UTC end second strictly before the following UTC-offset transition.
+    end_sec: i64,
+    offset_nanoseconds: i64,
+}
+
 /// What LocalTime and UTC need to know about the system time zone, kept per thread so that they take neither the lock
 /// of the shared identifier cache nor parse the identifier again on every call.
 struct SystemTimeZone {
     generation: u64,
     identifier: Utf16String,
     offset_minutes: Option<i64>,
-    /// The epoch seconds and offset in nanoseconds of the most recent named time zone offset lookup.
-    last_offset: Option<(i64, i64)>,
+    /// MRU cache of UTC transition-free offset intervals for `identifier`.
+    intervals: [TimeZoneInterval; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
+    interval_count: usize,
+}
+
+impl SystemTimeZone {
+    fn lookup_utc_offset(&mut self, seconds: i64) -> Option<i64> {
+        for i in 0..self.interval_count {
+            let entry = self.intervals[i];
+            if seconds >= entry.start_sec && seconds < entry.end_sec {
+                if i != 0 {
+                    self.intervals.copy_within(0..i, 1);
+                    self.intervals[0] = entry;
+                }
+                return Some(entry.offset_nanoseconds);
+            }
+        }
+        None
+    }
+
+    fn lookup_local_offset(&mut self, local_seconds: i64) -> Option<i64> {
+        for i in 0..self.interval_count {
+            let entry = self.intervals[i];
+            let candidate_utc_sec = local_seconds.saturating_sub(entry.offset_nanoseconds / 1_000_000_000);
+            let safe_start = entry.start_sec.saturating_add(TIME_ZONE_LOCAL_MARGIN_SEC);
+            let safe_end = entry.end_sec.saturating_sub(TIME_ZONE_LOCAL_MARGIN_SEC);
+            if candidate_utc_sec >= safe_start && candidate_utc_sec < safe_end {
+                if i != 0 {
+                    self.intervals.copy_within(0..i, 1);
+                    self.intervals[0] = entry;
+                }
+                return Some(entry.offset_nanoseconds);
+            }
+        }
+        None
+    }
+
+    fn cache_interval_for_utc(&mut self, seconds: i64, offset_nanoseconds: i64) {
+        if !(TIME_ZONE_CACHE_MIN_SEC..TIME_ZONE_CACHE_MAX_SEC).contains(&seconds) {
+            return;
+        }
+        let view = Utf16View::of_string(&self.identifier);
+        let query_time = UnixDateTime::from_seconds_since_epoch(seconds);
+        let prev_ms = unicode_time_zone::get_time_zone_transition(
+            view,
+            query_time,
+            TimeZoneTransitionOptions {
+                direction: TransitionDirection::Previous,
+                include_given_time: IncludeGivenTime::Yes,
+                transition_rule: TransitionRule::TransitionWhereUTCOffsetChanges,
+            },
+        );
+        let next_ms = unicode_time_zone::get_time_zone_transition(
+            view,
+            query_time,
+            TimeZoneTransitionOptions {
+                direction: TransitionDirection::Next,
+                include_given_time: IncludeGivenTime::No,
+                transition_rule: TransitionRule::TransitionWhereUTCOffsetChanges,
+            },
+        );
+        let start_sec = prev_ms
+            .map_or(TIME_ZONE_CACHE_MIN_SEC, |ms| ms.div_euclid(1_000).saturating_add(1))
+            .max(TIME_ZONE_CACHE_MIN_SEC);
+        let end_sec = next_ms
+            .map_or(TIME_ZONE_CACHE_MAX_SEC, |ms| ms.div_euclid(1_000))
+            .min(TIME_ZONE_CACHE_MAX_SEC);
+        if seconds < start_sec || seconds >= end_sec {
+            return;
+        }
+        let entry = TimeZoneInterval {
+            start_sec,
+            end_sec,
+            offset_nanoseconds,
+        };
+        let keep = self.interval_count.min(TIME_ZONE_INTERVAL_CACHE_CAPACITY - 1);
+        if keep > 0 {
+            self.intervals.copy_within(0..keep, 1);
+        }
+        self.intervals[0] = entry;
+        self.interval_count = (self.interval_count + 1).min(TIME_ZONE_INTERVAL_CACHE_CAPACITY);
+    }
 }
 
 /// Bumped whenever the system time zone cache is cleared, which makes every thread's SystemTimeZone stale.
@@ -608,7 +706,12 @@ fn with_system_time_zone<R>(callback: impl FnOnce(&mut SystemTimeZone) -> R) -> 
                 generation,
                 identifier,
                 offset_minutes,
-                last_offset: None,
+                intervals: [TimeZoneInterval {
+                    start_sec: 0,
+                    end_sec: 0,
+                    offset_nanoseconds: 0,
+                }; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
+                interval_count: 0,
             });
         }
         callback(system_time_zone.as_mut().expect("the system time zone was just cached"))
@@ -631,16 +734,14 @@ pub fn local_time(time: f64) -> f64 {
 
         // 4. Else,
         //     a. Let offsetNs be GetNamedTimeZoneOffsetNanoseconds(systemTimeZoneIdentifier, ℤ(ℝ(t) × 10^6)).
-        // OPTIMIZATION: Code tends to call several getters on the same Date in a row, so remember the offset of the
-        //               last second we looked up instead of asking the time zone database again.
+        // OPTIMIZATION: Cache transition-free UTC offset intervals so repeated Date lookups across days and years
+        //               skip ICU time zone queries completely.
         let seconds = clip_double_to_sane_time(time / 1000.0);
-        if let Some((cached_seconds, cached_offset_nanoseconds)) = system_time_zone.last_offset
-            && cached_seconds == seconds
-        {
+        if let Some(cached_offset_nanoseconds) = system_time_zone.lookup_utc_offset(seconds) {
             return cached_offset_nanoseconds as f64;
         }
         let offset = get_named_time_zone_offset_milliseconds(Utf16View::of_string(&system_time_zone.identifier), time);
-        system_time_zone.last_offset = Some((seconds, offset.offset_nanoseconds));
+        system_time_zone.cache_interval_for_utc(seconds, offset.offset_nanoseconds);
         offset.offset_nanoseconds as f64
     });
 
@@ -666,26 +767,42 @@ pub fn utc_time(time: f64) -> f64 {
     // 2. Let systemTimeZoneIdentifier be SystemTimeZoneIdentifier().
     // 3. Let parseResult be ! ParseTimeZoneIdentifier(systemTimeZoneIdentifier).
     // NB: Both come from the per-thread system time zone cache.
-    let (system_time_zone_identifier, offset_minutes) = with_system_time_zone(|system_time_zone| {
-        (system_time_zone.identifier.clone(), system_time_zone.offset_minutes)
-    });
-    let system_time_zone_identifier = Utf16View::of_string(&system_time_zone_identifier);
+    let Some(offset_nanoseconds) = with_system_time_zone(|system_time_zone| {
+        // 4. If parseResult.[[OffsetMinutes]] is not EMPTY, then
+        if let Some(offset_minutes) = system_time_zone.offset_minutes {
+            // a. Let offsetNs be parseResult.[[OffsetMinutes]] × (60 × 10**9).
+            return Some(offset_minutes as f64 * 60_000_000_000.0);
+        }
 
-    // 4. If parseResult.[[OffsetMinutes]] is not EMPTY, then
-    let offset_nanoseconds = if let Some(offset_minutes) = offset_minutes {
-        // a. Let offsetNs be parseResult.[[OffsetMinutes]] × (60 × 10**9).
-        offset_minutes as f64 * 60_000_000_000.0
-    }
-    // 5. Else,
-    else {
+        // 5. Else,
+        let local_ms = time as i64;
+        let local_sec = local_ms.div_euclid(1_000);
+        if let Some(cached_offset_nanoseconds) = system_time_zone.lookup_local_offset(local_sec) {
+            return Some(cached_offset_nanoseconds as f64);
+        }
+
         // Steps 5.a-f use the offset before the transition for both skipped and repeated local times.
-        let local_time = UnixDateTime::from_milliseconds_since_epoch(time as i64);
-        let Some(offset) =
-            unicode_time_zone::time_zone_offset(system_time_zone_identifier, local_time, TimeZoneTime::Local)
-        else {
-            return f64::NAN;
-        };
-        offset.offset_nanoseconds as f64
+        let local_time = UnixDateTime::from_milliseconds_since_epoch(local_ms);
+        let offset = unicode_time_zone::time_zone_offset(
+            Utf16View::of_string(&system_time_zone.identifier),
+            local_time,
+            TimeZoneTime::Local,
+        )?;
+        let utc_sec = local_ms
+            .saturating_sub(offset.offset_nanoseconds / 1_000_000)
+            .div_euclid(1_000);
+        // Only populate the UTC interval cache when `utc_sec` agrees with the local offset (skipping transition gaps).
+        let utc_offset = unicode_time_zone::time_zone_offset(
+            Utf16View::of_string(&system_time_zone.identifier),
+            UnixDateTime::from_seconds_since_epoch(utc_sec),
+            TimeZoneTime::Utc,
+        );
+        if utc_offset.is_some_and(|u| u.offset_nanoseconds == offset.offset_nanoseconds) {
+            system_time_zone.cache_interval_for_utc(utc_sec, offset.offset_nanoseconds);
+        }
+        Some(offset.offset_nanoseconds as f64)
+    }) else {
+        return f64::NAN;
     };
 
     // 6. Let offsetMs be truncate(offsetNs / 10^6).
@@ -948,4 +1065,60 @@ pub fn parse_date_time_utc_offset_from_parse_result(parse_result: &TimeZoneOffse
 
     // 17. Return sign × (((hours × 60 + minutes) × 60 + seconds) × 10^9 + nanoseconds).
     sign * (((hours * 60.0 + minutes) * 60.0 + seconds) * 1e9 + nanoseconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SystemTimeZone, TIME_ZONE_INTERVAL_CACHE_CAPACITY, TIME_ZONE_LOCAL_MARGIN_SEC, TimeZoneInterval};
+    use ak::Utf16String;
+
+    #[test]
+    fn system_time_zone_interval_cache_bounds_and_mru() {
+        let winter = TimeZoneInterval {
+            start_sec: 1_700_000_000,
+            end_sec: 1_710_000_000,
+            offset_nanoseconds: -5 * 3_600_000_000_000,
+        };
+        let summer = TimeZoneInterval {
+            start_sec: 1_710_000_001,
+            end_sec: 1_730_000_000,
+            offset_nanoseconds: -4 * 3_600_000_000_000,
+        };
+        let mut tz = SystemTimeZone {
+            generation: 0,
+            identifier: Utf16String::default(),
+            offset_minutes: None,
+            intervals: [TimeZoneInterval {
+                start_sec: 0,
+                end_sec: 0,
+                offset_nanoseconds: 0,
+            }; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
+            interval_count: 2,
+        };
+        tz.intervals[0] = winter;
+        tz.intervals[1] = summer;
+
+        // Exact UTC boundary semantics: [start_sec, end_sec).
+        assert_eq!(tz.lookup_utc_offset(1_699_999_999), None);
+        assert_eq!(tz.lookup_utc_offset(1_700_000_000), Some(winter.offset_nanoseconds));
+        assert_eq!(tz.lookup_utc_offset(1_709_999_999), Some(winter.offset_nanoseconds));
+        assert_eq!(tz.lookup_utc_offset(1_710_000_000), None);
+        assert_eq!(tz.lookup_utc_offset(1_710_000_001), Some(summer.offset_nanoseconds));
+        // MRU promoted `summer` to slot 0.
+        assert_eq!(tz.intervals[0].offset_nanoseconds, summer.offset_nanoseconds);
+
+        // Local lookup enforces the 48-hour transition safety margin on both ends.
+        let summer_offset_sec = summer.offset_nanoseconds / 1_000_000_000;
+        let near_start_local = summer.start_sec + summer_offset_sec + TIME_ZONE_LOCAL_MARGIN_SEC - 1;
+        let safe_start_local = summer.start_sec + summer_offset_sec + TIME_ZONE_LOCAL_MARGIN_SEC;
+        let safe_end_local = summer.end_sec + summer_offset_sec - TIME_ZONE_LOCAL_MARGIN_SEC - 1;
+        let near_end_local = summer.end_sec + summer_offset_sec - TIME_ZONE_LOCAL_MARGIN_SEC;
+        assert_eq!(tz.lookup_local_offset(near_start_local), None);
+        assert_eq!(
+            tz.lookup_local_offset(safe_start_local),
+            Some(summer.offset_nanoseconds)
+        );
+        assert_eq!(tz.lookup_local_offset(safe_end_local), Some(summer.offset_nanoseconds));
+        assert_eq!(tz.lookup_local_offset(near_end_local), None);
+    }
 }

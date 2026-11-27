@@ -39,6 +39,153 @@ struct SignificandAndExponent {
     exponent: i32,
 }
 
+const POWERS_OF_TEN_U64: [u64; 19] = {
+    let mut powers = [0u64; 19];
+    powers[0] = 1;
+    let mut i = 1;
+    while i < powers.len() {
+        powers[i] = powers[i - 1] * 10;
+        i += 1;
+    }
+    powers
+};
+
+const POWERS_OF_FIVE_U128: [u128; 56] = {
+    let mut powers = [0u128; 56];
+    powers[0] = 1;
+    let mut i = 1;
+    while i < powers.len() {
+        powers[i] = powers[i - 1] * 5;
+        i += 1;
+    }
+    powers
+};
+
+/// OPTIMIZATION: For `1 <= precision <= 18`, `10^precision` fits in a `u64`, so the exact significand and tie-break
+///               can be computed in 128-bit integer arithmetic without allocating `BigUint`s. Returns `None` if any
+///               intermediate would overflow `u128`, in which case the caller falls back to the arbitrary-precision
+///               implementation.
+fn try_compute_significand_and_exponent_in_u64(number: f64, precision: i32) -> Option<(u64, i32)> {
+    if !(1..=18).contains(&precision) {
+        return None;
+    }
+    let result = ak::convert_to_decimal_exponential_form(number, ak::RemoveTrailingZeroes::No);
+    let mut exponent = result.exponent + i32::from(count_digits(result.fraction)) - 1;
+
+    let BinaryDecomposition {
+        significand: binary_significand,
+        exponent: binary_exponent,
+    } = decompose_double(number);
+
+    let compute_significand = |exponent: i32| -> Option<u64> {
+        let scale = precision - exponent - 1;
+        let pow2 = binary_exponent + scale;
+        let mut num = u128::from(binary_significand);
+        let mut den = 1u128;
+
+        if scale > 0 {
+            let factor = *POWERS_OF_FIVE_U128.get(scale as usize)?;
+            num = num.checked_mul(factor)?;
+        } else if scale < 0 {
+            den = *POWERS_OF_FIVE_U128.get(scale.unsigned_abs() as usize)?;
+        }
+
+        if pow2 >= 0 {
+            let shift = pow2 as u32;
+            if shift >= 128 || num.leading_zeros() < shift {
+                return None;
+            }
+            num <<= shift;
+            if den == 1 {
+                return u64::try_from(num).ok();
+            }
+            let mut quotient = num / den;
+            let remainder = num % den;
+            if remainder >= den - remainder {
+                quotient += 1;
+            }
+            return u64::try_from(quotient).ok();
+        }
+
+        let shift = pow2.unsigned_abs();
+        if den == 1 {
+            if shift >= 129 {
+                return Some(0);
+            }
+            if shift == 128 {
+                return Some(u64::from(num >= (1u128 << 127)));
+            }
+            let quotient = (num >> shift) + ((num >> (shift - 1)) & 1);
+            return u64::try_from(quotient).ok();
+        }
+
+        if shift >= 128 || den.leading_zeros() < shift {
+            return None;
+        }
+        let full_den = den << shift;
+        let mut quotient = num / full_den;
+        let remainder = num % full_den;
+        if remainder >= full_den - remainder {
+            quotient += 1;
+        }
+        u64::try_from(quotient).ok()
+    };
+
+    let min_sig = POWERS_OF_TEN_U64[(precision - 1) as usize];
+    let max_sig = POWERS_OF_TEN_U64[precision as usize];
+
+    let mut significand = compute_significand(exponent)?;
+    if significand == 0 {
+        return None;
+    }
+    if significand >= max_sig {
+        exponent += 1;
+        significand = compute_significand(exponent)?;
+    } else if significand < min_sig {
+        exponent -= 1;
+        significand = compute_significand(exponent)?;
+    }
+
+    if significand == min_sig {
+        let alternate = compute_significand(exponent - 1)?;
+        if alternate >= min_sig && alternate < max_sig {
+            let mut lhs = u128::from(significand) * 10 + u128::from(alternate);
+            let mut rhs = u128::from(binary_significand);
+
+            let scale = exponent - precision;
+            if scale > 0 {
+                let factor = *POWERS_OF_FIVE_U128.get(scale as usize)?;
+                lhs = lhs.checked_mul(factor)?;
+            } else if scale < 0 {
+                let factor = *POWERS_OF_FIVE_U128.get(scale.unsigned_abs() as usize)?;
+                rhs = rhs.checked_mul(factor)?;
+            }
+
+            let pow2 = scale - binary_exponent - 1;
+            if pow2 > 0 {
+                let shift = pow2 as u32;
+                if shift >= 128 || lhs.leading_zeros() < shift {
+                    return None;
+                }
+                lhs <<= shift;
+            } else if pow2 < 0 {
+                let shift = pow2.unsigned_abs();
+                if shift >= 128 || rhs.leading_zeros() < shift {
+                    return None;
+                }
+                rhs <<= shift;
+            }
+
+            if lhs > rhs {
+                significand = alternate;
+                exponent -= 1;
+            }
+        }
+    }
+
+    Some((significand, exponent))
+}
+
 fn compute_significand_and_exponent_with_precision(number: f64, precision: i32) -> SignificandAndExponent {
     let result = ak::convert_to_decimal_exponential_form(number, ak::RemoveTrailingZeroes::No);
     let mut exponent = result.exponent + i32::from(count_digits(result.fraction)) - 1;
@@ -266,17 +413,22 @@ pub fn to_exponential(number: f64, fraction_digits: Option<u32>) -> String {
     }
     // 10. Else,
     else {
-        let significand;
-
         // a. If fractionDigits is not undefined, then
         if fraction_digits.is_some() {
             // i. Let e and n be integers such that 10^f ≤ n < 10^(f+1) and for which n × 10^(e-f) - x is as close to
             //    zero as possible. If there are two such sets of e and n, pick the e and n for which n × 10^(e-f) is
             //    larger.
-            let result = compute_significand_and_exponent_with_precision(number, fraction_digit_count as i32 + 1);
-
-            significand = result.significand;
-            exponent = result.exponent;
+            let precision = fraction_digit_count as i32 + 1;
+            if let Some((sig, exp)) = try_compute_significand_and_exponent_in_u64(number, precision) {
+                exponent = exp;
+                let mut buffer = [0u8; 20];
+                let digits = write_decimal_digits(sig, &mut buffer);
+                number_string = String::from_utf8(digits.to_vec()).expect("decimal digits are ASCII");
+            } else {
+                let result = compute_significand_and_exponent_with_precision(number, precision);
+                exponent = result.exponent;
+                number_string = result.significand.to_str_radix(10);
+            }
         }
         // b. Else,
         else {
@@ -285,13 +437,12 @@ pub fn to_exponential(number: f64, fraction_digits: Option<u32>) -> String {
             //    by 10, and the least significant digit of n is not necessarily uniquely determined by these criteria.
             let result = convert_to_decimal_exponential_form(number);
 
-            significand = BigUint::from(result.fraction);
             fraction_digit_count = u32::from(count_digits(result.fraction)) - 1;
             exponent = result.exponent + fraction_digit_count as i32;
+            let mut buffer = [0u8; 20];
+            let digits = write_decimal_digits(result.fraction, &mut buffer);
+            number_string = String::from_utf8(digits.to_vec()).expect("decimal digits are ASCII");
         }
-
-        // c. Let m be the String value consisting of the digits of the decimal representation of n (in order, with no leading zeroes).
-        number_string = significand.to_str_radix(10);
     }
 
     // 11. If f ≠ 0, then
@@ -480,12 +631,18 @@ pub fn to_precision(number: f64, precision: u32) -> String {
     else {
         // a. Let e and n be integers such that 10^(p-1) ≤ n < 10^p and for which n × 10^(e-p+1) - x is as close to zero
         //    as possible. If there are two such sets of e and n, pick the e and n for which n × 10^(e-p+1) is larger.
-        let result = compute_significand_and_exponent_with_precision(number, precision_as_exponent);
-        exponent = result.exponent;
-
         // b. Let m be the String value consisting of the digits of the decimal representation of n (in order, with no
         //    leading zeroes).
-        number_string = result.significand.to_str_radix(10);
+        if let Some((sig, exp)) = try_compute_significand_and_exponent_in_u64(number, precision_as_exponent) {
+            exponent = exp;
+            let mut buffer = [0u8; 20];
+            let digits = write_decimal_digits(sig, &mut buffer);
+            number_string = String::from_utf8(digits.to_vec()).expect("decimal digits are ASCII");
+        } else {
+            let result = compute_significand_and_exponent_with_precision(number, precision_as_exponent);
+            exponent = result.exponent;
+            number_string = result.significand.to_str_radix(10);
+        }
 
         // c. If e < -6 or e ≥ p, then
         if exponent < -6 || exponent >= precision_as_exponent {
@@ -655,4 +812,76 @@ pub fn to_string_with_radix(number: f64, radix: u32) -> String {
     }
 
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_significand_and_exponent_with_precision, try_compute_significand_and_exponent_in_u64};
+    use num_traits::ToPrimitive;
+
+    #[test]
+    fn u64_precision_fast_path_matches_biguint_reference() {
+        let test_values: &[f64] = &[
+            1.0,
+            0.5,
+            0.25,
+            0.1,
+            0.2,
+            0.3,
+            0.15,
+            0.000_000_1,
+            0.000_000_999_999_999_9,
+            0.999_999_999_999_999_9,
+            1.000_000_000_000_000_2,
+            1.234_567_890_123_456_7,
+            9.5,
+            9.95,
+            9.995,
+            9.999_999_999_999_998,
+            99.999_999_999_999_99,
+            100.0,
+            12345.6789,
+            1e-15,
+            1e-25,
+            1e-100,
+            1e-308,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            1e15,
+            1e21,
+            1e30,
+            1e50,
+            1e100,
+            f64::MAX,
+            core::f64::consts::PI,
+            core::f64::consts::E,
+            1.005,
+            35.855,
+            5e-7,
+            9.999_995e-7,
+            1.000_005e-6,
+            (1u64 << 53) as f64,
+            ((1u64 << 53) - 1) as f64,
+        ];
+
+        let mut fast_hits = 0usize;
+        for &value in test_values {
+            for precision in 1..=20 {
+                let reference = compute_significand_and_exponent_with_precision(value, precision);
+                if let Some((sig, exp)) = try_compute_significand_and_exponent_in_u64(value, precision) {
+                    fast_hits += 1;
+                    assert_eq!(
+                        sig,
+                        reference.significand.to_u64().expect("reference fits in u64"),
+                        "significand mismatch for value={value:?} precision={precision}"
+                    );
+                    assert_eq!(
+                        exp, reference.exponent,
+                        "exponent mismatch for value={value:?} precision={precision}"
+                    );
+                }
+            }
+        }
+        assert!(fast_hits > 400);
+    }
 }
