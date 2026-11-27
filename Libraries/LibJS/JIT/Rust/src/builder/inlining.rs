@@ -141,7 +141,8 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool, derived_construct:
         //     interpreter runs the handler in the callee's materialized frame (see `translate::leave()` in the
         //     runtime). A handler that caught before would make the code leave again and again.
         if opcode == OpCode::Catch {
-            return !super::has_run(callee.snapshot, callee.executable, instruction.pc);
+            return callee.executable.unprofiled
+                || !super::has_run(callee.snapshot, callee.executable, instruction.pc);
         }
         // NB: An inlined callee reads what its call passed for constant indices (see `try_build_argument()`).
         if opcode == OpCode::GetArgument {

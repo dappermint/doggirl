@@ -797,7 +797,7 @@ impl Executable {
 
     /// Frees the slot of the executable, which died, and drops its JIT code.
     pub fn free_jit_entry_slot(&self, vm: &Vm, sweep: &Sweep<'_>) {
-        if self.code().was_jit_compiled() && super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
+        if super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
             self.code()
                 .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
         }
@@ -892,6 +892,9 @@ impl Executable {
                 let Some(size) = max_size else {
                     return true;
                 };
+                if size >= 2 {
+                    return true;
+                }
                 self.speculated_property_lookup_cache(pc)
                     .is_none_or(|cache| speculated_cache_size(cache) <= size)
             })
