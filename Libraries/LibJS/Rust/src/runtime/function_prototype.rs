@@ -314,11 +314,23 @@ impl FunctionPrototype {
 
         let target = target_value.as_function();
 
-        let arguments = arguments_after_the_first(vm);
-
         // 3. Let F be ? BoundFunctionCreate(Target, thisArg, args).
-        let (function, length_and_name_slots) =
-            BoundFunction::create(vm, realm, target, this_argument, &arguments.to_vec())?;
+        let (function, length_and_name_slots) = if vm.argument_count() <= 1 {
+            BoundFunction::create(vm, realm, target, this_argument, &[])?
+        } else {
+            let count = vm.argument_count() - 1;
+            if count <= STACK_ARGUMENT_CAPACITY {
+                let mut stack_args = [Value::UNDEFINED; STACK_ARGUMENT_CAPACITY];
+                let slice = &mut stack_args[..count];
+                for (index, slot) in slice.iter_mut().enumerate() {
+                    *slot = vm.argument(index + 1);
+                }
+                BoundFunction::create(vm, realm, target, this_argument, slice)?
+            } else {
+                let arguments = arguments_after_the_first(vm);
+                BoundFunction::create(vm, realm, target, this_argument, &arguments.values())?
+            }
+        };
 
         // 4. Let L be 0.
         let mut length = 0.0;

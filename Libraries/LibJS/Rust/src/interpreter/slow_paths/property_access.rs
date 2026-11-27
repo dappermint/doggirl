@@ -337,6 +337,27 @@ pub fn get_by_value(
     values: &mut op::GetByValueValues,
     site_cache: KeyedSiteCache,
 ) -> SlowPathControl {
+    get_by_value_impl(vm, pc, instruction, values, site_cache, true)
+}
+
+pub fn get_by_value_skip_host_indexed(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetByValue,
+    values: &mut op::GetByValueValues,
+    site_cache: KeyedSiteCache,
+) -> SlowPathControl {
+    get_by_value_impl(vm, pc, instruction, values, site_cache, false)
+}
+
+fn get_by_value_impl(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetByValue,
+    values: &mut op::GetByValueValues,
+    site_cache: KeyedSiteCache,
+    try_host_indexed: bool,
+) -> SlowPathControl {
     let base_value = values.base;
     let property_key_value = values.property;
     // OPTIMIZATION: An index of a string reads a string of one code unit, and the VM has those of ASCII code units.
@@ -347,7 +368,8 @@ pub fn get_by_value(
         values.dst = value;
         return SlowPathControl::continue_at(pc + op::GetByValue::LENGTH);
     }
-    if base_value.is_object()
+    if try_host_indexed
+        && base_value.is_object()
         && property_key_value.is_non_negative_int32()
         && let Some(result) = crate::embedding::host::host_object::try_get_indexed_value_hook_fast(
             &base_value.as_object(),
