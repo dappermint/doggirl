@@ -109,8 +109,8 @@ public:
     GC::Ref<JS::Shape> ensure_web_wrapper_shape(InterfaceName interface_name, Utf16FlyString const& class_name)
     {
         auto index = to_underlying(interface_name);
-        if (auto shape = m_wrapper_shapes[index])
-            return *shape;
+        if (m_wrapper_shapes[index])
+            return *m_wrapper_shapes[index];
 
         auto& prototype = ensure_web_prototype<PrototypeType>(class_name);
         auto shape = JS::HostObject::initial_shape_for_prototype(*m_realm, prototype);
@@ -146,11 +146,12 @@ private:
     void create_web_constructor(JS::Realm& realm, InterfaceObjectMetadata const&, JS::Object& prototype);
     void create_legacy_factory_function(JS::Realm& realm, InterfaceObjectMetadata const&);
 
-    HashMap<Utf16FlyString, GC::Ref<JS::Object>> m_namespaces;
-    HashMap<Utf16FlyString, GC::Ref<JS::Object>> m_prototypes;
-    HashMap<Utf16FlyString, GC::Ptr<JS::NativeFunction>> m_constructors;
-    HashMap<UnforgeableKey, GC::Ref<JS::NativeFunction>> m_unforgeable_functions;
-    Array<GC::Ptr<JS::Shape>, to_underlying(InterfaceName::Count)> m_wrapper_shapes {};
+    // NB: The maps hold members, which visit_edges() visits as owned slots, so that collections can move the objects.
+    HashMap<Utf16FlyString, GC::NonnullMember<JS::Object>> m_namespaces;
+    HashMap<Utf16FlyString, GC::NonnullMember<JS::Object>> m_prototypes;
+    HashMap<Utf16FlyString, GC::Member<JS::NativeFunction>> m_constructors;
+    HashMap<UnforgeableKey, GC::NonnullMember<JS::NativeFunction>> m_unforgeable_functions;
+    Array<GC::Member<JS::Shape>, to_underlying(InterfaceName::Count)> m_wrapper_shapes {};
     GC::Ref<JS::Realm> m_realm;
 };
 
