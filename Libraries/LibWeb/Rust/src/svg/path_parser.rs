@@ -1057,9 +1057,11 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(input: Input<'a>) -> Self {
+        let len = input.len();
+        let initial_capacity = if len >= 64 { len / 16 } else { 0 };
         Self {
             lexer: Lexer::new(input),
-            instructions: Vec::new(),
+            instructions: Vec::with_capacity(initial_capacity),
         }
     }
 

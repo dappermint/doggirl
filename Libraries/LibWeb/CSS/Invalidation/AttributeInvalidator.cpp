@@ -128,7 +128,7 @@ void invalidate_style_after_attribute_change(
         // the presentational hint attributes do. The hints are published now, as a declaration
         // input the engine takes as current.
         record_element_declarations_changed(element, ElementDeclarationKind::SvgPresentationAttribute, true, true);
-        if (!element.publishes_presentational_hints_on_arrival())
+        if (!element.updates_presentational_hints_incrementally())
             StyleComputer::collect_presentational_hint_properties({ element });
     }
 

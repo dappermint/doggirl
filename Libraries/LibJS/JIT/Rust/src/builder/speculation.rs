@@ -1286,7 +1286,14 @@ impl<'a> GraphBuilder<'a, '_> {
         // NB: Strict equality with an int32 is false for anything but
         //     numbers.
         let strict_with_int32 = equality.is_some() && !comparison.is_loose() && with_int32;
-        if !int32s && !doubles && !strings && !strict_with_int32 {
+        let loose_nullish = equality.is_some()
+            && comparison.is_loose()
+            && self.runtime.no_htmldda_objects
+            && feedback & arith_feedback::OTHER != 0;
+        let loose_objects = equality.is_some()
+            && comparison.is_loose()
+            && feedback & arith_feedback::OBJECT_PAIR != 0;
+        if !int32s && !doubles && !strings && !strict_with_int32 && !loose_nullish && !loose_objects {
             return Ok(None);
         }
         let mut paths = self.start_slow_paths(Some(slow_repr))?;
@@ -1317,6 +1324,38 @@ impl<'a> GraphBuilder<'a, '_> {
             let result = self.test_not_empty(&mut paths, result);
             let truth = self.constant(value::TRUE);
             let result = self.emit(Op::TaggedEquals { equal }, &[result, truth], Some(Repr::Bool));
+            self.end_hot_path(&mut paths, &[result]);
+            started = true;
+        }
+        if let Some(equal) = equality
+            && loose_nullish
+            && (!started || self.start_next_case(&mut paths))
+        {
+            self.assume_no_htmldda_objects();
+            let (lhs, rhs) = (self.tagged(lhs), self.tagged(rhs));
+            self.branch_to_next_case(&mut paths, BranchCondition::Nullish, &[lhs], true);
+            let (rhs_nullish, rhs_not_nullish) = self.branch_both_ways(BranchCondition::Nullish, &[rhs]);
+            self.block = rhs_nullish;
+            let eq_true = self.typed_constant(u64::from(equal), Repr::Bool);
+            self.end_hot_path(&mut paths, &[eq_true]);
+            self.block = rhs_not_nullish;
+            let eq_false = self.typed_constant(u64::from(!equal), Repr::Bool);
+            self.end_hot_path(&mut paths, &[eq_false]);
+            if self.start_next_case(&mut paths) {
+                self.branch_to_next_case(&mut paths, BranchCondition::Nullish, &[rhs], true);
+                let eq_false = self.typed_constant(u64::from(!equal), Repr::Bool);
+                self.end_hot_path(&mut paths, &[eq_false]);
+            }
+            started = true;
+        }
+        if let Some(equal) = equality
+            && loose_objects
+            && (!started || self.start_next_case(&mut paths))
+        {
+            let (lhs, rhs) = (self.tagged(lhs), self.tagged(rhs));
+            let lhs = self.branch_to_next_case(&mut paths, BranchCondition::Object, &[lhs], true);
+            let rhs = self.branch_to_next_case(&mut paths, BranchCondition::Object, &[rhs], true);
+            let result = self.emit(Op::TaggedEquals { equal }, &[lhs, rhs], Some(Repr::Bool));
             self.end_hot_path(&mut paths, &[result]);
         }
         if strict_with_int32 && self.start_next_case(&mut paths) {
