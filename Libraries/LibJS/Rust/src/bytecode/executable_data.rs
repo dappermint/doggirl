@@ -7,8 +7,12 @@
 //! Compiled bytecode together with everything needed to run it, as owned Rust values.
 
 use core::num::NonZeroU32;
+#[cfg(all(not(test), feature = "jit"))]
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
+#[cfg(all(not(test), feature = "jit"))]
+use std::sync::{Mutex, PoisonError};
 
 use ak::Utf16String;
 
@@ -192,6 +196,130 @@ impl StrictRange {
     }
 }
 
+/// Non-GC JIT feedback and exit-site observations shared across realms linking the same `ExecutableData`.
+///
+/// Every field is either a pure bitmask, a bytecode offset, a cache slot index, or immutable bytecode analysis, so no
+/// GC cell or realm-specific pointer is ever stored here.
+#[cfg(all(not(test), feature = "jit"))]
+pub(crate) const SHARED_CALL_FLAGS_MASK: u8 = crate::layout::feedback::call_feedback_flags::POLYMORPHIC
+    | crate::layout::feedback::call_feedback_flags::SAW_NATIVE
+    | crate::layout::feedback::call_feedback_flags::FORWARDED_POLYMORPHIC
+    | crate::layout::feedback::call_feedback_flags::FORWARDED_CLOSURES
+    | crate::layout::feedback::call_feedback_flags::OTHER_FUNCTIONS;
+
+#[cfg(all(not(test), feature = "jit"))]
+const MAX_SHARED_EXIT_SITES: usize = 256;
+
+#[cfg(all(not(test), feature = "jit"))]
+#[derive(Default)]
+pub(crate) struct SharedJitLearning {
+    pub exit_sites: Vec<(u32, libjs_jit::code::ExitKind)>,
+    pub shape_exit_cache_sizes: Vec<(u32, u8)>,
+    pub has_feedback: bool,
+    pub arith: Vec<u8>,
+    pub value: Vec<u16>,
+    pub cache_value: Vec<u16>,
+    pub keyed_bits: Vec<u32>,
+    pub call_flags: Vec<u8>,
+    pub call_value: Vec<u16>,
+    pub megamorphic_property_caches: Vec<u64>,
+    pub captured_binding_accesses: Option<Arc<crate::jit::code::CapturedBindingAccesses>>,
+}
+
+#[cfg(all(not(test), feature = "jit"))]
+impl SharedJitLearning {
+    pub(crate) fn merge_feedback(
+        &mut self,
+        feedback: Option<&crate::bytecode::feedback::ExecutableFeedback>,
+        property_caches: &[crate::bytecode::executable::PropertyLookupCache],
+    ) {
+        if let Some(feedback) = feedback {
+            feedback.update_value_feedback();
+            self.has_feedback = true;
+
+            let arith = feedback.arith();
+            if self.arith.len() < arith.len() {
+                self.arith.resize(arith.len(), 0);
+            }
+            for (dst, src) in self.arith.iter_mut().zip(arith) {
+                *dst |= src.get();
+            }
+
+            let value = feedback.value();
+            if self.value.len() < value.len() {
+                self.value.resize(value.len(), 0);
+            }
+            for (dst, src) in self.value.iter_mut().zip(value) {
+                *dst |= src.get();
+            }
+
+            let cache_value = feedback.cache_value();
+            if self.cache_value.len() < cache_value.len() {
+                self.cache_value.resize(cache_value.len(), 0);
+            }
+            for (dst, src) in self.cache_value.iter_mut().zip(cache_value) {
+                *dst |= src.get();
+            }
+
+            let keyed = feedback.keyed();
+            if self.keyed_bits.len() < keyed.len() {
+                self.keyed_bits.resize(keyed.len(), 0);
+            }
+            for (dst, src) in self.keyed_bits.iter_mut().zip(keyed) {
+                *dst |= src.bits.get();
+            }
+
+            let calls = feedback.call();
+            if self.call_flags.len() < calls.len() {
+                self.call_flags.resize(calls.len(), 0);
+                self.call_value.resize(calls.len(), 0);
+            }
+            for ((dst_flags, dst_value), src) in self.call_flags.iter_mut().zip(&mut self.call_value).zip(calls) {
+                *dst_flags |= src.flags.get() & SHARED_CALL_FLAGS_MASK;
+                *dst_value |= src.value.get();
+            }
+        }
+
+        for (index, cache) in property_caches.iter().enumerate() {
+            if cache.tier() == crate::bytecode::executable::PropertyLookupCacheTier::Megamorphic {
+                let word = index / 64;
+                if self.megamorphic_property_caches.len() <= word {
+                    self.megamorphic_property_caches.resize(word + 1, 0);
+                }
+                self.megamorphic_property_caches[word] |= 1u64 << (index % 64);
+            }
+        }
+    }
+
+    pub(crate) fn record_exit_site(&mut self, pc: u32, kind: libjs_jit::code::ExitKind, bad_shape_size: Option<u8>) {
+        if !self.exit_sites.contains(&(pc, kind)) && self.exit_sites.len() < MAX_SHARED_EXIT_SITES {
+            self.exit_sites.push((pc, kind));
+        }
+        if let Some(size) = bad_shape_size {
+            if let Some((_, recorded)) = self.shape_exit_cache_sizes.iter_mut().find(|(site, _)| *site == pc) {
+                if size > *recorded {
+                    *recorded = size;
+                }
+            } else if self.shape_exit_cache_sizes.len() < MAX_SHARED_EXIT_SITES {
+                self.shape_exit_cache_sizes.push((pc, size));
+            }
+        }
+    }
+
+    fn memory_size(&self) -> usize {
+        size_of::<Mutex<Self>>()
+            + self.exit_sites.capacity() * size_of::<(u32, libjs_jit::code::ExitKind)>()
+            + self.shape_exit_cache_sizes.capacity() * size_of::<(u32, u8)>()
+            + self.arith.capacity() * size_of::<u8>()
+            + self.value.capacity() * size_of::<u16>()
+            + self.cache_value.capacity() * size_of::<u16>()
+            + self.keyed_bits.capacity() * size_of::<u32>()
+            + self.call_flags.capacity() * size_of::<u8>()
+            + self.call_value.capacity() * size_of::<u16>()
+            + self.megamorphic_property_caches.capacity() * size_of::<u64>()
+    }
+}
+
 /// One compiled script, module or function body: everything about it that does not depend on where it runs. Nothing
 /// here changes once it is compiled, so any number of [`Executable`]s can link it, each with caches, constants and
 /// functions of its own, and they all run the same bytecode.
@@ -223,6 +351,9 @@ pub struct ExecutableData {
     /// One for each of the local variables.
     pub local_variable_metadata: BlockSlice<LocalVariableMetadata>,
     rare_data: Option<Box<RareExecutableData>>,
+    /// Lazily allocated cross-realm JIT feedback and exit-site state (only populated for JIT-compiled executables).
+    #[cfg(all(not(test), feature = "jit"))]
+    shared_jit_learning: AtomicPtr<Mutex<SharedJitLearning>>,
     /// What linking reads, and nothing after it (see [`ExecutableData::release_link_inputs()`]).
     pub property_key_table: BlockSlice<ak::Utf16FlyString>,
     pub constants: BlockSlice<ConstantValue>,
@@ -237,7 +368,24 @@ pub struct ExecutableData {
 }
 
 // NB: Every compiled function has these bytes.
+#[cfg(all(not(test), feature = "jit"))]
+const _: () = assert!(size_of::<ExecutableData>() == 144);
+#[cfg(not(all(not(test), feature = "jit")))]
 const _: () = assert!(size_of::<ExecutableData>() == 136);
+
+#[cfg(all(not(test), feature = "jit"))]
+impl Drop for ExecutableData {
+    fn drop(&mut self) {
+        let ptr = *self.shared_jit_learning.get_mut();
+        if !ptr.is_null() {
+            // SAFETY: `shared_jit_learning` only ever stores null or a pointer created by `Box::into_raw` and owned
+            //         by this `ExecutableData`, and `&mut self` guarantees exclusive access during drop.
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
+    }
+}
 
 /// The parts of code that few codes have.
 #[derive(Default)]
@@ -360,6 +508,8 @@ impl ExecutableData {
             variable_names,
             local_variable_metadata,
             rare_data: has_rare_data.then(|| Box::new(rare_data)),
+            #[cfg(all(not(test), feature = "jit"))]
+            shared_jit_learning: AtomicPtr::new(core::ptr::null_mut()),
             property_key_table,
             constants,
             shared_function_data,
@@ -394,6 +544,104 @@ impl ExecutableData {
             self.jit_flags
                 .fetch_or(Self::JIT_FLAG_CAPTURED_BINDINGS_EMPTY, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn shared_jit_learning(&self) -> Option<&Mutex<SharedJitLearning>> {
+        let ptr = self.shared_jit_learning.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: Non-null pointers stored in `shared_jit_learning` remain valid for the lifetime of `self`.
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn ensure_shared_jit_learning(&self) -> &Mutex<SharedJitLearning> {
+        if let Some(learning) = self.shared_jit_learning() {
+            return learning;
+        }
+        let boxed = Box::into_raw(Box::new(Mutex::new(SharedJitLearning::default())));
+        match self.shared_jit_learning.compare_exchange(
+            core::ptr::null_mut(),
+            boxed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: `boxed` is now owned by `self` and lives until `ExecutableData::drop`.
+            Ok(_) => unsafe { &*boxed },
+            Err(existing) => {
+                // SAFETY: Another thread installed first; `boxed` was never shared and `existing` lives with `self`.
+                unsafe {
+                    drop(Box::from_raw(boxed));
+                    &*existing
+                }
+            }
+        }
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn record_shared_jit_exit_site(
+        &self,
+        pc: u32,
+        kind: libjs_jit::code::ExitKind,
+        bad_shape_size: Option<u8>,
+    ) {
+        let mut learning = self
+            .ensure_shared_jit_learning()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        learning.record_exit_site(pc, kind, bad_shape_size);
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn merge_shared_jit_feedback(
+        &self,
+        feedback: Option<&crate::bytecode::feedback::ExecutableFeedback>,
+        property_caches: &[crate::bytecode::executable::PropertyLookupCache],
+    ) {
+        let has_megamorphic = property_caches
+            .iter()
+            .any(|cache| cache.tier() == crate::bytecode::executable::PropertyLookupCacheTier::Megamorphic);
+        if feedback.is_none() && !has_megamorphic {
+            return;
+        }
+        let mut learning = self
+            .ensure_shared_jit_learning()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        learning.merge_feedback(feedback, property_caches);
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn shared_has_unexpected_value_exit(&self, pc: u32) -> bool {
+        let Some(mutex) = self.shared_jit_learning() else {
+            return false;
+        };
+        let learning = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        learning
+            .exit_sites
+            .contains(&(pc, libjs_jit::code::ExitKind::UnexpectedValue))
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn cached_captured_binding_accesses(&self) -> Option<Arc<crate::jit::code::CapturedBindingAccesses>> {
+        let mutex = self.shared_jit_learning()?;
+        let learning = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        learning.captured_binding_accesses.clone()
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn set_cached_captured_binding_accesses(
+        &self,
+        accesses: Arc<crate::jit::code::CapturedBindingAccesses>,
+    ) -> Arc<crate::jit::code::CapturedBindingAccesses> {
+        let mut learning = self
+            .ensure_shared_jit_learning()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(learning.captured_binding_accesses.get_or_insert(accesses))
     }
 
     /// Cached `(count, is_exact)` bytecode instruction count shared across realms.
@@ -509,6 +757,18 @@ impl ExecutableData {
                     + size_of_val(&*rare_data.strict_ranges)
                     + size_of_val(&*rare_data.string_table)
             })
+            + {
+                #[cfg(all(not(test), feature = "jit"))]
+                {
+                    self.shared_jit_learning().map_or(0, |mutex| {
+                        mutex.lock().unwrap_or_else(PoisonError::into_inner).memory_size()
+                    })
+                }
+                #[cfg(not(all(not(test), feature = "jit")))]
+                {
+                    0
+                }
+            }
             + size_of_val(&*self.source_map)
             + size_of_val(&*self.identifier_table)
             + size_of_val(&*self.variable_names)

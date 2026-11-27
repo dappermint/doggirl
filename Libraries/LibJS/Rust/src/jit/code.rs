@@ -703,7 +703,7 @@ pub struct ExecutableJitState {
     uncounted_discard: Cell<Option<UncountedDiscard>>,
     /// The loads and stores of bindings of the environments of the executable's closure (see `jit::snapshot`). The
     /// bytecode never changes, so snapshots find them once.
-    pub(crate) captured_binding_accesses: OnceCell<CapturedBindingAccesses>,
+    pub(crate) captured_binding_accesses: OnceCell<std::sync::Arc<CapturedBindingAccesses>>,
     /// The `CompileQueue` job id currently queued for this executable, used to check targeted completion.
     pub(crate) queued_job_id: Cell<u64>,
     /// How many non-loop queued tier-up checks saw `queued_job_id` ready before forcing a small-batch install.
@@ -797,6 +797,10 @@ impl Executable {
 
     /// Frees the slot of the executable, which died, and drops its JIT code.
     pub fn free_jit_entry_slot(&self, vm: &Vm, sweep: &Sweep<'_>) {
+        if self.code().was_jit_compiled() && super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
+            self.code()
+                .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
+        }
         let Some(table) = vm.jit.entry_table.as_ref() else {
             return;
         };
@@ -839,23 +843,53 @@ impl Executable {
     /// at an instruction whose property lookup cache grew since the code that exited there was compiled is left out:
     /// the interpreter added the shapes the code did not know to the cache, so recompiles speculate on them all. Each
     /// such exit needs a larger cache, so this ends once the cache is megamorphic.
-    pub fn jit_exit_sites_for_recompile(&self) -> Vec<(u32, ExitKind)> {
-        let sites = self.jit_state().exit_sites.borrow();
-        if sites.is_empty() {
+    ///
+    /// When `use_shared` is true, also includes exit sites learned by earlier realms linking the same `ExecutableData`
+    /// without mutating this executable's local `exit_sites`.
+    pub fn jit_exit_sites_for_recompile_with_shared(&self, use_shared: bool) -> Vec<(u32, ExitKind)> {
+        let local_sites = self.jit_state().exit_sites.borrow();
+        let local_sizes = self.jit_state().shape_exit_cache_sizes.borrow();
+
+        let shared_guard = use_shared
+            .then(|| self.code().shared_jit_learning())
+            .flatten()
+            .map(|mutex| mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let shared_sites = shared_guard.as_deref().map_or(&[][..], |learning| &learning.exit_sites);
+        let shared_sizes = shared_guard
+            .as_deref()
+            .map_or(&[][..], |learning| &learning.shape_exit_cache_sizes);
+
+        if local_sites.is_empty() && shared_sites.is_empty() {
             return Vec::new();
         }
-        let sizes = self.jit_state().shape_exit_cache_sizes.borrow();
-        if sizes.is_empty() {
-            return sites.clone();
+
+        let mut merged = Vec::with_capacity(local_sites.len() + shared_sites.len());
+        merged.extend(local_sites.iter().copied());
+        for &site in shared_sites {
+            if !merged.contains(&site) {
+                merged.push(site);
+            }
         }
-        sites
-            .iter()
-            .copied()
+
+        if local_sizes.is_empty() && shared_sizes.is_empty() {
+            return merged;
+        }
+
+        merged
+            .into_iter()
             .filter(|&(pc, kind)| {
                 if kind != ExitKind::BadShape {
                     return true;
                 }
-                let Some(&(_, size)) = sizes.iter().find(|(site, _)| *site == pc) else {
+                let local_size = local_sizes.iter().find(|(site, _)| *site == pc).map(|&(_, size)| size);
+                let shared_size = shared_sizes.iter().find(|(site, _)| *site == pc).map(|&(_, size)| size);
+                let max_size = match (local_size, shared_size) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let Some(size) = max_size else {
                     return true;
                 };
                 self.speculated_property_lookup_cache(pc)
@@ -872,16 +906,16 @@ impl Executable {
     }
 
     /// Notes that JIT code compiled when the property lookup caches of the executable had `cache_sizes` exited with
-    /// `ExitKind::BadShape` at `pc`. Returns whether that code speculated on more shapes there than the code that
-    /// exited there before, so that a recompile learns from the exit.
-    pub fn note_jit_shape_exit(&self, pc: u32, cache_sizes: &[u8]) -> bool {
+    /// `ExitKind::BadShape` at `pc`. Returns `(learned_more_shapes, speculated_size_at_pc)` so callers can propagate
+    /// the observed shape-cache size into shared cross-realm learning.
+    pub fn note_jit_shape_exit_with_size(&self, pc: u32, cache_sizes: &[u8]) -> (bool, Option<u8>) {
         let Some(size) = speculated_property_lookup_cache_index(self.bytecode(), pc)
             .and_then(|index| cache_sizes.get(index as usize).copied())
         else {
-            return false;
+            return (false, None);
         };
         let mut sizes = self.jit_state().shape_exit_cache_sizes.borrow_mut();
-        match sizes.iter_mut().find(|(site, _)| *site == pc) {
+        let learned = match sizes.iter_mut().find(|(site, _)| *site == pc) {
             Some((_, recorded)) if *recorded >= size => false,
             Some((_, recorded)) => {
                 *recorded = size;
@@ -891,7 +925,8 @@ impl Executable {
                 sizes.push((pc, size));
                 true
             }
-        }
+        };
+        (learned, Some(size))
     }
 
     pub fn jit_exit_site_count(&self) -> usize {
@@ -1045,6 +1080,10 @@ impl Executable {
 
     /// Drops the executable's discarded code, which no frame runs anymore.
     fn detach_jit_code(&self, vm: &Vm) {
+        if super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
+            self.code()
+                .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
+        }
         let state = self.jit_state();
         let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
         table.detach_code(slot, vm.jit.parking_for_detached_code());
