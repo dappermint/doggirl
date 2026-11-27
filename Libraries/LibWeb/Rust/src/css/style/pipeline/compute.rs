@@ -518,26 +518,28 @@ impl RetainedState {
             reads: &mut reads,
         };
         // A winner that needs nothing but its value absolutized against the element's context, with
-        // what it computes against known from how it was written, is applied as it is. An element
-        // whose every winner is one takes no drive, whatever it declares.
+        // what it computes against known from how it was written, is applied directly without going
+        // through `classify_winner`, even when other winners on the same element need classification.
         let takes_no_drive = parent_view.is_some()
             && !pseudo_kind::is_highlight(target_pseudo_kind)
             && parent_longhands.is_some_and(|longhands| longhands.effective_zoom() == 1.0);
-        let mut plain_dependencies = takes_no_drive.then_some(0_u32);
-        let mut plain_block = None;
-        for &Winner {
-            property,
-            source,
-            index,
-            ..
-        } in winners
-        {
-            let Some(dependencies) = plain_dependencies else {
-                break;
-            };
+        let mut is_plain = takes_no_drive;
+        let mut plain_dependencies = 0_u32;
+        let mut current_block: Option<(
+            WinnerSource,
+            crate::css::style::element_declarations::ElementDeclarations<'_>,
+        )> = None;
+        let mut rolls_back = false;
+        for (position, &winner) in winners.iter().enumerate() {
+            let Winner {
+                property,
+                source,
+                index,
+                ..
+            } = winner;
             // NB: A block's winners come one after another.
-            if plain_block.is_none_or(|(held, _)| held != source) {
-                plain_block = Some((
+            if current_block.is_none_or(|(held, _)| held != source) {
+                current_block = Some((
                     source,
                     match source {
                         WinnerSource::Rule(rule) => {
@@ -558,64 +560,63 @@ impl RetainedState {
                     },
                 ));
             }
-            let (_, block) = plain_block.expect("the block was just taken");
+            let (_, block) = current_block.expect("the block was just taken");
             let checks = block.checks(index);
-            let declaration = block
+            let declaration = *block
                 .declared_property(index)
                 .expect("the style engine answers every row");
             let written = block.written(index);
-            if !checks.is_plain()
-                || declaration.operator() != CascadeOperator::Declared
-                || is_quirk_inherit(property, written)
+            if checks.is_plain()
+                && declaration.operator() == CascadeOperator::Declared
+                && !is_quirk_inherit(property, written)
             {
-                plain_dependencies = None;
+                let prepared = checks.dependencies();
+                let value = match checks.is_shorthand() {
+                    true => {
+                        shorthand_longhand_data(property, written.data()).expect("the style engine answers every row")
+                    }
+                    false => written,
+                };
+                decided.easy.push((
+                    property,
+                    std::borrow::Cow::Borrowed(value),
+                    Some(winner_store::unpack_dependencies(prepared)),
+                    checks.known_computation(),
+                ));
+                decided.direct_inheritance.push((property, false));
+                decided.reads.environment_reads |= property_environment_reads(property);
+                plain_dependencies |= prepared & winner_store::DEPENDENCY_BITS;
+                if !is_plain {
+                    decided.deciding.push(winner);
+                    decided.substituted.push(None);
+                }
+                continue;
+            }
+            if is_plain {
+                is_plain = false;
+                decided.deciding.extend_from_slice(&winners[..position]);
+                decided.substituted.resize(position, None);
+            }
+            let classified =
+                self.classify_winner_with(declaration, written, checks, custom_properties, property, quirks_color);
+            if classified.rolls_back() {
+                rolls_back = true;
                 break;
             }
-            let prepared = checks.dependencies();
-            let value = match checks.is_shorthand() {
-                true => shorthand_longhand_data(property, written.data()).expect("the style engine answers every row"),
-                false => written,
+            let known = if !checks.waits_on_substitution() && declaration.operator() == CascadeOperator::Declared {
+                checks.known_computation()
+            } else {
+                Default::default()
             };
-            decided.easy.push((
-                property,
-                std::borrow::Cow::Borrowed(value),
-                Some(winner_store::unpack_dependencies(prepared)),
-                checks.known_computation(),
-            ));
-            decided.direct_inheritance.push((property, false));
-            decided.reads.environment_reads |= property_environment_reads(property);
-            plain_dependencies = Some(dependencies | (prepared & winner_store::DEPENDENCY_BITS));
+            decided.take(winner, classified, &defaulting, known);
         }
-        if plain_dependencies.is_none() {
-            decided.easy.clear();
-            decided.direct_inheritance.clear();
-            decided.reads.environment_reads = StyleEnvironment::default();
-        }
-        if let Some(dependencies) = plain_dependencies {
-            let dependencies = winner_store::unpack_dependencies(dependencies);
-            decided.reads.reads_root_font = dependencies.root_font_reads;
-            decided.reads.reads_font_metric_lengths = dependencies.font_metric_relative_length;
-            decided.reads.reads_own_font_metric_lengths = dependencies.font_metric_relative_length;
+        if !rolls_back && plain_dependencies != 0 {
+            let dependencies = winner_store::unpack_dependencies(plain_dependencies);
+            decided.reads.reads_root_font = decided.reads.reads_root_font.max(dependencies.root_font_reads);
+            decided.reads.reads_font_metric_lengths |= dependencies.font_metric_relative_length;
+            decided.reads.reads_own_font_metric_lengths |= dependencies.font_metric_relative_length;
             decided.reads.environment_reads |= dependency_environment_reads(dependencies);
         }
-        let is_plain = plain_dependencies.is_some();
-        // NB: A winner decides as it is classified, in the order of the winners, until one rolls back.
-        let rolls_back = !is_plain
-            && winners.iter().any(|&winner| {
-                let classified = self.classify_winner(
-                    &element_declarations,
-                    custom_properties,
-                    winner.property,
-                    winner.source,
-                    winner.index,
-                    quirks_color,
-                );
-                let rolls_back = classified.rolls_back();
-                if !rolls_back {
-                    decided.take(winner, classified, &defaulting);
-                }
-                rolls_back
-            });
         if rolls_back {
             self.decide_rolling_back(
                 &mut decided,
@@ -1144,7 +1145,7 @@ impl RetainedState {
         // The lookups of the groups assembled anew, which the cache takes the groups for once they
         // hold their values.
         let mut assembled: smallvec::SmallVec<[GroupLookup<'_>; 4]> = smallvec::SmallVec::new();
-        let group_inputs = GroupCache::inputs(&values, color_inputs.0, &length);
+        let group_inputs = std::cell::OnceCell::new();
         // The groups the cache had, which hold the element's values.
         let mut found_holding = 0_u32;
         let mut payloads = [std::ptr::null(); group_index::COUNT];
@@ -1159,11 +1160,13 @@ impl RetainedState {
                         || crate::css::table_group_builder::GROUPS_HOLDING_CURRENT_COLOR_FOR_THEIR_READER
                             & (1 << group)
                             == 0;
+                    let group_inputs =
+                        group_inputs.get_or_init(|| GroupCache::inputs(&values, color_inputs.0, &length));
                     GroupCache::key(
                         &values,
                         group,
                         reads_current_color.then_some(current_color),
-                        &group_inputs,
+                        group_inputs,
                     )
                 });
                 let found = key.as_ref().and_then(|key| group_cache.find(key));
@@ -1680,7 +1683,7 @@ impl RetainedState {
         }
         for (winner, classified, _) in resolved {
             if let Some(classified) = classified {
-                decided.take(winner, classified, defaulting);
+                decided.take(winner, classified, defaulting, Default::default());
             }
         }
     }
@@ -1701,6 +1704,18 @@ impl RetainedState {
         quirks_color: Option<&RetainedStyleValueData>,
     ) -> ClassifiedWinner<'a> {
         let (declaration, written, checks) = self.declaration_of(element_declarations, source, index);
+        self.classify_winner_with(declaration, written, checks, custom_properties, property, quirks_color)
+    }
+
+    fn classify_winner_with<'a>(
+        &'a self,
+        declaration: crate::css::declaration_block::DeclarationEntry,
+        written: &'a RetainedStyleValueData,
+        checks: WrittenValueChecks,
+        custom_properties: super::custom_properties::CustomPropertyStores<'_>,
+        property: u16,
+        quirks_color: Option<&RetainedStyleValueData>,
+    ) -> ClassifiedWinner<'a> {
         // https://quirks.spec.whatwg.org/#the-tables-inherit-color-from-body-quirk
         // Resolve the UA marker before computation, including when a revert exposes it.
         if is_quirk_inherit(property, written) {
@@ -2518,7 +2533,13 @@ impl<'a> ParentValues<'a> {
 impl<'a> DecidedWinners<'_, 'a> {
     /// Takes a winner as it decides, in cascade order, with its classification.
     #[inline]
-    fn take(&mut self, winner: Winner, classified: ClassifiedWinner<'a>, defaulting: &WinnerDefaulting<'_>) {
+    fn take(
+        &mut self,
+        winner: Winner,
+        classified: ClassifiedWinner<'a>,
+        defaulting: &WinnerDefaulting<'_>,
+        known: crate::css::style_compute::KnownComputation,
+    ) {
         use crate::css::style_compute::{LOGICAL_ALIAS_BIT, map_logical_alias_to_physical, table_row_bits};
         let ClassifiedWinner {
             value,
@@ -2627,15 +2648,18 @@ impl<'a> DecidedWinners<'_, 'a> {
                 Some(Default::default()),
                 Default::default(),
             )),
-            (WinnerComputation::Direct(dependencies), None) => self.easy.push((
-                property,
-                match &value {
-                    ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
-                    _ => std::borrow::Cow::Owned(written.clone()),
-                },
-                dependencies,
-                Default::default(),
-            )),
+            (WinnerComputation::Direct(dependencies), None) => {
+                let is_written = matches!(&value, ResolvedWinnerValue::Written(_));
+                self.easy.push((
+                    property,
+                    match &value {
+                        ResolvedWinnerValue::Written(written) => std::borrow::Cow::Borrowed(*written),
+                        _ => std::borrow::Cow::Owned(written.clone()),
+                    },
+                    dependencies,
+                    if is_written { known } else { Default::default() },
+                ));
+            }
             (WinnerComputation::Full, None) if font_computes_natively => self.native_font.push((
                 property,
                 match &value {
