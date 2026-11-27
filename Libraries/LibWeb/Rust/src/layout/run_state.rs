@@ -194,13 +194,15 @@ impl LayoutScratch {
         self.fc_run_cache_store.cover_slots(slot_count);
         self.in_flow_block_cache_store.cover_slots(slot_count);
         self.prepared_inline_content_memos.cover_slots(slot_count);
-        arena.take_memo_invalidations().apply_to(
-            &mut self.fc_run_cache_store,
-            &mut self.in_flow_block_cache_store,
-            &mut self.text_memos,
-            &mut self.prepared_inline_content_memos,
-            &mut self.intrinsic_size_caches,
-        );
+        arena.drain_memo_invalidations(|notes| {
+            notes.apply_and_clear(
+                &mut self.fc_run_cache_store,
+                &mut self.in_flow_block_cache_store,
+                &mut self.text_memos,
+                &mut self.prepared_inline_content_memos,
+                &mut self.intrinsic_size_caches,
+            );
+        });
     }
 
     /// Brings the run memos up to date with what the commit into `arena` did to their boxes, and sweeps the run cache.

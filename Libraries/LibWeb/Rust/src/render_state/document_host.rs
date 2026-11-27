@@ -1893,6 +1893,7 @@ mod tests {
         host.queue_change(ArenaChange::Paint(PaintChange::NoteVisualContextBoxDirty {
             node: viewport,
             kind: crate::painting::visual_context::dirty::VisualContextBoxDirtyKind::StyleValueChange,
+            check_table_wrapper: false,
         }));
         assert_eq!(host.known_layout_up_to_date_unless_built(), Some(true));
         assert_eq!(host.changes.moves().rows, RowWrite::None);

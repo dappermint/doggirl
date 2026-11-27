@@ -11263,22 +11263,36 @@ void Document::schedule_accumulated_visual_context_update(Layout::Node const& la
     };
     note_style_change(layout_node);
     // A table box's wrapper carries table properties of its own, such as its clip and what makes its stacking context,
-    // so the visual contexts they make move with the table's.
-    if (auto const* wrapper = layout_node.parent(); wrapper && wrapper->is_table_wrapper()
-        && Painting::display(layout_node).is_table_inside() && Painting::has_committed_box(*wrapper))
-        note_style_change(*wrapper);
+    // so the visual contexts they make move with the table's. Check table-inside before asking for parent(), because
+    // resolving parent() drains queued style changes and materializes a C++ shell for every element.
+    if (auto const* node_with_style = as_if<Layout::NodeWithStyle>(layout_node);
+        node_with_style && node_with_style->display().is_table_inside()) {
+        if (auto const* wrapper = layout_node.parent(); wrapper && wrapper->is_table_wrapper()
+            && Painting::has_committed_box(*wrapper))
+            note_style_change(*wrapper);
+    }
 
     set_needs_accumulated_visual_contexts_update();
 }
 
 void Document::schedule_accumulated_visual_context_update(Layout::BegunRead const& read, Element& element, AccumulatedVisualContextUpdateScope scope)
 {
-    if (auto* layout_node = element.unsafe_layout_node(read))
-        schedule_accumulated_visual_context_update(*layout_node, scope);
-    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
-        if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node(read))
-            schedule_accumulated_visual_context_update(*pseudo_element_layout_node, scope);
+    auto* arena = layout_node_arena_if_created();
+    if (!arena)
+        return;
+    auto const style_node = element.style_node_id().value();
+    if (style_node == 0)
+        return;
+    bool const changes_structure = scope == AccumulatedVisualContextUpdateScope::Structure;
+    bool scheduled = Layout::RustFFI::render_state_note_visual_context_style_change_for_style_node(
+        arena->host(), &read, style_node, 0, changes_structure);
+    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, SyntheticPseudoElement const&) {
+        if (Layout::RustFFI::render_state_note_visual_context_style_change_for_style_node(
+                arena->host(), &read, style_node, Layout::Node::encode_generated_for(pseudo_element), changes_structure))
+            scheduled = true;
     });
+    if (scheduled)
+        set_needs_accumulated_visual_contexts_update();
 }
 
 Compositing::SnappedAreas const& Document::snapped_areas_of_scroll_container(Web::AsyncScrollNodeStableID const& stable_node_id) const

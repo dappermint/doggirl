@@ -91,7 +91,8 @@ fn expand_dirty_entries(
     dirty: &VisualContextDirtySet,
     offset_path_boxes: &crate::cow_map::CowSet<NodeSlotId>,
 ) -> Result<WorkPlan, VisualContextUpdateScope> {
-    let mut work: HashMap<NodeSlotId, BoxDirtyBits> = HashMap::default();
+    let mut work: HashMap<NodeSlotId, BoxDirtyBits> =
+        HashMap::with_capacity_and_hasher(dirty.boxes.len(), Default::default());
     let mut known_to_be_outside_svg_resources = HashSet::default();
     for (slot, bits) in dirty.boxes.iter() {
         if !layout_arena.paintable_row_is_populated(*slot) {
@@ -146,21 +147,23 @@ fn expand_dirty_entries(
     }
     // The offset transform of a box with an offset path depends on the geometry and style of its containing block,
     // so the box is rebuilt whenever its containing block is.
-    let offset_path_boxes_to_rebuild: Vec<_> = offset_path_boxes
-        .iter()
-        .copied()
-        .filter(|slot| {
-            !work.contains_key(slot)
-                && layout_arena.paintable_row_is_populated(*slot)
-                && layout_arena
-                    .node_containing_block_if_live(*slot)
-                    .is_some_and(|containing_block| work.contains_key(&containing_block))
-        })
-        .collect();
-    for slot in offset_path_boxes_to_rebuild {
-        work.entry(slot)
-            .or_default()
-            .insert(VisualContextBoxDirtyKind::OffsetPathContainingBlockChanged);
+    if !offset_path_boxes.is_empty() {
+        let offset_path_boxes_to_rebuild: Vec<_> = offset_path_boxes
+            .iter()
+            .copied()
+            .filter(|slot| {
+                !work.contains_key(slot)
+                    && layout_arena.paintable_row_is_populated(*slot)
+                    && layout_arena
+                        .node_containing_block_if_live(*slot)
+                        .is_some_and(|containing_block| work.contains_key(&containing_block))
+            })
+            .collect();
+        for slot in offset_path_boxes_to_rebuild {
+            work.entry(slot)
+                .or_default()
+                .insert(VisualContextBoxDirtyKind::OffsetPathContainingBlockChanged);
+        }
     }
     let mut plan = WorkPlan {
         work,
@@ -385,31 +388,47 @@ pub(crate) fn box_owns_geometry_dependent_nodes(
     if has_svg_filter_bounds {
         return true;
     }
-    let spatial_is_geometry_dependent = handles.spatial.iter().any(|index| {
+    if handles.spatial.is_empty()
+        && handles.chain_clips.is_empty()
+        && handles.descendant_clips.is_empty()
+        && handles.effects.is_empty()
+    {
+        return false;
+    }
+    if handles.spatial.iter().any(|index| {
         matches!(
             tree.spatial_nodes[index.0 as usize].data,
             SpatialData::Transform(_) | SpatialData::Perspective(_) | SpatialData::Sticky(_)
         )
-    });
-    let effects_filter_is_resolved_by_the_host_against_geometry = layout_arena
-        .node_style_if_live(slot)
-        .is_some_and(|style| crate::painting::css_filter::contains_url(&style.effects().filter));
-    let clips_are_geometry_dependent = handles
+    }) {
+        return true;
+    }
+    if handles
         .clip_handles()
-        .any(|index| tree.clip_nodes[index.0 as usize].data.is_live());
-    let effects_are_geometry_dependent = handles.effects.iter().any(|index| {
+        .any(|index| tree.clip_nodes[index.0 as usize].data.is_live())
+    {
+        return true;
+    }
+    if handles.effects.is_empty() {
+        return false;
+    }
+    let mut effects_filter_is_resolved_by_the_host_against_geometry: Option<bool> = None;
+    handles.effects.iter().any(|index| {
         let node = &tree.effect_nodes[index.0 as usize];
         match &node.data {
-            EffectNodeData::BackgroundColorAnimation => false,
+            EffectNodeData::BackgroundColorAnimation | EffectNodeData::Dead => false,
             EffectNodeData::Mask(_) => true,
             EffectNodeData::Effects(effects) => {
                 effects.backdrop_filter.is_some()
-                    || (effects.filter.is_some() && effects_filter_is_resolved_by_the_host_against_geometry)
+                    || (effects.filter.is_some()
+                        && *effects_filter_is_resolved_by_the_host_against_geometry.get_or_insert_with(|| {
+                            layout_arena
+                                .node_style_if_live(slot)
+                                .is_some_and(|style| crate::painting::css_filter::contains_url(&style.effects().filter))
+                        }))
             }
-            EffectNodeData::Dead => false,
         }
-    });
-    spatial_is_geometry_dependent || clips_are_geometry_dependent || effects_are_geometry_dependent
+    })
 }
 
 /// Whether the box owns no node, and its style and kind have its geometry give it none: a box like that keeps its
@@ -740,7 +759,7 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsWrite>(
                 .is_some_and(|style| style.transform().has_offset_path)
             {
                 state.offset_path_boxes.insert(slot);
-            } else {
+            } else if !state.offset_path_boxes.is_empty() {
                 state.offset_path_boxes.remove(&slot);
             }
             let new_output = assignment.record.output_for_descendants;

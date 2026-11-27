@@ -2110,9 +2110,23 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
     // A new style can change the states and the text formatting the accessibility tree reports for the element.
     if (document().page().accessibility_interested())
         document().invalidate_cached_accessibility_records_after_style_change(*this);
-    // NB: The render side installed the record in a box it styles itself, which the box adopts.
-    if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(m_installed_style);
+    // NB: The render side installed the record in a box it styles itself, which the box adopts. When no C++ shell
+    //     exists yet and did_update_style_record() has no side effects, avoid materializing one.
+    if (auto* arena = document().layout_node_arena_if_created(); arena && style_node_id() != 0) {
+        bool const has_highlight_styles = custom_highlight_styles() != nullptr
+            || (pseudo_element_data() != nullptr
+                && (has_style(CSS::PseudoElement::Selection)
+                    || has_style(CSS::PseudoElement::SearchText)
+                    || has_style(CSS::PseudoElement::SearchTextCurrent)
+                    || has_style(CSS::PseudoElement::SpellingError)));
+        bool const skip_if_render_installed = !has_highlight_styles
+            && !is_document_element()
+            && document().has_no_snapped_areas()
+            && CSS::style_record_group<CSS::ComputedValues::MiscInteractionValues>(m_installed_style.groups()).scroll_snap_strictness_value() == CSS::ScrollSnapStrictness::None;
+        if (auto* layout_node = static_cast<Layout::NodeWithStyle*>(Layout::RustFFI::layout_row_bound_shell_for_style_swap(
+                arena->host(), &read, style_node_id().value(), 0, m_installed_style.record().value(), skip_if_render_installed)))
+            layout_node->set_style_record_identity(m_installed_style);
+    }
 }
 
 Element::CustomHighlightStyles const* Element::custom_highlight_styles() const

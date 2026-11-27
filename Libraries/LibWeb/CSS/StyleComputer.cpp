@@ -1058,7 +1058,13 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         .after = abstract_element.installed_style().record_pointer(),
         .target_node = element.style_node_id().value(),
         .target_pseudo_kind = pseudo_element_to_ffi(pseudo_element),
-        .element_box_slot = Layout::Node::slot_id(element.unsafe_layout_node(read)).index,
+        .element_box_slot = [&] {
+            auto* arena = document().layout_node_arena_if_created();
+            auto const style_node = element.style_node_id().value();
+            if (!arena || style_node == 0)
+                return Compositing::RustFFI::NodeSlotId_INVALID.index;
+            return Layout::RustFFI::layout_row_bound_slot_id(arena->host(), &read, style_node).index;
+        }(),
         .no_ancestor_animations = no_ancestor_animations,
         .tree_order = Animations::compare_elements_in_tree_order_for_composite_order,
     };

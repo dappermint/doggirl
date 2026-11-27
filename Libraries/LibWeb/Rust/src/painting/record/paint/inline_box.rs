@@ -320,7 +320,7 @@ pub(crate) struct InlineStrip {
     inline_axis_is_reverse: bool,
     inline_size: CssPixels,
     /// Where each piece starts in the strip, in logical order.
-    piece_inline_offsets: std::collections::HashMap<u32, CssPixels>,
+    piece_inline_offsets: crate::css::style::fast_hash::FastMap<u32, CssPixels>,
 }
 
 impl InlineStrip {
@@ -331,7 +331,7 @@ impl InlineStrip {
     ) -> Option<Self> {
         let is_horizontal = style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB;
         let mut inline_size = CssPixels::default();
-        let piece_inline_offsets: std::collections::HashMap<u32, CssPixels> = pieces
+        let piece_inline_offsets: crate::css::style::fast_hash::FastMap<u32, CssPixels> = pieces
             .map(|(index, rect)| {
                 let offset = inline_size;
                 inline_size += if is_horizontal { rect.width } else { rect.height };

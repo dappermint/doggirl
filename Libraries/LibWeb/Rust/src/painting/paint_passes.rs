@@ -206,8 +206,8 @@ fn carry_visual_animations_to_new_nodes(
     animations: &[crate::painting::visual_animation::VisualAnimation],
 ) -> Result<Vec<crate::painting::visual_animation::VisualAnimation>, VisualContextsNeedHost> {
     use crate::painting::host::FfiVisualAnimationTargetKind;
-    let mut effect_owners = std::collections::HashMap::new();
-    let mut spatial_owners = std::collections::HashMap::new();
+    let mut effect_owners = crate::css::style::fast_hash::FastMap::default();
+    let mut spatial_owners = crate::css::style::fast_hash::FastMap::default();
     for index in 0..handles_before.slot_capacity() {
         let Some(Some(handles)) = handles_before.get(index) else {
             continue;

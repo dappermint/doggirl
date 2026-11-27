@@ -105,8 +105,22 @@ void SyntheticPseudoElement::swap_in_style_record(Layout::BegunRead const& read,
     if (m_installed_style.record() == style_record)
         return;
     m_installed_style = move(style);
-    if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(m_installed_style);
+    auto& document = m_originating_element->document();
+    if (auto* arena = document.layout_node_arena_if_created(); arena && m_originating_element->style_node_id() != 0) {
+        bool const has_highlight_styles = m_originating_element->custom_highlight_styles() != nullptr
+            || m_originating_element->has_style(CSS::PseudoElement::Selection)
+            || m_originating_element->has_style(CSS::PseudoElement::SearchText)
+            || m_originating_element->has_style(CSS::PseudoElement::SearchTextCurrent)
+            || m_originating_element->has_style(CSS::PseudoElement::SpellingError);
+        bool const skip_if_render_installed = !has_highlight_styles
+            && !m_originating_element->is_document_element()
+            && document.has_no_snapped_areas()
+            && CSS::style_record_group<CSS::ComputedValues::MiscInteractionValues>(m_installed_style.groups()).scroll_snap_strictness_value() == CSS::ScrollSnapStrictness::None;
+        if (auto* layout_node = static_cast<Layout::NodeWithStyle*>(Layout::RustFFI::layout_row_bound_shell_for_style_swap(
+                arena->host(), &read, m_originating_element->style_node_id().value(), Layout::Node::encode_generated_for(m_type),
+                m_installed_style.record().value(), skip_if_render_installed)))
+            layout_node->set_style_record_identity(m_installed_style);
+    }
 }
 
 void SyntheticPseudoElement::set_computed_style(Layout::BegunRead const& read, CSS::InstalledStyle style)

@@ -13,6 +13,7 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
+#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementRareData.h>
@@ -340,6 +341,119 @@ static RefPtr<CSS::StyleValue const> parse_presentation_attribute_uncached(DOM::
     return parse_css_value(parsing_context, value, property_id);
 }
 
+static Optional<double> parse_simple_svg_presentation_number(Utf16View value)
+{
+    auto const trimmed = value.trim_ascii_whitespace();
+    auto const length = trimmed.length_in_code_units();
+    if (length == 0 || length > 32)
+        return {};
+    char buffer[33];
+    bool has_digit = false;
+    bool has_dot = false;
+    for (size_t i = 0; i < length; ++i) {
+        u16 const ch = trimmed.code_unit_at(i);
+        if (ch >= '0' && ch <= '9') {
+            has_digit = true;
+        } else if (ch == '.') {
+            if (has_dot || i + 1 == length)
+                return {};
+            has_dot = true;
+        } else if (ch == '-' || ch == '+') {
+            if (i != 0)
+                return {};
+        } else {
+            return {};
+        }
+        buffer[i] = static_cast<char>(ch);
+    }
+    if (!has_digit)
+        return {};
+    auto parsed = StringView { buffer, length }.to_number<double>();
+    if (!parsed.has_value() || !isfinite(*parsed))
+        return {};
+    return parsed;
+}
+
+static RefPtr<CSS::StyleValue const> try_parse_simple_svg_translate(Utf16View value)
+{
+    auto const trimmed = value.trim_ascii_whitespace();
+    // "translate(" is 10 code units, plus at least one digit and ')'.
+    if (trimmed.length_in_code_units() < 12 || trimmed.code_unit_at(trimmed.length_in_code_units() - 1) != u')')
+        return {};
+    static constexpr StringView prefix = "translate("sv;
+    for (size_t i = 0; i < prefix.length(); ++i) {
+        if (trimmed.code_unit_at(i) != static_cast<u16>(prefix[i]))
+            return {};
+    }
+    auto const args = trimmed.substring_view(prefix.length(), trimmed.length_in_code_units() - prefix.length() - 1).trim_ascii_whitespace();
+    if (args.is_empty() || args.contains(u'(') || args.contains(u')'))
+        return {};
+
+    // Split on comma or ASCII whitespace into 1 or 2 plain numbers.
+    size_t sep = 0;
+    while (sep < args.length_in_code_units()) {
+        u16 const ch = args.code_unit_at(sep);
+        if (ch == u',' || ch == u' ' || ch == u'\t' || ch == u'\n' || ch == u'\r' || ch == u'\f')
+            break;
+        ++sep;
+    }
+    auto tx = parse_simple_svg_presentation_number(args.substring_view(0, sep));
+    if (!tx.has_value())
+        return {};
+    double ty = 0.0;
+    if (sep < args.length_in_code_units()) {
+        auto rest = args.substring_view(sep).trim_ascii_whitespace();
+        if (!rest.is_empty() && rest.code_unit_at(0) == u',')
+            rest = rest.substring_view(1).trim_ascii_whitespace();
+        if (rest.is_empty())
+            return {};
+        auto parsed_ty = parse_simple_svg_presentation_number(rest);
+        if (!parsed_ty.has_value())
+            return {};
+        ty = *parsed_ty;
+    }
+    CSS::StyleValueVector matrix_parameters {
+        CSS::NumberStyleValue::create(1.0f),
+        CSS::NumberStyleValue::create(0.0f),
+        CSS::NumberStyleValue::create(0.0f),
+        CSS::NumberStyleValue::create(1.0f),
+        CSS::NumberStyleValue::create(static_cast<float>(*tx)),
+        CSS::NumberStyleValue::create(static_cast<float>(ty)),
+    };
+    return CSS::StyleValueList::create(
+        CSS::StyleValueVector { CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Matrix, move(matrix_parameters)) },
+        CSS::StyleValueList::Separator::Space);
+}
+
+static RefPtr<CSS::StyleValue const> try_parse_simple_svg_presentation_attribute(CSS::PropertyID property_id, Utf16View value)
+{
+    switch (property_id) {
+    case CSS::PropertyID::X:
+    case CSS::PropertyID::Y:
+    case CSS::PropertyID::Cx:
+    case CSS::PropertyID::Cy:
+        if (auto number = parse_simple_svg_presentation_number(value); number.has_value() && AK::fabs(*number) < 1e7) {
+            double const px = (*number == 0.0) ? 0.0 : CSSPixels::nearest_value_for(*number).to_double();
+            return CSS::LengthStyleValue::create(CSS::Length::make_px(px));
+        }
+        return {};
+    case CSS::PropertyID::Width:
+    case CSS::PropertyID::Height:
+    case CSS::PropertyID::R:
+    case CSS::PropertyID::Rx:
+    case CSS::PropertyID::Ry:
+        if (auto number = parse_simple_svg_presentation_number(value); number.has_value() && *number >= 0.0 && *number < 1e7) {
+            double const px = (*number == 0.0) ? 0.0 : CSSPixels::nearest_value_for(*number).to_double();
+            return CSS::LengthStyleValue::create(CSS::Length::make_px(px));
+        }
+        return {};
+    case CSS::PropertyID::Transform:
+        return try_parse_simple_svg_translate(value);
+    default:
+        return {};
+    }
+}
+
 // Every copy of an icon repeats its presentation attributes, and each copy that gets a style parses them. A value
 // without a function in it, like a path's data and a transform list, parses the same in any document of the same
 // mode, and a parsed value is immutable, so the copies share one.
@@ -358,7 +472,9 @@ RefPtr<CSS::StyleValue const> SVGElement::parse_presentation_attribute(CSS::Prop
     if (auto it = values.find(hash, [&](auto const& entry) { return entry.key.property_id == property_id && entry.key.in_quirks_mode == in_quirks_mode && entry.key.value == value; }); it != values.end())
         return it->value;
 
-    auto parsed = parse_presentation_attribute_uncached(document(), property_id, value);
+    auto parsed = try_parse_simple_svg_presentation_attribute(property_id, value);
+    if (!parsed)
+        parsed = parse_presentation_attribute_uncached(document(), property_id, value);
     // A page that generates its attributes would grow this without bound.
     if (values.size() >= 16384)
         values.clear();

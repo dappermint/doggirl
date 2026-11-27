@@ -173,6 +173,7 @@ fn ancestor_opacity_is_positive(
     if let Some(&cached) = cache.get(&start) {
         return cached;
     }
+    let mut visited: smallvec::SmallVec<[NodeSlotId; 16]> = smallvec::SmallVec::new();
     let mut positive = true;
     let mut cursor = start;
     while let Some(row) = rows.node(cursor) {
@@ -180,6 +181,7 @@ fn ancestor_opacity_is_positive(
             positive = cached;
             break;
         }
+        visited.push(cursor);
         if let Some(style) = row.style()
             && style.effects().opacity <= 0.0
         {
@@ -188,7 +190,9 @@ fn ancestor_opacity_is_positive(
         }
         cursor = row.parent();
     }
-    cache.insert(start, positive);
+    for node in visited {
+        cache.insert(node, positive);
+    }
     positive
 }
 
@@ -204,6 +208,7 @@ fn ancestor_can_compute_without_visual_context(
     if let Some(&cached) = cache.get(&start) {
         return cached;
     }
+    let mut visited: smallvec::SmallVec<[NodeSlotId; 16]> = smallvec::SmallVec::new();
     let mut ok = true;
     let mut cursor = start;
     while let Some(row) = rows.node(cursor) {
@@ -211,6 +216,7 @@ fn ancestor_can_compute_without_visual_context(
             ok = cached;
             break;
         }
+        visited.push(cursor);
         let (kind, flags, parent) = (row.kind(), row.flags(), row.parent());
         if node_facts::kind_is_svg_box(kind) || kind == NodeKind::SVGForeignObjectBox || kind == NodeKind::SVGSVGBox {
             ok = false;
@@ -243,7 +249,9 @@ fn ancestor_can_compute_without_visual_context(
         }
         cursor = parent;
     }
-    cache.insert(start, ok);
+    for node in visited {
+        cache.insert(node, ok);
+    }
     ok
 }
 
