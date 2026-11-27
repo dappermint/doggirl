@@ -306,7 +306,7 @@ Element::PseudoElementData const* Element::pseudo_element_data() const
     return rare_data ? rare_data->pseudo_element_data.ptr() : nullptr;
 }
 
-GC_DEFINE_ALLOCATOR(Element);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(Element);
 
 static void invalidate_content_blocker_style_if_needed(Element& element)
 {

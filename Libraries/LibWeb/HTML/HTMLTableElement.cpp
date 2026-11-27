@@ -27,11 +27,12 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLTableElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLTableElement);
 
 HTMLTableElement::HTMLTableElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
+    set_tree_mutation_fast_path(DOM::Element::TreeMutationFastPath::PlainHTML);
 }
 
 HTMLTableElement::~HTMLTableElement() = default;

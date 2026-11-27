@@ -2742,29 +2742,56 @@ struct ComputedFacts {
 unsafe impl Send for Scratch<'_> {}
 
 /// The scratch of every thread of the pool, plus one for a traversal on the calling thread.
+/// Worker slots are allocated lazily so single-threaded passes pay neither a Vec allocation nor
+/// per-worker Mutex construction.
 struct Scratches<'a> {
     pool: Option<&'a rayon::ThreadPool>,
-    slots: Vec<Mutex<Option<Scratch<'a>>>>,
+    calling_index: usize,
+    calling: Mutex<Option<Scratch<'a>>>,
+    workers: std::sync::OnceLock<Vec<Mutex<Option<Box<Scratch<'a>>>>>>,
 }
 
 impl<'a> Scratches<'a> {
+    fn new(pool: Option<&'a rayon::ThreadPool>) -> Self {
+        let calling_index = pool.map_or(0, rayon::ThreadPool::current_num_threads);
+        Self {
+            pool,
+            calling_index,
+            calling: Mutex::new(None),
+            workers: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn init_scratch(context: &PassContext<'a>, index: usize) -> Scratch<'a> {
+        let mut scratch = Scratch::new_for_slot(context, index);
+        if context.uses_caches
+            && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
+        {
+            std::mem::swap(
+                &mut scratch.groups,
+                &mut *cache.lock().expect("no thread panicked while styling"),
+            );
+        }
+        scratch
+    }
+
     fn with<R>(&self, context: &PassContext<'a>, run: impl FnOnce(&mut Scratch<'a>) -> R) -> R {
-        let index = self
-            .pool
-            .and_then(rayon::ThreadPool::current_thread_index)
-            .unwrap_or(self.slots.len() - 1);
-        let mut slot = self.slots[index]
+        if let Some(worker_index) = self.pool.and_then(rayon::ThreadPool::current_thread_index) {
+            let workers = self
+                .workers
+                .get_or_init(|| (0..self.calling_index).map(|_| Mutex::new(None)).collect());
+            let mut slot = workers[worker_index]
+                .lock()
+                .expect("a thread's scratch is only ever held by that thread");
+            let scratch = slot.get_or_insert_with(|| Box::new(Self::init_scratch(context, worker_index)));
+            return run(scratch);
+        }
+        let mut slot = self
+            .calling
             .lock()
             .expect("a thread's scratch is only ever held by that thread");
-        run(slot.get_or_insert_with(|| {
-            let mut scratch = Scratch::new_for_slot(context, index);
-            if context.uses_caches
-                && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
-            {
-                scratch.groups = std::mem::take(&mut *cache.lock().expect("no thread panicked while styling"));
-            }
-            scratch
-        }))
+        let scratch = slot.get_or_insert_with(|| Self::init_scratch(context, self.calling_index));
+        run(scratch)
     }
 }
 
@@ -3104,11 +3131,7 @@ fn style_queued<T: Sync>(
     queued: impl Fn(&T) -> Queued + Copy + Send,
     pseudo_elements: Vec<SuspendedPseudoElements>,
 ) -> Statistics {
-    let workers = pool.map_or(0, rayon::ThreadPool::current_num_threads);
-    let scratches = Scratches {
-        pool,
-        slots: (0..=workers).map(|_| Mutex::new(None)).collect(),
-    };
+    let scratches = Scratches::new(pool);
     if !pseudo_elements.is_empty() {
         scratches.with(context, |scratch| {
             for suspended in pseudo_elements {
@@ -3178,17 +3201,28 @@ fn style_queued<T: Sync>(
     }
     let mut statistics = Statistics::default();
     let mut styled_threads = 0u64;
-    for (index, scratch) in scratches.slots.into_iter().enumerate() {
-        let Some(mut scratch) = scratch.into_inner().expect("no thread panicked while styling") else {
-            continue;
-        };
+    let mut finish_scratch = |index: usize, mut scratch: Scratch<'_>| {
         if context.uses_caches
             && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
         {
-            *cache.lock().expect("no thread panicked while styling") = std::mem::take(&mut scratch.groups).kept();
+            scratch.groups.keep_for_next_pass();
+            std::mem::swap(
+                &mut *cache.lock().expect("no thread panicked while styling"),
+                &mut scratch.groups,
+            );
             styled_threads |= 1 << index;
         }
         statistics.add_recycling(scratch, index);
+    };
+    if let Some(workers) = scratches.workers.into_inner() {
+        for (index, slot) in workers.into_iter().enumerate() {
+            if let Some(scratch) = slot.into_inner().expect("no thread panicked while styling") {
+                finish_scratch(index, *scratch);
+            }
+        }
+    }
+    if let Some(scratch) = scratches.calling.into_inner().expect("no thread panicked while styling") {
+        finish_scratch(scratches.calling_index, scratch);
     }
     // NB: The caches of the threads that sat the pass out count it as a small one too, so the room a large pass left
     //     them goes back while only the calling thread styles, as it does for an animation.
@@ -3197,8 +3231,10 @@ fn style_queued<T: Sync>(
     {
         for (index, cache) in caches.made_with_index() {
             if styled_threads & (1 << index) == 0 {
-                let mut cache = cache.lock().expect("no thread panicked while styling");
-                *cache = std::mem::take(&mut *cache).kept();
+                cache
+                    .lock()
+                    .expect("no thread panicked while styling")
+                    .keep_for_next_pass();
             }
         }
     }

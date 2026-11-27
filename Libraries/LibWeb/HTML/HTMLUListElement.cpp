@@ -11,7 +11,7 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLUListElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLUListElement);
 
 HTMLUListElement::HTMLUListElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))

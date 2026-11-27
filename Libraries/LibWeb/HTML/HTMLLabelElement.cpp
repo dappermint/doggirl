@@ -21,7 +21,7 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLLabelElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLLabelElement);
 
 HTMLLabelElement::HTMLLabelElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))

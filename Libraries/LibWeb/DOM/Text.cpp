@@ -68,16 +68,20 @@ SlottableMixin::RareData& Text::ensure_slottable_rare_data()
     return static_cast<RareData&>(ensure_rare_data());
 }
 
-GC_DEFINE_ALLOCATOR(Text);
+GC_DEFINE_ALLOCATOR_WITH_CONDITIONAL_BATCH_DESTRUCTOR(Text);
 
 Text::Text(Document& document, Utf16String data)
     : CharacterData(document, NodeType::TEXT_NODE, move(data))
 {
+    if (this->data().has_long_storage())
+        mark_needs_destruction();
 }
 
 Text::Text(Document& document, NodeType type, Utf16String data)
     : CharacterData(document, type, move(data))
 {
+    if (this->data().has_long_storage())
+        mark_needs_destruction();
 }
 
 GC::Ref<Text> Text::create(Document& document, Utf16String data)

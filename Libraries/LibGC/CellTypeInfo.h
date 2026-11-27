@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/BuiltinWrappers.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <LibGC/Cell.h>
@@ -43,6 +44,17 @@ struct CellTypeThunks {
     static void destroy(Cell* cell)
     {
         static_cast<T*>(cell)->T::~T();
+    }
+
+    template<typename T>
+    static void destroy_dead_cells(size_t cell_base, size_t cell_size, size_t word_index, u64 dead)
+    {
+        size_t const word_base = cell_base + word_index * 64 * cell_size;
+        while (dead != 0) {
+            size_t const bit = count_trailing_zeroes(dead);
+            dead &= dead - 1;
+            reinterpret_cast<T*>(word_base + bit * cell_size)->T::~T();
+        }
     }
 
     template<typename T>
