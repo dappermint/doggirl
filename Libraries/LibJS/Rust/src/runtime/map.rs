@@ -198,13 +198,16 @@ impl<V: StoredValue> Storage<V> {
     }
 
     /// Changes the storage of a collection, and tells the heap how much the memory of the storage changed.
+    #[inline]
     pub(crate) fn modify<R>(storage: &GcRefCell<Self>, vm: &Vm, modify: impl FnOnce(&mut Self) -> R) -> R {
         let mut storage = storage.borrow_mut(vm);
         let old_size = storage.external_memory_size();
         let result = modify(&mut storage);
         let new_size = storage.external_memory_size();
         drop(storage);
-        vm.heap().account_external_memory_change(old_size, new_size);
+        if new_size != old_size {
+            vm.heap().account_external_memory_change(old_size, new_size);
+        }
         result
     }
 

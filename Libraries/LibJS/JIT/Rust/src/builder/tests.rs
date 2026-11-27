@@ -3055,3 +3055,57 @@ mod globals {
         assert!(text.contains("CallSlowPath ResolveGlobalBinding"), "{text}");
     }
 }
+
+#[test]
+fn object_is_and_collection_helper_intrinsics_lower_and_verify() {
+    use crate::snapshot::{CallFeedbackSnapshot, CellId, Intrinsic, NativeCallTarget};
+
+    let build_intrinsic_call = |intrinsic: Intrinsic, arg_count: usize| -> String {
+        let arg_operands = [a(0), r(6)];
+        let args: Vec<Operand> = arg_operands[..arg_count].to_vec();
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                inlining::call(r(5), c(0), c(1), args.clone()),
+                Instruction::Return { value: r(5) },
+            ]
+        });
+        let mut snapshot = snapshot_for(&program, test_layout());
+        snapshot.runtime.helper_calls = crate::snapshot::HelperCallAddresses(|_| 0x2000);
+        let realm = snapshot.runtime.realm;
+        snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
+            target: Some(CellId(0x9000)),
+            flags: 0,
+            value: 0,
+            inline_executable: None,
+            direct_call: None,
+            native_call: Some(NativeCallTarget {
+                function: CellId(0x9000),
+                realm,
+                entry: core::num::NonZeroU64::new(0x1000),
+                direct_getter: None,
+            }),
+            forwarded: None,
+            target_intrinsic: Some(intrinsic),
+            target_builtin: None,
+            construct: None,
+        }]);
+        let graph = optimized_graph(&snapshot);
+        dump(&graph, &test_layout())
+    };
+
+    let object_is_ir = build_intrinsic_call(Intrinsic::ObjectIs, 2);
+    assert!(object_is_ir.contains("BranchTaggedEquals"), "{object_is_ir}");
+    assert!(object_is_ir.contains("CallIntrinsic ObjectIs"), "{object_is_ir}");
+    assert!(object_is_ir.contains("BoxBool"), "{object_is_ir}");
+
+    for (intrinsic, argc) in [
+        (Intrinsic::ObjectKeys, 1),
+        (Intrinsic::MapPrototypeSet, 2),
+        (Intrinsic::SetPrototypeHas, 1),
+        (Intrinsic::SetPrototypeAdd, 1),
+    ] {
+        let ir = build_intrinsic_call(intrinsic, argc);
+        assert!(ir.contains(&format!("CallIntrinsic {intrinsic:?}")), "{ir}");
+    }
+}

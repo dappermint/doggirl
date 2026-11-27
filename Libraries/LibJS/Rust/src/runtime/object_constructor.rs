@@ -14,6 +14,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
+use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{
     PropertyKeyGroups, group_by, ordinary_create_from_constructor, require_object_coercible,
 };
@@ -32,6 +33,11 @@ use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::value::same_value;
 use crate::utf16::utf16_formatted;
+
+/// %Object.is%, which JIT code inlines with a runtime helper fallback.
+pub(crate) static IS_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectConstructor::is);
+/// %Object.keys%, which JIT code calls through a runtime helper.
+pub(crate) static KEYS_FUNCTION: RawNativeFunctionPointer = raw_native!(ObjectConstructor::keys);
 
 #[repr(C)]
 #[derive(Trace)]
@@ -84,7 +90,7 @@ impl ObjectConstructor {
             raw_native!(ObjectConstructor::define_properties),
             2,
         );
-        define_native_function(&names.is, raw_native!(ObjectConstructor::is), 2);
+        define_native_function(&names.is, IS_FUNCTION, 2);
         define_native_function(
             &names.getOwnPropertyDescriptor,
             raw_native!(ObjectConstructor::get_own_property_descriptor),
@@ -127,7 +133,7 @@ impl ObjectConstructor {
         define_native_function(&names.freeze, raw_native!(ObjectConstructor::freeze), 1);
         define_native_function(&names.fromEntries, raw_native!(ObjectConstructor::from_entries), 1);
         define_native_function(&names.seal, raw_native!(ObjectConstructor::seal), 1);
-        define_native_function(&names.keys, raw_native!(ObjectConstructor::keys), 1);
+        define_native_function(&names.keys, KEYS_FUNCTION, 1);
         define_native_function(&names.values, raw_native!(ObjectConstructor::values), 1);
         define_native_function(&names.entries, raw_native!(ObjectConstructor::entries), 1);
         define_native_function(&names.create, raw_native!(ObjectConstructor::object_create), 2);
@@ -316,7 +322,7 @@ impl ObjectConstructor {
             let shape = object.shape();
             let count = shape.property_count() as usize;
             if count == 0 {
-                return Ok(Value::from_object(Array::create(vm, realm, 0, None).must()));
+                return Ok(Value::from_object(Array::create_empty(vm, realm)));
             }
             let (all_enumerable_contiguous, has_accessors) =
                 shape.with_own_enumerable_string_keys(vm, |_, contiguous| {
@@ -330,8 +336,8 @@ impl ObjectConstructor {
             if all_enumerable_contiguous && !has_accessors {
                 let entry_list = MarkedVec::with_capacity(vm, count);
                 for index in 0..count {
-                    let pair = Array::create(vm, realm, 0, None).must();
-                    // Read key and value fresh after `Array::create` in case GC moved cells.
+                    let pair = Array::create_empty(vm, realm);
+                    // Read key and value fresh after `Array::create_empty` in case GC moved cells.
                     let key = object.shape().cached_own_enumerable_string_key_at(index);
                     let value = object.get_direct(index as u32);
                     pair.set_indexed_property_elements(&[key, value]);
@@ -604,7 +610,7 @@ impl ObjectConstructor {
         // OPTIMIZATION: The enumerable own keys of an object whose own keys are those of its shape are the enumerable
         //               string keys of the shape, which the shape caches as a contiguous slice of string values.
         if object.own_property_keys_are_those_of_its_shape() {
-            let array = Array::create(vm, realm, 0, None).must();
+            let array = Array::create_empty(vm, realm);
             object
                 .shape()
                 .with_own_enumerable_string_keys(vm, |keys, _| array.set_indexed_property_elements(keys));
@@ -711,7 +717,7 @@ impl ObjectConstructor {
             let shape = object.shape();
             let property_count = shape.property_count();
             if property_count == 0 {
-                return Ok(Value::from_object(Array::create(vm, realm, 0, None).must()));
+                return Ok(Value::from_object(Array::create_empty(vm, realm)));
             }
             let mut has_accessors = false;
             let mut contiguous = true;
@@ -732,7 +738,7 @@ impl ObjectConstructor {
                 ControlFlow::Continue(())
             });
             if !has_accessors {
-                let array = Array::create(vm, realm, 0, None).must();
+                let array = Array::create_empty(vm, realm);
                 if enumerable_count > 0 {
                     if contiguous {
                         array.set_indexed_property_elements(object.named_properties_prefix(enumerable_count as usize));

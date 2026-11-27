@@ -34,8 +34,10 @@ use crate::runtime::realm::Realm;
 use crate::runtime::set::{Set, get_set_record, set_data_has};
 use crate::runtime::set_iterator::SetIterator;
 
-/// %Set.prototype.add%, which the Set constructor calls directly when it finds it as the adder.
+/// %Set.prototype.add%, which the Set constructor and JIT helper call directly.
 pub(crate) static ADD_FUNCTION: RawNativeFunctionPointer = raw_native!(SetPrototype::add);
+/// %Set.prototype.has%, which JIT code calls through a runtime helper.
+pub(crate) static HAS_FUNCTION: RawNativeFunctionPointer = raw_native!(SetPrototype::has);
 
 /// %Set.prototype%.
 #[repr(C)]
@@ -95,7 +97,7 @@ impl SetPrototype {
         define_native_function(&names.difference, raw_native!(SetPrototype::difference), 1);
         define_native_function(&names.entries, raw_native!(SetPrototype::entries), 0);
         define_native_function(&names.forEach, raw_native!(SetPrototype::for_each), 1);
-        define_native_function(&names.has, raw_native!(SetPrototype::has), 1);
+        define_native_function(&names.has, HAS_FUNCTION, 1);
         define_native_function(&names.intersection, raw_native!(SetPrototype::intersection), 1);
         define_native_function(&names.isDisjointFrom, raw_native!(SetPrototype::is_disjoint_from), 1);
         define_native_function(&names.isSubsetOf, raw_native!(SetPrototype::is_subset_of), 1);

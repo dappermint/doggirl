@@ -6,7 +6,7 @@
 
 use core::ops::Deref;
 
-use ak::Utf16String;
+use ak::{Utf16FlyString, Utf16String};
 use libjs_abi::Builtin;
 
 use crate::gc::class::{Class, define_cell, downcast_ref};
@@ -117,6 +117,48 @@ impl FunctionObject {
         name_arg: &ClassElementName,
         prefix: Option<&str>,
     ) -> Gc<PrimitiveString> {
+        let native_function = self.as_native_function();
+
+        // OPTIMIZATION: Avoid constructing an intermediate `Utf16String` and redundant `Utf16FlyString` lookup when
+        //               `name_arg` is already backed by a `Utf16FlyString` (the overwhelmingly common case during
+        //               realm/prototype initialization and property/method definitions).
+        let fly_name = match name_arg {
+            ClassElementName::PropertyKey(property_key) if property_key.is_string() => Some(property_key.as_string()),
+            ClassElementName::PrivateName(private_name) => Some(&private_name.description),
+            _ => None,
+        };
+        if let Some(fly_name) = fly_name {
+            match prefix {
+                None => {
+                    if let Some(native_function) = native_function {
+                        native_function.set_initial_name(fly_name.clone());
+                    }
+                    return PrimitiveString::create_from_fly_string(vm, fly_name);
+                }
+                Some(prefix)
+                    if prefix.is_ascii()
+                        && let Utf16View::Ascii(name_bytes) = Utf16View::of_fly_string(fly_name)
+                        && prefix.len() + 1 + name_bytes.len() <= 64 =>
+                {
+                    let mut buf = [0u8; 64];
+                    let p = prefix.len();
+                    let total = p + 1 + name_bytes.len();
+                    buf[..p].copy_from_slice(prefix.as_bytes());
+                    buf[p] = b' ';
+                    buf[p + 1..total].copy_from_slice(name_bytes);
+                    if let Some(native_function) = native_function {
+                        let prefixed = Utf16FlyString::from_utf8(
+                            core::str::from_utf8(&buf[..total]).expect("prefixed name is ASCII"),
+                        );
+                        native_function.set_initial_name(prefixed.clone());
+                        return PrimitiveString::create_from_fly_string(vm, &prefixed);
+                    }
+                    return PrimitiveString::create_from_ascii(vm, &buf[..total]);
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut name: Utf16String = match name_arg {
             // 2. If Type(name) is Symbol, then
             ClassElementName::PropertyKey(property_key) if property_key.is_symbol() => {
@@ -143,14 +185,6 @@ impl FunctionObject {
             ClassElementName::PropertyKey(property_key) => property_key.to_utf16_string(),
         };
 
-        // 4. If F has an [[InitialName]] internal slot, then
-        let native_function = self.as_native_function();
-
-        if let Some(native_function) = native_function {
-            // a. Set F.[[InitialName]] to name.
-            native_function.set_initial_name(Utf16View::of_string(&name).to_utf16_fly_string());
-        }
-
         // 5. If prefix is present, then
         if let Some(prefix) = prefix {
             // a. Set name to the string-concatenation of prefix, the code unit 0x0020 (SPACE), and name.
@@ -158,12 +192,13 @@ impl FunctionObject {
             code_units.push(u16::from(b' '));
             Utf16View::of_string(&name).append_to(&mut code_units);
             name = Utf16String::from_utf16(&code_units);
+        }
 
-            // b. If F has an [[InitialName]] internal slot, then
-            if let Some(native_function) = native_function {
-                // i. Optionally, set F.[[InitialName]] to name.
-                native_function.set_initial_name(Utf16View::of_string(&name).to_utf16_fly_string());
-            }
+        // 4 & 5.b. Set F.[[InitialName]] once to the final name (including any prefix).
+        if let Some(native_function) = native_function {
+            let fly = Utf16View::of_string(&name).to_utf16_fly_string();
+            native_function.set_initial_name(fly.clone());
+            return PrimitiveString::create_from_fly_string(vm, &fly);
         }
 
         PrimitiveString::create(vm, name)
