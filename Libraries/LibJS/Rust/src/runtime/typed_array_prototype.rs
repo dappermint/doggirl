@@ -17,6 +17,7 @@ use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{call_function_object, checked_js_string_length_sum, species_constructor};
 use crate::runtime::array::{Holes, sort_indexed_properties};
 use crate::runtime::array_buffer::{ElementType, Order, clone_array_buffer};
+use crate::runtime::array_prototype::array_merge_sort;
 use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::canonical_index::{CanonicalIndex, CanonicalIndexType};
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -241,6 +242,197 @@ fn fast_typed_array_fill(typed_array: &TypedArrayBase, begin: usize, end: usize,
         byte_index += chunk_size;
         remaining_bytes -= chunk_size;
     }
+}
+
+#[inline]
+fn cmp_f32_es(a: &f32, b: &f32) -> core::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => core::cmp::Ordering::Equal,
+        (true, false) => core::cmp::Ordering::Greater,
+        (false, true) => core::cmp::Ordering::Less,
+        (false, false) => a.total_cmp(b),
+    }
+}
+
+#[inline]
+fn cmp_f64_es(a: &f64, b: &f64) -> core::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => core::cmp::Ordering::Equal,
+        (true, false) => core::cmp::Ordering::Greater,
+        (false, true) => core::cmp::Ordering::Less,
+        (false, false) => a.total_cmp(b),
+    }
+}
+
+/// Sorts a non-shared, non-detached typed array's raw bytes in place using the exact ES
+/// `CompareTypedArrayElements` default numeric order. Returns `false` if the fallback path is needed.
+fn try_fast_sort_typed_array_in_place(typed_array: &TypedArrayBase, length: usize) -> bool {
+    if !cfg!(target_endian = "little") {
+        return false;
+    }
+    let buffer = typed_array.viewed_array_buffer();
+    if buffer.is_detached() || buffer.is_shared_array_buffer() {
+        return false;
+    }
+    let element_size = typed_array.element_size();
+    let Some(byte_len) = length.checked_mul(element_size) else {
+        return false;
+    };
+    let byte_offset = typed_array.byte_offset();
+    let Some(byte_end) = byte_offset.checked_add(byte_len) else {
+        return false;
+    };
+    buffer.with_data_block(|block| {
+        if byte_end > block.size() {
+            return false;
+        }
+        let ptr = block.data_at(byte_offset);
+        macro_rules! sort_typed_slice {
+            ($ty:ty, $sort_expr:expr) => {{
+                if !(ptr as usize).is_multiple_of(align_of::<$ty>()) {
+                    return false;
+                }
+                // SAFETY: The buffer is non-shared, non-detached, aligned for `$ty`, and covers `length` elements.
+                let slice = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<$ty>(), length) };
+                ($sort_expr)(slice);
+                true
+            }};
+        }
+        match typed_array.kind() {
+            Kind::Int8Array => sort_typed_slice!(i8, |s: &mut [i8]| s.sort_unstable()),
+            Kind::Uint8Array | Kind::Uint8ClampedArray => sort_typed_slice!(u8, |s: &mut [u8]| s.sort_unstable()),
+            Kind::Int16Array => sort_typed_slice!(i16, |s: &mut [i16]| s.sort_unstable()),
+            Kind::Uint16Array => sort_typed_slice!(u16, |s: &mut [u16]| s.sort_unstable()),
+            Kind::Int32Array => sort_typed_slice!(i32, |s: &mut [i32]| s.sort_unstable()),
+            Kind::Uint32Array => sort_typed_slice!(u32, |s: &mut [u32]| s.sort_unstable()),
+            Kind::BigInt64Array => sort_typed_slice!(i64, |s: &mut [i64]| s.sort_unstable()),
+            Kind::BigUint64Array => sort_typed_slice!(u64, |s: &mut [u64]| s.sort_unstable()),
+            Kind::Float32Array => sort_typed_slice!(f32, |s: &mut [f32]| s.sort_unstable_by(cmp_f32_es)),
+            Kind::Float64Array => sort_typed_slice!(f64, |s: &mut [f64]| s.sort_unstable_by(cmp_f64_es)),
+            Kind::Float16Array => false,
+        }
+    })
+}
+
+/// Bulk-reads `length` elements of a non-shared numeric typed array directly into a `MarkedVec<Value>`.
+fn try_read_numeric_typed_array_values<'vm>(
+    vm: &'vm Vm,
+    typed_array: &TypedArrayBase,
+    length: usize,
+) -> Option<MarkedVec<'vm, Value>> {
+    if !cfg!(target_endian = "little") {
+        return None;
+    }
+    let buffer = typed_array.viewed_array_buffer();
+    if buffer.is_detached() || buffer.is_shared_array_buffer() {
+        return None;
+    }
+    let element_size = typed_array.element_size();
+    let byte_offset = typed_array.byte_offset();
+    let byte_end = length.checked_mul(element_size)?.checked_add(byte_offset)?;
+    let kind = typed_array.kind();
+    if matches!(kind, Kind::Float16Array | Kind::BigInt64Array | Kind::BigUint64Array) {
+        return None;
+    }
+    buffer.with_data_block(|block| {
+        if byte_end > block.size() {
+            return None;
+        }
+        let ptr = block.data_at(byte_offset);
+        let items = MarkedVec::with_capacity(vm, length);
+        macro_rules! read_typed {
+            ($ty:ty, $to_value:expr) => {{
+                if !(ptr as usize).is_multiple_of(align_of::<$ty>()) {
+                    return None;
+                }
+                // SAFETY: The buffer is non-shared, non-detached, aligned for `$ty`, and covers `length` elements.
+                let slice = unsafe { core::slice::from_raw_parts(ptr.cast::<$ty>(), length) };
+                for &elem in slice {
+                    items.push(($to_value)(elem));
+                }
+            }};
+        }
+        match kind {
+            Kind::Int8Array => read_typed!(i8, |v: i8| Value::from_i32(i32::from(v))),
+            Kind::Uint8Array | Kind::Uint8ClampedArray => read_typed!(u8, |v: u8| Value::from_i32(i32::from(v))),
+            Kind::Int16Array => read_typed!(i16, |v: i16| Value::from_i32(i32::from(v))),
+            Kind::Uint16Array => read_typed!(u16, |v: u16| Value::from_i32(i32::from(v))),
+            Kind::Int32Array => read_typed!(i32, Value::from_i32),
+            Kind::Uint32Array => read_typed!(u32, |v: u32| {
+                if v <= i32::MAX as u32 {
+                    Value::from_i32(v as i32)
+                } else {
+                    Value::from_f64(f64::from(v))
+                }
+            }),
+            Kind::Float32Array => read_typed!(f32, |v: f32| Value::from_f64(f64::from(v))),
+            Kind::Float64Array => read_typed!(f64, Value::from_f64),
+            Kind::Float16Array | Kind::BigInt64Array | Kind::BigUint64Array => return None,
+        }
+        Some(items)
+    })
+}
+
+/// Bulk-writes `length` sorted numeric `Value`s back into a non-shared, non-detached typed array.
+/// Returns `false` if the buffer was detached/shrunk or the kind is unsupported (caller falls back to spec `Set`).
+fn try_write_numeric_typed_array_values(
+    typed_array: &TypedArrayBase,
+    length: usize,
+    sorted_list: &MarkedVec<'_, Value>,
+) -> bool {
+    if !cfg!(target_endian = "little") || sorted_list.len() < length {
+        return false;
+    }
+    let buffer = typed_array.viewed_array_buffer();
+    if buffer.is_detached() || buffer.is_shared_array_buffer() {
+        return false;
+    }
+    let kind = typed_array.kind();
+    if matches!(kind, Kind::Float16Array | Kind::BigInt64Array | Kind::BigUint64Array) {
+        return false;
+    }
+    let element_size = typed_array.element_size();
+    let byte_offset = typed_array.byte_offset();
+    let Some(byte_end) = length.checked_mul(element_size).and_then(|n| n.checked_add(byte_offset)) else {
+        return false;
+    };
+    buffer.with_data_block(|block| {
+        if byte_end > block.size() {
+            return false;
+        }
+        let ptr = block.data_at(byte_offset);
+        macro_rules! write_typed {
+            ($ty:ty, $from_value:expr) => {{
+                if !(ptr as usize).is_multiple_of(align_of::<$ty>()) {
+                    return false;
+                }
+                // SAFETY: The buffer is non-shared, non-detached, aligned for `$ty`, and covers `length` elements.
+                let slice = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<$ty>(), length) };
+                for (dst, j) in slice.iter_mut().zip(0..length) {
+                    let v = sorted_list.get(j).expect("the index is in bounds");
+                    *dst = ($from_value)(v);
+                }
+                true
+            }};
+        }
+        match kind {
+            Kind::Int8Array => write_typed!(i8, |v: Value| v.as_i32() as i8),
+            Kind::Uint8Array | Kind::Uint8ClampedArray => write_typed!(u8, |v: Value| v.as_i32() as u8),
+            Kind::Int16Array => write_typed!(i16, |v: Value| v.as_i32() as i16),
+            Kind::Uint16Array => write_typed!(u16, |v: Value| v.as_i32() as u16),
+            Kind::Int32Array => write_typed!(i32, |v: Value| v.as_i32()),
+            Kind::Uint32Array => write_typed!(u32, |v: Value| {
+                if v.is_int32() {
+                    v.as_i32() as u32
+                } else {
+                    v.as_f64() as u32
+                }
+            }),
+            Kind::Float32Array => write_typed!(f32, |v: Value| v.as_f64() as f32),
+            Kind::Float64Array => write_typed!(f64, |v: Value| v.as_f64()),
+            Kind::Float16Array | Kind::BigInt64Array | Kind::BigUint64Array => false,
+        }
+    })
 }
 
 fn typed_array_element_types_have_same_bit_encoding(source: &TypedArrayBase, target: &TypedArrayBase) -> bool {
@@ -2194,33 +2386,51 @@ impl TypedArrayPrototype {
 
         // 4. Let len be TypedArrayLength(taRecord).
         let length = typed_array_length(&typed_array_record);
+        if length <= 1 {
+            return Ok(Value::from_object(typed_array));
+        }
 
         // 5. NOTE: The following closure performs a numeric comparison rather than the string comparison used in 23.1.3.30.
         // 6. Let SortCompare be a new Abstract Closure with parameters (x, y) that captures comparefn and performs the following steps when called:
         let comparefn = (!compare_function.is_undefined()).then(|| compare_function.as_function());
+
+        // OPTIMIZATION: For non-shared numeric typed arrays without a custom comparator, sort the raw buffer in place
+        //               in Rust using the exact ES CompareTypedArrayElements total order (zero Value boxing or GC).
+        if comparefn.is_none() && try_fast_sort_typed_array_in_place(&typed_array, length) {
+            return Ok(Value::from_object(typed_array));
+        }
+
         let sort_compare = |x: Value, y: Value| -> ThrowCompletionOr<f64> {
             // a. Return ? CompareTypedArrayElements(x, y, comparefn).
             compare_typed_array_elements(vm, x, y, comparefn)
         };
 
         // 7. Let sortedList be ? SortIndexedProperties(obj, len, SortCompare, read-through-holes).
-        let sorted_list =
-            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?;
+        // OPTIMIZATION: Bulk-read raw numeric elements directly into MarkedVec instead of calling Get(obj, ToString(k))
+        //               per element, and bulk-write back after re-checking buffer bounds.
+        let sorted_list = if let Some(items) = try_read_numeric_typed_array_values(vm, &typed_array, length) {
+            array_merge_sort(vm, &sort_compare, &items)?;
+            items
+        } else {
+            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?
+        };
 
         // 8. Let j be 0.
         // 9. Repeat, while j < len,
-        for j in 0..length as usize {
-            // a. Perform ! Set(obj, ! ToString(𝔽(j)), sortedList[j], true).
-            typed_array
-                .set(
-                    vm,
-                    &PropertyKey::from_number(j as u64),
-                    sorted_list.get(j).expect("the index is in bounds"),
-                    ShouldThrowExceptions::Yes,
-                )
-                .must();
+        if !try_write_numeric_typed_array_values(&typed_array, length, &sorted_list) {
+            for j in 0..length {
+                // a. Perform ! Set(obj, ! ToString(𝔽(j)), sortedList[j], true).
+                typed_array
+                    .set(
+                        vm,
+                        &PropertyKey::from_number(j as u64),
+                        sorted_list.get(j).expect("the index is in bounds"),
+                        ShouldThrowExceptions::Yes,
+                    )
+                    .must();
 
-            // b. Set j to j + 1.
+                // b. Set j to j + 1.
+            }
         }
 
         // 10. Return obj.
@@ -2477,29 +2687,57 @@ impl TypedArrayPrototype {
 
         // 6. NOTE: The following closure performs a numeric comparison rather than the string comparison used in 23.1.3.34.
         let comparefn = (!compare_function.is_undefined()).then(|| compare_function.as_function());
+
+        // OPTIMIZATION: For default numeric toSorted on a non-shared, non-detached buffer, copy the raw bytes into
+        //               the fresh array and sort in place.
+        if comparefn.is_none() {
+            let source_buffer = typed_array.viewed_array_buffer();
+            let target_buffer = array.viewed_array_buffer();
+            let byte_len = length.checked_mul(typed_array.element_size());
+            if let Some(byte_len) = byte_len
+                && !source_buffer.is_detached()
+                && !source_buffer.is_shared_array_buffer()
+                && !target_buffer.is_detached()
+                && !target_buffer.is_shared_array_buffer()
+                && typed_array.byte_offset().checked_add(byte_len).is_some_and(|end| end <= source_buffer.byte_length())
+                && array.byte_offset().checked_add(byte_len).is_some_and(|end| end <= target_buffer.byte_length())
+            {
+                source_buffer.copy_data_to(&target_buffer, typed_array.byte_offset(), array.byte_offset(), byte_len);
+                if length <= 1 || try_fast_sort_typed_array_in_place(&array, length) {
+                    return Ok(Value::from_object(array));
+                }
+            }
+        }
+
         let sort_compare = |x: Value, y: Value| -> ThrowCompletionOr<f64> {
             // a. Return ? CompareTypedArrayElements(x, y, comparefn).
             compare_typed_array_elements(vm, x, y, comparefn)
         };
 
         // 8. Let sortedList be ? SortIndexedProperties(O, len, SortCompare, read-through-holes).
-        let sorted_list =
-            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?;
+        let sorted_list = if let Some(items) = try_read_numeric_typed_array_values(vm, &typed_array, length) {
+            array_merge_sort(vm, &sort_compare, &items)?;
+            items
+        } else {
+            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?
+        };
 
         // 9. Let j be 0.
         // 10. Repeat, while j < len,
-        for j in 0..length as usize {
-            // a. Perform ! Set(A, ! ToString(𝔽(j)), sortedList[j], true).
-            array
-                .set(
-                    vm,
-                    &PropertyKey::from_number(j as u64),
-                    sorted_list.get(j).expect("the index is in bounds"),
-                    ShouldThrowExceptions::Yes,
-                )
-                .must();
+        if !try_write_numeric_typed_array_values(&array, length, &sorted_list) {
+            for j in 0..length {
+                // a. Perform ! Set(A, ! ToString(𝔽(j)), sortedList[j], true).
+                array
+                    .set(
+                        vm,
+                        &PropertyKey::from_number(j as u64),
+                        sorted_list.get(j).expect("the index is in bounds"),
+                        ShouldThrowExceptions::Yes,
+                    )
+                    .must();
 
-            // b. Set j to j + 1.
+                // b. Set j to j + 1.
+            }
         }
 
         // 11. Return A.

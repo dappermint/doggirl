@@ -541,21 +541,58 @@ impl Vm {
         let callee_context = unsafe { callee_context_pointer.as_ref() };
 
         // Copy the supplied arguments into the callee's argument slots.
+        // OPTIMIZATION: Inline copies and undefined fills for <= 4 arguments to avoid dylib `memcpy` /
+        //               `_platform_memset_pattern16` calls on typical JS function calls.
         let callee_argument_values = callee_context.arguments();
-        if !arguments.is_empty() {
-            // SAFETY: `arguments.len() <= passed_argument_count <= argument_count == callee_argument_values.len()`,
-            // `Cell<Value>` is `#[repr(transparent)]` over `Value`, and the freshly allocated frame does not overlap `arguments`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    arguments.as_ptr(),
-                    callee_argument_values.as_ptr().cast::<Value>().cast_mut(),
-                    arguments.len(),
-                );
-            }
+        let arg_len = arguments.len();
+        let dst_ptr = callee_argument_values.as_ptr().cast::<Value>().cast_mut();
+        match arg_len {
+            0 => {}
+            1 => unsafe { dst_ptr.write(*arguments.get_unchecked(0)) },
+            2 => unsafe {
+                dst_ptr.write(*arguments.get_unchecked(0));
+                dst_ptr.add(1).write(*arguments.get_unchecked(1));
+            },
+            3 => unsafe {
+                dst_ptr.write(*arguments.get_unchecked(0));
+                dst_ptr.add(1).write(*arguments.get_unchecked(1));
+                dst_ptr.add(2).write(*arguments.get_unchecked(2));
+            },
+            4 => unsafe {
+                dst_ptr.write(*arguments.get_unchecked(0));
+                dst_ptr.add(1).write(*arguments.get_unchecked(1));
+                dst_ptr.add(2).write(*arguments.get_unchecked(2));
+                dst_ptr.add(3).write(*arguments.get_unchecked(3));
+            },
+            _ => unsafe {
+                core::ptr::copy_nonoverlapping(arguments.as_ptr(), dst_ptr, arg_len);
+            },
         }
-        if arguments.len() < callee_argument_values.len() {
-            for slot in &callee_argument_values[arguments.len()..] {
-                slot.set(Value::UNDEFINED);
+        let missing = callee_argument_values.len() - arg_len;
+        if missing != 0 {
+            let tail_ptr = unsafe { dst_ptr.add(arg_len) };
+            match missing {
+                1 => unsafe { tail_ptr.write(Value::UNDEFINED) },
+                2 => unsafe {
+                    tail_ptr.write(Value::UNDEFINED);
+                    tail_ptr.add(1).write(Value::UNDEFINED);
+                },
+                3 => unsafe {
+                    tail_ptr.write(Value::UNDEFINED);
+                    tail_ptr.add(1).write(Value::UNDEFINED);
+                    tail_ptr.add(2).write(Value::UNDEFINED);
+                },
+                4 => unsafe {
+                    tail_ptr.write(Value::UNDEFINED);
+                    tail_ptr.add(1).write(Value::UNDEFINED);
+                    tail_ptr.add(2).write(Value::UNDEFINED);
+                    tail_ptr.add(3).write(Value::UNDEFINED);
+                },
+                _ => {
+                    for slot in &callee_argument_values[arg_len..] {
+                        slot.set(Value::UNDEFINED);
+                    }
+                }
             }
         }
         callee_context.passed_argument_count.set(passed_argument_count);

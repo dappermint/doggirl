@@ -12037,6 +12037,15 @@ void Document::sync_custom_property_registrations_to_rust()
     for (auto const& [name, registration] : m_registered_property_set)
         effective_registrations.set(name, &registration);
 
+    bool has_non_inherited = false;
+    for (auto const& [name, registration] : effective_registrations) {
+        if (!registration->inherit) {
+            has_non_inherited = true;
+            break;
+        }
+    }
+    m_has_non_inherited_registered_custom_properties = has_non_inherited;
+
     Vector<Utf16String> names;
     Vector<Optional<Utf16String>> initial_values;
     Vector<NonnullRefPtr<CSS::StyleValue const>> computed_initial_values;

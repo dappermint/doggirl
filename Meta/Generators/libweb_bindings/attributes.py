@@ -73,16 +73,19 @@ def validate_direct_getter(context: GenerationContext, interface: Interface, att
 
     description = f"[DirectGetter] attribute '{attribute.name}' on '{interface.name}'"
     resolved_type = context.resolve_typedef(attribute.type)
-    for target_type in resolved_type.flattened_member_types():
-        target_interface = context.interface(target_type)
-        if target_interface is None or target_interface.is_callback_interface:
-            raise RuntimeError(f"{description} must have an interface type or a union of interface types")
-        if target_interface.extended_attributes.get("ImplementedIn") == "Rust":
-            # NB: The engine reads the wrapper of a direct getter's object as a Wrappable keeps it, and the object of an
-            #     interface implemented in Rust is a cell that keeps its wrapper elsewhere.
-            raise RuntimeError(f"{description} cannot return {target_interface.name}, which is implemented in Rust")
-        if not cpp_type_for_idl_type_details(target_type, context).gc_ref_target_type:
-            raise RuntimeError(f"{description} must convert from a GC pointer")
+    if not resolved_type.nullable and resolved_type.name in ("unsigned short", "boolean"):
+        pass
+    else:
+        for target_type in resolved_type.flattened_member_types():
+            target_interface = context.interface(target_type)
+            if target_interface is None or target_interface.is_callback_interface:
+                raise RuntimeError(f"{description} must have an interface type or a union of interface types")
+            if target_interface.extended_attributes.get("ImplementedIn") == "Rust":
+                # NB: The engine reads the wrapper of a direct getter's object as a Wrappable keeps it, and the object of an
+                #     interface implemented in Rust is a cell that keeps its wrapper elsewhere.
+                raise RuntimeError(f"{description} cannot return {target_interface.name}, which is implemented in Rust")
+            if not cpp_type_for_idl_type_details(target_type, context).gc_ref_target_type:
+                raise RuntimeError(f"{description} must convert from a GC pointer")
 
     incompatible_extended_attributes = (
         "CachedAttribute",
@@ -272,10 +275,15 @@ def define_the_attributes(
             includes.add("LibJS/Runtime/NativeFunction.h")
             includes.add("LibWeb/Bindings/Wrappable.h")
             implementation_type = fully_qualified_name_for_interface(interface)
+            offset_expr = f"{implementation_type}::{direct_getter_field}_offset()"
+            if attribute.type.name == "unsigned short":
+                offset_expr = f"JS::DirectGetterValueOffset::unsigned_short({offset_expr})"
+            elif attribute.type.name == "boolean":
+                offset_expr = f"JS::DirectGetterValueOffset::boolean({offset_expr})"
             definition.write(
                 f"""    auto {native_getter_name} = JS::DirectGetterFunction::create(realm, {getter_name}, 0, {cpp_name}_id, {{
         .wrapper_implementation_offset = JS::HostObject::wrappable_offset(),
-        .implementation_value_offset = {implementation_type}::{direct_getter_field}_offset(),
+        .implementation_value_offset = {offset_expr},
         .main_world_wrapper_offset = Wrappable::main_world_wrapper_offset(),
         .weak_impl_value_offset = GC::WeakImpl::value_offset(),
     }}, "get"sv);

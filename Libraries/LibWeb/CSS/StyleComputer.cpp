@@ -1058,13 +1058,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         .after = abstract_element.installed_style().record_pointer(),
         .target_node = element.style_node_id().value(),
         .target_pseudo_kind = pseudo_element_to_ffi(pseudo_element),
-        .element_box_slot = [&] {
-            auto* arena = document().layout_node_arena_if_created();
-            auto const style_node = element.style_node_id().value();
-            if (!arena || style_node == 0)
-                return Compositing::RustFFI::NodeSlotId_INVALID.index;
-            return Layout::RustFFI::layout_row_bound_slot_id(arena->host(), &read, style_node).index;
-        }(),
+        .element_box_slot = Compositing::RustFFI::NodeSlotId_INVALID.index,
         .no_ancestor_animations = no_ancestor_animations,
         .tree_order = Animations::compare_elements_in_tree_order_for_composite_order,
     };
@@ -1230,7 +1224,7 @@ static OrderedHashMap<Utf16FlyString, StyleProperty> own_values_of_custom_proper
 
 RefPtr<CustomPropertyData const> StyleComputer::engine_custom_property_declarations_over(Layout::BegunRead const& read, u64 identity, RefPtr<CustomPropertyData const> const& inherited) const
 {
-    if (!m_style_engine.is_engine_custom_property_environment(read, identity))
+    if (!identity)
         return {};
     u64 parent_identity = 0;
     auto const* store = StyleEngineFFI::style_engine_borrow_engine_custom_property_environment(m_style_engine.host(), &read, identity, &parent_identity);
@@ -1243,7 +1237,7 @@ RefPtr<CustomPropertyData const> StyleComputer::engine_custom_property_declarati
 
 RefPtr<CustomPropertyData const> StyleComputer::engine_custom_property_environment(Layout::BegunRead const& read, u64 identity, RefPtr<CustomPropertyData const> const& inherited) const
 {
-    if (!m_style_engine.is_engine_custom_property_environment(read, identity))
+    if (!identity)
         return {};
     u64 parent_identity = 0;
     auto const* store = StyleEngineFFI::style_engine_borrow_engine_custom_property_environment(m_style_engine.host(), &read, identity, &parent_identity);
@@ -1259,6 +1253,11 @@ RefPtr<CustomPropertyData const> StyleComputer::engine_custom_property_environme
 
 RefPtr<CustomPropertyData const> StyleComputer::inheritable_custom_property_environment(Layout::BegunRead const& read, CustomPropertyData const& environment) const
 {
+    // OPTIMIZATION: Without any registered custom property with `inherits: false`, every custom property inherits,
+    //               so every environment hands down itself without FFI calls or cache lookups.
+    if (!document().has_non_inherited_registered_custom_properties())
+        return environment;
+
     // NB: What an environment the style engine resolved hands down is the engine's to name, under the registrations as
     //     they are now: the environments its records resolve over the element's are built over that one.
     if (m_style_engine.is_engine_custom_property_environment(read, environment.identity())) {

@@ -424,6 +424,16 @@ public:
 
     static constexpr GC::MemberOffset parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
     static constexpr GC::MemberOffset first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
+    static constexpr size_t node_type_offset()
+    {
+        static_assert(sizeof(NodeType) == sizeof(u16));
+        return offsetof(Node, m_type);
+    }
+    static constexpr size_t is_connected_offset()
+    {
+        static_assert(sizeof(m_is_connected) == sizeof(bool));
+        return offsetof(Node, m_is_connected);
+    }
     static constexpr GC::MemberOffset last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
     static constexpr GC::MemberOffset previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
     static constexpr GC::MemberOffset next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }

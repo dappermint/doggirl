@@ -1679,10 +1679,19 @@ pub(crate) unsafe fn decide_transitions(
             .then(|| StyleNodeID::from_raw(input.target_node))
             .flatten(),
     };
-    let element_box = crate::layout::node_data::NodeSlotId {
+    let input_element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,
     };
     let (mut actions, custom_properties) = with_engine_and_arena(read, host, |engine, arena| {
+        let element_box = if !input_element_box.is_invalid() {
+            input_element_box
+        } else if let Some(target_node) = StyleNodeID::from_raw(input.target_node)
+            && input.target_pseudo_kind == u8::MAX
+        {
+            arena.bound_row(target_node)
+        } else {
+            crate::layout::node_data::NodeSlotId::INVALID
+        };
         let reference_box =
             crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
         (

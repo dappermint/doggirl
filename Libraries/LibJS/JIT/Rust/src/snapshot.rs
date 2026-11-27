@@ -754,18 +754,28 @@ pub struct NativeCallTarget {
     pub direct_getter: Option<DirectGetterFields>,
 }
 
+/// How a `DirectGetterFunction` loads and boxes the field of its implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectGetterValueKind {
+    /// Full pointer to a `Wrappable` (or null), returned as its main-world wrapper or `null`.
+    Pointer,
+    /// Compressed `GC::Member` pointer to a `Wrappable` (or 0), returned as its main-world wrapper or `null`.
+    CompressedPointer,
+    /// Unsigned 16-bit integer (`u16`), returned boxed as `Int32`.
+    UnsignedShort,
+    /// Plain `bool` byte (`u8 != 0`), returned boxed as `Bool`.
+    Boolean,
+}
+
 /// The byte offsets a `DirectGetterFunction` reads: the implementation of a
-/// wrapper, the field of the implementation the attribute returns, the weak
-/// reference of an implementation to its main world wrapper, and the cell of
-/// that weak reference. The getter returns the main world wrapper of the
-/// field's implementation, or null for a null field. The field holds a
-/// compressed cell pointer if `implementation_value_is_compressed`, and a
-/// full one otherwise.
+/// wrapper, the field of the implementation the attribute returns, and for
+/// wrapper-valued fields the weak reference of an implementation to its main
+/// world wrapper and the cell of that weak reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectGetterFields {
     pub wrapper_implementation: u32,
     pub implementation_value: u32,
-    pub implementation_value_is_compressed: bool,
+    pub value_kind: DirectGetterValueKind,
     pub main_world_wrapper: u32,
     pub weak_impl_value: u32,
 }

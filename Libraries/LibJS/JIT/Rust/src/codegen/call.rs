@@ -50,6 +50,7 @@ use crate::ir::value;
 use crate::snapshot::CellId;
 use crate::snapshot::DirectCallTarget;
 use crate::snapshot::DirectGetterFields;
+use crate::snapshot::DirectGetterValueKind;
 use crate::snapshot::EnvironmentTemplateSnapshot;
 use crate::snapshot::InlinedFunctionSnapshot;
 use crate::snapshot::NativeCallTarget;
@@ -1365,6 +1366,27 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm
             .load64(implementation, &field(receiver, fields.wrapper_implementation));
         self.masm.branch64_imm(Condition::Equal, implementation, 0, call);
+
+        let value = field(implementation, fields.implementation_value);
+        match fields.value_kind {
+            DirectGetterValueKind::UnsignedShort => {
+                self.masm.load16(temp, &value);
+                self.emit_box_int32(M::RETURN_GPRS[0], temp);
+                self.masm.jump(done);
+                self.masm.bind(call);
+                return;
+            }
+            DirectGetterValueKind::Boolean => {
+                self.masm.load8(temp, &value);
+                self.masm.compare32_imm_set(Condition::NotEqual, temp, temp, 0);
+                self.emit_box_bool(M::RETURN_GPRS[0], temp);
+                self.masm.jump(done);
+                self.masm.bind(call);
+                return;
+            }
+            DirectGetterValueKind::Pointer | DirectGetterValueKind::CompressedPointer => {}
+        }
+
         self.masm
             .load64(temp, &field(implementation, fields.main_world_wrapper));
         self.masm.branch64_imm(Condition::Equal, temp, 0, call);
@@ -1372,8 +1394,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.branch64(Condition::NotEqual, temp, receiver, call);
 
         let null = self.masm.new_label();
-        let value = field(implementation, fields.implementation_value);
-        if fields.implementation_value_is_compressed {
+        if fields.value_kind == DirectGetterValueKind::CompressedPointer {
             self.emit_load_compressed_cell_or_branch(implementation, &value, null);
         } else {
             self.masm.load64(implementation, &value);

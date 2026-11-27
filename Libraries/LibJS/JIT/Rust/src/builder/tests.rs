@@ -1148,7 +1148,7 @@ pub(crate) mod property_access {
                 direct_getter: validated.then_some(DirectGetterFields {
                     wrapper_implementation: 8,
                     implementation_value: 16,
-                    implementation_value_is_compressed: false,
+                    value_kind: crate::snapshot::DirectGetterValueKind::Pointer,
                     main_world_wrapper: 24,
                     weak_impl_value: 32,
                 }),
