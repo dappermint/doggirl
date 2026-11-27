@@ -1295,11 +1295,13 @@ fn record_move_damage(
         let old_direction = old_values.direction();
         let new_writing_mode = new_values.writing_mode();
         let new_direction = new_values.direction();
+        let same_flow = old_writing_mode == new_writing_mode && old_direction == new_direction;
+        let horizontal_ltr_same_flow = same_flow
+            && old_writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB
+            && old_direction == crate::css::css_enums::direction::LTR;
         // A longhand whose value both records hold in a group they share computes the same in
         // both, which only an animated value or a writing mode mapping it elsewhere would change.
-        let shared = old_table
-            .shared_with(new_table)
-            .filter(|_| old_writing_mode == new_writing_mode && old_direction == new_direction);
+        let shared = same_flow.then(|| old_table.shared_with(new_table)).flatten();
         let old_overlay = old_record.animated_overlay;
         let new_overlay = new_record.animated_overlay;
         let has_overlays = old_overlay.is_some() || new_overlay.is_some();
@@ -1307,7 +1309,7 @@ fn record_move_damage(
         //               still compute the same in both records apart from the longhands either overlay holds.
         let mut to_compare = shared.map_or(
             [u64::MAX; crate::css::property_metadata::LONGHAND_WORD_COUNT],
-            super::computed::SharedLonghands::longhands_to_compare,
+            |shared| shared.longhands_to_compare_for_flow(old_writing_mode, old_direction),
         );
         let record_property_change = |property: u16, new_physical: u16, result: &mut StyleInvalidation| {
             result.any_computed_value_changed = true;
@@ -1341,18 +1343,41 @@ fn record_move_damage(
                 property
             }
         };
+        let layout = crate::css::computed_values::GroupValueLayout::get();
+        let old_groups = old_table.value_groups();
+        let new_groups = new_table.value_groups();
         if !has_overlays {
-            for index in longhand_indices(to_compare) {
-                let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
-                let old_physical = resolve_physical(property, old_writing_mode, old_direction);
-                let new_physical = resolve_physical(property, new_writing_mode, new_direction);
-                if shared.is_some_and(|shared| shared.holds(new_physical)) {
-                    continue;
+            if same_flow {
+                for index in longhand_indices(to_compare) {
+                    let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
+                    let physical = resolve_physical(property, old_writing_mode, old_direction);
+                    if !horizontal_ltr_same_flow
+                        && physical != property
+                        && shared.is_some_and(|shared| shared.holds(physical))
+                    {
+                        continue;
+                    }
+                    if same_value(
+                        ViewLonghands::physical_value(old_groups, layout, physical),
+                        ViewLonghands::physical_value(new_groups, layout, physical),
+                    ) {
+                        continue;
+                    }
+                    record_property_change(property, physical, &mut result);
                 }
-                if same_value(old_table.value(old_physical), new_table.value(new_physical)) {
-                    continue;
+            } else {
+                for index in longhand_indices(to_compare) {
+                    let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
+                    let old_physical = resolve_physical(property, old_writing_mode, old_direction);
+                    let new_physical = resolve_physical(property, new_writing_mode, new_direction);
+                    if same_value(
+                        ViewLonghands::physical_value(old_groups, layout, old_physical),
+                        ViewLonghands::physical_value(new_groups, layout, new_physical),
+                    ) {
+                        continue;
+                    }
+                    record_property_change(property, new_physical, &mut result);
                 }
-                record_property_change(property, new_physical, &mut result);
             }
             result.merge(baked_filter_color_damage(old_values, new_values));
         } else {

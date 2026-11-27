@@ -1560,6 +1560,7 @@ public:
     Compositing::SnappedAreas const& snapped_areas_of_scroll_container(Web::AsyncScrollNodeStableID const&) const;
     void set_snapped_areas_of_scroll_container(Web::AsyncScrollNodeStableID const&, Compositing::SnappedAreas);
     void forget_snapped_areas_of_scroll_container(Layout::Node const&);
+    [[nodiscard]] bool has_no_snapped_areas() const { return m_scroll_container_snapped_areas.is_empty(); }
 
     void schedule_list_item_renumber(Element& list_owner);
     void did_render_list_item_counter_value(Element&);

@@ -557,9 +557,17 @@ impl TransitionDecision {
         }
         let to_compare = no_overlays
             .then(|| {
-                before_longhands
-                    .shared_with(after_longhands)
-                    .map(|shared| shared.longhands_to_compare())
+                before_longhands.shared_with(after_longhands).map(|shared| {
+                    let before_bits = before_longhands.value_groups().inherited_bits();
+                    let after_bits = after_longhands.value_groups().inherited_bits();
+                    if before_bits.writing_mode() == after_bits.writing_mode()
+                        && before_bits.direction() == after_bits.direction()
+                    {
+                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+                    } else {
+                        shared.longhands_to_compare()
+                    }
+                })
             })
             .flatten();
         if existing.is_empty()
@@ -711,9 +719,17 @@ impl TransitionDecision {
         }
         let to_compare = no_overlays
             .then(|| {
-                before_longhands
-                    .shared_with(after_longhands)
-                    .map(|shared| shared.longhands_to_compare())
+                before_longhands.shared_with(after_longhands).map(|shared| {
+                    let before_bits = before_longhands.value_groups().inherited_bits();
+                    let after_bits = after_longhands.value_groups().inherited_bits();
+                    if before_bits.writing_mode() == after_bits.writing_mode()
+                        && before_bits.direction() == after_bits.direction()
+                    {
+                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+                    } else {
+                        shared.longhands_to_compare()
+                    }
+                })
             })
             .flatten();
         let context = std::cell::OnceCell::new();
@@ -932,9 +948,17 @@ impl TransitionDecision {
         // overlays, existing transitions, or inherited animations they cannot start a transition.
         let to_compare = no_overlays
             .then(|| {
-                before_longhands
-                    .shared_with(after_longhands)
-                    .map(|shared| shared.longhands_to_compare())
+                before_longhands.shared_with(after_longhands).map(|shared| {
+                    let before_bits = before_longhands.value_groups().inherited_bits();
+                    let after_bits = after_longhands.value_groups().inherited_bits();
+                    if before_bits.writing_mode() == after_bits.writing_mode()
+                        && before_bits.direction() == after_bits.direction()
+                    {
+                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+                    } else {
+                        shared.longhands_to_compare()
+                    }
+                })
             })
             .flatten();
         let context = std::cell::OnceCell::new();

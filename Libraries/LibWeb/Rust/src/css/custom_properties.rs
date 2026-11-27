@@ -7,12 +7,12 @@
 //! Rust-owned custom-property data with the same structurally shared parent shape as the C++
 //! `CustomPropertyData` shell.
 
+use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::css::style_value::{RandomValueSharingPayload, UnresolvedPayload};
+use foldhash::{HashMapExt, HashSetExt};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
@@ -4329,7 +4329,7 @@ mod tests {
 
     #[test]
     fn html_attribute_names_are_ascii_case_insensitive() {
-        let attributes = HashMap::from([(utf16("data-value"), utf16("hello"))]);
+        let attributes: HashMap<_, _> = [(utf16("data-value"), utf16("hello"))].into_iter().collect();
         let mut context = ASFResolutionContext {
             attributes: Some(&attributes),
             attribute_names_are_ascii_case_insensitive: true,

@@ -3925,6 +3925,41 @@ const GROUP_LONGHANDS: [[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT
     groups
 };
 
+/// Per group, the longhands whose values it holds in horizontal-tb, left-to-right flow, including
+/// logical aliases whose physical longhand in that flow lives in the group.
+const GROUP_LONGHANDS_HORIZONTAL_LTR: [[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]; group_index::COUNT] = {
+    let mut groups = GROUP_LONGHANDS;
+    let mut longhand = 0;
+    while longhand < LONGHAND_COUNT {
+        let property = crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID + longhand as u16;
+        if is_logical_alias(property) {
+            let physical = physical_longhand(property, 0, 0);
+            let group = GROUP_VALUE_LAYOUT.places[longhand_index_of(physical)].group;
+            if group != LonghandPlace::NONE.group && group != LonghandPlace::BITS_GROUP {
+                groups[group as usize][longhand / 64] |= 1 << (longhand % 64);
+            }
+        }
+        longhand += 1;
+    }
+    groups
+};
+
+/// The longhands stored in [`StyleBits`], one bit per longhand from the first.
+const BITS_LONGHANDS: [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] = {
+    let mut bits = [0; crate::css::property_metadata::LONGHAND_WORD_COUNT];
+    let mut longhand = 0;
+    while longhand < LONGHAND_COUNT {
+        if GROUP_VALUE_LAYOUT.places[longhand].group == LonghandPlace::BITS_GROUP {
+            bits[longhand / 64] |= 1 << (longhand % 64);
+        }
+        longhand += 1;
+    }
+    bits
+};
+
+const _: () =
+    assert!(crate::css::css_enums::writing_mode::HORIZONTAL_TB == 0 && crate::css::css_enums::direction::LTR == 0);
+
 impl GroupValueLayout {
     pub(crate) fn get() -> &'static Self {
         &GROUP_VALUE_LAYOUT
@@ -3934,6 +3969,18 @@ impl GroupValueLayout {
     pub(crate) fn group_longhands()
     -> &'static [[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]; group_index::COUNT] {
         &GROUP_LONGHANDS
+    }
+
+    /// The longhands whose values each group holds in horizontal-tb, left-to-right flow, including
+    /// logical aliases resolved in that flow.
+    pub(crate) fn group_longhands_horizontal_ltr()
+    -> &'static [[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]; group_index::COUNT] {
+        &GROUP_LONGHANDS_HORIZONTAL_LTR
+    }
+
+    /// The longhands stored in [`StyleBits`], one bit per longhand from the first.
+    pub(crate) fn bits_longhands() -> &'static [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] {
+        &BITS_LONGHANDS
     }
 
     const fn compute() -> Self {
