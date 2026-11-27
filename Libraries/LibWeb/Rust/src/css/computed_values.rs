@@ -4268,34 +4268,60 @@ impl crate::heap_size::HeapSize for InheritanceDependentValue {
     }
 }
 
+/// The shared set of inheritance-dependent values held by [`GroupValueFacts`], stored behind a
+/// thin `Arc` with a precomputed property-ID bloom filter so [`GroupValueFacts`] stays 40 bytes.
+#[derive(Clone)]
+pub(crate) struct InheritanceDependentValues {
+    idv_property_bloom: u64,
+    values: smallvec::SmallVec<[InheritanceDependentValue; 2]>,
+}
+
+impl crate::heap_size::HeapSize for InheritanceDependentValues {
+    fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
+        let spilled = if self.values.spilled() {
+            self.values.capacity() * size_of::<InheritanceDependentValue>()
+        } else {
+            0
+        };
+        spilled + self.values.iter().map(|held| held.heap_size(sizer)).sum::<usize>()
+    }
+}
+
 /// What an element's groups are built from beside their computed values: the recorded specified
 /// values of the longhands whose computed values depend on what the element inherits, its zoom,
 /// its display before the box type transformation, and its color scheme.
 #[derive(Clone)]
 pub(crate) struct GroupValueFacts {
-    inheritance_dependent_values: Option<std::sync::Arc<[InheritanceDependentValue]>>,
+    inheritance_dependent_values: Option<std::sync::Arc<InheritanceDependentValues>>,
     /// Computed background lists with entries beyond the image layers, for keyframe reflection.
     uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
+    /// Bloom filter of property IDs in `inheritance_dependent_values` with `read_by_groups == true`.
+    read_in_place_property_bloom: u64,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
+    /// The groups holding colors resolved against `currentcolor`, through the recorded specified
+    /// values or the inherited values that read it.
+    current_color_groups: u32,
+    /// What of the recorded specified values a group build reads in place of computed values, by
+    /// [`read_in_place_bits_of`], so that a build of another group mostly need not look through them.
+    read_in_place_bits: u16,
     effective_color_scheme: i8,
     /// What the origins of the element's winning declarations decide for its box: whether an author declaration
     /// disables its native appearance (`NATIVE_APPEARANCE_DISABLED_FACT`), and the physical sides whose margins the
     /// user agent's style sheet sets in a quirks-mode document (`user_agent_margin_side` bits).
     /// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
     origin_facts: u8,
-    /// What of the recorded specified values a group build reads in place of computed values, by
-    /// [`read_in_place_bits_of`], so that a build of another group mostly need not look through them.
-    read_in_place_bits: u16,
-    /// The groups holding colors resolved against `currentcolor`, through the recorded specified
-    /// values or the inherited values that read it.
-    current_color_groups: u32,
 }
 
 /// The bit of [`GroupValueFacts::origin_facts`] that says an author declaration disables the element's native
 /// appearance. The bits below it are `user_agent_margin_side` bits.
 const NATIVE_APPEARANCE_DISABLED_FACT: u8 = 1 << 7;
 const USER_AGENT_MARGIN_SIDES_FACTS: u8 = 0x0f;
+
+#[inline]
+fn idv_property_bit(property: u16) -> u64 {
+    1_u64 << (property & 63)
+}
 
 /// The bits standing for `groups` among the recorded values a group build reads in place: those of
 /// their indices, each group sharing its bit with any other sixteen indices away.
@@ -4326,12 +4352,13 @@ impl GroupValueFacts {
         Self {
             inheritance_dependent_values: None,
             uncoordinated_background_values: None,
+            read_in_place_property_bloom: 0,
             effective_zoom: 1.0,
             display_before_box_type_transformation: 0,
+            current_color_groups: 0,
+            read_in_place_bits: 0,
             effective_color_scheme: -1,
             origin_facts: 0,
-            read_in_place_bits: 0,
-            current_color_groups: 0,
         }
     }
 
@@ -4357,18 +4384,20 @@ impl GroupValueFacts {
     pub(crate) fn inheritance_dependent_values(&self) -> impl Iterator<Item = (u16, &RetainedStyleValueData)> + Clone {
         self.inheritance_dependent_values
             .iter()
-            .flat_map(|values| values.iter())
+            .flat_map(|held| held.values.iter())
             .map(|held| (held.property, &held.value))
     }
 
     /// The recorded value a group build reads for `property` in place of its computed value: its
     /// currentcolor-dependent specified value where a drive did not evaluate it.
+    #[inline]
     pub(crate) fn value_read_in_place(&self, property: u16) -> Option<&RetainedStyleValueData> {
-        if self.read_in_place_bits & read_in_place_bit(property) == 0 {
+        if self.read_in_place_property_bloom & idv_property_bit(property) == 0 {
             return None;
         }
         self.inheritance_dependent_values
             .as_deref()?
+            .values
             .iter()
             .find(|held| held.property == property && held.read_by_groups)
             .map(|held| &held.value)
@@ -4384,7 +4413,7 @@ impl GroupValueFacts {
         self.inheritance_dependent_values
             .iter()
             .filter(move |_| self.read_in_place_bits & read_in_place_bits_of(read_groups) != 0)
-            .flat_map(|values| values.iter())
+            .flat_map(|held| held.values.iter())
             .filter(move |held| {
                 held.read_by_groups && GroupValueLayout::reads(reads, GROUP_VALUE_LAYOUT.place_of(held.property))
             })
@@ -4416,8 +4445,13 @@ impl GroupValueFacts {
     pub(crate) fn publication_equals(&self, other: &Self) -> bool {
         use crate::css::style_value::retained_style_values_equal;
         let (mine, theirs) = (
-            self.inheritance_dependent_values.as_deref().unwrap_or_default(),
-            other.inheritance_dependent_values.as_deref().unwrap_or_default(),
+            self.inheritance_dependent_values
+                .as_deref()
+                .map_or(&[][..], |held| &held.values[..]),
+            other
+                .inheritance_dependent_values
+                .as_deref()
+                .map_or(&[][..], |held| &held.values[..]),
         );
         let same_recorded_values = std::ptr::eq(mine, theirs);
         self.same_uncoordinated_background_values(other)
@@ -4441,7 +4475,7 @@ impl GroupValueFacts {
             let mut values: Vec<_> = facts
                 .inheritance_dependent_values
                 .iter()
-                .flat_map(|values| values.iter())
+                .flat_map(|held| held.values.iter())
                 .map(|held| (held.property, held.value.pointer() as usize, held.read_by_groups))
                 .collect();
             values.sort_unstable();
@@ -4643,7 +4677,7 @@ fn written_values<'v>(
         .peekable();
     values.iter().enumerate().map(
         move |(at, value)| match writes.next_if(|write| write.place.index() == at) {
-            Some(write) => &write.value,
+            Some(write) => write.as_ref(),
             None => value,
         },
     )
@@ -4656,10 +4690,13 @@ fn written_values<'v>(
 pub(crate) struct GroupValues<'a> {
     seeds: SeedGroups<'a>,
     /// The values written over those of `seeds`, in place order, each differing from the value it
-    /// is written over.
+    /// is written over. Borrowed entries are valid for `'a` (tracked by `_borrowed_values`).
     writes: smallvec::SmallVec<[ValueWrite; WRITES_INLINE]>,
+    _borrowed_values: std::marker::PhantomData<&'a RetainedStyleValueData>,
     /// The groups `writes` writes into, one bit per group.
     written_groups: u32,
+    /// Conservative bitmask of physical longhands present in `writes`, one bit per longhand.
+    written_longhands: [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT],
     /// The values of the longhands held as bits.
     bits: StyleBits,
     facts: GroupValueFacts,
@@ -4732,18 +4769,22 @@ impl GroupValues<'_> {
     /// The computed value of `property`.
     #[inline]
     pub(crate) fn value(&self, property: u16) -> &RetainedStyleValueData {
+        let mut resolved_property = property;
         let mut place = GROUP_VALUE_LAYOUT.place_of(property);
         if place == LonghandPlace::NONE {
-            let resolved = GROUP_VALUE_LAYOUT.resolved(property, |property| self.value(property));
-            place = GROUP_VALUE_LAYOUT.place_of(resolved);
+            resolved_property = GROUP_VALUE_LAYOUT.resolved(property, |property| self.value(property));
+            place = GROUP_VALUE_LAYOUT.place_of(resolved_property);
         }
         if let Some(field) = place.bit_field() {
             return self.bits.value(field);
         }
-        if self.written_groups & (1 << place.group()) != 0
-            && let Some(write) = self.writes.iter().find(|write| write.place == place)
-        {
-            return &write.value;
+        if self.written_groups & (1 << place.group()) != 0 {
+            let index = LonghandID::new(resolved_property).index();
+            if self.written_longhands[index / 64] & (1 << (index % 64)) != 0
+                && let Some(write) = self.writes.iter().find(|write| write.place == place)
+            {
+                return write.as_ref();
+            }
         }
         self.seeds.value(place)
     }
@@ -4813,7 +4854,7 @@ impl GroupValues<'_> {
         writes
             .iter()
             .filter(|write| write.place.is_read_by(reads))
-            .map(|write| (write.place.order(), &write.value))
+            .map(|write| (write.place.order(), write.as_ref()))
     }
 
     /// Whether these start from the seeds `seeds`, those of each group `read_groups` names in group
@@ -4886,7 +4927,7 @@ impl GroupValues<'_> {
             true => self
                 .writes_of(group)
                 .iter()
-                .all(|write| told(write.place, &write.value)),
+                .all(|write| told(write.place, write.as_ref())),
             false => GroupValueLayout::handles_of(group).all(|(property, place)| told(place, self.value(property))),
         };
         if tells_all {
@@ -4943,12 +4984,45 @@ impl GroupValues<'_> {
 /// for the groups whose written values no seed holds: a copy-on-write style builder, at the
 /// granularity of groups.
 #[derive(Clone)]
+enum WriterUncoordinatedBackground<'a> {
+    Seeded(Option<&'a std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>),
+    Owned(Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>),
+}
+
+impl WriterUncoordinatedBackground<'_> {
+    fn is_none(&self) -> bool {
+        match self {
+            Self::Seeded(value) => value.is_none(),
+            Self::Owned(value) => value.is_none(),
+        }
+    }
+
+    fn into_owned(self) -> Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>> {
+        match self {
+            Self::Seeded(value) => value.cloned(),
+            Self::Owned(value) => value,
+        }
+    }
+
+    fn to_mut(&mut self) -> &mut Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>> {
+        if let Self::Seeded(value) = *self {
+            *self = Self::Owned(value.cloned());
+        }
+        match self {
+            Self::Owned(value) => value,
+            Self::Seeded(_) => unreachable!(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct GroupValuesWriter<'a> {
     /// The values the element holds before its own declarations, which no write changes.
     seeded: SeedGroups<'a>,
     /// The values written over the seeded ones, one per longhand whose value differs from the
-    /// seeded one where it was written.
+    /// seeded one where it was written. Borrowed entries are valid for `'a`.
     writes: smallvec::SmallVec<[ValueWrite; WRITES_INLINE]>,
+    _borrowed_values: std::marker::PhantomData<&'a RetainedStyleValueData>,
     /// The groups `writes` writes into, one bit per group.
     written_groups: u32,
     /// The longhands `writes` writes, one bit per longhand.
@@ -4958,11 +5032,17 @@ pub(crate) struct GroupValuesWriter<'a> {
     bits: StyleBits,
     /// The recorded specified values of the longhands whose computed values depend on what the
     /// element inherits, as the initial style records them.
-    seeded_inheritance_dependent_values: Option<std::sync::Arc<[InheritanceDependentValue]>>,
-    /// The recorded specified values of the longhands whose computed values depend on what the
-    /// element inherits, once the computation records others than the seeded ones.
-    inheritance_dependent_values: Option<Vec<(u16, RetainedStyleValueData)>>,
-    uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
+    seeded_inheritance_dependent_values: Option<&'a std::sync::Arc<InheritanceDependentValues>>,
+    /// Bloom filter of property IDs present in `seeded_inheritance_dependent_values`.
+    seeded_idv_bloom: u64,
+    /// Bitmask of indices in `seeded_inheritance_dependent_values` that were removed or overridden
+    /// (used when `overflow_idv` is `None` and `seeded.len() <= 32`).
+    seeded_idv_removed: u32,
+    /// Added or overridden inheritance-dependent values when `overflow_idv` is `None`.
+    added_idv: smallvec::SmallVec<[(u16, RetainedStyleValueData); 4]>,
+    /// Fallback when `seeded_inheritance_dependent_values` holds more than 32 entries.
+    overflow_idv: Option<Vec<(u16, RetainedStyleValueData)>>,
+    uncoordinated_background_values: WriterUncoordinatedBackground<'a>,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
     effective_color_scheme: i16,
@@ -4976,10 +5056,91 @@ pub(crate) struct GroupValuesWriter<'a> {
 }
 
 /// A value written over an element's seeded values, at its place among them.
-#[derive(Clone)]
+///
+/// Stores a `ManuallyDrop<RetainedStyleValueData>` plus an `owned` flag rather than a `Cow<'a, _>`
+/// so each entry stays 16 bytes, reads are branchless, and `SmallVec<[ValueWrite; WRITES_INLINE]>`
+/// keeps [`GroupValues<'a>`] and [`GroupValuesWriter<'a>`] covariant in `'a`.
 struct ValueWrite {
     place: LonghandPlace,
-    value: RetainedStyleValueData,
+    owned: bool,
+    value: std::mem::ManuallyDrop<RetainedStyleValueData>,
+}
+
+impl ValueWrite {
+    #[inline]
+    fn owned(place: LonghandPlace, value: RetainedStyleValueData) -> Self {
+        Self {
+            place,
+            owned: true,
+            value: std::mem::ManuallyDrop::new(value),
+        }
+    }
+
+    /// Creates a non-owning write referencing `value`.
+    ///
+    /// # Safety
+    /// `value` must outlive the `GroupValuesWriter<'a>` / `GroupValues<'a>` storing this entry.
+    #[inline]
+    unsafe fn borrowed(place: LonghandPlace, value: &RetainedStyleValueData) -> Self {
+        Self {
+            place,
+            owned: false,
+            // SAFETY: `RetainedStyleValueData` is a `#[repr(C)]` pointer handle; copying the
+            // handle bits without taking a refcount is valid while `value` stays alive, and `Drop`
+            // does not drop `self.value` when `owned` is false.
+            value: std::mem::ManuallyDrop::new(unsafe { std::ptr::read(value) }),
+        }
+    }
+
+    #[inline]
+    fn as_ref(&self) -> &RetainedStyleValueData {
+        &self.value
+    }
+
+    #[inline]
+    fn replace_owned(&mut self, value: RetainedStyleValueData) {
+        if self.owned {
+            // SAFETY: `self.value` owns a reference iff `self.owned` is true.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.value) };
+        }
+        self.owned = true;
+        self.value = std::mem::ManuallyDrop::new(value);
+    }
+
+    /// Replaces the held value with a non-owning reference to `value`.
+    ///
+    /// # Safety
+    /// `value` must outlive the `GroupValuesWriter<'a>` / `GroupValues<'a>` storing this entry.
+    #[inline]
+    unsafe fn replace_borrowed(&mut self, value: &RetainedStyleValueData) {
+        if self.owned {
+            // SAFETY: `self.value` owns a reference iff `self.owned` is true.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.value) };
+        }
+        self.owned = false;
+        // SAFETY: As in `Self::borrowed`.
+        self.value = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(value) });
+    }
+}
+
+impl Clone for ValueWrite {
+    fn clone(&self) -> Self {
+        if self.owned {
+            Self::owned(self.place, (*self.value).clone())
+        } else {
+            // SAFETY: Cloned only by `GroupValuesWriter<'a>::clone`, which preserves `'a`.
+            unsafe { Self::borrowed(self.place, &self.value) }
+        }
+    }
+}
+
+impl Drop for ValueWrite {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: `self.value` owns a reference iff `self.owned` is true.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.value) };
+        }
+    }
 }
 
 /// How many written values a [`GroupValuesWriter`] holds before they go to an allocation of their
@@ -5027,6 +5188,7 @@ impl<'a> GroupValuesWriter<'a> {
         Self {
             seeded,
             writes: smallvec::SmallVec::new(),
+            _borrowed_values: std::marker::PhantomData,
             written_groups: 0,
             written_longhands: [0; crate::css::property_metadata::LONGHAND_WORD_COUNT],
             // NB: A child inherits its parent's inherited bits, and starts from the initial reset ones.
@@ -5034,9 +5196,18 @@ impl<'a> GroupValuesWriter<'a> {
                 inherited: parent.style_bits().inherited,
                 reset: initial.style_bits().reset,
             },
-            seeded_inheritance_dependent_values: initial.facts.inheritance_dependent_values.clone(),
-            inheritance_dependent_values: None,
-            uncoordinated_background_values: initial.facts.uncoordinated_background_values.clone(),
+            seeded_inheritance_dependent_values: initial.facts.inheritance_dependent_values.as_ref(),
+            seeded_idv_bloom: initial
+                .facts
+                .inheritance_dependent_values
+                .as_deref()
+                .map_or(0, |held| held.idv_property_bloom),
+            seeded_idv_removed: 0,
+            added_idv: smallvec::SmallVec::new(),
+            overflow_idv: None,
+            uncoordinated_background_values: WriterUncoordinatedBackground::Seeded(
+                initial.facts.uncoordinated_background_values.as_ref(),
+            ),
             effective_zoom: parent.facts.effective_zoom,
             display_before_box_type_transformation: initial.facts.display_before_box_type_transformation,
             effective_color_scheme: parent.facts.effective_color_scheme(),
@@ -5063,17 +5234,21 @@ impl<'a> GroupValuesWriter<'a> {
         }
         // NB: An initial recorded value is that of the initial value. A longhand that inherits another one holds none,
         //     or a group build would read the initial `currentcolor` in place of what the parent hands down.
-        for held in initial
+        let seeded = initial
             .facts
             .inheritance_dependent_values
             .as_deref()
-            .unwrap_or_default()
-        {
+            .map_or(&[][..], |held| &held.values[..]);
+        for (index, held) in seeded.iter().enumerate() {
             if property_is_inherited(held.property)
                 && crate::css::style_value::retained_value_depends_on_current_color(&held.value)
                 && *self.value(held.property) != held.value
             {
-                self.set_inheritance_dependent_value(held.property, None);
+                if self.overflow_idv.is_none() && seeded.len() <= 32 {
+                    self.seeded_idv_removed |= 1_u32 << index;
+                } else {
+                    self.set_inheritance_dependent_value(held.property, None);
+                }
             }
         }
     }
@@ -5085,7 +5260,8 @@ impl<'a> GroupValuesWriter<'a> {
     /// The recorded specified values the initial style holds of the longhands whose computed
     /// values depend on what the element inherits.
     fn seeded_inheritance_dependent_values(&self) -> &[InheritanceDependentValue] {
-        self.seeded_inheritance_dependent_values.as_deref().unwrap_or_default()
+        self.seeded_inheritance_dependent_values
+            .map_or(&[][..], |held| &held.values[..])
     }
 
     /// The write of `property`, whose place is `place`, if there is one.
@@ -5105,7 +5281,7 @@ impl<'a> GroupValuesWriter<'a> {
             return self.bits.value(field);
         }
         match self.write_of(property, place) {
-            Some(write) => &write.value,
+            Some(write) => write.as_ref(),
             None => self.seeded.value(place),
         }
     }
@@ -5124,7 +5300,7 @@ impl<'a> GroupValuesWriter<'a> {
             return self.bits.get(field) != seeded_bits.get(field);
         }
         self.write_of(property, place)
-            .is_some_and(|write| write.value != *self.seeded.value(place))
+            .is_some_and(|write| *write.as_ref() != *self.seeded.value(place))
     }
 
     /// The computed value of `property` written so far, where it has one.
@@ -5136,16 +5312,29 @@ impl<'a> GroupValuesWriter<'a> {
     /// value where the computation did not evaluate it, else its computed value.
     pub(crate) fn effective_value(&self, property: u16) -> &RetainedStyleValueData {
         if !self.was_written(property) {
-            let recorded = match &self.inheritance_dependent_values {
+            let recorded = match &self.overflow_idv {
                 Some(values) => values
                     .iter()
                     .find(|(held, _)| *held == property)
                     .map(|(_, value)| value),
                 None => self
-                    .seeded_inheritance_dependent_values()
+                    .added_idv
                     .iter()
-                    .find(|held| held.property == property)
-                    .map(|held| &held.value),
+                    .find(|(held, _)| *held == property)
+                    .map(|(_, value)| value)
+                    .or_else(|| {
+                        if self.seeded_idv_bloom & idv_property_bit(property) == 0 {
+                            return None;
+                        }
+                        self.seeded_inheritance_dependent_values()
+                            .iter()
+                            .enumerate()
+                            .find(|(index, held)| {
+                                (*index >= 32 || self.seeded_idv_removed & (1_u32 << *index) == 0)
+                                    && held.property == property
+                            })
+                            .map(|(_, held)| &held.value)
+                    }),
             };
             if let Some(recorded) = recorded
                 && crate::css::style_value::retained_value_depends_on_current_color(recorded)
@@ -5163,10 +5352,17 @@ impl<'a> GroupValuesWriter<'a> {
     }
 
     /// Writes `value` as the computed value of `property`, which the computation evaluated,
+    /// borrowing `value` without cloning when it lives for `'a`.
+    pub(crate) fn set_cow(&mut self, property: u16, value: std::borrow::Cow<'a, RetainedStyleValueData>) {
+        self.flags.mark_evaluated(property);
+        self.put(property, value);
+    }
+
+    /// Writes `value` as the computed value of `property`, which the computation evaluated,
     /// holding a reference to it only where it stays as a write.
     pub(crate) fn set_borrowed(&mut self, property: u16, value: &RetainedStyleValueData) {
         self.flags.mark_evaluated(property);
-        self.put(property, std::borrow::Cow::Borrowed(value));
+        self.put_borrowed(property, value);
     }
 
     /// Writes `value` as the computed value of `property`, keeping the value held where it is
@@ -5174,12 +5370,40 @@ impl<'a> GroupValuesWriter<'a> {
     pub(crate) fn set_or_keep_equal(&mut self, property: u16, value: &RetainedStyleValueData) {
         let held = self.value(property);
         if held.pointer().is_null() || held != value {
-            self.put(property, std::borrow::Cow::Borrowed(value));
+            self.put_borrowed(property, value);
         }
         self.flags.mark_evaluated(property);
     }
 
-    fn put(&mut self, property: u16, value: std::borrow::Cow<'_, RetainedStyleValueData>) {
+    fn put_borrowed(&mut self, property: u16, value: &RetainedStyleValueData) {
+        if !GROUP_VALUE_LAYOUT.holds_value(LonghandID::new(property)) {
+            return;
+        }
+        let place = GROUP_VALUE_LAYOUT.place_of(property);
+        if let Some(field) = place.bit_field() {
+            self.bits = self.bits.with_value(field, value);
+            return;
+        }
+        let index = LonghandID::new(property).index();
+        let (word, bit) = (index / 64, 1 << (index % 64));
+        if self.written_longhands[word] & bit != 0 {
+            let write = self
+                .writes
+                .iter_mut()
+                .find(|write| write.place == place)
+                .expect("a longhand written has a write");
+            write.replace_owned(value.clone());
+            return;
+        }
+        if self.seeded.value(place).pointer() == value.pointer() {
+            return;
+        }
+        self.written_longhands[word] |= bit;
+        self.written_groups |= 1 << place.group();
+        self.writes.push(ValueWrite::owned(place, value.clone()));
+    }
+
+    fn put(&mut self, property: u16, value: std::borrow::Cow<'a, RetainedStyleValueData>) {
         // NB: A logical alias holding no value of its own computes as the physical longhand it
         //     maps to, which the computation writes.
         if !GROUP_VALUE_LAYOUT.holds_value(LonghandID::new(property)) {
@@ -5198,7 +5422,13 @@ impl<'a> GroupValuesWriter<'a> {
                 .iter_mut()
                 .find(|write| write.place == place)
                 .expect("a longhand written has a write");
-            write.value = value.into_owned();
+            match value {
+                std::borrow::Cow::Borrowed(borrowed) => {
+                    // SAFETY: `borrowed` lives for `'a`, matching `GroupValuesWriter<'a>` / `GroupValues<'a>`.
+                    unsafe { write.replace_borrowed(borrowed) };
+                }
+                std::borrow::Cow::Owned(owned) => write.replace_owned(owned),
+            }
             return;
         }
         if self.seeded.value(place).pointer() == value.pointer() {
@@ -5206,19 +5436,22 @@ impl<'a> GroupValuesWriter<'a> {
         }
         self.written_longhands[word] |= bit;
         self.written_groups |= 1 << place.group();
-        self.writes.push(ValueWrite {
-            place,
-            value: value.into_owned(),
-        });
+        let entry = match value {
+            std::borrow::Cow::Borrowed(borrowed) => {
+                // SAFETY: `borrowed` lives for `'a`, matching `GroupValuesWriter<'a>` / `GroupValues<'a>`.
+                unsafe { ValueWrite::borrowed(place, borrowed) }
+            }
+            std::borrow::Cow::Owned(owned) => ValueWrite::owned(place, owned),
+        };
+        self.writes.push(entry);
     }
 
     pub(crate) fn set_uncoordinated_background_value(&mut self, property: u16, value: Option<RetainedStyleValueData>) {
         if self.uncoordinated_background_values.is_none() && value.is_none() {
             return;
         }
-        let values = self
-            .uncoordinated_background_values
-            .get_or_insert_with(Default::default);
+        let slot = self.uncoordinated_background_values.to_mut();
+        let values = slot.get_or_insert_with(Default::default);
         let values = std::sync::Arc::make_mut(values);
         values.retain(|(held, _)| *held != property);
         if let Some(value) = value {
@@ -5226,27 +5459,77 @@ impl<'a> GroupValuesWriter<'a> {
             values.sort_by_key(|(property, _)| *property);
         }
         if values.is_empty() {
-            self.uncoordinated_background_values = None;
+            *slot = None;
         }
     }
 
     /// Records `value` as the specified value of `property` where its computed value depends on
     /// what the element inherits, or that it does not depend on it for none.
+    #[inline]
     pub(crate) fn set_inheritance_dependent_value(&mut self, property: u16, value: Option<RetainedStyleValueData>) {
-        if self.inheritance_dependent_values.is_none() {
-            let seeded = self.seeded_inheritance_dependent_values();
-            match (seeded.iter().find(|held| held.property == property), &value) {
-                (None, None) => return,
-                (Some(held), Some(value)) if held.value.pointer() == value.pointer() => return,
-                _ => {}
+        if self.overflow_idv.is_none() {
+            let in_seeded_bloom = self.seeded_idv_bloom & idv_property_bit(property) != 0;
+            if value.is_none() && self.added_idv.is_empty() && !in_seeded_bloom {
+                return;
             }
-            self.inheritance_dependent_values =
-                Some(seeded.iter().map(|held| (held.property, held.value.clone())).collect());
+            let seeded = self.seeded_inheritance_dependent_values();
+            if seeded.len() <= 32 {
+                let seeded_index = in_seeded_bloom
+                    .then(|| seeded.iter().position(|held| held.property == property))
+                    .flatten();
+                let added_index = (!self.added_idv.is_empty())
+                    .then(|| self.added_idv.iter().position(|(held, _)| *held == property))
+                    .flatten();
+                match (seeded_index, added_index, value) {
+                    (Some(si), None, None) => {
+                        self.seeded_idv_removed |= 1_u32 << si;
+                    }
+                    (Some(si), Some(ai), None) => {
+                        self.seeded_idv_removed |= 1_u32 << si;
+                        self.added_idv.swap_remove(ai);
+                    }
+                    (None, Some(ai), None) => {
+                        self.added_idv.swap_remove(ai);
+                    }
+                    (None, None, None) => {}
+                    (Some(si), ai_opt, Some(value)) => {
+                        if seeded[si].value.pointer() == value.pointer() {
+                            self.seeded_idv_removed &= !(1_u32 << si);
+                            if let Some(ai) = ai_opt {
+                                self.added_idv.swap_remove(ai);
+                            }
+                        } else {
+                            self.seeded_idv_removed |= 1_u32 << si;
+                            match ai_opt {
+                                Some(ai) => {
+                                    if self.added_idv[ai].1.pointer() != value.pointer() {
+                                        self.added_idv[ai].1 = value;
+                                    }
+                                }
+                                None => self.added_idv.push((property, value)),
+                            }
+                        }
+                    }
+                    (None, Some(ai), Some(value)) => {
+                        if self.added_idv[ai].1.pointer() != value.pointer() {
+                            self.added_idv[ai].1 = value;
+                        }
+                    }
+                    (None, None, Some(value)) => {
+                        self.added_idv.push((property, value));
+                    }
+                }
+                return;
+            }
+            let mut vec: Vec<(u16, RetainedStyleValueData)> =
+                seeded.iter().map(|held| (held.property, held.value.clone())).collect();
+            vec.extend(self.added_idv.drain(..));
+            self.overflow_idv = Some(vec);
         }
         let values = self
-            .inheritance_dependent_values
+            .overflow_idv
             .as_mut()
-            .expect("the seeded values were just copied");
+            .expect("overflow inheritance-dependent values were materialized");
         let existing = values.iter().position(|(held, _)| *held == property);
         match (existing, value) {
             (Some(index), Some(value)) => {
@@ -5268,24 +5551,65 @@ impl<'a> GroupValuesWriter<'a> {
     fn finished_inheritance_dependent_values(
         &self,
         seeds: &[GroupSeed<'_>],
-    ) -> Option<std::sync::Arc<[InheritanceDependentValue]>> {
+    ) -> Option<std::sync::Arc<InheritanceDependentValues>> {
         let read_by_groups = |property: u16, value: &RetainedStyleValueData| {
             !self.was_written(property) && crate::css::style_value::retained_value_depends_on_current_color(value)
         };
+        if let Some(values) = &self.overflow_idv {
+            let length = values.len();
+            if length == 0 {
+                return None;
+            }
+            let same = |held: &[InheritanceDependentValue]| {
+                held.len() == length
+                    && held.iter().zip(values).all(|(held, (property, value))| {
+                        held.property == *property
+                            && held.value.pointer() == value.pointer()
+                            && held.read_by_groups == read_by_groups(*property, value)
+                    })
+            };
+            if let Some(shared) = seeds
+                .iter()
+                .filter_map(|seed| seed.facts.inheritance_dependent_values.as_ref())
+                .find(|held| same(&held.values))
+            {
+                return Some(shared.clone());
+            }
+            let mut idv_property_bloom = 0_u64;
+            let built: smallvec::SmallVec<[InheritanceDependentValue; 2]> = values
+                .iter()
+                .map(|(property, value)| {
+                    idv_property_bloom |= idv_property_bit(*property);
+                    InheritanceDependentValue {
+                        property: *property,
+                        value: value.clone(),
+                        read_by_groups: read_by_groups(*property, value),
+                    }
+                })
+                .collect();
+            return Some(std::sync::Arc::new(InheritanceDependentValues {
+                idv_property_bloom,
+                values: built,
+            }));
+        }
         let seeded = self.seeded_inheritance_dependent_values();
-        let edited = self.inheritance_dependent_values.as_deref();
-        let length = edited.map_or(seeded.len(), <[_]>::len);
+        let kept_seeded = seeded.len() - self.seeded_idv_removed.count_ones() as usize;
+        let length = kept_seeded + self.added_idv.len();
         if length == 0 {
             return None;
         }
-        let entry = |index: usize| match edited {
-            Some(values) => (values[index].0, &values[index].1),
-            None => (seeded[index].property, &seeded[index].value),
+        let removed = self.seeded_idv_removed;
+        let live_entries = || {
+            seeded
+                .iter()
+                .enumerate()
+                .filter(move |(index, _)| removed & (1_u32 << *index) == 0)
+                .map(|(_, held)| (held.property, &held.value))
+                .chain(self.added_idv.iter().map(|(property, value)| (*property, value)))
         };
         let same = |held: &[InheritanceDependentValue]| {
             held.len() == length
-                && held.iter().enumerate().all(|(index, held)| {
-                    let (property, value) = entry(index);
+                && held.iter().zip(live_entries()).all(|(held, (property, value))| {
                     held.property == property
                         && held.value.pointer() == value.pointer()
                         && held.read_by_groups == read_by_groups(property, value)
@@ -5294,22 +5618,25 @@ impl<'a> GroupValuesWriter<'a> {
         if let Some(shared) = seeds
             .iter()
             .filter_map(|seed| seed.facts.inheritance_dependent_values.as_ref())
-            .find(|held| same(held))
+            .find(|held| same(&held.values))
         {
             return Some(shared.clone());
         }
-        Some(
-            (0..length)
-                .map(|index| {
-                    let (property, value) = entry(index);
-                    InheritanceDependentValue {
-                        property,
-                        value: value.clone(),
-                        read_by_groups: read_by_groups(property, value),
-                    }
-                })
-                .collect(),
-        )
+        let mut idv_property_bloom = 0_u64;
+        let built: smallvec::SmallVec<[InheritanceDependentValue; 2]> = live_entries()
+            .map(|(property, value)| {
+                idv_property_bloom |= idv_property_bit(property);
+                InheritanceDependentValue {
+                    property,
+                    value: value.clone(),
+                    read_by_groups: read_by_groups(property, value),
+                }
+            })
+            .collect();
+        Some(std::sync::Arc::new(InheritanceDependentValues {
+            idv_property_bloom,
+            values: built,
+        }))
     }
 
     pub(crate) fn set_display_before_box_type_transformation(&mut self, display: u32) {
@@ -5410,7 +5737,7 @@ impl<'a> GroupValuesWriter<'a> {
         u8,
     ) {
         let inheritance_dependent_values = self.finished_inheritance_dependent_values(seeds);
-        let read_in_place_bits = match (
+        let (read_in_place_bits, read_in_place_property_bloom) = match (
             seeds.iter().find(
                 |seed| match (&seed.facts.inheritance_dependent_values, &inheritance_dependent_values) {
                     (Some(held), Some(values)) => std::sync::Arc::ptr_eq(held, values),
@@ -5419,12 +5746,19 @@ impl<'a> GroupValuesWriter<'a> {
             ),
             &inheritance_dependent_values,
         ) {
-            (Some(seed), _) => seed.facts.read_in_place_bits,
-            (None, Some(values)) => values
-                .iter()
-                .filter(|held| held.read_by_groups)
-                .fold(0, |bits, held| bits | read_in_place_bit(held.property)),
-            (None, None) => 0,
+            (Some(seed), _) => (seed.facts.read_in_place_bits, seed.facts.read_in_place_property_bloom),
+            (None, Some(held_values)) => {
+                let mut bits = 0_u16;
+                let mut rip_bloom = 0_u64;
+                for held in &held_values.values {
+                    if held.read_by_groups {
+                        bits |= read_in_place_bit(held.property);
+                        rip_bloom |= idv_property_bit(held.property);
+                    }
+                }
+                (bits, rip_bloom)
+            }
+            (None, None) => (0, 0),
         };
         // NB: A value written back over the seed's leaves the seed's.
         let seeded = &self.seeded;
@@ -5474,13 +5808,18 @@ impl<'a> GroupValuesWriter<'a> {
             GroupValues {
                 seeds: self.seeded,
                 writes: self.writes,
+                _borrowed_values: std::marker::PhantomData,
                 written_groups: written_groups & !shared_groups,
+                written_longhands: self.written_longhands,
                 bits: self.bits,
                 facts: GroupValueFacts {
                     inheritance_dependent_values,
-                    uncoordinated_background_values: self.uncoordinated_background_values,
+                    uncoordinated_background_values: self.uncoordinated_background_values.into_owned(),
+                    read_in_place_property_bloom,
                     effective_zoom: self.effective_zoom,
                     display_before_box_type_transformation: self.display_before_box_type_transformation,
+                    current_color_groups: 0,
+                    read_in_place_bits,
                     effective_color_scheme: i8::try_from(self.effective_color_scheme)
                         .expect("a color scheme is a small code"),
                     origin_facts: self.user_agent_margin_sides
@@ -5489,8 +5828,6 @@ impl<'a> GroupValuesWriter<'a> {
                         } else {
                             0
                         },
-                    read_in_place_bits,
-                    current_color_groups: 0,
                 },
             },
             self.flags,
