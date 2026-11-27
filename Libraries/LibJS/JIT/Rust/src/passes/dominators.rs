@@ -197,18 +197,15 @@ impl<'w> Dominators<'w> {
     fn compute_children(&mut self) {
         let count = self.idom.len();
         self.children.begin_counts(count);
-        for block in 0..count {
-            if let Some(idom) = self.idom[block]
-                && self.reachable[block]
-            {
+        for &block in &self.order {
+            if let Some(idom) = self.idom[block.index()] {
                 self.children.count(idom.index());
             }
         }
         self.children.end_counts(BlockId(0));
+        // NB: `self.idom` is `None` for unreachable blocks, and iterating `0..count` preserves linear child order.
         for block in 0..count {
-            if let Some(idom) = self.idom[block]
-                && self.reachable[block]
-            {
+            if let Some(idom) = self.idom[block] {
                 self.children.fill(idom.index(), BlockId::from_index(block));
             }
         }
@@ -221,9 +218,9 @@ impl<'w> Dominators<'w> {
         self.tree_intervals.resize(count, (0, 0));
         let mut time = 0;
         self.pending.clear();
-        for block in 0..count {
-            if self.reachable[block] && self.idom[block].is_none() {
-                self.pending.push((BlockId::from_index(block), false));
+        for &block in &self.order {
+            if self.idom[block.index()].is_none() {
+                self.pending.push((block, false));
             }
         }
         while let Some((block, leaving)) = self.pending.pop() {

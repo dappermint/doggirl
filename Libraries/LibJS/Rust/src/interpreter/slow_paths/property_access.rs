@@ -347,6 +347,16 @@ pub fn get_by_value(
         values.dst = value;
         return SlowPathControl::continue_at(pc + op::GetByValue::LENGTH);
     }
+    if base_value.is_object()
+        && property_key_value.is_non_negative_int32()
+        && let Some(result) = crate::embedding::host::host_object::try_get_indexed_value_hook_fast(
+            &base_value.as_object(),
+            property_key_value.as_i32() as u32,
+        )
+    {
+        values.dst = asm_try!(vm, pc, result);
+        return SlowPathControl::continue_at(pc + op::GetByValue::LENGTH);
+    }
     let object = asm_try!(
         vm,
         pc,

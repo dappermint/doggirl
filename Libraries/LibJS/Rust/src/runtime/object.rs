@@ -4413,7 +4413,7 @@ impl Object {
             && self.indexed_element(index) != Value::EMPTY
     }
 
-    fn indexed_element(&self, index: u32) -> Value {
+    pub(crate) fn indexed_element(&self, index: u32) -> Value {
         assert!(index < self.indexed_elements_capacity());
         // SAFETY: The index is within the elements buffer.
         unsafe { self.indexed_elements.get().add(index as usize).read() }

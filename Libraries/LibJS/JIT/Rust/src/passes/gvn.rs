@@ -27,13 +27,12 @@ use crate::ir::Graph;
 use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
-use ak::FastHasher;
 
 const EMPTY_NODE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct Bucket {
-    hash: u64,
+    hash: u32,
     head: u32,
 }
 
@@ -42,24 +41,65 @@ fn is_numbered(op: &Op) -> bool {
     !matches!(op, Op::Constant(_) | Op::Phi) && op.meta().is_gvn_pure()
 }
 
-#[inline(always)]
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    x ^ (x >> 32)
+struct DiscriminantHasher(u32);
+
+impl Hasher for DiscriminantHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        u64::from(self.0)
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(31).wrapping_add(u32::from(b));
+        }
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = u32::from(i);
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = u32::from(i);
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = i;
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i as u32;
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = i as u32;
+    }
 }
 
 #[inline(always)]
-fn node_hash(node: &Node, replacements: &Replacements) -> u64 {
-    let mut hasher = FastHasher::default();
+fn mix32(mut x: u32) -> u32 {
+    x = x.wrapping_mul(0x9e37_79b9);
+    x ^ (x >> 16)
+}
+
+#[inline(always)]
+fn node_hash(node: &Node, replacements: &Replacements) -> u32 {
+    let mut hasher = DiscriminantHasher(0);
     discriminant(&node.op).hash(&mut hasher);
-    let mut h = hasher.finish() ^ (node.inputs.len() as u64);
+    let mut h = mix32(hasher.0 ^ ((node.inputs.len() as u32) << 16));
     if replacements.is_empty() {
         for input in &node.inputs {
-            h = mix64(h ^ u64::from(input.0));
+            h = mix32(h ^ input.0);
         }
     } else {
         for input in &node.inputs {
-            h = mix64(h ^ u64::from(replacements.resolve(*input).0));
+            h = mix32(h ^ replacements.resolve(*input).0);
         }
     }
     h
@@ -73,7 +113,7 @@ fn run_with_hash(
     graph: &mut Graph,
     work: &Zone,
     dominators: &mut CachedDominators,
-    hash: impl Fn(&Node, &Replacements) -> u64,
+    hash: impl Fn(&Node, &Replacements) -> u32,
 ) {
     let mut numbered_count = 0usize;
     for block in &graph.blocks {

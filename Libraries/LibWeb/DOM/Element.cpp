@@ -1362,9 +1362,14 @@ void Element::handle_attribute_changes(QualifiedName name, Optional<Utf16String>
         history->notify_dom_mutation();
 
     // 1. Queue a mutation record of "attributes" for element with attribute’s local name, attribute’s namespace, oldValue, « », « », null, and null.
-    // NB: A detached element with no parent and no rare data has no registered observers of its own or on any ancestor.
-    if (is_connected() || parent() || rare_data() || document().page().accessibility_interested()
-        || document().page().listen_for_dom_mutations() || document().document_translator_if_exists())
+    // NB: Matches Node::queue_mutation_record's early-out so attribute mutations skip the out-of-line call and
+    //     Optional<Utf16FlyString> copies when no attribute observer, accessibility consumer, or translator is active.
+    auto& doc = document();
+    auto& page = doc.page();
+    if (doc.has_mutation_observers_of_type(MutationType::attributes)
+        || page.accessibility_interested()
+        || page.listen_for_dom_mutations()
+        || doc.document_translator_if_exists())
         queue_mutation_record(MutationType::attributes, name.local_name(), name.namespace_(), old_value, {}, {}, nullptr, nullptr);
 
     // 2. If element is custom, then enqueue a custom element callback reaction with element, callback name "attributeChangedCallback",
@@ -1750,9 +1755,12 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
 
     // An SVG element's parsed attributes are layout input, published under its style node. Published here,
     // after the change steps, rather than from SVGElement's: each SVG element runs its base class's steps before it
-    // parses the new value itself.
-    if (auto* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->attribute_affects_svg_attribute_facts(local_name))
-        svg_element->publish_svg_attribute_facts();
+    // parses the new value itself. Skip the check while style_node_id() == 0, since publish_svg_attribute_facts()
+    // is a no-op until the element gets a style node (at which point it publishes all SVG attribute facts).
+    if (style_node_id() != 0) {
+        if (auto* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->attribute_affects_svg_attribute_facts(local_name))
+            svg_element->publish_svg_attribute_facts();
+    }
     if (local_name.is_one_of(HTML::AttributeNames::colspan, HTML::AttributeNames::rowspan, HTML::AttributeNames::span)) {
         Layout::publish_table_spans(*this);
         Layout::ForcedReadScope read { document() };

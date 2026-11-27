@@ -6,11 +6,12 @@
 
 use libjs_runtime_macros::Trace;
 
+use crate::bytecode::property_access::get_by_value_with_keyed_cache;
 use crate::gc::class::{GcCell, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::function_object::RawNativeFunction;
-use crate::layout::object::Object;
+use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{call_function_object, construct, create_argument_list_from_array_like};
@@ -41,6 +42,7 @@ define_object_class!(ReflectObject, extends: [Object], methods: {
 });
 
 static APPLY_FUNCTION: RawNativeFunctionPointer = raw_native!(ReflectObject::apply);
+pub(crate) static GET_FUNCTION: RawNativeFunctionPointer = raw_native!(ReflectObject::get);
 
 impl ReflectObject {
     /// Whether the function is Reflect.apply (of any realm).
@@ -70,7 +72,7 @@ impl ReflectObject {
         define_native_function(&names.construct, raw_native!(ReflectObject::construct), 2);
         define_native_function(&names.defineProperty, raw_native!(ReflectObject::define_property), 3);
         define_native_function(&names.deleteProperty, raw_native!(ReflectObject::delete_property), 2);
-        define_native_function(&names.get, raw_native!(ReflectObject::get), 2);
+        define_native_function(&names.get, GET_FUNCTION, 2);
         define_native_function(
             &names.getOwnPropertyDescriptor,
             raw_native!(ReflectObject::get_own_property_descriptor),
@@ -202,6 +204,21 @@ impl ReflectObject {
             return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&target]);
         }
 
+        let target_object = target.as_object();
+        let has_ordinary_get =
+            core::ptr::fn_addr_eq(target_object.methods().internal_get, ORDINARY_OBJECT_METHODS.internal_get);
+
+        if has_ordinary_get
+            && property_key.is_non_negative_int32()
+            && !target_object.may_interfere_with_indexed_property_access()
+            && target_object.indexed_storage_kind() == IndexedStorageKind::Packed
+        {
+            let index = property_key.as_i32() as u32;
+            if index < target_object.indexed_packed_element_count() {
+                return Ok(target_object.indexed_element(index));
+            }
+        }
+
         // 2. Let key be ? ToPropertyKey(propertyKey).
         let key = property_key.to_property_key(vm)?;
 
@@ -212,9 +229,10 @@ impl ReflectObject {
         }
 
         // 4. Return ? target.[[Get]](key, receiver).
-        target
-            .as_object()
-            .internal_get(vm, &key, receiver, None, PropertyLookupPhase::OwnProperty)
+        if has_ordinary_get {
+            return get_by_value_with_keyed_cache(vm, target_object, receiver, &key, None);
+        }
+        target_object.internal_get(vm, &key, receiver, None, PropertyLookupPhase::OwnProperty)
     }
 
     // 28.1.6 Reflect.getOwnPropertyDescriptor ( target, propertyKey ), https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor
@@ -335,8 +353,22 @@ impl ReflectObject {
             receiver = target;
         }
 
+        let target_object = target.as_object();
+        if receiver.0 == target.0
+            && key.is_string()
+            && core::ptr::fn_addr_eq(target_object.methods().internal_set, ORDINARY_OBJECT_METHODS.internal_set)
+            && target_object.own_string_keyed_properties_are_in_shape()
+            && !(target_object.has_magical_length_property() && key.as_string() == vm.names.length.as_string())
+            && let Some(metadata) = target_object.shape().lookup(&key)
+            && metadata.attributes.is_writable()
+            && !target_object.get_direct(metadata.offset).is_accessor()
+        {
+            target_object.replace_direct(vm, metadata.offset, value);
+            return Ok(Value::from_bool(true));
+        }
+
         // 4. Return ? target.[[Set]](key, V, receiver).
-        Ok(Value::from_bool(target.as_object().internal_set(
+        Ok(Value::from_bool(target_object.internal_set(
             vm,
             &key,
             value,

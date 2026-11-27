@@ -985,6 +985,8 @@ pub enum Intrinsic {
     ObjectKeys,
     /// `Object.assign`.
     ObjectAssign,
+    /// `Reflect.get`.
+    ReflectGet,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -1168,6 +1170,13 @@ impl Intrinsic {
                 result: HelperResult::Value,
                 reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
                 writes: Locations::NAMED,
+            }),
+            Intrinsic::ReflectGet => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value, HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
+                writes: Locations::NONE,
             }),
             _ => None,
         }
