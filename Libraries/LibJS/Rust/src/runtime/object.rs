@@ -1525,6 +1525,34 @@ impl Object {
         Ok(properties)
     }
 
+    /// Whether [[Set]] of each key in `keys` on this object (which has none of them) creates a data property on it:
+    /// its prototypes have ordinary property lookup and [[Set]], and none of them has one of those keys as an accessor
+    /// or as a non-writable data property.
+    pub fn set_of_keys_create_them(&self, vm: &Vm, keys: &[PropertyKey]) -> bool {
+        let object_prototype = vm.current_realm().map(|realm| realm.object_prototype());
+        let mut prototype = self.shape().prototype();
+        while let Some(current) = prototype {
+            // NB: %Object.prototype% only has an exotic [[SetPrototypeOf]].
+            let is_ordinary = Some(current) == object_prototype || current.has_ordinary_named_property_lookup_and_set();
+            if !is_ordinary
+                || current.indexed_storage_kind() != IndexedStorageKind::None
+                || current.has_intrinsic_accessors()
+            {
+                return false;
+            }
+            let current_shape = current.shape();
+            for property_key in keys {
+                if let Some(metadata) = current_shape.lookup(property_key)
+                    && (!metadata.attributes.is_writable() || current.get_direct(metadata.offset).is_accessor())
+                {
+                    return false;
+                }
+            }
+            prototype = current_shape.prototype();
+        }
+        true
+    }
+
     /// Whether [[Set]] of each property of `from` on this object, which has none of them, creates a data property on
     /// it: its prototypes have ordinary property lookup and [[Set]], and none of them has one of those properties as an
     /// accessor or as a data property that is not writable.
@@ -4104,6 +4132,33 @@ impl Object {
     /// the value of a slot that caches write to (see `Shape::note_slot_written_by_caches()`).
     pub fn put_direct_from_cache(&self, index: u32, value: Value) {
         debug_assert!(!self.shape().is_slot_watched(index));
+        self.write_direct(index, value);
+    }
+
+    /// Prepares named storage for a batch shape transition in `Object.assign` (never triggers GC).
+    #[inline(always)]
+    pub(crate) fn prepare_for_shape_transition(&self, needed_properties: u32) {
+        self.ensure_named_storage_capacity(needed_properties);
+    }
+
+    /// Commits a batch shape transition after `prepare_for_shape_transition` and all slot writes have completed.
+    #[inline(always)]
+    pub(crate) fn finish_shape_transition(&self, shape: Gc<Shape>) {
+        debug_assert!(shape.property_count() <= self.named_storage_capacity());
+        self.shape.set(shape);
+    }
+
+    /// Raw pointer to named property storage, for bulk copies in `Object.assign`.
+    #[inline(always)]
+    pub(crate) fn named_properties_ptr(&self) -> *mut Value {
+        self.named_properties.get()
+    }
+
+    /// Writes a slot during an unwatched, non-global `Object.assign` batch apply (capacity already ensured).
+    #[inline(always)]
+    pub(crate) fn write_direct_from_assign(&self, index: u32, value: Value) {
+        debug_assert!(!self.has_global_object_flag());
+        debug_assert!(!self.shape().has_watched_slots());
         self.write_direct(index, value);
     }
 

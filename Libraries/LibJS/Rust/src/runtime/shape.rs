@@ -521,6 +521,99 @@ impl Default for PrototypeTransitionCache {
     }
 }
 
+pub const ASSIGN_PLAN_MAX_PROPERTIES: usize = 32;
+const ASSIGN_PLAN_CACHE_INDEX_BITS: u32 = 7;
+
+/// A cached plan for `Object.assign(target, source)` from an ordinary non-dictionary `source_shape`
+/// onto an ordinary non-dictionary `target_shape`, where every enumerable property of `source_shape`
+/// is a string key that either overwrites an existing writable own property of `target_shape` or adds
+/// a new default data property.
+#[derive(Clone, Copy)]
+pub struct AssignPlan {
+    pub target_shape: Option<Gc<Shape>>,
+    pub source_shape: Option<Gc<Shape>>,
+    pub result_shape: Option<Gc<Shape>>,
+    /// Prototype chain validity of `target_shape.prototype()`, checked whenever properties are added
+    /// (`result_shape != target_shape`).
+    pub prototype_validity: Option<Gc<WatchpointSet>>,
+    /// Number of properties on `target_shape` before applying the plan. Any `dst_offset < target_property_count`
+    /// overwrites an existing slot and must be checked for accessors before mutating; any
+    /// `dst_offset >= target_property_count` initializes a newly appended slot.
+    pub target_property_count: u16,
+    pub copy_count: u8,
+    pub copies: [(u16, u16); ASSIGN_PLAN_MAX_PROPERTIES],
+}
+
+impl Default for AssignPlan {
+    fn default() -> Self {
+        Self {
+            target_shape: None,
+            source_shape: None,
+            result_shape: None,
+            prototype_validity: None,
+            target_property_count: 0,
+            copy_count: 0,
+            copies: [(0, 0); ASSIGN_PLAN_MAX_PROPERTIES],
+        }
+    }
+}
+
+/// Cache of `(target_shape, source_shape) -> AssignPlan` transitions for `Object.assign`.
+/// Does not keep its cells alive: the VM's sweep callback forgets entries whose cells died or moved.
+pub struct AssignPlanCache {
+    entries: core::cell::RefCell<Box<[AssignPlan]>>,
+}
+
+impl AssignPlanCache {
+    pub fn new() -> Self {
+        Self {
+            entries: core::cell::RefCell::new(vec![AssignPlan::default(); 1 << ASSIGN_PLAN_CACHE_INDEX_BITS].into_boxed_slice()),
+        }
+    }
+
+    #[inline]
+    fn entry_index(target_shape: Gc<Shape>, source_shape: Gc<Shape>) -> usize {
+        let hash = ((target_shape.as_ptr().addr() as u32) ^ (source_shape.as_ptr().addr() as u32).rotate_left(13))
+            .wrapping_mul(0x9e37_79b9);
+        (hash >> (32 - ASSIGN_PLAN_CACHE_INDEX_BITS)) as usize
+    }
+
+    #[inline]
+    pub fn get(&self, target_shape: Gc<Shape>, source_shape: Gc<Shape>) -> Option<AssignPlan> {
+        let entries = self.entries.borrow();
+        let entry = &entries[Self::entry_index(target_shape, source_shape)];
+        (entry.target_shape == Some(target_shape) && entry.source_shape == Some(source_shape)).then_some(*entry)
+    }
+
+    pub fn set(&self, plan: AssignPlan) {
+        let (Some(target_shape), Some(source_shape)) = (plan.target_shape, plan.source_shape) else {
+            return;
+        };
+        let index = Self::entry_index(target_shape, source_shape);
+        self.entries.borrow_mut()[index] = plan;
+    }
+
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
+        for entry in self.entries.borrow_mut().iter_mut() {
+            if entry.target_shape.is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || entry.source_shape.is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || entry.result_shape.is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || entry
+                    .prototype_validity
+                    .is_some_and(|cell| sweep.is_dead_or_moving(cell))
+            {
+                *entry = AssignPlan::default();
+            }
+        }
+    }
+}
+
+impl Default for AssignPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[inline(always)]
 fn property_key_bloom_mask(raw_bits: usize) -> u64 {
     let h = (raw_bits as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);

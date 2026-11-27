@@ -44,7 +44,6 @@ use crate::runtime::regexp_constructor::is_raw_native_function_running;
 use crate::runtime::regexp_legacy_static_properties::{
     LegacyCaptureSlots, invalidate_legacy_regexp_static_properties, update_legacy_regexp_static_properties_lazy,
 };
-#[cfg(feature = "jit")]
 use crate::runtime::regexp_object::NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET;
 use crate::runtime::regexp_object::{
     REGEXP_FLAGS_WITH_CHARACTERS, RegExpFlags, RegExpObject, compile_flags_for, parse_regex_pattern,
@@ -67,6 +66,8 @@ fn cache(vm: &Vm, site: CacheSite) -> &PropertyLookupCache {
 
 /// The getter of RegExp.prototype.flags, which primordial_properties_are_unchanged() looks for.
 static FLAGS_GETTER: RawNativeFunctionPointer = raw_native!(RegExpPrototype::flags);
+/// %RegExp.prototype.test%, which JIT code calls through a runtime helper.
+pub(crate) static TEST_FUNCTION: RawNativeFunctionPointer = raw_native!(RegExpPrototype::test);
 
 macro_rules! define_regexp_flag_getters {
     ($($flag:ident, $flag_name:ident, $property_name:ident, $getter_static:ident, $flags_cache:ident;)*) => {
@@ -386,6 +387,143 @@ pub(crate) fn regexp_builtin_exec_running_no_code(vm: &Vm, value: Value, string:
     }
     let regexp_object = object.downcast::<RegExpObject>()?;
     regexp_builtin_exec(vm, regexp_object, string).ok()
+}
+
+/// Pure `ToLength` for a `Value` already known to be a number (runs no JS code).
+#[inline]
+fn number_to_length(value: Value) -> u64 {
+    if value.is_int32() {
+        return value.as_i32().max(0) as u64;
+    }
+    let number = value.as_f64();
+    if number.is_nan() || number <= 0.0 {
+        return 0;
+    }
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if number >= MAX_SAFE_INTEGER {
+        return 9_007_199_254_740_991;
+    }
+    number.trunc() as u64
+}
+
+/// `RegExp.prototype.test(string)` for an unmodified RegExp object whose `exec` and `lastIndex` run no code,
+/// avoiding match-array allocation for both non-global/non-sticky and global/sticky RegExps.
+/// Returns `None` having done nothing observable if the slow path must run (or backtrack limit exceeded).
+pub(crate) fn regexp_builtin_test_running_no_code(
+    vm: &Vm,
+    value: Value,
+    string: Gc<PrimitiveString>,
+) -> Option<Value> {
+    if !value.is_object() {
+        return None;
+    }
+    let object = value.as_object();
+    let realm = vm.current_realm()?;
+    if object.shape() != realm.intrinsics().new_regexp_object_shape(vm) {
+        return None;
+    }
+    let last_index_value = object.get_direct(NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET);
+    if !last_index_value.is_number() {
+        return None;
+    }
+    if !realm_watchpoints::regexp_primordial_properties_are_unchanged(vm, realm) {
+        return None;
+    }
+    let typed_regexp = object.downcast::<RegExpObject>()?;
+    let flag_bits = typed_regexp.flag_bits();
+    let global = flag_bits.has(RegExpFlags::GLOBAL);
+    let sticky = flag_bits.has(RegExpFlags::STICKY);
+
+    let last_index = if global || sticky {
+        let len = number_to_length(last_index_value);
+        if len > string.length_in_utf16_code_units() as u64 {
+            object.replace_direct(vm, NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET, Value::from_i32(0));
+            return Some(Value::FALSE);
+        }
+        len as usize
+    } else {
+        0
+    };
+
+    let Some(compiled_regex) = get_or_compile_regex(vm, &typed_regexp) else {
+        if global || sticky {
+            object.replace_direct(vm, NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET, Value::from_i32(0));
+        }
+        return Some(Value::FALSE);
+    };
+
+    let utf16_view = string.utf16_string_view();
+    if !global && !sticky {
+        if !typed_regexp.legacy_features_enabled() {
+            let test_result = compiled_regex.test(utf16_view, 0);
+            if test_result == MatchResult::LimitExceeded {
+                return None;
+            }
+            if test_result == MatchResult::Match && realm == typed_regexp.realm() {
+                invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
+            }
+            return Some(Value::from_bool(test_result == MatchResult::Match));
+        }
+        let test_exec_result = compiled_regex.exec(utf16_view, 0);
+        if test_exec_result == MatchResult::LimitExceeded {
+            return None;
+        }
+        let matched = test_exec_result == MatchResult::Match;
+        if matched && realm == typed_regexp.realm() {
+            let n_capture_groups = compiled_regex.capture_count();
+            let match_start = compiled_regex.capture_slot(0) as usize;
+            let match_end = compiled_regex.capture_slot(1) as usize;
+            let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
+            update_legacy_regexp_static_properties_lazy(
+                vm,
+                realm.intrinsics().regexp_constructor(vm),
+                string,
+                match_start,
+                match_end,
+                &legacy_captures,
+            );
+        }
+        return Some(Value::from_bool(matched));
+    }
+
+    let unicode_mode = flag_bits.has(RegExpFlags::UNICODE) || flag_bits.has(RegExpFlags::UNICODE_SETS);
+    let exec_result = exec_with_unicode_last_index(&compiled_regex, utf16_view, last_index, unicode_mode, sticky);
+    if exec_result.result == MatchResult::LimitExceeded {
+        return None;
+    }
+    let mut matched = exec_result.result == MatchResult::Match;
+    if matched && sticky {
+        let match_start = compiled_regex.capture_slot(0);
+        if match_start < 0 || match_start as usize != exec_result.effective_last_index {
+            matched = false;
+        }
+    }
+    if !matched {
+        object.replace_direct(vm, NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET, Value::from_i32(0));
+        return Some(Value::FALSE);
+    }
+
+    let match_start = compiled_regex.capture_slot(0) as usize;
+    let match_end = compiled_regex.capture_slot(1) as usize;
+    object.replace_direct(vm, NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET, index_value(match_end));
+
+    if realm == typed_regexp.realm() {
+        if typed_regexp.legacy_features_enabled() {
+            let n_capture_groups = compiled_regex.capture_count();
+            let legacy_captures = legacy_capture_slots(&compiled_regex, n_capture_groups);
+            update_legacy_regexp_static_properties_lazy(
+                vm,
+                realm.intrinsics().regexp_constructor(vm),
+                string,
+                match_start,
+                match_end,
+                &legacy_captures,
+            );
+        } else {
+            invalidate_legacy_regexp_static_properties(realm.intrinsics().regexp_constructor(vm));
+        }
+    }
+    Some(Value::TRUE)
 }
 
 fn regexp_builtin_exec(
@@ -804,7 +942,7 @@ impl RegExpPrototype {
             vm,
             realm,
             &names.test,
-            raw_native!(RegExpPrototype::test),
+            TEST_FUNCTION,
             1,
             attributes,
             None,
@@ -2557,7 +2695,13 @@ impl RegExpPrototype {
         // 3. Let string be ? ToString(S).
         let string = vm.argument(0).to_primitive_string(vm)?;
 
-        // OPTIMIZATION: Fast path for test() on non-global, non-sticky RegExp objects.
+        // OPTIMIZATION: Fast path for unmodified RegExp objects (both non-global/non-sticky and global/sticky),
+        // avoiding result Array allocation.
+        if let Some(result) = regexp_builtin_test_running_no_code(vm, Value::from_object(regexp_object), string) {
+            return Ok(result);
+        }
+
+        // OPTIMIZATION: Fast path for test() on non-global, non-sticky RegExp objects with non-default shapes.
         // Use the regex test() directly, avoiding result Array creation.
         let realm = vm.current_realm().expect("a builtin runs in a realm");
         if Self::test_is_fast_and_non_observable(vm, realm, &regexp_object) {

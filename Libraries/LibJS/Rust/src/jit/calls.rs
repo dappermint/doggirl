@@ -1633,10 +1633,7 @@ pub fn get_by_id_from_jit(
         Some(hit) => hit,
         None if cache.is_megamorphic() => {
             let property_key = executable.get_property_key(&instruction.property);
-            (
-                lookup_vm_keyed_cache_and_remember(vm, object, property_key, cache)?,
-                false,
-            )
+            lookup_vm_keyed_cache_and_remember(vm, object, property_key, cache)?
         }
         None => return None,
     };
@@ -1665,7 +1662,8 @@ pub fn get_by_id_from_jit(
                 if is_direct_getter && !direct_getter_validated {
                     let executable = vm.current_executable();
                     let cache = executable.property_lookup_cache(instruction.cache as usize);
-                    record_validated_direct_getter(object, cache, getter);
+                    let property_key = executable.get_property_key(&instruction.property);
+                    record_validated_direct_getter(vm, object, property_key, cache, getter);
                 }
                 values.dst = result;
                 SlowPathControl::continue_at(pc + op::GetById::LENGTH)

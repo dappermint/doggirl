@@ -3061,7 +3061,7 @@ fn object_is_and_collection_helper_intrinsics_lower_and_verify() {
     use crate::snapshot::{CallFeedbackSnapshot, CellId, Intrinsic, NativeCallTarget};
 
     let build_intrinsic_call = |intrinsic: Intrinsic, arg_count: usize| -> String {
-        let arg_operands = [a(0), r(6)];
+        let arg_operands = [a(0), r(6), a(0), r(6), a(0)];
         let args: Vec<Operand> = arg_operands[..arg_count].to_vec();
         let program = assemble(|_| {
             vec![
@@ -3101,6 +3101,10 @@ fn object_is_and_collection_helper_intrinsics_lower_and_verify() {
 
     for (intrinsic, argc) in [
         (Intrinsic::ObjectKeys, 1),
+        (Intrinsic::ObjectAssign, 2),
+        (Intrinsic::ObjectAssign, 3),
+        (Intrinsic::ObjectAssign, 4),
+        (Intrinsic::RegExpPrototypeTest, 1),
         (Intrinsic::MapPrototypeSet, 2),
         (Intrinsic::SetPrototypeHas, 1),
         (Intrinsic::SetPrototypeAdd, 1),
@@ -3108,4 +3112,9 @@ fn object_is_and_collection_helper_intrinsics_lower_and_verify() {
         let ir = build_intrinsic_call(intrinsic, argc);
         assert!(ir.contains(&format!("CallIntrinsic {intrinsic:?}")), "{ir}");
     }
+    let object_assign_5 = build_intrinsic_call(Intrinsic::ObjectAssign, 5);
+    assert!(
+        !object_assign_5.contains("CallIntrinsic ObjectAssign"),
+        "{object_assign_5}"
+    );
 }
