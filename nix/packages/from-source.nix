@@ -43,13 +43,14 @@
 }:
 
 let
+  version = "0.2.1";
   cargoDeps = rustPlatform.importCargoLock {
     lockFile = "${src}/Cargo.lock";
   };
 in
 stdenv.mkDerivation {
   pname = "doggirl-unwrapped";
-  version = "0.2.0";
+  inherit version;
 
   inherit src;
 
@@ -78,6 +79,7 @@ stdenv.mkDerivation {
     "-DLADYBIRD_ENABLE_UPDATE_CHECK=${if enableUpdateCheck then "ON" else "OFF"}"
     "-DLADYBIRD_ENABLE_SPARKLE=${if enableSparkle then "ON" else "OFF"}"
     "-DLADYBIRD_ENABLE_CCACHE=OFF"
+    "-DLADYBIRD_VERSION=${version}"
     "-DRUST_CARGO=${rustToolchain}/bin/cargo"
     "-DRUST_RUSTC=${rustToolchain}/bin/rustc"
   ]

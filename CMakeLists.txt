@@ -19,7 +19,7 @@ if (APPLE AND NOT CMAKE_OSX_SYSROOT)
 endif()
 
 project(ladybird
-    VERSION 0.2.0
+    VERSION 0.2.1
     LANGUAGES C CXX
     DESCRIPTION "Doggirl Web Browser"
     HOMEPAGE_URL "https://github.com/dappermint/doggirl"
