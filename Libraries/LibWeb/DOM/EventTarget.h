@@ -84,6 +84,7 @@ public:
     bool has_blocking_wheel_event_listener() const;
     bool has_blocking_keyboard_event_listener() const;
     bool has_event_listeners() const;
+    static bool has_any_css_animation_or_transition_event_listeners();
 
 protected:
     EventTarget();
@@ -103,6 +104,7 @@ private:
         // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-map
         // Spec Note: The order of the entries of event handler map could be arbitrary. It is not observable through any algorithms that operate on the map.
         HashMap<Utf16FlyString, GC::Ref<HTML::EventHandler>> event_handler_map;
+        u32 css_animation_or_transition_listener_count { 0 };
     };
 
     Data& ensure_data();

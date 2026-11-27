@@ -218,8 +218,36 @@ EventTarget::EventTarget()
     set_wrappable_flag(WrappableFlag::IsEventTarget);
 }
 
+static thread_local size_t s_live_css_animation_or_transition_event_listeners { 0 };
+
+static bool is_css_animation_or_transition_event_type(Utf16FlyString const& type)
+{
+    if (type.length_in_code_units() < 12)
+        return false;
+    return AK::first_is_one_of(type,
+        HTML::EventNames::animationcancel,
+        HTML::EventNames::animationend,
+        HTML::EventNames::animationiteration,
+        HTML::EventNames::animationstart,
+        HTML::EventNames::transitioncancel,
+        HTML::EventNames::transitionend,
+        HTML::EventNames::transitionrun,
+        HTML::EventNames::transitionstart,
+        HTML::EventNames::webkitAnimationEnd,
+        HTML::EventNames::webkitAnimationIteration,
+        HTML::EventNames::webkitAnimationStart,
+        HTML::EventNames::webkitTransitionEnd);
+}
+
+bool EventTarget::has_any_css_animation_or_transition_event_listeners()
+{
+    return s_live_css_animation_or_transition_event_listeners != 0;
+}
+
 void EventTarget::destroy_data()
 {
+    if (m_data->css_animation_or_transition_listener_count != 0)
+        s_live_css_animation_or_transition_event_listeners -= m_data->css_animation_or_transition_listener_count;
     m_data.clear();
 }
 
@@ -494,6 +522,10 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
     if (it == event_listener_list.end()) {
         prepare_to_observe_css_animation_events(*this, listener);
         event_listener_list.append(listener);
+        if (is_css_animation_or_transition_event_type(listener.type)) {
+            ++m_data->css_animation_or_transition_listener_count;
+            ++s_live_css_animation_or_transition_event_listeners;
+        }
         invalidate_compositor_keyboard_scroll_state(*this, listener);
         invalidate_compositor_wheel_event_listener_state(*this, listener);
         wake_animation_frame_pump_for_animation_event_listener(*this, listener);
@@ -562,6 +594,11 @@ void EventTarget::remove_an_event_listener(DOMEventListener& listener)
     VERIFY(m_data);
     auto did_remove = m_data->event_listener_list.remove_first_matching([&](auto& entry) { return entry.ptr() == &listener; });
     if (did_remove) {
+        if (is_css_animation_or_transition_event_type(listener.type)) {
+            VERIFY(m_data->css_animation_or_transition_listener_count > 0);
+            --m_data->css_animation_or_transition_listener_count;
+            --s_live_css_animation_or_transition_event_listeners;
+        }
         invalidate_compositor_keyboard_scroll_state(*this, listener);
         invalidate_compositor_wheel_event_listener_state(*this, listener);
         update_needs_beforeunload_check(*this, listener);

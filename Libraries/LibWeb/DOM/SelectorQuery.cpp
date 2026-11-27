@@ -546,20 +546,29 @@ void SelectorQuery::walk_subject_subtree(ParentNode& search_root, bool is_html_d
 {
     auto const filter_bits = m_subject_filter_bits;
     auto const attr_filter_bits = m_subject_attribute_filter_bits;
-    auto* next = search_root.next_in_pre_order(&search_root);
+    auto const& subject = m_fast_subject;
+    auto* next = search_root.first_child();
     while (next) {
-        if (auto* element = as_if<Element>(*next)) {
-            if ((filter_bits && (element->subtree_name_filter() & filter_bits) != filter_bits)
-                || (attr_filter_bits && (element->subtree_attribute_filter() & attr_filter_bits) != attr_filter_bits)) {
+        if (next->is_element()) {
+            auto& element = static_cast<Element&>(*next);
+            if ((filter_bits && (element.subtree_name_filter() & filter_bits) != filter_bits)
+                || (attr_filter_bits && (element.subtree_attribute_filter() & attr_filter_bits) != attr_filter_bits)) {
                 while (next != &search_root && !next->next_sibling())
                     next = next->parent();
                 next = next == &search_root ? nullptr : next->next_sibling();
                 continue;
             }
-            if (matches_simple_compound(*element, m_fast_subject, is_html_document) && callback(*element))
+            if (matches_simple_compound(element, subject, is_html_document) && callback(element))
                 return;
+            if (auto* first_child = element.first_child()) {
+                next = first_child;
+                continue;
+            }
         }
-        next = next->next_in_pre_order(&search_root);
+        // Non-element nodes (Text, Comment, etc.) never have children, so advance directly to siblings/ancestors.
+        while (next != &search_root && !next->next_sibling())
+            next = next->parent();
+        next = next == &search_root ? nullptr : next->next_sibling();
     }
 }
 

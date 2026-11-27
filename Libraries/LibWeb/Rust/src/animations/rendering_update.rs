@@ -136,13 +136,41 @@ unsafe fn sample_effects_in_composite_order(
     has_throttled: bool,
     host: &FfiAnimatedStyleSampleHost,
 ) -> bool {
-    let mut tree_order = host_tree_order(web_animation_compare_elements_in_tree_order);
-    effects.sort_by(|(a, _), (b, _)| {
-        if a.ptr_eq(b) {
-            return std::cmp::Ordering::Equal;
+    // OPTIMIZATION: `AnimationUpdateContext` groups sampled effects into an unordered map keyed by target element and
+    //               pseudo-element, so relative order only matters among effects sharing the same target. Group by
+    //               target in pure Rust and only run `composite_order` (which may query DOM tree order over FFI) on
+    //               groups with two or more effects.
+    if effects.len() > 1 {
+        let target_key = |effect: &EffectHandle| -> (usize, u8, usize) {
+            let effect = effect.borrow();
+            let target = effect.target_element().map_or(0, |ptr| ptr.as_ptr() as usize);
+            match effect.pseudo_element() {
+                Some(pseudo) => (target, pseudo.kind, pseudo.serialization.raw()),
+                None => (target, 0, 0),
+            }
+        };
+        effects.sort_unstable_by_key(|(_, effect)| target_key(effect));
+        let mut tree_order = None;
+        let mut start = 0;
+        while start < effects.len() {
+            let key = target_key(&effects[start].1);
+            let mut end = start + 1;
+            while end < effects.len() && target_key(&effects[end].1) == key {
+                end += 1;
+            }
+            if end - start > 1 {
+                let tree_order =
+                    tree_order.get_or_insert_with(|| host_tree_order(web_animation_compare_elements_in_tree_order));
+                effects[start..end].sort_by(|(a, _), (b, _)| {
+                    if a.ptr_eq(b) {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    composite_order(&a.borrow(), &b.borrow(), tree_order)
+                });
+            }
+            start = end;
         }
-        composite_order(&a.borrow(), &b.borrow(), &mut tree_order)
-    });
+    }
 
     let mut has_throttled_animation_style_update = !force_throttled && has_throttled;
     for (_, effect) in &effects {

@@ -1214,13 +1214,15 @@ pub unsafe extern "C" fn web_animation_dispatch_pending_animation_events(
     animations: NonNull<c_void>,
     tree_order: unsafe extern "C" fn(first: *mut c_void, second: *mut c_void) -> i32,
     host: &PendingAnimationEventHost,
+    dispatch_css_events: bool,
 ) {
     use libweb_rust::web_animations::{PendingAnimationEventKind, take_pending_animation_events_to_dispatch};
     // 4. Let events to dispatch be a copy of doc’s pending animation event queue.
     // 5. Clear doc’s pending animation event queue.
     // 6. Perform a stable sort of the animation events in events to dispatch as follows:
     // SAFETY: Guaranteed by the caller; nothing else reaches the queue until the events are taken.
-    let events_to_dispatch = unsafe { take_pending_animation_events_to_dispatch(animations, tree_order) };
+    let events_to_dispatch =
+        unsafe { take_pending_animation_events_to_dispatch(animations, tree_order, dispatch_css_events) };
     // NB: Dispatching an event runs script, which can run the GC, which must not collect the animation of an event yet to
     //     be dispatched.
     for (animation, _) in &events_to_dispatch {
