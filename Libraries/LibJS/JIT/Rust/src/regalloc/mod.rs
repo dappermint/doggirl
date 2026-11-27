@@ -519,6 +519,9 @@ pub fn allocate<'w>(graph: &Graph, registers: &RegisterSet, work: &'w Zone) -> R
         value_registers: ZoneVec::from_elem_in(None, size.nodes, work),
         end_entries: ZoneVec::with_capacity_in(size.blocks.saturating_mul(8), work),
         end_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
+        merge_entries: ZoneVec::with_capacity_in(size.blocks.saturating_mul(4), work),
+        merge_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
+        merge_recorded: ZoneVec::from_elem_in(false, size.blocks, work),
         finished: ZoneVec::from_elem_in(false, size.blocks, work),
         position: 0,
         slot_classes: &coalescing.classes,
@@ -547,6 +550,13 @@ struct Allocator<'a, 'w> {
     end_entries: ZoneVec<'w, (u8, NodeId)>,
     /// Range in `end_entries` for each finished block.
     end_runs: ZoneVec<'w, Run>,
+    /// Frozen non-phi `(register, value)` entries kept in registers on entry to a merge/loop header with a state
+    /// predecessor, shared verbatim by `place_merge_phis`, `start_block`, and `add_merge_moves`.
+    merge_entries: ZoneVec<'w, (u8, NodeId)>,
+    /// Range in `merge_entries` for each block with `merge_recorded[block] == true`.
+    merge_runs: ZoneVec<'w, Run>,
+    /// Whether `merge_runs[block]` has been frozen for `block`.
+    merge_recorded: ZoneVec<'w, bool>,
     /// Whether each block is finished.
     finished: ZoneVec<'w, bool>,
     /// The position of the node being allocated.
@@ -732,7 +742,7 @@ impl<'w> Allocator<'_, 'w> {
     }
 
     /// Whether the loop with the header `block`, if it is one, leaves `value` in its stack slot: a value that has one
-    /// from its definition on and that the loop only carries through, so that its register is free for the loop.
+    /// before the loop starts and that the loop only carries through, so that its register is free for the loop.
     fn loop_leaves_in_stack(&self, block: BlockId, value: NodeId) -> bool {
         self.loops
             .headed_by(block)
@@ -749,14 +759,30 @@ impl<'w> Allocator<'_, 'w> {
                 self.finished[predecessor.index()],
                 "blocks come after the predecessor whose state they start with"
             );
-            if !live_in.is_empty() {
-                let run = self.end_runs[predecessor.index()].range();
+            if self.merge_recorded[block.index()] {
+                let run = self.merge_runs[block.index()].range();
                 for entry_index in run {
-                    let (register, value) = self.end_entries[entry_index];
-                    if live_in.binary_search(&value).is_ok() && !self.loop_leaves_in_stack(block, value) {
-                        self.assign_register(register, value);
+                    let (register, value) = self.merge_entries[entry_index];
+                    self.assign_register(register, value);
+                }
+            } else {
+                let start = self.merge_entries.len();
+                if !live_in.is_empty() {
+                    let phis = &block_data.phis;
+                    let run = self.end_runs[predecessor.index()].range();
+                    for entry_index in run {
+                        let (register, value) = self.end_entries[entry_index];
+                        if live_in.binary_search(&value).is_ok()
+                            && !self.loop_leaves_in_stack(block, value)
+                            && !phis.contains(&value)
+                        {
+                            self.merge_entries.push((register, value));
+                            self.assign_register(register, value);
+                        }
                     }
                 }
+                self.merge_runs[block.index()] = Run::new(start, self.merge_entries.len());
+                self.merge_recorded[block.index()] = true;
             }
             for phi in &block_data.phis {
                 if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
@@ -1107,12 +1133,20 @@ impl<'w> Allocator<'_, 'w> {
     /// (preferably the input's own), or stack slots if there are none.
     fn place_merge_phis(&mut self, predecessor: BlockId, join: BlockId) {
         let mut taken = RegisterMask::default();
+        let start = self.merge_entries.len();
+        let phis = &self.graph.block(join).phis;
         for register in self.occupied.iter() {
             let value = self.contents[register as usize];
-            if self.liveness.is_live_in(join, value) && !self.loop_leaves_in_stack(join, value) {
+            if self.liveness.is_live_in(join, value)
+                && !self.loop_leaves_in_stack(join, value)
+                && !phis.contains(&value)
+            {
                 taken = taken.with(register);
+                self.merge_entries.push((register, value));
             }
         }
+        self.merge_runs[join.index()] = Run::new(start, self.merge_entries.len());
+        self.merge_recorded[join.index()] = true;
         for (phi, input) in liveness::phi_inputs_from(self.graph, predecessor, join) {
             let class = RegisterClass::of(self.graph.node(phi).repr);
             let candidates = self.registers.allocatable(class).0 & !taken.0;
@@ -1166,20 +1200,32 @@ impl<'w> Allocator<'_, 'w> {
             self.finished[predecessor.index()],
             "blocks come after the predecessor whose state they start with"
         );
-        let live_in = self.liveness.live_in.get(join.index());
-        if !live_in.is_empty() {
-            let phis = &self.graph.block(join).phis;
-            let run = self.end_runs[predecessor.index()].range();
+        if self.merge_recorded[join.index()] {
+            let run = self.merge_runs[join.index()].range();
             for entry_index in run {
-                let (register, value) = self.end_entries[entry_index];
-                if live_in.binary_search(&value).is_ok()
-                    && !self.loop_leaves_in_stack(join, value)
-                    && !phis.contains(&value)
-                {
-                    let to = Location::Register(register);
-                    let from = self.current_location(value);
-                    if from != to {
-                        self.parallel_moves.push(Move { from, to });
+                let (register, value) = self.merge_entries[entry_index];
+                let to = Location::Register(register);
+                let from = self.current_location(value);
+                if from != to {
+                    self.parallel_moves.push(Move { from, to });
+                }
+            }
+        } else {
+            let live_in = self.liveness.live_in.get(join.index());
+            if !live_in.is_empty() {
+                let phis = &self.graph.block(join).phis;
+                let run = self.end_runs[predecessor.index()].range();
+                for entry_index in run {
+                    let (register, value) = self.end_entries[entry_index];
+                    if live_in.binary_search(&value).is_ok()
+                        && !self.loop_leaves_in_stack(join, value)
+                        && !phis.contains(&value)
+                    {
+                        let to = Location::Register(register);
+                        let from = self.current_location(value);
+                        if from != to {
+                            self.parallel_moves.push(Move { from, to });
+                        }
                     }
                 }
             }
