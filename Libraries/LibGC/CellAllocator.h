@@ -61,6 +61,21 @@ public:
     bool is_movable() const { return m_movable; }
     void set_movable() { m_movable = true; }
 
+    // Whether blocks of this allocator only need per-cell destruction when marked via
+    // gc_cell_mark_needs_destruction().
+    bool is_conditional_destructor() const { return m_conditional_destructor; }
+    void set_conditional_destructor() { m_conditional_destructor = true; }
+
+    // Whether blocks of this allocator only need post-mark finalization when marked via
+    // gc_cell_mark_needs_finalization().
+    bool is_conditional_finalize() const { return m_conditional_finalize; }
+    void set_conditional_finalize() { m_conditional_finalize = true; }
+
+    // Optional non-reentrant batch destructor invoked once per 64-cell bitmap word during sweep.
+    using DestroyDeadCellsFn = void (*)(size_t cell_base, size_t cell_size, size_t word_index, u64 dead);
+    DestroyDeadCellsFn destroy_dead_cells() const { return m_destroy_dead_cells; }
+    void set_destroy_dead_cells(DestroyDeadCellsFn fn) { m_destroy_dead_cells = fn; }
+
     // Where each heap keeps its allocator for this descriptor, see Heap::cell_allocator_for().
     size_t index() const { return m_index; }
 
@@ -81,6 +96,9 @@ private:
     size_t m_index { 0 };
     TraceThread m_trace_thread { TraceThread::OwnerThreadOnly };
     bool m_movable { false };
+    bool m_conditional_destructor { false };
+    bool m_conditional_finalize { false };
+    DestroyDeadCellsFn m_destroy_dead_cells { nullptr };
 };
 
 // The cells of one type in one heap. LibGC's Rust core keeps the allocator's blocks, hands out their free cells in runs

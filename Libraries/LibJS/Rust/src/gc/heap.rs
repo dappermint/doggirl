@@ -155,6 +155,62 @@ enum AllocationKind {
     Storage,
 }
 
+const BLOCK_DESCRIPTOR_SIZE: usize = 256;
+const BLOCK_DESCRIPTOR_HAS_CELLS_NEEDING_DESTRUCTION_OFFSET: usize = 223;
+const BLOCK_DESCRIPTOR_HAS_CELLS_NEEDING_FINALIZATION_OFFSET: usize = 224;
+
+struct BlockDescriptorsCopy(core::cell::UnsafeCell<*mut u8>);
+
+// SAFETY: Written once before any cell exists in the heap, and never mutated after.
+unsafe impl Sync for BlockDescriptorsCopy {}
+
+static BLOCK_DESCRIPTORS: BlockDescriptorsCopy = BlockDescriptorsCopy(core::cell::UnsafeCell::new(core::ptr::null_mut()));
+
+fn initialize_block_descriptors() {
+    static INITIALIZE: std::sync::Once = std::sync::Once::new();
+    INITIALIZE.call_once(|| {
+        let table = capi::gc_block_descriptors().cast_mut().cast::<u8>();
+        // SAFETY: Written once before any cell exists; synchronized by `INITIALIZE`.
+        unsafe { *BLOCK_DESCRIPTORS.0.get() = table };
+    });
+}
+
+#[inline(always)]
+fn mark_block_descriptor_flag(cell_address: usize, flag_offset: usize) {
+    debug_assert!(super::class::is_in_heap_region(cell_address));
+    let base = crate::layout_forward::heap_region_base();
+    let block_index = (cell_address - base) / BLOCK_SIZE;
+    // SAFETY: `Heap::new` initialized `BLOCK_DESCRIPTORS` before any cell was allocated; only the heap's owner thread
+    //         reads and writes these per-block flags outside marking.
+    unsafe {
+        let descriptors = *BLOCK_DESCRIPTORS.0.get();
+        let flag = descriptors.add(block_index * BLOCK_DESCRIPTOR_SIZE + flag_offset);
+        if *flag == 0 {
+            *flag = 1;
+        }
+    }
+}
+
+/// Marks the GC block containing `cell` as holding at least one cell that owns resources outside the GC heap and must
+/// run its destructor during sweeping.
+#[inline(always)]
+pub(crate) fn mark_cell_needs_destruction<T>(cell: &T) {
+    mark_block_descriptor_flag(
+        core::ptr::from_ref(cell).addr(),
+        BLOCK_DESCRIPTOR_HAS_CELLS_NEEDING_DESTRUCTION_OFFSET,
+    );
+}
+
+/// Marks the GC block containing `cell` as holding at least one cell that must run its finalizer during post-mark
+/// finalization.
+#[inline(always)]
+pub(crate) fn mark_cell_needs_finalization<T>(cell: &T) {
+    mark_block_descriptor_flag(
+        core::ptr::from_ref(cell).addr(),
+        BLOCK_DESCRIPTOR_HAS_CELLS_NEEDING_FINALIZATION_OFFSET,
+    );
+}
+
 impl Heap {
     /// Creates a heap that calls `gather_roots` with `context` whenever it gathers its roots. A heap that becomes the
     /// default of its thread is the one GC::Heap::the() returns to C++ code on that thread.
@@ -165,6 +221,7 @@ impl Heap {
     pub unsafe fn new(gather_roots: GCGatherRootsCallback, context: *mut c_void, become_thread_default: bool) -> Self {
         let layout = check_layout();
         crate::layout_forward::initialize_heap_region_base();
+        initialize_block_descriptors();
         // SAFETY: The caller keeps the context alive for the heap's lifetime.
         let raw = unsafe { capi::gc_heap_create(gather_roots, context, become_thread_default) };
         let raw = NonNull::new(raw).expect("LibGC creates the heap");
@@ -568,6 +625,20 @@ impl Heap {
         if class.is_movable() && !class_in_tail {
             // SAFETY: The allocator is live and has not allocated yet.
             unsafe { capi::gc_allocator_set_movable(raw.as_ptr()) };
+        }
+        if class.has_conditional_destructor() {
+            // SAFETY: The allocator is live and has not allocated yet.
+            unsafe { capi::gc_allocator_set_conditional_destructor(raw.as_ptr()) };
+        }
+        if class.has_conditional_finalize() {
+            // SAFETY: The allocator is live and has not allocated yet.
+            unsafe { capi::gc_allocator_set_conditional_finalize(raw.as_ptr()) };
+        }
+        if class.has_non_reentrant_destructor()
+            && let Some(destroy_dead_cells) = class.destroy_dead_cells
+        {
+            // SAFETY: The allocator is live and has not allocated yet.
+            unsafe { capi::gc_allocator_set_destroy_dead_cells(raw.as_ptr(), destroy_dead_cells) };
         }
         // SAFETY: The heap and the allocator are live.
         let local_free_list = unsafe { capi::gc_heap_allocator_local_free_list(self.raw.as_ptr(), raw.as_ptr()) };

@@ -374,6 +374,35 @@ void gc_allocator_set_movable(GCAllocator* allocator)
     reinterpret_cast<CAPICellAllocator*>(allocator)->set_movable();
 }
 
+void gc_allocator_set_conditional_destructor(GCAllocator* allocator)
+{
+    reinterpret_cast<CAPICellAllocator*>(allocator)->set_conditional_destructor();
+}
+
+void gc_allocator_set_conditional_finalize(GCAllocator* allocator)
+{
+    reinterpret_cast<CAPICellAllocator*>(allocator)->set_conditional_finalize();
+}
+
+void gc_allocator_set_destroy_dead_cells(GCAllocator* allocator, GCDestroyDeadCells destroy_dead_cells)
+{
+    reinterpret_cast<CAPICellAllocator*>(allocator)->set_destroy_dead_cells(destroy_dead_cells);
+}
+
+void gc_cell_mark_needs_destruction(GCCell const* cell)
+{
+    auto& descriptor = block_descriptor_for(cell);
+    if (!descriptor.has_cells_needing_destruction)
+        descriptor.has_cells_needing_destruction = true;
+}
+
+void gc_cell_mark_needs_finalization(GCCell const* cell)
+{
+    auto& descriptor = block_descriptor_for(cell);
+    if (!descriptor.has_cells_needing_finalization)
+        descriptor.has_cells_needing_finalization = true;
+}
+
 GCCell* gc_heap_allocate_cell(GCHeap* heap, GCAllocator* allocator)
 {
     auto& descriptor = *reinterpret_cast<CAPICellAllocator*>(allocator);
@@ -420,6 +449,8 @@ void const* gc_block_descriptors()
     static_assert(FFI::CELL_BITMAP_WORDS == 11);
     static_assert(offsetof(FFI::BlockDescriptor, cell_index_magic) == 20);
     static_assert(offsetof(FFI::BlockDescriptor, marked) == 40);
+    static_assert(offsetof(FFI::BlockDescriptor, has_cells_needing_destruction) == 223);
+    static_assert(offsetof(FFI::BlockDescriptor, has_cells_needing_finalization) == 224);
     return GC::g_block_descriptors;
 }
 

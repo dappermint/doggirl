@@ -129,6 +129,8 @@ CellAllocator::CellAllocator(Heap& heap, CellAllocatorDescriptorBase& descriptor
         .traced_on_owner_thread_only = descriptor.trace_thread() == TraceThread::OwnerThreadOnly,
         .movable = descriptor.is_movable(),
         .has_destructor = type_info().destroy != nullptr,
+        .conditional_destructor = descriptor.is_conditional_destructor(),
+        .conditional_finalize = descriptor.is_conditional_finalize(),
 #ifdef HAS_ADDRESS_SANITIZER
         .has_address_sanitizer = true,
 #else
@@ -139,6 +141,7 @@ CellAllocator::CellAllocator(Heap& heap, CellAllocatorDescriptorBase& descriptor
         .initialize_block = initialize_block,
         .free_cell = free_cell,
         .destroy_cell = reinterpret_cast<void (*)(void*)>(type_info().destroy),
+        .destroy_dead_cells = descriptor.destroy_dead_cells(),
     };
     m_allocator = FFI::rust_gc_allocator_create(&config);
 }
