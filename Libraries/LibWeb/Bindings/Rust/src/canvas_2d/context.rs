@@ -176,9 +176,6 @@ pub(crate) struct ContextState {
     color_cache: RefCell<Vec<ColorCacheEntry>>,
     #[gc(untraced)]
     font_cache: RefCell<Vec<FontCacheEntry>>,
-    /// Reusable buffer for serializing paths into command records without per-draw heap allocation.
-    #[gc(untraced)]
-    encoded_path_scratch: RefCell<Vec<u8>>,
 }
 
 fn empty_path() -> Path {
@@ -223,7 +220,6 @@ impl ContextState {
             cached_readback: RefCell::new(None),
             color_cache: RefCell::new(Vec::new()),
             font_cache: RefCell::new(Vec::new()),
-            encoded_path_scratch: RefCell::new(Vec::new()),
         }
     }
 
@@ -321,9 +317,6 @@ impl ContextState {
             .ok()
             .and_then(|readback| readback.as_ref().map(|readback| readback.pixels.size_in_bytes()))
             .unwrap_or(0);
-        if let Ok(scratch) = self.encoded_path_scratch.try_borrow() {
-            size = size.saturating_add(scratch.capacity());
-        }
         let has_backing_storage = self
             .backing_storage
             .try_borrow()
@@ -808,14 +801,6 @@ impl ContextState {
         state.current_compositing_and_blending_operator == CompositingAndBlendingOperator::SourceOver
     }
 
-    fn trim_encoded_path_scratch(bytes: &mut Vec<u8>) {
-        const MAX_RETAINED_ENCODED_PATH_CAPACITY: usize = 256 * 1024;
-        bytes.clear();
-        if bytes.capacity() > MAX_RETAINED_ENCODED_PATH_CAPACITY {
-            *bytes = Vec::new();
-        }
-    }
-
     pub(crate) fn fill_internal(&self, path: &Path, winding_rule: WindingRule) {
         if !self.recorder_is_ready() {
             return;
@@ -825,23 +810,66 @@ impl ContextState {
             if !state.fill_style.is_visible() && Self::transparent_source_paint_can_be_ignored(&state) {
                 return;
             }
-        }
-
-        {
-            let mut path_bytes = self.encoded_path_scratch.borrow_mut();
-            path.serialize_into(&mut path_bytes);
-            let state = self.drawing_state();
             self.record(|recorder| {
                 let paint = paint_of(recorder, &state.fill_style, self.context_attributes.color_space);
-                recorder.fill_path(&path_bytes, &paint, winding_rule, &Self::compositing(&state));
+                recorder.fill_path_geometry(path, &paint, winding_rule, &Self::compositing(&state));
             });
-            Self::trim_encoded_path_scratch(&mut path_bytes);
+        }
+        self.did_draw();
+    }
+
+    pub(crate) fn fill_rect_internal(&self, x: f32, y: f32, width: f32, height: f32, winding_rule: WindingRule) {
+        if !self.recorder_is_ready() {
+            return;
+        }
+        {
+            let state = self.drawing_state();
+            if !state.fill_style.is_visible() && Self::transparent_source_paint_can_be_ignored(&state) {
+                return;
+            }
+            self.record(|recorder| {
+                let paint = paint_of(recorder, &state.fill_style, self.context_attributes.color_space);
+                recorder.fill_rect_path(x, y, width, height, &paint, winding_rule, &Self::compositing(&state));
+            });
         }
         self.did_draw();
     }
 
     pub(crate) fn fill_current_path(&self, winding_rule: WindingRule) {
         self.fill_internal(&self.path.borrow(), winding_rule);
+    }
+
+    fn record_stroke_with_state(&self, state: &DrawingState, record: impl FnOnce(&mut CanvasRecorder, &Paint, &Stroke, &Compositing)) {
+        let mut dash_stack = [0.0f32; 8];
+        let dash_heap;
+        let dash_array: &[f32] = if state.dash_list.is_empty() {
+            &[]
+        } else if state.dash_list.len() <= dash_stack.len() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a stroke records its dashes in floats, as the C++ did"
+            )]
+            for (dst, &src) in dash_stack.iter_mut().zip(&state.dash_list) {
+                *dst = src as f32;
+            }
+            &dash_stack[..state.dash_list.len()]
+        } else {
+            dash_heap = state.dash_array();
+            &dash_heap
+        };
+        let stroke = Stroke {
+            thickness: state.line_width,
+            cap_style: state.cap_style(),
+            join_style: state.join_style(),
+            miter_limit: state.miter_limit,
+            dash_array,
+            dash_offset: state.line_dash_offset,
+        };
+        let compositing = Self::compositing(state);
+        self.record(|recorder| {
+            let paint = paint_of(recorder, &state.stroke_style, self.context_attributes.color_space);
+            record(recorder, &paint, &stroke, &compositing);
+        });
     }
 
     pub(crate) fn stroke_internal(&self, path: &Path) {
@@ -853,26 +881,25 @@ impl ContextState {
             if !state.stroke_style.is_visible() && Self::transparent_source_paint_can_be_ignored(&state) {
                 return;
             }
-        }
-
-        let dash_array = self.drawing_state().dash_array();
-        {
-            let mut path_bytes = self.encoded_path_scratch.borrow_mut();
-            path.serialize_into(&mut path_bytes);
-            let state = self.drawing_state();
-            let stroke = Stroke {
-                thickness: state.line_width,
-                cap_style: state.cap_style(),
-                join_style: state.join_style(),
-                miter_limit: state.miter_limit,
-                dash_array: &dash_array,
-                dash_offset: state.line_dash_offset,
-            };
-            self.record(|recorder| {
-                let paint = paint_of(recorder, &state.stroke_style, self.context_attributes.color_space);
-                recorder.stroke_path(&path_bytes, &paint, &stroke, &Self::compositing(&state));
+            self.record_stroke_with_state(&state, |recorder, paint, stroke, compositing| {
+                recorder.stroke_path_geometry(path, paint, stroke, compositing);
             });
-            Self::trim_encoded_path_scratch(&mut path_bytes);
+        }
+        self.did_draw();
+    }
+
+    pub(crate) fn stroke_rect_internal(&self, x: f32, y: f32, width: f32, height: f32) {
+        if !self.recorder_is_ready() {
+            return;
+        }
+        {
+            let state = self.drawing_state();
+            if !state.stroke_style.is_visible() && Self::transparent_source_paint_can_be_ignored(&state) {
+                return;
+            }
+            self.record_stroke_with_state(&state, |recorder, paint, stroke, compositing| {
+                recorder.stroke_rect_path(x, y, width, height, paint, stroke, compositing);
+            });
         }
         self.did_draw();
     }
@@ -885,10 +912,7 @@ impl ContextState {
         if !self.recorder_is_ready() {
             return;
         }
-        let mut path_bytes = self.encoded_path_scratch.borrow_mut();
-        path.serialize_into(&mut path_bytes);
-        self.record(|recorder| recorder.clip_path(&path_bytes, winding_rule));
-        Self::trim_encoded_path_scratch(&mut path_bytes);
+        self.record(|recorder| recorder.clip_path_geometry(path, winding_rule));
     }
 
     pub(crate) fn clip_current_path(&self, winding_rule: WindingRule) {

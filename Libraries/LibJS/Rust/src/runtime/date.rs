@@ -585,7 +585,7 @@ const TIME_ZONE_CACHE_MIN_SEC: i64 = -9_000_000_000_000;
 const TIME_ZONE_CACHE_MAX_SEC: i64 = 9_000_000_000_000;
 /// 48-hour safety margin from transition boundaries before answering `UTC(local_time)` from a UTC offset interval.
 const TIME_ZONE_LOCAL_MARGIN_SEC: i64 = 172_800;
-const TIME_ZONE_INTERVAL_CACHE_CAPACITY: usize = 16;
+const TIME_ZONE_INTERVAL_CACHE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy)]
 struct TimeZoneInterval {
@@ -602,20 +602,28 @@ struct SystemTimeZone {
     generation: u64,
     identifier: Utf16String,
     offset_minutes: Option<i64>,
-    /// MRU cache of UTC transition-free offset intervals for `identifier`.
+    /// Sorted cache of disjoint UTC transition-free offset intervals for `identifier`, with `last_index` caching
+    /// the most recently matched slot for O(1) hits on sequential dates.
     intervals: [TimeZoneInterval; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
     interval_count: usize,
+    last_index: usize,
 }
 
 impl SystemTimeZone {
     fn lookup_utc_offset(&mut self, seconds: i64) -> Option<i64> {
-        for i in 0..self.interval_count {
-            let entry = self.intervals[i];
-            if seconds >= entry.start_sec && seconds < entry.end_sec {
-                if i != 0 {
-                    self.intervals.copy_within(0..i, 1);
-                    self.intervals[0] = entry;
-                }
+        if self.interval_count == 0 {
+            return None;
+        }
+        let last = self.intervals[self.last_index];
+        if seconds >= last.start_sec && seconds < last.end_sec {
+            return Some(last.offset_nanoseconds);
+        }
+        let pos = self.intervals[..self.interval_count].partition_point(|entry| entry.start_sec <= seconds);
+        if pos > 0 {
+            let idx = pos - 1;
+            let entry = self.intervals[idx];
+            if seconds < entry.end_sec {
+                self.last_index = idx;
                 return Some(entry.offset_nanoseconds);
             }
         }
@@ -623,20 +631,66 @@ impl SystemTimeZone {
     }
 
     fn lookup_local_offset(&mut self, local_seconds: i64) -> Option<i64> {
-        for i in 0..self.interval_count {
-            let entry = self.intervals[i];
+        if self.interval_count == 0 {
+            return None;
+        }
+        let matches_local = |entry: TimeZoneInterval| -> bool {
             let candidate_utc_sec = local_seconds.saturating_sub(entry.offset_nanoseconds / 1_000_000_000);
             let safe_start = entry.start_sec.saturating_add(TIME_ZONE_LOCAL_MARGIN_SEC);
             let safe_end = entry.end_sec.saturating_sub(TIME_ZONE_LOCAL_MARGIN_SEC);
-            if candidate_utc_sec >= safe_start && candidate_utc_sec < safe_end {
-                if i != 0 {
-                    self.intervals.copy_within(0..i, 1);
-                    self.intervals[0] = entry;
-                }
+            candidate_utc_sec >= safe_start && candidate_utc_sec < safe_end
+        };
+        let last = self.intervals[self.last_index];
+        if matches_local(last) {
+            return Some(last.offset_nanoseconds);
+        }
+        let pos = self.intervals[..self.interval_count]
+            .partition_point(|entry| entry.start_sec.saturating_add(entry.offset_nanoseconds / 1_000_000_000) <= local_seconds);
+        if pos > 0 {
+            let idx = pos - 1;
+            let entry = self.intervals[idx];
+            if matches_local(entry) {
+                self.last_index = idx;
+                return Some(entry.offset_nanoseconds);
+            }
+        }
+        if pos < self.interval_count {
+            let entry = self.intervals[pos];
+            if matches_local(entry) {
+                self.last_index = pos;
                 return Some(entry.offset_nanoseconds);
             }
         }
         None
+    }
+
+    fn insert_interval(&mut self, entry: TimeZoneInterval) {
+        let pos = self.intervals[..self.interval_count].partition_point(|existing| existing.start_sec < entry.start_sec);
+        if pos < self.interval_count && self.intervals[pos].start_sec == entry.start_sec {
+            self.intervals[pos] = entry;
+            self.last_index = pos;
+            return;
+        }
+        if self.interval_count < TIME_ZONE_INTERVAL_CACHE_CAPACITY {
+            self.intervals.copy_within(pos..self.interval_count, pos + 1);
+            self.intervals[pos] = entry;
+            self.interval_count += 1;
+            self.last_index = pos;
+        } else if pos <= TIME_ZONE_INTERVAL_CACHE_CAPACITY / 2 {
+            // Evict the newest entry so the active historical window remains intact.
+            self.intervals
+                .copy_within(pos..TIME_ZONE_INTERVAL_CACHE_CAPACITY - 1, pos + 1);
+            self.intervals[pos] = entry;
+            self.last_index = pos;
+        } else {
+            // Evict the oldest entry at index 0.
+            let target = pos - 1;
+            if target > 0 {
+                self.intervals.copy_within(1..pos, 0);
+            }
+            self.intervals[target] = entry;
+            self.last_index = target;
+        }
     }
 
     fn cache_interval_for_utc(&mut self, seconds: i64, offset_nanoseconds: i64) {
@@ -672,17 +726,11 @@ impl SystemTimeZone {
         if seconds < start_sec || seconds >= end_sec {
             return;
         }
-        let entry = TimeZoneInterval {
+        self.insert_interval(TimeZoneInterval {
             start_sec,
             end_sec,
             offset_nanoseconds,
-        };
-        let keep = self.interval_count.min(TIME_ZONE_INTERVAL_CACHE_CAPACITY - 1);
-        if keep > 0 {
-            self.intervals.copy_within(0..keep, 1);
-        }
-        self.intervals[0] = entry;
-        self.interval_count = (self.interval_count + 1).min(TIME_ZONE_INTERVAL_CACHE_CAPACITY);
+        });
     }
 }
 
@@ -712,6 +760,7 @@ fn with_system_time_zone<R>(callback: impl FnOnce(&mut SystemTimeZone) -> R) -> 
                     offset_nanoseconds: 0,
                 }; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
                 interval_count: 0,
+                last_index: 0,
             });
         }
         callback(system_time_zone.as_mut().expect("the system time zone was just cached"))
@@ -1093,19 +1142,24 @@ mod tests {
                 end_sec: 0,
                 offset_nanoseconds: 0,
             }; TIME_ZONE_INTERVAL_CACHE_CAPACITY],
-            interval_count: 2,
+            interval_count: 0,
+            last_index: 0,
         };
-        tz.intervals[0] = winter;
-        tz.intervals[1] = summer;
+        // Insert out of order to verify sorted insertion.
+        tz.insert_interval(summer);
+        tz.insert_interval(winter);
+        assert_eq!(tz.interval_count, 2);
+        assert_eq!(tz.intervals[0].start_sec, winter.start_sec);
+        assert_eq!(tz.intervals[1].start_sec, summer.start_sec);
 
         // Exact UTC boundary semantics: [start_sec, end_sec).
         assert_eq!(tz.lookup_utc_offset(1_699_999_999), None);
         assert_eq!(tz.lookup_utc_offset(1_700_000_000), Some(winter.offset_nanoseconds));
+        assert_eq!(tz.last_index, 0);
         assert_eq!(tz.lookup_utc_offset(1_709_999_999), Some(winter.offset_nanoseconds));
         assert_eq!(tz.lookup_utc_offset(1_710_000_000), None);
         assert_eq!(tz.lookup_utc_offset(1_710_000_001), Some(summer.offset_nanoseconds));
-        // MRU promoted `summer` to slot 0.
-        assert_eq!(tz.intervals[0].offset_nanoseconds, summer.offset_nanoseconds);
+        assert_eq!(tz.last_index, 1);
 
         // Local lookup enforces the 48-hour transition safety margin on both ends.
         let summer_offset_sec = summer.offset_nanoseconds / 1_000_000_000;
@@ -1120,5 +1174,24 @@ mod tests {
         );
         assert_eq!(tz.lookup_local_offset(safe_end_local), Some(summer.offset_nanoseconds));
         assert_eq!(tz.lookup_local_offset(near_end_local), None);
+
+        // Verify 64-entry capacity and sorted eviction when full.
+        for i in 0..(TIME_ZONE_INTERVAL_CACHE_CAPACITY + 10) {
+            let start = 1_000_000_000 + (i as i64) * 10_000_000;
+            tz.insert_interval(TimeZoneInterval {
+                start_sec: start,
+                end_sec: start + 9_999_999,
+                offset_nanoseconds: (i as i64) * 1_000_000_000,
+            });
+        }
+        assert_eq!(tz.interval_count, TIME_ZONE_INTERVAL_CACHE_CAPACITY);
+        for i in 1..tz.interval_count {
+            assert!(tz.intervals[i - 1].start_sec < tz.intervals[i].start_sec);
+        }
+        let newest_start = 1_000_000_000 + ((TIME_ZONE_INTERVAL_CACHE_CAPACITY + 9) as i64) * 10_000_000;
+        assert_eq!(
+            tz.lookup_utc_offset(newest_start + 123),
+            Some(((TIME_ZONE_INTERVAL_CACHE_CAPACITY + 9) as i64) * 1_000_000_000)
+        );
     }
 }

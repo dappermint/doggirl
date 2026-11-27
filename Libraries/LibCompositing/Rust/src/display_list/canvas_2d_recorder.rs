@@ -7,9 +7,10 @@
 //! The recorder of a 2D canvas, which writes a record for each command of the canvas and hands it, with the fonts, the
 //! image frames and the video frames that it names, to the stream that WebContent shares between its canvases.
 
-use super::canvas_2d::{Compositing, Paint, Stroke, TapeWriter};
+use super::canvas_2d::{Compositing, Paint, Stroke, TapeAppender};
 use super::commands::*;
 use crate::ipc_types::Web_Bindings_PredefinedColorSpace;
+use libgfx_rust::path::Path;
 use libgfx_rust::{
     AffineTransform, Color, FloatPoint, FloatRect, IntPoint, IntRect, IntSize, ScalingMode, WindingRule,
 };
@@ -72,6 +73,12 @@ pub trait Transport {
 
     /// Appends one record for the canvas of the context to the shared stream.
     fn append_command(&self, record: &[u8]);
+    /// Writes one record directly into the transport's destination buffer when supported, avoiding intermediate copies.
+    fn append_command_with(&self, scratch: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
+        scratch.clear();
+        write(scratch);
+        self.append_command(scratch);
+    }
     fn add_font(&self, font: &Self::Font) -> FontResourceId;
     fn add_image_frame(&self, frame: &Self::ImageFrame) -> ImageFrameResourceId;
     /// Keeps the held video frame until the Compositor has drawn the records that name it.
@@ -92,14 +99,14 @@ pub trait Transport {
 
 pub struct Recorder<T: Transport> {
     transport: T,
-    tape: TapeWriter,
+    scratch: Vec<u8>,
 }
 
 impl<T: Transport> Recorder<T> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
-            tape: TapeWriter::default(),
+            scratch: Vec::new(),
         }
     }
 
@@ -153,10 +160,10 @@ impl<T: Transport> Recorder<T> {
         self.transport.add_image_frame(frame)
     }
 
-    fn record(&mut self, write: impl FnOnce(&mut TapeWriter)) {
-        self.tape.clear();
-        write(&mut self.tape);
-        self.transport.append_command(self.tape.bytes());
+    fn record(&mut self, write: impl FnOnce(&mut TapeAppender<'_>)) {
+        self.transport.append_command_with(&mut self.scratch, |bytes| {
+            write(&mut TapeAppender::new(bytes));
+        });
     }
 
     /// `path` is a serialized `libgfx_rust::path::Path`.
@@ -164,9 +171,51 @@ impl<T: Transport> Recorder<T> {
         self.record(|tape| tape.fill_path(path, paint, winding_rule, compositing));
     }
 
+    pub fn fill_path_geometry(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        winding_rule: WindingRule,
+        compositing: &Compositing,
+    ) {
+        self.record(|tape| tape.fill_path_geometry(path, paint, winding_rule, compositing));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rect_path(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        paint: &Paint,
+        winding_rule: WindingRule,
+        compositing: &Compositing,
+    ) {
+        self.record(|tape| tape.fill_rect_path(x, y, width, height, paint, winding_rule, compositing));
+    }
+
     /// `path` is a serialized `libgfx_rust::path::Path`.
     pub fn stroke_path(&mut self, path: &[u8], paint: &Paint, stroke: &Stroke, compositing: &Compositing) {
         self.record(|tape| tape.stroke_path(path, paint, stroke, compositing));
+    }
+
+    pub fn stroke_path_geometry(&mut self, path: &Path, paint: &Paint, stroke: &Stroke, compositing: &Compositing) {
+        self.record(|tape| tape.stroke_path_geometry(path, paint, stroke, compositing));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_rect_path(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        paint: &Paint,
+        stroke: &Stroke,
+        compositing: &Compositing,
+    ) {
+        self.record(|tape| tape.stroke_rect_path(x, y, width, height, paint, stroke, compositing));
     }
 
     /// Draws the glyphs of a text as one draw. Each run is a font and how many of the next glyphs it draws.
@@ -255,11 +304,11 @@ impl<T: Transport> Recorder<T> {
     }
 
     pub fn save(&mut self) {
-        self.record(TapeWriter::save);
+        self.record(|tape| tape.save());
     }
 
     pub fn restore(&mut self) {
-        self.record(TapeWriter::restore);
+        self.record(|tape| tape.restore());
     }
 
     /// `path` is a serialized `libgfx_rust::path::Path`.
@@ -267,8 +316,12 @@ impl<T: Transport> Recorder<T> {
         self.record(|tape| tape.clip_path(path, winding_rule));
     }
 
+    pub fn clip_path_geometry(&mut self, path: &Path, winding_rule: WindingRule) {
+        self.record(|tape| tape.clip_path_geometry(path, winding_rule));
+    }
+
     pub fn reset(&mut self) {
-        self.record(TapeWriter::reset);
+        self.record(|tape| tape.reset());
     }
 
     pub fn clear_canvas(&mut self, color: Color) {

@@ -258,6 +258,13 @@ impl Transport for CompositorTransport {
             .append_command(self.connection_serial, canvas_id, record);
     }
 
+    fn append_command_with(&self, _scratch: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
+        let canvas_id = self.recording_canvas_id();
+        self.stream
+            .borrow_mut()
+            .append_command_with(self.connection_serial, canvas_id, write);
+    }
+
     fn add_font(&self, font: &FontHandle) -> FontResourceId {
         self.stream.borrow_mut().add_font(font)
     }
