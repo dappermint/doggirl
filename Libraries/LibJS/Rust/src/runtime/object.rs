@@ -4276,6 +4276,7 @@ impl Object {
         // SAFETY: Callers pass storage value_storage::allocate() returned.
         if unsafe { value_storage::kind(new_storage) } == ValueStorageKind::Malloc {
             self.set_flag(malloc_flag);
+            crate::gc::heap::mark_cell_needs_destruction(self);
         } else {
             self.clear_flag(malloc_flag);
         }
@@ -4544,6 +4545,7 @@ impl Object {
 
             self.set_indexed_dictionary_pointer(Box::into_raw(Box::new(GcRefCell::new(dictionary))));
             self.indexed_storage_kind.set(IndexedStorageKind::Dictionary);
+            crate::gc::heap::mark_cell_needs_destruction(self);
         });
     }
 

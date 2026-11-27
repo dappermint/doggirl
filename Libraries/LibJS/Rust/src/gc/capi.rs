@@ -91,6 +91,7 @@ pub struct GCPrimitiveStorageLayout {
 }
 
 pub type GCCallback = unsafe extern "C" fn(context: *mut c_void);
+pub type GCDestroyDeadCells = unsafe extern "C" fn(cell_base: usize, cell_size: usize, word_index: usize, dead: u64);
 pub type GCGatherRootsCallback = unsafe extern "C" fn(context: *mut c_void, root_visitor: *mut GCVisitor);
 
 unsafe extern "C" {
@@ -139,6 +140,9 @@ unsafe extern "C" {
     pub fn gc_allocator_destroy(allocator: *mut GCAllocator);
     pub fn gc_allocator_set_traced_on_owner_thread_only(allocator: *mut GCAllocator);
     pub fn gc_allocator_set_movable(allocator: *mut GCAllocator);
+    pub fn gc_allocator_set_conditional_destructor(allocator: *mut GCAllocator);
+    pub fn gc_allocator_set_conditional_finalize(allocator: *mut GCAllocator);
+    pub fn gc_allocator_set_destroy_dead_cells(allocator: *mut GCAllocator, destroy_dead_cells: GCDestroyDeadCells);
     pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
     pub fn gc_heap_allocate_storage_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
     pub fn gc_heap_allocator_local_free_list(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut *mut c_void;

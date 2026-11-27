@@ -905,9 +905,7 @@ impl Vm {
         // NB: The empty and single ASCII character strings are interned without being in the table of interned
         //     strings, since every way to create one of them returns these.
         let allocate_interned_string = |string: &str| {
-            let string = self
-                .heap()
-                .allocate(|_| PrimitiveString::new(Utf16String::from_utf8(string)));
+            let string = PrimitiveString::allocate_resolved(self.heap(), Utf16String::from_utf8(string));
             string.set_interned();
             string
         };

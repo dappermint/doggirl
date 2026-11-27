@@ -36,6 +36,7 @@ typedef struct GCRoot GCRoot;
 typedef struct GCWeakImpl GCWeakImpl;
 
 typedef void (*GCCallback)(void* context);
+typedef void (*GCDestroyDeadCells)(size_t cell_base, size_t cell_size, size_t word_index, uint64_t dead);
 
 // Called whenever the heap gathers its roots. Every cell passed to root_visitor is kept alive by this collection.
 // root_visitor only accepts cells and values, not possible values, and the callback must not allocate.
@@ -173,6 +174,17 @@ GC_API void gc_allocator_set_traced_on_owner_thread_only(GCAllocator*);
 // may only be movable if everything that keeps its address without visiting it as a slot either pins it or forgets it
 // (see gc_cell_will_move()). It must be called before the allocator allocates a cell.
 GC_API void gc_allocator_set_movable(GCAllocator*);
+// Lets sweeping skip per-cell destructors for blocks where no cell has been marked with
+// gc_cell_mark_needs_destruction(). Must be called before the allocator allocates a cell.
+GC_API void gc_allocator_set_conditional_destructor(GCAllocator*);
+// Lets post-mark finalization skip blocks where no cell has been marked with
+// gc_cell_mark_needs_finalization(). Must be called before the allocator allocates a cell.
+GC_API void gc_allocator_set_conditional_finalize(GCAllocator*);
+// Sets a non-reentrant batch destructor invoked once per 64-cell bitmap word during sweep.
+// Must be called before the allocator allocates a cell.
+GC_API void gc_allocator_set_destroy_dead_cells(GCAllocator*, GCDestroyDeadCells);
+GC_API void gc_cell_mark_needs_destruction(GCCell const*);
+GC_API void gc_cell_mark_needs_finalization(GCCell const*);
 
 // Returns uninitialized storage for one cell.
 GC_API GCCell* gc_heap_allocate_cell(GCHeap*, GCAllocator*);
