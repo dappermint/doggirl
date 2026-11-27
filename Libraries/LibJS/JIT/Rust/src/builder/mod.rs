@@ -135,11 +135,7 @@ pub fn has_run(snapshot: &Snapshot, executable: &ExecutableSnapshot, pc: u32) ->
         return true;
     };
     if executable.unprofiled {
-        return slots.arith.is_none()
-            && slots.value.is_none()
-            && slots.cache_value.is_none()
-            && slots.call.is_none()
-            && slots.keyed.is_none();
+        return true;
     }
     let feedback = &executable.feedback;
     let slot = |slot: Option<u16>| slot.map(usize::from);
@@ -789,6 +785,12 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
                         .filter(|(cell, _, _)| *cell == executable.cell)
                         .map(|(_, pc, kind)| (index, *pc, *kind)),
                 );
+                let shared_sites = &snapshot[executable.exit_sites];
+                for &(pc, kind) in shared_sites {
+                    if !graph.exit_sites.contains(&(index, pc, kind)) {
+                        graph.exit_sites.push((index, pc, kind));
+                    }
+                }
             } else {
                 let sites = &snapshot[executable.exit_sites];
                 graph

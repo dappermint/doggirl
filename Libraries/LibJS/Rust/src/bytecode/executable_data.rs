@@ -214,6 +214,7 @@ const MAX_SHARED_EXIT_SITES: usize = 256;
 #[derive(Default)]
 pub(crate) struct SharedJitLearning {
     pub exit_sites: Vec<(u32, libjs_jit::code::ExitKind)>,
+    pub builtin_exit_sites: Vec<(u64, u32, libjs_jit::code::ExitKind)>,
     pub shape_exit_cache_sizes: Vec<(u32, u8)>,
     pub has_feedback: bool,
     pub arith: Vec<u8>,
@@ -222,7 +223,7 @@ pub(crate) struct SharedJitLearning {
     pub keyed_bits: Vec<u32>,
     pub call_flags: Vec<u8>,
     pub call_value: Vec<u16>,
-    pub megamorphic_property_caches: Vec<u64>,
+    pub max_property_cache_sizes: Vec<u8>,
     pub captured_binding_accesses: Option<Arc<crate::jit::code::CapturedBindingAccesses>>,
 }
 
@@ -281,12 +282,15 @@ impl SharedJitLearning {
         }
 
         for (index, cache) in property_caches.iter().enumerate() {
-            if cache.tier() == crate::bytecode::executable::PropertyLookupCacheTier::Megamorphic {
-                let word = index / 64;
-                if self.megamorphic_property_caches.len() <= word {
-                    self.megamorphic_property_caches.resize(word + 1, 0);
+            let size = crate::jit::code::speculated_cache_size(cache);
+            if size > 0 {
+                if self.max_property_cache_sizes.len() <= index {
+                    self.max_property_cache_sizes.resize(index + 1, 0);
                 }
-                self.megamorphic_property_caches[word] |= 1u64 << (index % 64);
+                let slot = &mut self.max_property_cache_sizes[index];
+                if size > *slot {
+                    *slot = size;
+                }
             }
         }
     }
@@ -306,9 +310,22 @@ impl SharedJitLearning {
         }
     }
 
+    pub(crate) fn record_builtin_exit_site(
+        &mut self,
+        builtin_fingerprint: u64,
+        pc: u32,
+        kind: libjs_jit::code::ExitKind,
+    ) {
+        let site = (builtin_fingerprint, pc, kind);
+        if !self.builtin_exit_sites.contains(&site) && self.builtin_exit_sites.len() < MAX_SHARED_EXIT_SITES {
+            self.builtin_exit_sites.push(site);
+        }
+    }
+
     fn memory_size(&self) -> usize {
         size_of::<Mutex<Self>>()
             + self.exit_sites.capacity() * size_of::<(u32, libjs_jit::code::ExitKind)>()
+            + self.builtin_exit_sites.capacity() * size_of::<(u64, u32, libjs_jit::code::ExitKind)>()
             + self.shape_exit_cache_sizes.capacity() * size_of::<(u32, u8)>()
             + self.arith.capacity() * size_of::<u8>()
             + self.value.capacity() * size_of::<u16>()
@@ -316,7 +333,7 @@ impl SharedJitLearning {
             + self.keyed_bits.capacity() * size_of::<u32>()
             + self.call_flags.capacity() * size_of::<u8>()
             + self.call_value.capacity() * size_of::<u16>()
-            + self.megamorphic_property_caches.capacity() * size_of::<u64>()
+            + self.max_property_cache_sizes.capacity() * size_of::<u8>()
     }
 }
 
@@ -582,6 +599,17 @@ impl ExecutableData {
     }
 
     #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn bytecode_fingerprint(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in &*self.bytecode {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= self.bytecode.len() as u64;
+        hash.wrapping_mul(0x0000_0100_0000_01b3)
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
     pub(crate) fn record_shared_jit_exit_site(
         &self,
         pc: u32,
@@ -596,15 +624,42 @@ impl ExecutableData {
     }
 
     #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn record_shared_builtin_exit_site(
+        &self,
+        builtin_fingerprint: u64,
+        pc: u32,
+        kind: libjs_jit::code::ExitKind,
+    ) {
+        let mut learning = self
+            .ensure_shared_jit_learning()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        learning.record_builtin_exit_site(builtin_fingerprint, pc, kind);
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
+    pub(crate) fn shared_builtin_exit_sites_for(&self, builtin_fingerprint: u64) -> Vec<(u32, libjs_jit::code::ExitKind)> {
+        let Some(mutex) = self.shared_jit_learning() else {
+            return Vec::new();
+        };
+        let learning = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        learning
+            .builtin_exit_sites
+            .iter()
+            .filter_map(|&(fingerprint, pc, kind)| (fingerprint == builtin_fingerprint).then_some((pc, kind)))
+            .collect()
+    }
+
+    #[cfg(all(not(test), feature = "jit"))]
     pub(crate) fn merge_shared_jit_feedback(
         &self,
         feedback: Option<&crate::bytecode::feedback::ExecutableFeedback>,
         property_caches: &[crate::bytecode::executable::PropertyLookupCache],
     ) {
-        let has_megamorphic = property_caches
+        let has_non_empty_cache = property_caches
             .iter()
-            .any(|cache| cache.tier() == crate::bytecode::executable::PropertyLookupCacheTier::Megamorphic);
-        if feedback.is_none() && !has_megamorphic {
+            .any(|cache| crate::jit::code::speculated_cache_size(cache) > 0);
+        if feedback.is_none() && !has_non_empty_cache {
             return;
         }
         let mut learning = self

@@ -72,7 +72,8 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         let executable = self.function.executable;
         if executable.builtin {
             let site = (executable.cell, self.function.pc, kind);
-            return !self.snapshot[self.snapshot.executables[0].builtin_exit_sites].contains(&site);
+            return !self.snapshot[self.snapshot.executables[0].builtin_exit_sites].contains(&site)
+                && !self.snapshot[executable.exit_sites].contains(&(self.function.pc, kind));
         }
         !self.snapshot[executable.exit_sites].contains(&(self.function.pc, kind))
     }

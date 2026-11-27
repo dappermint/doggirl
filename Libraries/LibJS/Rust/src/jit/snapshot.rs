@@ -109,7 +109,7 @@ pub(crate) struct SnapshotScratch {
     property_cache_ranges: Vec<(u32, u32)>,
     shared_call_flags: Vec<u8>,
     shared_call_value: Vec<u16>,
-    shared_megamorphic_caches: Vec<u64>,
+    shared_max_cache_sizes: Vec<u8>,
 }
 
 impl SnapshotScratch {
@@ -122,14 +122,12 @@ impl SnapshotScratch {
         self.property_cache_ranges.clear();
         self.shared_call_flags.clear();
         self.shared_call_value.clear();
-        self.shared_megamorphic_caches.clear();
+        self.shared_max_cache_sizes.clear();
     }
 
     #[inline]
-    fn is_shared_megamorphic(&self, cache_index: usize) -> bool {
-        self.shared_megamorphic_caches
-            .get(cache_index / 64)
-            .is_some_and(|word| word & (1u64 << (cache_index % 64)) != 0)
+    fn shared_max_cache_size(&self, cache_index: usize) -> u8 {
+        self.shared_max_cache_sizes.get(cache_index).copied().unwrap_or(0)
     }
 }
 
@@ -697,9 +695,9 @@ impl SnapshotBuilder<'_> {
         caller: &Entry,
         known_shape: Option<Gc<Shape>>,
         primitive_prototype_shapes: &[Gc<Shape>; 3],
-        force_megamorphic: bool,
+        shared_max_size: u8,
     ) -> (PropertyCacheSnapshot, u8) {
-        if force_megamorphic && cache.tier() != PropertyLookupCacheTier::Megamorphic {
+        if shared_max_size == u8::MAX && cache.tier() != PropertyLookupCacheTier::Megamorphic {
             return (
                 PropertyCacheSnapshot {
                     kind: PropertyCacheKind::Megamorphic,
@@ -707,6 +705,18 @@ impl SnapshotBuilder<'_> {
                 },
                 u8::MAX,
             );
+        }
+        if shared_max_size > 1 && cache.tier() != PropertyLookupCacheTier::Megamorphic {
+            let local_size = super::code::speculated_cache_size(cache);
+            if local_size > 0 && local_size < shared_max_size {
+                return (
+                    PropertyCacheSnapshot {
+                        kind: PropertyCacheKind::Empty,
+                        entries: List::empty(),
+                    },
+                    0,
+                );
+            }
         }
         let kind = match cache.tier() {
             PropertyLookupCacheTier::Empty => {
@@ -1559,7 +1569,7 @@ impl SnapshotBuilder<'_> {
 
         self.scratch.shared_call_flags.clear();
         self.scratch.shared_call_value.clear();
-        self.scratch.shared_megamorphic_caches.clear();
+        self.scratch.shared_max_cache_sizes.clear();
         let caches_slice = executable.property_lookup_caches();
 
         // NB: Value feedback is only up to date once the values the interpreter recorded since the last update are
@@ -1574,8 +1584,8 @@ impl SnapshotBuilder<'_> {
                     .unwrap_or_else(PoisonError::into_inner);
                 learning.merge_feedback(local_feedback, caches_slice);
                 self.scratch
-                    .shared_megamorphic_caches
-                    .extend_from_slice(&learning.megamorphic_property_caches);
+                    .shared_max_cache_sizes
+                    .extend_from_slice(&learning.max_property_cache_sizes);
                 if learning.has_feedback {
                     self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
                     self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
@@ -1678,13 +1688,17 @@ impl SnapshotBuilder<'_> {
         let mut has_megamorphic_cache = false;
         let property_caches = self.snapshot.begin();
         for (cache_index, cache) in caches_slice.iter().enumerate() {
-            let force_megamorphic = self.use_shared_learning && self.scratch.is_shared_megamorphic(cache_index);
+            let shared_max_size = if self.use_shared_learning {
+                self.scratch.shared_max_cache_size(cache_index)
+            } else {
+                0
+            };
             let (row, cache_size) = self.property_cache(
                 cache,
                 entry,
                 construct_this_shape,
                 &primitive_prototype_shapes,
-                force_megamorphic,
+                shared_max_size,
             );
             has_megamorphic_cache |= row.kind == PropertyCacheKind::Megamorphic;
             self.property_cache_sizes.push(cache_size);
@@ -1770,9 +1784,20 @@ impl SnapshotBuilder<'_> {
                     end_offset: handler.end_offset,
                     handler_offset: handler.handler_offset,
                 })),
-            exit_sites: self
-                .snapshot
-                .add(&executable.jit_exit_sites_for_recompile_with_shared(self.use_shared_learning)),
+            exit_sites: if matches!(entry.function, Some(InlinedFunction::Builtin(_))) {
+                if self.use_shared_learning {
+                    let shared_sites = self.entries[0]
+                        .executable
+                        .code()
+                        .shared_builtin_exit_sites_for(code.bytecode_fingerprint());
+                    self.snapshot.add(&shared_sites)
+                } else {
+                    List::empty()
+                }
+            } else {
+                self.snapshot
+                    .add(&executable.jit_exit_sites_for_recompile_with_shared(self.use_shared_learning))
+            },
             builtin_exit_sites: if entry.function.is_none() {
                 self.snapshot.add_exact_iter(
                     executable
