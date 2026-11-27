@@ -2,8 +2,8 @@
   lib,
   stdenvNoCC,
   fetchurl,
-  version ? "0.2.1",
-  hash ? "sha256-tQnrJ2i3sa4shnEWlhjG0ffLV4iZuZYyFJYUx0QfUeo=",
+  version ? "0.3.0",
+  hash ? "sha256-mmGrsGqD8FT4yk42EJCG109xsz1rg47sbx/H7IZaxh0=",
 }:
 
 stdenvNoCC.mkDerivation {
