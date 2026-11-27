@@ -276,7 +276,7 @@ fn write_codes_in_chunk(chunk: &Chunk, writes: &[CodeWrite<'_>]) {
                 .all(|pair| (pair[0].destination as usize) <= (pair[1].destination as usize)),
             "writes must be sorted by destination before coalescing icache invalidation"
         );
-        const MAX_COALESCE_GAP: usize = 4096;
+        const MAX_COALESCE_GAP: usize = 16384;
         let mut range_start = 0usize;
         let mut range_end = 0usize;
         for write in writes {

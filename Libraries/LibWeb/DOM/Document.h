@@ -809,9 +809,13 @@ public:
     void set_has_inert_element() { m_has_inert_element = true; }
     bool has_svg_paint_resource_element() const { return m_has_svg_paint_resource_element; }
     void set_has_svg_paint_resource_element() { m_has_svg_paint_resource_element = true; }
+    bool has_anchor_names() const { return m_has_anchor_names; }
+    void set_has_anchor_names() { m_has_anchor_names = true; }
 
     SubtreeInsertionScope* subtree_insertion_scope() const { return m_subtree_insertion_scope; }
     void set_subtree_insertion_scope(Badge<SubtreeInsertionScope>, SubtreeInsertionScope* scope) { m_subtree_insertion_scope = scope; }
+    SubtreeRemovalScope* subtree_removal_scope() const { return m_subtree_removal_scope; }
+    void set_subtree_removal_scope(Badge<SubtreeRemovalScope>, SubtreeRemovalScope* scope) { m_subtree_removal_scope = scope; }
 
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
@@ -1233,6 +1237,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-policy-container
     NonnullRefPtr<HTML::PolicyContainer> policy_container() const;
+    HTML::PolicyContainer const* policy_container_if_exists() const { return m_policy_container.ptr(); }
     void set_policy_container(NonnullRefPtr<HTML::PolicyContainer>);
 
     Vector<GC::Root<HTML::Navigable>> descendant_navigables();
@@ -1828,6 +1833,7 @@ public:
     // https://html.spec.whatwg.org/multipage/dom.html#allows-adding-render-blocking-elements
     [[nodiscard]] bool allows_adding_render_blocking_elements() const;
 
+    [[nodiscard]] bool has_render_blocking_elements() const { return !m_render_blocking_elements.is_empty(); }
     [[nodiscard]] bool is_render_blocking_element(GC::Ref<Element>) const;
 
     void add_render_blocking_element(GC::Ref<Element>);
@@ -2107,7 +2113,9 @@ private:
     bool m_has_form_element { false };
     bool m_has_inert_element { false };
     bool m_has_svg_paint_resource_element { false };
+    bool m_has_anchor_names { false };
     SubtreeInsertionScope* m_subtree_insertion_scope { nullptr };
+    SubtreeRemovalScope* m_subtree_removal_scope { nullptr };
 
     bool m_parser_cannot_change_the_mode { false };
 

@@ -30,9 +30,7 @@ use super::allocation::{
     SampleSlots, allocation_infos, closure_template_snapshots, closure_templates, function_environment_template,
     lexical_environment_templates,
 };
-use super::code::{
-    CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, SnapshotExecutables, speculated_cache_size,
-};
+use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, SnapshotExecutables};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::executable_data::ExecutableData;
@@ -231,11 +229,10 @@ pub(crate) fn ecmascript_function(cell: Option<Gc<CellHeader>>) -> Option<Gc<Ecm
 
 /// The target of a call site if it is a builtin written in JavaScript that JIT code can inline: a normal function
 /// without a function environment of the caller's realm, which already ran.
-fn builtin_inlining_candidate(
-    target: Option<Gc<CellHeader>>,
+fn builtin_inlining_candidate_typed(
+    builtin: Gc<NativeJavaScriptBackedFunction>,
     caller_realm: Gc<Realm>,
 ) -> Option<Gc<NativeJavaScriptBackedFunction>> {
-    let builtin = target?.downcast::<NativeJavaScriptBackedFunction>()?;
     let shared_data = builtin.shared_data();
     (shared_data.kind() == FunctionKind::Normal
         && !builtin.function_environment_needed()
@@ -244,21 +241,26 @@ fn builtin_inlining_candidate(
         .then_some(builtin)
 }
 
-/// The intrinsic the compiler knows an object as, if it is one.
-fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
-    let cell = cell?;
-    if let Some(function) = cell.downcast::<RawNativeFunction>() {
-        match function.builtin() {
-            Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
-            Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
-            _ => {}
-        }
-        let address = function.native_function(vm)? as usize;
-        return lookup_native_intrinsic(address);
+fn builtin_inlining_candidate(
+    target: Option<Gc<CellHeader>>,
+    caller_realm: Gc<Realm>,
+) -> Option<Gc<NativeJavaScriptBackedFunction>> {
+    builtin_inlining_candidate_typed(target?.downcast::<NativeJavaScriptBackedFunction>()?, caller_realm)
+}
+
+/// The intrinsic the compiler knows a raw native function as, if it is one.
+fn intrinsic_of_raw_native(vm: &Vm, function: Gc<RawNativeFunction>) -> Option<Intrinsic> {
+    match function.builtin() {
+        Some(Builtin::StringFromCharCode) => return Some(Intrinsic::StringFromCharCode),
+        Some(Builtin::RegExpPrototypeExec) => return Some(Intrinsic::RegExpPrototypeExec),
+        _ => {}
     }
-    if cell.downcast::<EcmascriptFunctionObject>().is_some() {
-        return None;
-    }
+    let address = function.native_function(vm)? as usize;
+    lookup_native_intrinsic(address)
+}
+
+/// The intrinsic the compiler knows a non-raw-native, non-ECMAScript object as, if it is one.
+fn intrinsic_of_constructor(cell: Gc<CellHeader>) -> Option<Intrinsic> {
     if cell.downcast::<StringConstructor>().is_some() {
         return Some(Intrinsic::StringConstructor);
     }
@@ -272,6 +274,18 @@ fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
         return Some(Intrinsic::BooleanConstructor);
     }
     None
+}
+
+/// The intrinsic the compiler knows an object as, if it is one.
+fn intrinsic_of(vm: &Vm, cell: Option<Gc<CellHeader>>) -> Option<Intrinsic> {
+    let cell = cell?;
+    if let Some(function) = cell.downcast::<RawNativeFunction>() {
+        return intrinsic_of_raw_native(vm, function);
+    }
+    if cell.downcast::<EcmascriptFunctionObject>().is_some() {
+        return None;
+    }
+    intrinsic_of_constructor(cell)
 }
 
 /// The intrinsics the compiler knows by their native functions (of any realm).
@@ -450,42 +464,6 @@ fn entry_holds_accessor_with_proto_value(entry: &PropertyLookupCacheEntryData, p
     }
 }
 
-/// The target of a call site if JIT code can call it directly, building its frame the way the interpreter's call
-/// fast path does, and the function environment as libjs_jit_prepare_call_environment() does if it needs one, with
-/// whether the site also called other closures of it.
-fn direct_call_target(feedback: &CallFeedback) -> Option<(Gc<EcmascriptFunctionObject>, bool)> {
-    let flags = feedback.flags.get();
-    let closures = flags & call_feedback_flags::POLYMORPHIC != 0;
-    if closures && flags & (call_feedback_flags::OTHER_FUNCTIONS | call_feedback_flags::SAW_NATIVE) != 0 {
-        return None;
-    }
-    let function = ecmascript_function(feedback.target())?;
-    function.can_inline_call().then_some((function, closures))
-}
-
-/// The target of a call site if it is a native function, which JIT code can call directly in the frame the
-/// interpreter's call fast path builds for it, or replace with an intrinsic, and the entry it calls it at, if it can:
-/// none where native functions do not return their completion in two registers, and JIT code leaves calls of them to
-/// the runtime. Function.prototype.call and apply forward their calls, which the runtime does for JIT code.
-fn native_call_target(vm: &Vm, feedback: &CallFeedback) -> Option<(Gc<NativeFunction>, Option<NonZeroU64>)> {
-    if feedback.flags.get() & call_feedback_flags::POLYMORPHIC != 0 {
-        return None;
-    }
-    let function = feedback.target()?.downcast::<NativeFunction>()?;
-    let entry = if let Some(raw) = function.downcast::<RawNativeFunction>() {
-        if FunctionPrototype::is_call_function(vm, &raw) || FunctionPrototype::is_apply_function(vm, &raw) {
-            return None;
-        }
-        raw.native_function(vm)
-    } else {
-        function.capturing_call_entry()
-    };
-    let entry = entry
-        .filter(|_| RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS)
-        .and_then(|pointer| NonZeroU64::new(pointer as usize as u64));
-    Some((function, entry))
-}
-
 /// The words of an ECMAScript function its frames start with, which stay the same for its lifetime.
 fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFrameFields {
     let shared_data = function.shared_data();
@@ -590,15 +568,63 @@ impl SnapshotBuilder<'_> {
             .map(|metadata| metadata.offset);
         let accessor_function = entry_accessor_function_with_proto_value(&entry, proto_value).map(|function| {
             let cell = self.cell(function);
+            let (intrinsic, inline_executable, native) =
+                if let Some(raw_native) = function.downcast::<RawNativeFunction>() {
+                    (
+                        intrinsic_of_raw_native(self.vm, raw_native),
+                        None,
+                        self.native_accessor_target_raw(raw_native, cell, entry.getter == Some(function)),
+                    )
+                } else if let Some(ecmascript) = as_ecmascript_function_object(function.upcast::<Object>()) {
+                    (
+                        None,
+                        self.inlining_candidate_ecmascript(ecmascript, caller.realm)
+                            .and_then(|f| self.inlined_function_index(f, caller)),
+                        None,
+                    )
+                } else if let Some(builtin) = function.downcast::<NativeJavaScriptBackedFunction>() {
+                    (
+                        None,
+                        builtin_inlining_candidate_typed(builtin, caller.realm)
+                            .and_then(|b| self.inlined_builtin_index(b, caller)),
+                        None,
+                    )
+                } else {
+                    (intrinsic_of_constructor(function.upcast::<CellHeader>()), None, None)
+                };
             AccessorFunctionSnapshot {
                 cached_value_offset,
                 function: cell,
-                intrinsic: intrinsic_of(self.vm, Some(Value::from_object(function.upcast::<Object>()).as_cell())),
-                inline_executable: self
-                    .inline_executable_index(Some(Value::from_object(function.upcast::<Object>()).as_cell()), caller),
-                native: self.native_accessor_target(function, cell, entry.getter == Some(function)),
+                intrinsic,
+                inline_executable,
+                native,
             }
         });
+        let (prototype_property_intrinsic, prototype_property_inline_executable, prototype_property_direct_call) =
+            match prototype_property {
+                Some(object) => {
+                    if let Some(raw_native) = object.downcast::<RawNativeFunction>() {
+                        (intrinsic_of_raw_native(self.vm, raw_native), None, None)
+                    } else if let Some(ecmascript) = as_ecmascript_function_object(object) {
+                        (
+                            None,
+                            self.inlining_candidate_ecmascript(ecmascript, caller.realm)
+                                .and_then(|f| self.inlined_function_index(f, caller)),
+                            self.prototype_method_direct_call_ecmascript(ecmascript),
+                        )
+                    } else if let Some(builtin) = object.downcast::<NativeJavaScriptBackedFunction>() {
+                        (
+                            None,
+                            builtin_inlining_candidate_typed(builtin, caller.realm)
+                                .and_then(|b| self.inlined_builtin_index(b, caller)),
+                            None,
+                        )
+                    } else {
+                        (intrinsic_of_constructor(object.upcast::<CellHeader>()), None, None)
+                    }
+                }
+                None => (None, None, None),
+            };
         Some(PropertyCacheEntrySnapshot {
             entry_type,
             property_offset: entry.property_offset,
@@ -616,14 +642,9 @@ impl SnapshotBuilder<'_> {
             key: (entry.key != 0).then(|| self.cell(Value::from_bits(entry.key).as_cell())),
             key_value: entry.key,
             prototype_property: self.optional_cell(prototype_property),
-            prototype_property_intrinsic: intrinsic_of(
-                self.vm,
-                prototype_property.map(|object| Value::from_object(object).as_cell()),
-            ),
-            prototype_property_inline_executable: prototype_property
-                .and_then(|object| self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)),
-            prototype_property_direct_call: prototype_property
-                .and_then(|object| self.prototype_method_direct_call(object)),
+            prototype_property_intrinsic,
+            prototype_property_inline_executable,
+            prototype_property_direct_call,
             // NB: Watching a slot allocates, which collects no garbage while the snapshot is taken. Slots
             //     replaced while watched are checked instead, as invalidated code learns nothing, while the
             //     check learns from its exit.
@@ -642,21 +663,25 @@ impl SnapshotBuilder<'_> {
         })
     }
 
-    /// What property lookup cache `cache` of `caller` knows. Of a megamorphic cache, that is the entry for
-    /// `known_shape` if it has one: JIT code only uses megamorphic entries for objects whose shape it knows.
+    /// What property lookup cache `cache` of `caller` knows, along with its speculated cache size (matching
+    /// `speculated_cache_size(cache)`). Of a megamorphic cache, that is the entry for `known_shape` if it has one:
+    /// JIT code only uses megamorphic entries for objects whose shape it knows.
     fn property_cache(
         &mut self,
         cache: &PropertyLookupCache,
         caller: &Entry,
         known_shape: Option<Gc<Shape>>,
         primitive_prototype_shapes: &[Gc<Shape>; 3],
-    ) -> PropertyCacheSnapshot {
+    ) -> (PropertyCacheSnapshot, u8) {
         let kind = match cache.tier() {
             PropertyLookupCacheTier::Empty => {
-                return PropertyCacheSnapshot {
-                    kind: PropertyCacheKind::Empty,
-                    entries: List::empty(),
-                };
+                return (
+                    PropertyCacheSnapshot {
+                        kind: PropertyCacheKind::Empty,
+                        entries: List::empty(),
+                    },
+                    0,
+                );
             }
             PropertyLookupCacheTier::Monomorphic => PropertyCacheKind::Monomorphic,
             PropertyLookupCacheTier::Polymorphic => PropertyCacheKind::Polymorphic,
@@ -665,27 +690,46 @@ impl SnapshotBuilder<'_> {
         // NB: The interpreter caches the properties strings, numbers and booleans get from their prototypes as
         //     properties of those prototypes. JIT code speculating on such entries would check for an object and exit
         //     for every primitive, so caches with them are left to the fast paths, which look these up themselves.
-        let known_shape_slot = known_shape.and_then(|shape| cache.megamorphic_entry_for_shape(shape, 0));
+        let is_megamorphic = kind == PropertyCacheKind::Megamorphic;
+        let known_shape_slot = if is_megamorphic {
+            known_shape.and_then(|shape| cache.megamorphic_entry_for_shape(shape, 0))
+        } else {
+            None
+        };
         let slots = match known_shape_slot {
             Some(slot) => core::slice::from_ref(slot),
             None => cache.entries(),
         };
         if slots.len() == 1 {
+            let slot = &slots[0];
+            if slot.entry_type.get() == PropertyLookupCacheEntryType::Empty {
+                return (
+                    PropertyCacheSnapshot {
+                        kind,
+                        entries: List::empty(),
+                    },
+                    if is_megamorphic { u8::MAX } else { 0 },
+                );
+            }
             let mut sees_primitives = false;
-            let entries = match self.property_cache_entry(
-                slots[0].get(),
-                caller,
-                primitive_prototype_shapes,
-                &mut sees_primitives,
-            ) {
-                Some(row) if !sees_primitives => self.snapshot.add(core::slice::from_ref(&row)),
-                _ => List::empty(),
-            };
-            return PropertyCacheSnapshot { kind, entries };
+            let entries =
+                match self.property_cache_entry(slot.get(), caller, primitive_prototype_shapes, &mut sees_primitives) {
+                    Some(row) if !sees_primitives => self.snapshot.add(core::slice::from_ref(&row)),
+                    _ => List::empty(),
+                };
+            return (
+                PropertyCacheSnapshot { kind, entries },
+                if is_megamorphic { u8::MAX } else { 1 },
+            );
         }
         let mut sees_primitives = false;
+        let mut non_empty = 0usize;
         let entries = self.snapshot.begin();
         for slot in slots {
+            if slot.entry_type.get() == PropertyLookupCacheEntryType::Empty {
+                continue;
+            }
+            non_empty += 1;
             if let Some(row) =
                 self.property_cache_entry(slot.get(), caller, primitive_prototype_shapes, &mut sees_primitives)
             {
@@ -695,10 +739,18 @@ impl SnapshotBuilder<'_> {
         if sees_primitives {
             self.snapshot.drop_rows(&entries);
         }
-        PropertyCacheSnapshot {
-            kind,
-            entries: self.snapshot.end(entries),
-        }
+        let cache_size = if is_megamorphic {
+            u8::MAX
+        } else {
+            u8::try_from(non_empty).expect("caches that are not megamorphic have few entries")
+        };
+        (
+            PropertyCacheSnapshot {
+                kind,
+                entries: self.snapshot.end(entries),
+            },
+            cache_size,
+        )
     }
 
     /// What the global variable caches of `executable`, whose frames run in the realm of `caller`, know about the global
@@ -888,13 +940,12 @@ impl SnapshotBuilder<'_> {
         }
     }
 
-    /// Whether the target of a call site can be inlined, per the inlining contract in the JIT design.
-    fn inlining_candidate(
+    /// Whether an ECMAScript function can be inlined, per the inlining contract in the JIT design.
+    fn inlining_candidate_ecmascript(
         &self,
-        target: Option<Gc<CellHeader>>,
+        function: Gc<EcmascriptFunctionObject>,
         caller_realm: Gc<Realm>,
     ) -> Option<Gc<EcmascriptFunctionObject>> {
-        let function = ecmascript_function(target)?;
         // NB: can_inline_call() rules out generators, async functions and class constructors.
         if !function.can_inline_call()
             || function.needs_environment_or_this_value_resolution()
@@ -905,6 +956,16 @@ impl SnapshotBuilder<'_> {
         }
         let limit = self.vm.jit.options.inline_max_size;
         (instruction_count(&function.inline_call_executable(), limit) <= limit).then_some(function)
+    }
+
+    /// Whether the target of a call site can be inlined, per the inlining contract in the JIT design.
+    fn inlining_candidate(
+        &self,
+        target: Option<Gc<CellHeader>>,
+        caller_realm: Gc<Realm>,
+    ) -> Option<Gc<EcmascriptFunctionObject>> {
+        let function = ecmascript_function(target)?;
+        self.inlining_candidate_ecmascript(function, caller_realm)
     }
 
     fn inline_executable_index(&mut self, target: Option<Gc<CellHeader>>, caller: &Entry) -> Option<u32> {
@@ -1011,8 +1072,11 @@ impl SnapshotBuilder<'_> {
     /// without fields (whose construct only creates `this` before running its body), or a derived constructor whose
     /// chain of [[Prototype]]s up to such a base constructor are derived constructors, with a function object of a
     /// shape that has its "prototype" as a data property holding an object.
-    fn construct_target(&mut self, target: Option<Gc<CellHeader>>, caller: &Entry) -> Option<ConstructTarget> {
-        let function = ecmascript_function(target)?;
+    fn construct_target_ecmascript(
+        &mut self,
+        function: Gc<EcmascriptFunctionObject>,
+        caller: &Entry,
+    ) -> Option<ConstructTarget> {
         // NB: The super() of an inlined derived constructor initializes its instance elements through the slow path of
         //     BindThisFromSuperCall.
         let inlinable = |constructor: Gc<EcmascriptFunctionObject>| {
@@ -1262,10 +1326,12 @@ impl SnapshotBuilder<'_> {
         }
     }
 
-    /// The target through which JIT code may call `object`, a method a prototype held, directly, if it can and its
+    /// The target through which JIT code may call `function`, a method a prototype held, directly, if it can and its
     /// calls need no function environment (whose template would belong to the executable of the call).
-    fn prototype_method_direct_call(&mut self, object: Gc<Object>) -> Option<DirectCallTarget> {
-        let function = as_ecmascript_function_object(object)?;
+    fn prototype_method_direct_call_ecmascript(
+        &mut self,
+        function: Gc<EcmascriptFunctionObject>,
+    ) -> Option<DirectCallTarget> {
         if !function.can_inline_call() || function.function_environment_needed() {
             return None;
         }
@@ -1275,59 +1341,107 @@ impl SnapshotBuilder<'_> {
     fn call_feedback(&mut self, call: &CallFeedback, entry: &Entry) -> CallFeedbackSnapshot {
         let target = call.target();
         let flags = call.flags.get();
+        let Some(target) = target else {
+            return CallFeedbackSnapshot {
+                flags,
+                value: call.value.get(),
+                ..CallFeedbackSnapshot::default()
+            };
+        };
+        let target_cell = self.cell(target);
         let monomorphic = flags & call_feedback_flags::POLYMORPHIC == 0;
         let mut snapshot = CallFeedbackSnapshot {
-            target: self.optional_cell(target),
+            target: Some(target_cell),
             flags,
             value: call.value.get(),
-            target_intrinsic: intrinsic_of(self.vm, target),
-            target_builtin: target
-                .and_then(|target| target.downcast::<RawNativeFunction>()?.builtin())
-                .map(|builtin| builtin as u8),
             ..CallFeedbackSnapshot::default()
         };
-        if monomorphic {
-            snapshot.inline_executable = self.inline_executable_index(target, entry);
-            if flags & call_feedback_flags::SAW_CONSTRUCT != 0 {
-                snapshot.construct = self.construct_target(target, entry);
+        if let Some(function) = ecmascript_function(Some(target)) {
+            if monomorphic {
+                snapshot.inline_executable = self
+                    .inlining_candidate_ecmascript(function, entry.realm)
+                    .and_then(|f| self.inlined_function_index(f, entry));
+                if flags & call_feedback_flags::SAW_CONSTRUCT != 0 {
+                    snapshot.construct = self.construct_target_ecmascript(function, entry);
+                }
+                if flags & call_feedback_flags::FORWARDED_POLYMORPHIC == 0 {
+                    snapshot.forwarded = self.forwarded_call(call, entry);
+                }
             }
-            if target.is_some() && flags & call_feedback_flags::FORWARDED_POLYMORPHIC == 0 {
+            // NB: The environment of a direct call's function environment is the target's, so closures with their own
+            //     environments are only called directly if they need no function environment.
+            let closures = !monomorphic;
+            if !(closures && flags & (call_feedback_flags::OTHER_FUNCTIONS | call_feedback_flags::SAW_NATIVE) != 0)
+                && function.can_inline_call()
+                && let Some(environment) = self.direct_call_environment(function)
+                && !(closures && environment.is_some())
+            {
+                snapshot.direct_call = Some(self.direct_call_target_snapshot(function, environment, closures));
+            }
+            return snapshot;
+        }
+        if let Some(raw_native) = target.downcast::<RawNativeFunction>() {
+            snapshot.target_intrinsic = intrinsic_of_raw_native(self.vm, raw_native);
+            snapshot.target_builtin = raw_native.builtin().map(|builtin| builtin as u8);
+            if monomorphic {
+                if flags & call_feedback_flags::FORWARDED_POLYMORPHIC == 0 {
+                    snapshot.forwarded = self.forwarded_call(call, entry);
+                }
+                if !FunctionPrototype::is_call_function(self.vm, &raw_native)
+                    && !FunctionPrototype::is_apply_function(self.vm, &raw_native)
+                {
+                    let entry = raw_native
+                        .native_function(self.vm)
+                        .filter(|_| RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS)
+                        .and_then(|pointer| NonZeroU64::new(pointer as usize as u64));
+                    snapshot.native_call = Some(NativeCallTarget {
+                        function: target_cell,
+                        realm: self.cell(raw_native.realm()),
+                        entry,
+                        direct_getter: None,
+                    });
+                }
+            }
+            return snapshot;
+        }
+        snapshot.target_intrinsic = intrinsic_of_constructor(target);
+        if monomorphic {
+            if let Some(builtin) = builtin_inlining_candidate(Some(target), entry.realm) {
+                snapshot.inline_executable = self.inlined_builtin_index(builtin, entry);
+            }
+            if flags & call_feedback_flags::FORWARDED_POLYMORPHIC == 0 {
                 snapshot.forwarded = self.forwarded_call(call, entry);
             }
-        }
-        // NB: The environment of a direct call's function environment is the target's, so closures with their own
-        //     environments are only called directly if they need no function environment.
-        if let Some((function, closures)) = direct_call_target(call)
-            && let Some(environment) = self.direct_call_environment(function)
-            && !(closures && environment.is_some())
-        {
-            snapshot.direct_call = Some(self.direct_call_target_snapshot(function, environment, closures));
-        } else if let Some((function, entry)) = native_call_target(self.vm, call) {
-            snapshot.native_call = Some(NativeCallTarget {
-                function: self.cell(function),
-                realm: self.cell(function.realm()),
-                entry,
-                direct_getter: None,
-            });
+            if let Some(native) = target.downcast::<NativeFunction>() {
+                let entry = native
+                    .capturing_call_entry()
+                    .filter(|_| RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS)
+                    .and_then(|pointer| NonZeroU64::new(pointer as usize as u64));
+                snapshot.native_call = Some(NativeCallTarget {
+                    function: target_cell,
+                    realm: self.cell(native.realm()),
+                    entry,
+                    direct_getter: None,
+                });
+            }
         }
         snapshot
     }
 
-    /// The target through which JIT code may call an accessor's function, whose cell is `function_cell`, directly,
-    /// if it is a raw native function. Like the interpreter, JIT code reads the value of a direct getter without
-    /// calling it only through a cache entry on which the getter ran (`direct_getter_validated`).
-    fn native_accessor_target(
+    /// The target through which JIT code may call an accessor's raw native function, whose cell is `function_cell`,
+    /// directly. Like the interpreter, JIT code reads the value of a direct getter without calling it only through a
+    /// cache entry on which the getter ran (`direct_getter_validated`).
+    fn native_accessor_target_raw(
         &mut self,
-        function: Gc<FunctionObject>,
+        native_function: Gc<RawNativeFunction>,
         function_cell: CellId,
         direct_getter_validated: bool,
     ) -> Option<NativeCallTarget> {
         if !RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS {
             return None;
         }
-        let native_function = function.downcast::<RawNativeFunction>()?;
         let entry = NonZeroU64::new(native_function.native_function(self.vm)? as usize as u64)?;
-        let direct_getter = function
+        let direct_getter = native_function
             .downcast::<DirectGetterFunction>()
             .filter(|_| direct_getter_validated)
             .map(|getter| {
@@ -1449,10 +1563,13 @@ impl SnapshotBuilder<'_> {
         let cache_sizes_start =
             u32::try_from(self.property_cache_sizes.len()).expect("property cache sizes count fits in u32");
         self.property_cache_sizes.reserve(caches_slice.len());
+        let mut has_megamorphic_cache = false;
         let property_caches = self.snapshot.begin();
         for cache in caches_slice {
-            self.property_cache_sizes.push(speculated_cache_size(cache));
-            let row = self.property_cache(cache, entry, construct_this_shape, &primitive_prototype_shapes);
+            let (row, cache_size) =
+                self.property_cache(cache, entry, construct_this_shape, &primitive_prototype_shapes);
+            has_megamorphic_cache |= row.kind == PropertyCacheKind::Megamorphic;
+            self.property_cache_sizes.push(cache_size);
             self.snapshot.push(row);
         }
         let property_caches = self.snapshot.end(property_caches);
@@ -1611,15 +1728,18 @@ impl SnapshotBuilder<'_> {
             } else {
                 List::empty()
             },
-            property_key_names: self
-                .snapshot
-                .add_exact_iter(executable.property_keys().iter().map(|key| {
-                    if key.is_string() {
-                        key.as_string().raw_identity() as u64
-                    } else {
-                        0
-                    }
-                })),
+            property_key_names: if has_megamorphic_cache {
+                self.snapshot
+                    .add_exact_iter(executable.property_keys().iter().map(|key| {
+                        if key.is_string() {
+                            key.as_string().raw_identity() as u64
+                        } else {
+                            0
+                        }
+                    }))
+            } else {
+                List::empty()
+            },
         }
     }
 
@@ -1836,8 +1956,8 @@ pub fn capture_snapshot<'d>(
                 .iter()
                 .map(|template| template.as_ref().map(|(sample, _)| *sample))
                 .collect::<Vec<_>>();
-            let mut cells = Vec::with_capacity(allocation.cells.len() + 256);
-            cells.extend_from_slice(&allocation.cells);
+            let mut cells = Vec::with_capacity(256);
+            cells.push(*allocation.array_shape);
             let realm_new_object_shape_gc = realm.intrinsics().new_object_shape();
             let realm_new_object_shape = ShapeSnapshot {
                 shape: note_cell(&mut cells, realm_new_object_shape_gc),

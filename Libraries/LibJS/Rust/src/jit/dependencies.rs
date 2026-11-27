@@ -15,7 +15,9 @@
 use core::cell::RefCell;
 use core::ops::Range;
 use core::ptr::NonNull;
-use std::collections::HashMap;
+
+use foldhash::fast::RandomState;
+use hashbrown::HashMap;
 
 pub use libjs_jit::code::Dependency;
 pub use libjs_jit::snapshot::CellId;
@@ -41,7 +43,7 @@ struct DependentCode {
 /// The installed code that depends on each dependency. Entries for code that is gone are stale and skipped.
 #[derive(Default)]
 pub struct Dependents {
-    code: RefCell<HashMap<Dependency, Vec<DependentCode>>>,
+    code: RefCell<HashMap<Dependency, Vec<DependentCode>, RandomState>>,
     /// The slots of the named properties of global objects that may have been assigned, as bit sets by the object,
     /// which only VMs that compile note (see `Dependency::GlobalPropertyUnassigned`). The table is keyed by the
     /// identity of the objects, which moves do not change, and a collection that moves an object rewrites its key.
@@ -58,7 +60,7 @@ pub struct Dependents {
     /// `global_object_slot_may_have_been_assigned()`). And no other object ever gets one of the shapes of a global
     /// object once it has a dictionary shape, which belongs to it alone, as do the shapes it gets from that one, so
     /// that writes the caches made for other objects never apply to it.
-    assigned_global_object_slots: RefCell<HashMap<Gc<Object>, Vec<u64>>>,
+    assigned_global_object_slots: RefCell<HashMap<Gc<Object>, Vec<u64>, RandomState>>,
 }
 
 // SAFETY: The VM's sweep callback calls remove_dead_entries() after each collection, which forgets the global objects

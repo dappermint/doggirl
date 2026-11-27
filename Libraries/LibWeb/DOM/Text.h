@@ -27,6 +27,7 @@ public:
     virtual ~Text() override = default;
 
     [[nodiscard]] static GC::Ref<Text> create(Document&, Utf16String data);
+    [[nodiscard]] static GC::Ref<Text> create(Document&, GC::Heap&, Utf16String data);
     [[nodiscard]] static GC::Ref<Text> create_for_constructor(JS::Object&, Utf16String data);
 
     // ^Node

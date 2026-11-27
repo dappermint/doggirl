@@ -738,15 +738,15 @@ impl Object {
         if property_count as usize <= inline_capacity {
             let tail_slots = inline_capacity - 1;
             // Defer GC until `cell.named_properties` points at the inline slots so a moving GC traces and updates
-            // every value just copied into `cell`.
+            // every value just copied into `cell`. With GC deferred, `values` can be borrowed once for both closures.
             let defer_gc = crate::gc::defer_gc::DeferGc::of_heap(vm.heap());
+            let borrowed = values.borrow();
+            let slice = &borrowed[first_value..];
             // SAFETY: Every slot in the inline tail `[0..tail_slots)` is written once while GC is deferred.
             let cell = unsafe {
                 vm.heap().allocate_with_size_class_init_tail(
                     size_class_allocator,
                     |_| {
-                        let borrowed = values.borrow();
-                        let slice = &borrowed[first_value..];
                         let first = slice.first().copied().unwrap_or(Value::UNDEFINED);
                         object
                             .indexed_elements
@@ -755,23 +755,22 @@ impl Object {
                     },
                     |tail_start, tail_size| {
                         debug_assert_eq!(tail_size, tail_slots * size_of::<Value>());
-                        let borrowed = values.borrow();
-                        let tail_values = borrowed[first_value..].get(1..).unwrap_or(&[]);
+                        let tail_values = slice.get(1..).unwrap_or(&[]);
                         let dst = tail_start.cast::<Value>();
-                        if !tail_values.is_empty() {
-                            core::ptr::copy_nonoverlapping(tail_values.as_ptr(), dst, tail_values.len());
+                        let mut index = 0usize;
+                        while index < tail_values.len() {
+                            dst.add(index).write(tail_values[index]);
+                            index += 1;
                         }
-                        if tail_values.len() < tail_slots {
-                            ak::slice_from_raw_parts_mut(
-                                dst.add(tail_values.len()).cast::<core::mem::MaybeUninit<Value>>(),
-                                tail_slots - tail_values.len(),
-                            )
-                            .fill(core::mem::MaybeUninit::new(Value::UNDEFINED));
+                        while index < tail_slots {
+                            dst.add(index).write(Value::UNDEFINED);
+                            index += 1;
                         }
                     },
                 )
             };
             cell.named_properties.set(cell.indexed_elements.as_ptr().cast());
+            drop(borrowed);
             drop(defer_gc);
             return cell;
         }
