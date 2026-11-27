@@ -6,26 +6,11 @@
 
 //! https://html.spec.whatwg.org/multipage/canvas.html#canvasrect
 
-use libgfx_rust::path::Path;
-use libgfx_rust::{FloatPoint, FloatRect, WindingRule};
+use libgfx_rust::{FloatRect, WindingRule};
 
 use crate::bindings::{CallContext, WebIdlResult};
 use crate::canvas_2d::context::{CanvasKind, RenderingContext2D};
 use crate::canvas_2d::float;
-
-/// The outline of a rectangle, as a closed subpath that goes around it clockwise from its top left corner.
-fn rect_path(x: f32, y: f32, width: f32, height: f32) -> Path {
-    let mut path = Path::new();
-    path.move_to(FloatPoint { x, y });
-    path.line_to(FloatPoint { x: x + width, y });
-    path.line_to(FloatPoint {
-        x: x + width,
-        y: y + height,
-    });
-    path.line_to(FloatPoint { x, y: y + height });
-    path.line_to(FloatPoint { x, y });
-    path
-}
 
 impl<K: CanvasKind> RenderingContext2D<K> {
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-clearrect
@@ -46,7 +31,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
 
     /// https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillrect
     pub(crate) fn fill_rect(&self, _: &mut CallContext, x: f64, y: f64, w: f64, h: f64) -> WebIdlResult<()> {
-        self.fill_internal(&rect_path(float(x), float(y), float(w), float(h)), WindingRule::EvenOdd);
+        self.fill_rect_internal(float(x), float(y), float(w), float(h), WindingRule::EvenOdd);
         Ok(())
     }
 
@@ -74,9 +59,7 @@ impl<K: CanvasKind> RenderingContext2D<K> {
         // INTEROP: The path is the closed outline of the rectangle in every case. Tracing it prunes zero-length
         //          lines, so a rectangle with just one of w and h zero strokes as a closed line, with joins and no
         //          caps, and a rectangle with both zero strokes nothing.
-        let mut path = rect_path(x, y, w, h);
-        path.close();
-        self.stroke_internal(&path);
+        self.stroke_rect_internal(x, y, w, h);
         Ok(())
     }
 }

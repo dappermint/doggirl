@@ -653,6 +653,24 @@ pub fn append_record<C: DisplayListCommand>(bytes: &mut Vec<u8>, command: &C, in
     bytes[inline_start..inline_start + inline_data.len()].copy_from_slice(inline_data);
 }
 
+/// Appends one record directly into `bytes` without an intermediate inline-data scratch buffer.
+pub fn append_record_with<C: DisplayListCommand>(
+    bytes: &mut Vec<u8>,
+    build: impl FnOnce(&mut Vec<u8>, usize) -> C,
+) {
+    debug_assert_eq!(bytes.len() % COMMAND_ALIGNMENT, 0);
+    let record_start = bytes.len();
+    let payload_start = record_start + HEADER_SIZE;
+    let struct_size = std::mem::size_of::<C>();
+    bytes.resize(payload_start + struct_size, 0);
+    let command = build(bytes, payload_start);
+    let padded_record_size = (bytes.len() - record_start).next_multiple_of(COMMAND_ALIGNMENT);
+    bytes.resize(record_start + padded_record_size, 0);
+    let header = DisplayListBuilder::header_for::<C>(&[], None, padded_record_size - HEADER_SIZE);
+    header.write_ffi_bytes(&mut bytes[record_start..payload_start]);
+    command.write_ffi_bytes(&mut bytes[payload_start..payload_start + struct_size]);
+}
+
 pub(crate) fn note_command(
     runs: &mut Vec<DisplayListCommandRun>,
     command_type: DisplayListCommandType,
