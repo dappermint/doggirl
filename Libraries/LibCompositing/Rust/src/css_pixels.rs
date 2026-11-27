@@ -64,7 +64,7 @@ fn clamp_f32_to_i32(value: f32) -> i32 {
 }
 
 impl CssPixels {
-    pub fn from_raw(raw: i32) -> Self {
+    pub const fn from_raw(raw: i32) -> Self {
         Self(raw)
     }
 

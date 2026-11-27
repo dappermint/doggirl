@@ -29,7 +29,7 @@ impl PartialRelayoutBoundaryRoots {
 
     /// Notes that the node `node` names is freed, which the next registration prunes where it is a registered root.
     pub(crate) fn note_freed(&mut self, node: NodeSlotId) {
-        if self.registered.contains(&node) {
+        if !self.registered.is_empty() && self.registered.contains(&node) {
             self.freed += 1;
         }
     }
