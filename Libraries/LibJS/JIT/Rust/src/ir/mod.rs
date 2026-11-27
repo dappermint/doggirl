@@ -114,7 +114,7 @@ impl FrameField {
 }
 
 /// What `Op::Branch` tests its inputs for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BranchCondition {
     /// The input is a `Repr::Bool`.
     Bool,
@@ -213,7 +213,7 @@ pub enum BranchCondition {
 }
 
 /// What `typeof` results in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeofKind {
     Number,
     Undefined,
@@ -247,7 +247,7 @@ pub enum AccessorPart {
 }
 
 /// A shape an object may have, as `CheckShape` and `ShapeSwitch` test it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShapeCheck {
     pub shape: CellId,
     /// For dictionary shapes, the generation the shape must still have.
@@ -327,7 +327,7 @@ impl ElementsKind {
 }
 
 /// An arithmetic or bitwise operation of two operands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -377,7 +377,7 @@ impl BinaryOp {
 }
 
 /// A comparison of two operands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Comparison {
     LessThan,
     LessThanEquals,
