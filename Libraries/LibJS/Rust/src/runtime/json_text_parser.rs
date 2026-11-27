@@ -44,27 +44,53 @@ impl From<Latin1Byte> for u32 {
     }
 }
 
-/// Storage width discovered while scanning an unescaped JSON string.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StringWidth {
-    Ascii,
-    Latin1,
-    Utf16,
+/// Inline word-wise equality for UTF-16 slices, avoiding PLT calls to `memcmp` on short JSON keys and cached strings.
+#[inline(always)]
+fn u16_slices_equal(a: &[u16], b: &[u16]) -> bool {
+    let len = a.len();
+    if len != b.len() {
+        return false;
+    }
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut index = 0usize;
+    // SAFETY: Every unaligned read stays strictly within `0..len` of both `a` and `b`.
+    unsafe {
+        while index + 4 <= len {
+            if core::ptr::read_unaligned(pa.add(index).cast::<u64>())
+                != core::ptr::read_unaligned(pb.add(index).cast::<u64>())
+            {
+                return false;
+            }
+            index += 4;
+        }
+        if index + 2 <= len {
+            if core::ptr::read_unaligned(pa.add(index).cast::<u32>())
+                != core::ptr::read_unaligned(pb.add(index).cast::<u32>())
+            {
+                return false;
+            }
+            index += 2;
+        }
+        if index < len && *pa.add(index) != *pb.add(index) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The code units of a JSON text: ASCII bytes, Latin-1 bytes or UTF-16 code units.
 trait CodeUnit: Copy + Eq + Into<u32> + 'static {
     fn make_string(units: &[Self]) -> Utf16String;
-    fn make_primitive_string(vm: &Vm, units: &[Self], width: StringWidth) -> Gc<PrimitiveString>;
-    fn make_fly_string(units: &[Self], width: StringWidth) -> Utf16FlyString;
+    fn make_primitive_string(vm: &Vm, units: &[Self]) -> Gc<PrimitiveString>;
+    fn make_fly_string(units: &[Self]) -> Utf16FlyString;
     fn equals_byte_slice(units: &[Self], bytes: &[u8]) -> bool;
     fn equals_u16_slice(units: &[Self], code_units: &[u16]) -> bool;
     fn equals_simple_key(units: &[Self], simple: &SimpleByteKeys, start: usize, end: usize) -> bool;
 
     /// The position of the first unit at or after `position` that is a quotation mark, a reverse solidus or a
-    /// control character, or the length of `units` if there is none. Widens `*width` if any ordinary unit scanned
-    /// before that position is above U+007F or above U+00FF.
-    fn skip_ordinary_string_units(units: &[Self], position: usize, width: &mut StringWidth) -> usize;
+    /// control character, or the length of `units` if there is none.
+    fn skip_ordinary_string_units(units: &[Self], position: usize) -> usize;
 }
 
 impl CodeUnit for u8 {
@@ -72,15 +98,15 @@ impl CodeUnit for u8 {
         Utf16String::from_ascii(units)
     }
 
-    fn make_primitive_string(vm: &Vm, units: &[u8], _width: StringWidth) -> Gc<PrimitiveString> {
+    fn make_primitive_string(vm: &Vm, units: &[u8]) -> Gc<PrimitiveString> {
         PrimitiveString::create_from_ascii(vm, units)
     }
 
-    fn make_fly_string(units: &[u8], _width: StringWidth) -> Utf16FlyString {
+    fn make_fly_string(units: &[u8]) -> Utf16FlyString {
         Utf16FlyString::from_utf8(core::str::from_utf8(units).expect("the text is ASCII"))
     }
 
-    #[inline]
+    #[inline(always)]
     fn equals_byte_slice(units: &[u8], bytes: &[u8]) -> bool {
         units == bytes
     }
@@ -99,7 +125,7 @@ impl CodeUnit for u8 {
         units == &simple.bytes[start..end]
     }
 
-    fn skip_ordinary_string_units(units: &[u8], mut position: usize, _width: &mut StringWidth) -> usize {
+    fn skip_ordinary_string_units(units: &[u8], mut position: usize) -> usize {
         while let Some(chunk) = units.get(position..position + 8) {
             let word = u64::from_le_bytes(chunk.try_into().expect("the chunk has eight units"));
             let special_lanes = json_special_code_unit_lanes(word, 0x0101_0101_0101_0101);
@@ -121,23 +147,23 @@ impl CodeUnit for Latin1Byte {
         Utf16String::from_latin1(bytes)
     }
 
-    fn make_primitive_string(vm: &Vm, units: &[Latin1Byte], width: StringWidth) -> Gc<PrimitiveString> {
+    fn make_primitive_string(vm: &Vm, units: &[Latin1Byte]) -> Gc<PrimitiveString> {
         let bytes = Self::as_bytes(units);
-        if width == StringWidth::Ascii {
+        if bytes.is_ascii() {
             return PrimitiveString::create_from_ascii(vm, bytes);
         }
         PrimitiveString::create(vm, Utf16String::from_latin1(bytes))
     }
 
-    fn make_fly_string(units: &[Latin1Byte], width: StringWidth) -> Utf16FlyString {
+    fn make_fly_string(units: &[Latin1Byte]) -> Utf16FlyString {
         let bytes = Self::as_bytes(units);
-        if width == StringWidth::Ascii {
+        if bytes.is_ascii() {
             return Utf16FlyString::from_utf8(core::str::from_utf8(bytes).expect("the slice is ASCII"));
         }
         Utf16View::Latin1(bytes).to_utf16_fly_string()
     }
 
-    #[inline]
+    #[inline(always)]
     fn equals_byte_slice(units: &[Latin1Byte], bytes: &[u8]) -> bool {
         Self::as_bytes(units) == bytes
     }
@@ -157,31 +183,18 @@ impl CodeUnit for Latin1Byte {
         Self::as_bytes(units) == &simple.bytes[start..end]
     }
 
-    fn skip_ordinary_string_units(units: &[Latin1Byte], mut position: usize, width: &mut StringWidth) -> usize {
+    fn skip_ordinary_string_units(units: &[Latin1Byte], mut position: usize) -> usize {
         let bytes = Self::as_bytes(units);
-        let mut or_bits = 0u64;
         while let Some(chunk) = bytes.get(position..position + 8) {
             let word = u64::from_le_bytes(chunk.try_into().expect("the chunk has eight units"));
             let special_lanes = json_special_code_unit_lanes(word, 0x0101_0101_0101_0101);
             if special_lanes != 0 {
-                let offset = (special_lanes.trailing_zeros() / 8) as usize;
-                if offset != 0 {
-                    or_bits |= word & ((1u64 << (offset * 8)) - 1);
-                }
-                if or_bits & 0x8080_8080_8080_8080 != 0 {
-                    *width = StringWidth::Latin1;
-                }
-                return position + offset;
+                return position + (special_lanes.trailing_zeros() / 8) as usize;
             }
-            or_bits |= word;
             position += 8;
         }
         while position < bytes.len() && !is_json_special_code_unit(u32::from(bytes[position])) {
-            or_bits |= u64::from(bytes[position]);
             position += 1;
-        }
-        if or_bits & 0x8080_8080_8080_8080 != 0 {
-            *width = StringWidth::Latin1;
         }
         position
     }
@@ -206,53 +219,35 @@ impl CodeUnit for u16 {
         Utf16String::from_utf16(units)
     }
 
-    fn make_primitive_string(vm: &Vm, units: &[u16], width: StringWidth) -> Gc<PrimitiveString> {
-        match width {
-            StringWidth::Ascii => {
-                // OPTIMIZATION: Short ASCII strings narrow directly into an inline stack buffer so
-                //               `create_from_inline_characters` stores them in `InlineString` with a single copy;
-                //               longer ones narrow directly into heap storage in a single pass.
-                const MAX_INLINE_ASCII: usize = crate::layout::primitive_string::INLINE_STRING_CAPACITY;
-                if units.len() <= MAX_INLINE_ASCII {
-                    let mut ascii = [0u8; MAX_INLINE_ASCII];
-                    let mut index = 0usize;
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use core::arch::aarch64::*;
-                        // SAFETY: NEON is always available on aarch64 and every load/store stays within `units` and `ascii`.
-                        unsafe {
-                            while index + 8 <= units.len() {
-                                let wide = vld1q_u16(units.as_ptr().add(index));
-                                vst1_u8(ascii.as_mut_ptr().add(index), vmovn_u16(wide));
-                                index += 8;
-                            }
-                        }
-                    }
-                    while index < units.len() {
-                        ascii[index] = units[index] as u8;
-                        index += 1;
-                    }
-                    return PrimitiveString::create_from_inline_characters(vm, ascii, units.len());
-                }
-                // SAFETY: `skip_ordinary_string_units` verified every code unit in `units` is `<= 0x7f`.
-                PrimitiveString::create(vm, unsafe { Utf16String::from_utf16_known_ascii(units) })
+    fn make_primitive_string(vm: &Vm, units: &[u16]) -> Gc<PrimitiveString> {
+        const MAX_INLINE_ASCII: usize = crate::layout::primitive_string::INLINE_STRING_CAPACITY;
+        if units.len() <= MAX_INLINE_ASCII {
+            let mut ascii = [0u8; MAX_INLINE_ASCII];
+            let mut or_bits = 0u16;
+            for (index, &unit) in units.iter().enumerate() {
+                or_bits |= unit;
+                ascii[index] = unit as u8;
             }
-            // SAFETY: `skip_ordinary_string_units` verified every code unit is `<= 0xff` and at least one is `>= 0x80`.
-            StringWidth::Latin1 => PrimitiveString::create(vm, unsafe { Utf16String::from_utf16_known_latin1(units) }),
-            // SAFETY: `skip_ordinary_string_units` verified at least one code unit is `> 0xff`.
-            StringWidth::Utf16 => {
-                PrimitiveString::create(vm, unsafe { Utf16String::from_utf16_known_non_latin1(units) })
+            if or_bits <= 0x7f {
+                return PrimitiveString::create_from_inline_characters(vm, ascii, units.len());
             }
         }
+        PrimitiveString::create(vm, Utf16String::from_utf16(units))
     }
 
-    fn make_fly_string(units: &[u16], width: StringWidth) -> Utf16FlyString {
-        if width == StringWidth::Ascii && units.len() <= 64 {
+    fn make_fly_string(units: &[u16]) -> Utf16FlyString {
+        if units.len() <= 64 {
             let mut ascii = [0u8; 64];
+            let mut or_bits = 0u16;
             for (byte, &unit) in ascii.iter_mut().zip(units) {
+                or_bits |= unit;
                 *byte = unit as u8;
             }
-            return Utf16FlyString::from_utf8(core::str::from_utf8(&ascii[..units.len()]).expect("the slice is ASCII"));
+            if or_bits <= 0x7f {
+                return Utf16FlyString::from_utf8(
+                    core::str::from_utf8(&ascii[..units.len()]).expect("the slice is ASCII"),
+                );
+            }
         }
         Utf16FlyString::from_utf16(units)
     }
@@ -290,43 +285,24 @@ impl CodeUnit for u16 {
 
     #[inline(always)]
     fn equals_u16_slice(units: &[u16], code_units: &[u16]) -> bool {
-        units == code_units
+        u16_slices_equal(units, code_units)
     }
 
     #[inline(always)]
     fn equals_simple_key(units: &[u16], simple: &SimpleByteKeys, start: usize, end: usize) -> bool {
-        units == &simple.u16_units[start..end]
+        u16_slices_equal(units, &simple.u16_units[start..end])
     }
 
-    fn skip_ordinary_string_units(units: &[u16], mut position: usize, width: &mut StringWidth) -> usize {
-        #[inline(always)]
-        fn record_bits(width: &mut StringWidth, bits: u16) {
-            if bits > 0xff {
-                *width = StringWidth::Utf16;
-            } else if bits >= 0x80 && *width == StringWidth::Ascii {
-                *width = StringWidth::Latin1;
-            }
-        }
-
+    #[inline]
+    fn skip_ordinary_string_units(units: &[u16], mut position: usize) -> usize {
         #[cfg(target_arch = "aarch64")]
         {
             use core::arch::aarch64::*;
-            const TAIL_MASKS: [[u16; 8]; 8] = [
-                [0, 0, 0, 0, 0, 0, 0, 0],
-                [0xFFFF, 0, 0, 0, 0, 0, 0, 0],
-                [0xFFFF, 0xFFFF, 0, 0, 0, 0, 0, 0],
-                [0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0, 0],
-                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0],
-                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0],
-                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0],
-                [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0],
-            ];
             // SAFETY: NEON is always available on aarch64 and every load stays within `units`.
             unsafe {
                 let quote = vdupq_n_u16(0x22);
                 let backslash = vdupq_n_u16(0x5C);
                 let space = vdupq_n_u16(0x20);
-                let mut or_vec = vdupq_n_u16(0);
                 while position + 8 <= units.len() {
                     let chunk = vld1q_u16(units.as_ptr().add(position));
                     let special = vorrq_u16(
@@ -335,27 +311,18 @@ impl CodeUnit for u16 {
                     );
                     let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(special, 4)), 0);
                     if mask != 0 {
-                        let offset = (mask.trailing_zeros() / 8) as usize;
-                        let tail_mask = vld1q_u16(TAIL_MASKS[offset].as_ptr());
-                        let combined = vorrq_u16(or_vec, vandq_u16(chunk, tail_mask));
-                        record_bits(width, vmaxvq_u16(combined));
-                        return position + offset;
+                        return position + (mask.trailing_zeros() >> 3) as usize;
                     }
-                    or_vec = vorrq_u16(or_vec, chunk);
                     position += 8;
                 }
-                let mut or_bits = vmaxvq_u16(or_vec);
                 while position < units.len() && !is_json_special_code_unit(u32::from(units[position])) {
-                    or_bits |= units[position];
                     position += 1;
                 }
-                record_bits(width, or_bits);
                 position
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let mut or_bits = 0u64;
             while let Some(chunk) = units.get(position..position + 4) {
                 #[cfg(target_endian = "little")]
                 let word = {
@@ -366,24 +333,13 @@ impl CodeUnit for u16 {
                 let word = chunk.iter().rev().fold(0, |word, unit| (word << 16) | u64::from(*unit));
                 let special_lanes = json_special_code_unit_lanes(word, 0x0001_0001_0001_0001);
                 if special_lanes != 0 {
-                    let offset = (special_lanes.trailing_zeros() / 16) as usize;
-                    if offset != 0 {
-                        or_bits |= word & ((1u64 << (offset * 16)) - 1);
-                    }
-                    let folded = (or_bits | (or_bits >> 32)) as u32;
-                    record_bits(width, (folded | (folded >> 16)) as u16);
-                    return position + offset;
+                    return position + (special_lanes.trailing_zeros() / 16) as usize;
                 }
-                or_bits |= word;
                 position += 4;
             }
-            let folded = (or_bits | (or_bits >> 32)) as u32;
-            let mut scalar_or = (folded | (folded >> 16)) as u16;
             while position < units.len() && !is_json_special_code_unit(u32::from(units[position])) {
-                scalar_or |= units[position];
                 position += 1;
             }
-            record_bits(width, scalar_or);
             position
         }
     }
@@ -580,14 +536,14 @@ impl KeyCache {
         (hash ^ (hash >> 15)) as usize % Self::ENTRY_COUNT
     }
 
-    fn key<C: CodeUnit>(&mut self, units: &[C], width: StringWidth) -> NonSymbolPropertyKey {
+    fn key<C: CodeUnit>(&mut self, units: &[C]) -> NonSymbolPropertyKey {
         let entry = &mut self.entries[Self::slot(units)];
         if let Some(key) = entry
             && are_code_units_of(units, key)
         {
             return key.clone();
         }
-        let key = NonSymbolPropertyKey::from(C::make_fly_string(units, width));
+        let key = NonSymbolPropertyKey::from(C::make_fly_string(units));
         // NB: Array indices are not kept, since they are numbers rather than strings.
         if key.is_string() {
             *entry = Some(key.clone());
@@ -779,7 +735,363 @@ struct StringToken {
     start: usize,
     end: usize,
     has_escapes: bool,
-    width: StringWidth,
+}
+
+enum PredictedFlatOutcome {
+    Complete,
+    EarlyClose { matched: usize },
+    FallbackAtKey { matched: usize },
+    FallbackAtNestedValue { matched: usize },
+}
+
+#[inline(always)]
+fn skip_whitespace_at<C: CodeUnit>(units: &[C], position: &mut usize) {
+    if let Some(&unit) = units.get(*position)
+        && unit.into() > 0x20
+    {
+        return;
+    }
+    skip_whitespace_slow(units, position);
+}
+
+#[cold]
+#[inline(never)]
+fn skip_whitespace_slow<C: CodeUnit>(units: &[C], position: &mut usize) {
+    // NB: JSON whitespace is only tab, line feed, carriage return and space, so any unit above 0x20 ends the run.
+    while let Some(&unit) = units.get(*position) {
+        let code_unit: u32 = unit.into();
+        if code_unit > 0x20 || !matches!(code_unit, 0x09 | 0x0A | 0x0D | 0x20) {
+            break;
+        }
+        *position += 1;
+    }
+}
+
+#[inline(always)]
+fn consume_literal_at<C: CodeUnit>(vm: &Vm, units: &[C], position: &mut usize, literal: &[u8]) -> ThrowCompletionOr<()> {
+    let Some(slice) = units.get(*position..*position + literal.len()) else {
+        return json_malformed(vm);
+    };
+    if !C::equals_byte_slice(slice, literal) {
+        return json_malformed(vm);
+    }
+    *position += literal.len();
+    Ok(())
+}
+
+#[inline]
+fn make_unescaped_primitive_string_from<C: CodeUnit>(
+    vm: &Vm,
+    string_values: &[Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS],
+    units: &[C],
+) -> Gc<PrimitiveString> {
+    let len = units.len();
+    if len == 0 {
+        return vm.empty_string();
+    }
+    if len == 1 {
+        let unit: u32 = units[0].into();
+        if unit < 0x80 {
+            return vm.single_ascii_character_string(unit as u8);
+        }
+    }
+    if len <= STRING_VALUE_CACHE_MAX_LEN {
+        let base = string_value_cache_set(units) * 2;
+        let slot0 = &string_values[base];
+        if let Some(cached) = slot0.get()
+            && cached.length_in_utf16_code_units() == len
+            && are_code_units_of_view(units, cached.utf16_string_view())
+        {
+            return cached;
+        }
+        let slot1 = &string_values[base + 1];
+        if let Some(cached) = slot1.get()
+            && cached.length_in_utf16_code_units() == len
+            && are_code_units_of_view(units, cached.utf16_string_view())
+        {
+            slot1.set(slot0.get());
+            slot0.set(Some(cached));
+            return cached;
+        }
+        let created = C::make_primitive_string(vm, units);
+        slot1.set(slot0.get());
+        slot0.set(Some(created));
+        return created;
+    }
+    C::make_primitive_string(vm, units)
+}
+
+#[inline]
+fn scan_string_at<C: CodeUnit>(vm: &Vm, units: &[C], position: &mut usize) -> ThrowCompletionOr<StringToken> {
+    let start = *position + 1;
+    let mut pos = start;
+    let mut has_escapes = false;
+    loop {
+        pos = C::skip_ordinary_string_units(units, pos);
+        let Some(unit) = units.get(pos).map(|unit| (*unit).into()) else {
+            return json_malformed(vm);
+        };
+        match unit {
+            0x22 => break,
+            0x5C => {
+                has_escapes = true;
+                pos += 2;
+            }
+            0x00..=0x1F => return json_malformed(vm),
+            _ => unreachable!("skip_ordinary_string_units stops only on special JSON code units"),
+        }
+    }
+    *position = pos + 1;
+    Ok(StringToken {
+        start,
+        end: pos,
+        has_escapes,
+    })
+}
+
+fn make_string_from<C: CodeUnit>(vm: &Vm, units: &[C], token: &StringToken) -> ThrowCompletionOr<Utf16String> {
+    let units = &units[token.start..token.end];
+    if !token.has_escapes {
+        return Ok(C::make_string(units));
+    }
+
+    let mut code_units: Vec<u16> = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        let unit: u32 = units[index].into();
+        index += 1;
+        if unit != 0x5C {
+            code_units.push(unit as u16);
+            continue;
+        }
+        let Some(escaped) = units.get(index).map(|unit| (*unit).into()) else {
+            return json_malformed(vm);
+        };
+        index += 1;
+        let code_unit = match escaped {
+            0x22 => 0x22,
+            0x5C => 0x5C,
+            0x2F => 0x2F,
+            0x62 => 0x08,
+            0x66 => 0x0C,
+            0x6E => 0x0A,
+            0x72 => 0x0D,
+            0x74 => 0x09,
+            0x75 => {
+                let Some(hex_digits) = units.get(index..index + 4) else {
+                    return json_malformed(vm);
+                };
+                index += 4;
+                let mut code_unit: u32 = 0;
+                for digit in hex_digits {
+                    let Some(value) = char::from_u32((*digit).into()).and_then(|digit| digit.to_digit(16)) else {
+                        return json_malformed(vm);
+                    };
+                    code_unit = (code_unit << 4) | value;
+                }
+                code_unit
+            }
+            _ => return json_malformed(vm),
+        };
+        code_units.push(code_unit as u16);
+    }
+    Ok(Utf16String::from_utf16(&code_units))
+}
+
+#[inline]
+fn parse_number_at<C: CodeUnit>(vm: &Vm, units: &[C], position: &mut usize) -> ThrowCompletionOr<Value> {
+    let start = *position;
+    let peek_at = |pos: usize| units.get(pos).map(|unit| (*unit).into());
+    let is_digit = |unit: Option<u32>| unit.is_some_and(|unit| (0x30..=0x39).contains(&unit));
+
+    let is_negative = peek_at(*position) == Some(0x2D);
+    if is_negative {
+        *position += 1;
+    }
+
+    // Integer part: 0, or a digit other than 0 followed by digits.
+    let integer_start = *position;
+    let mut integer_value: u64 = 0;
+    match peek_at(*position) {
+        Some(0x30) => *position += 1,
+        Some(first @ 0x31..=0x39) => {
+            integer_value = u64::from(first - 0x30);
+            *position += 1;
+            while let Some(&unit) = units.get(*position) {
+                let digit = unit.into().wrapping_sub(0x30);
+                if digit >= 10 {
+                    break;
+                }
+                integer_value = integer_value.wrapping_mul(10).wrapping_add(u64::from(digit));
+                *position += 1;
+            }
+        }
+        _ => return json_malformed(vm),
+    }
+    let integer_digits = *position - integer_start;
+
+    let mut is_integer = true;
+    if peek_at(*position) == Some(0x2E) {
+        is_integer = false;
+        *position += 1;
+        if !is_digit(peek_at(*position)) {
+            return json_malformed(vm);
+        }
+        while is_digit(peek_at(*position)) {
+            *position += 1;
+        }
+    }
+    if matches!(peek_at(*position), Some(0x45 | 0x65)) {
+        is_integer = false;
+        *position += 1;
+        if matches!(peek_at(*position), Some(0x2B | 0x2D)) {
+            *position += 1;
+        }
+        if !is_digit(peek_at(*position)) {
+            return json_malformed(vm);
+        }
+        while is_digit(peek_at(*position)) {
+            *position += 1;
+        }
+    }
+
+    // OPTIMIZATION: Every integer up to 15 digits is below 2^53 and converts exactly to i32 or f64 with no
+    //               decimal string float parsing.
+    if is_integer && integer_digits <= 15 {
+        if is_negative {
+            if integer_value == 0 {
+                return Ok(Value::from_f64(-0.0));
+            }
+            if integer_value <= (i32::MAX as u64) + 1 {
+                return Ok(Value::from_i32(integer_value.wrapping_neg() as i32));
+            }
+            return Ok(Value::from_f64(-(integer_value as f64)));
+        }
+        if integer_value <= i32::MAX as u64 {
+            return Ok(Value::from_i32(integer_value as i32));
+        }
+        return Ok(Value::from_f64(integer_value as f64));
+    }
+
+    // NB: The units of a number are ASCII digits and signs, so each one is a byte of its literal.
+    let slice = &units[start..*position];
+    let mut buffer = [0u8; 64];
+    let mut long_literal = Vec::new();
+    let literal = match buffer.get_mut(..slice.len()) {
+        Some(bytes) => bytes,
+        None => {
+            long_literal.resize(slice.len(), 0);
+            &mut long_literal[..]
+        }
+    };
+    for (byte, unit) in literal.iter_mut().zip(slice) {
+        *byte = (*unit).into() as u8;
+    }
+    let value: f64 = core::str::from_utf8(literal)
+        .ok()
+        .and_then(|literal| literal.parse().ok())
+        .expect("a JSON number is a valid float literal");
+    Ok(Value::from_f64(value))
+}
+
+/// Fast loop for flat objects whose keys match `simple_keys` in order and whose values are primitives.
+/// Borrows `simple_keys` once outside the property loop, avoiding repeated shape-table indexing,
+/// generation checks, and recursive `parse_value` dispatch.
+fn try_parse_predicted_flat_object<C: CodeUnit>(
+    vm: &Vm,
+    units: &[C],
+    position: &mut usize,
+    values: &JsonValueStack,
+    string_values: &[Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS],
+    simple_keys: &SimpleByteKeys,
+) -> ThrowCompletionOr<PredictedFlatOutcome> {
+    let key_count = simple_keys.ranges.len();
+    for index in 0..key_count {
+        let mut pos = *position;
+        if units.get(pos).map(|u| (*u).into()) != Some(0x22) {
+            return json_malformed(vm);
+        }
+        let (key_start, key_end) = simple_keys.ranges[index];
+        let key_start = key_start as usize;
+        let key_end = key_end as usize;
+        let start = pos + 1;
+        let end = start + (key_end - key_start);
+        let Some(slice) = units.get(start..end) else {
+            return Ok(PredictedFlatOutcome::FallbackAtKey { matched: index });
+        };
+        if units.get(end).map(|u| (*u).into()) != Some(0x22)
+            || !C::equals_simple_key(slice, simple_keys, key_start, key_end)
+        {
+            return Ok(PredictedFlatOutcome::FallbackAtKey { matched: index });
+        }
+
+        pos = end + 1;
+        if units.get(pos).map(|u| (*u).into()) == Some(0x3A) {
+            pos += 1;
+        } else {
+            skip_whitespace_at(units, &mut pos);
+            if units.get(pos).map(|u| (*u).into()) != Some(0x3A) {
+                return json_malformed(vm);
+            }
+            pos += 1;
+        }
+        skip_whitespace_at(units, &mut pos);
+
+        let value = match units.get(pos).map(|u| (*u).into()) {
+            Some(0x22) => {
+                let token = scan_string_at(vm, units, &mut pos)?;
+                if !token.has_escapes {
+                    Value::from_string(make_unescaped_primitive_string_from(
+                        vm,
+                        string_values,
+                        &units[token.start..token.end],
+                    ))
+                } else {
+                    Value::from_string(PrimitiveString::create(vm, make_string_from(vm, units, &token)?))
+                }
+            }
+            Some(0x74) => {
+                consume_literal_at(vm, units, &mut pos, b"true")?;
+                Value::TRUE
+            }
+            Some(0x66) => {
+                consume_literal_at(vm, units, &mut pos, b"false")?;
+                Value::FALSE
+            }
+            Some(0x6E) => {
+                consume_literal_at(vm, units, &mut pos, b"null")?;
+                Value::NULL
+            }
+            Some(0x2D | 0x30..=0x39) => parse_number_at(vm, units, &mut pos)?,
+            Some(0x7B | 0x5B) => {
+                *position = pos;
+                return Ok(PredictedFlatOutcome::FallbackAtNestedValue { matched: index });
+            }
+            _ => return json_malformed(vm),
+        };
+        values.push(value);
+
+        skip_whitespace_at(units, &mut pos);
+        match units.get(pos).map(|u| (*u).into()) {
+            Some(0x2C) => {
+                pos += 1;
+                skip_whitespace_at(units, &mut pos);
+                *position = pos;
+                if index + 1 == key_count {
+                    return Ok(PredictedFlatOutcome::FallbackAtKey { matched: key_count });
+                }
+            }
+            Some(0x7D) => {
+                *position = pos + 1;
+                if index + 1 == key_count {
+                    return Ok(PredictedFlatOutcome::Complete);
+                }
+                return Ok(PredictedFlatOutcome::EarlyClose { matched: index + 1 });
+            }
+            _ => return json_malformed(vm),
+        }
+    }
+    unreachable!("key_count > 0 returns from the loop above")
 }
 
 impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
@@ -797,41 +1109,8 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
     }
 
     #[inline]
-    fn make_unescaped_primitive_string(&self, units: &[C], width: StringWidth) -> Gc<PrimitiveString> {
-        let len = units.len();
-        if len == 0 {
-            return self.vm.empty_string();
-        }
-        if len == 1 {
-            let unit: u32 = units[0].into();
-            if unit < 0x80 {
-                return self.vm.single_ascii_character_string(unit as u8);
-            }
-        }
-        if len <= STRING_VALUE_CACHE_MAX_LEN {
-            let base = string_value_cache_set(units) * 2;
-            let slot0 = &self.string_values[base];
-            if let Some(cached) = slot0.get()
-                && cached.length_in_utf16_code_units() == len
-                && are_code_units_of_view(units, cached.utf16_string_view())
-            {
-                return cached;
-            }
-            let slot1 = &self.string_values[base + 1];
-            if let Some(cached) = slot1.get()
-                && cached.length_in_utf16_code_units() == len
-                && are_code_units_of_view(units, cached.utf16_string_view())
-            {
-                slot1.set(slot0.get());
-                slot0.set(Some(cached));
-                return cached;
-            }
-            let created = C::make_primitive_string(self.vm, units, width);
-            slot1.set(slot0.get());
-            slot0.set(Some(created));
-            return created;
-        }
-        C::make_primitive_string(self.vm, units, width)
+    fn make_unescaped_primitive_string(&self, units: &[C]) -> Gc<PrimitiveString> {
+        make_unescaped_primitive_string_from(self.vm, self.string_values, units)
     }
 
     #[inline(always)]
@@ -841,14 +1120,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
 
     #[inline(always)]
     fn skip_whitespace(&mut self) {
-        // NB: JSON whitespace is only tab, line feed, carriage return and space, so any unit above 0x20 ends the run.
-        while let Some(&unit) = self.units.get(self.position) {
-            let code_unit: u32 = unit.into();
-            if code_unit > 0x20 || !matches!(code_unit, 0x09 | 0x0A | 0x0D | 0x20) {
-                break;
-            }
-            self.position += 1;
-        }
+        skip_whitespace_at(self.units, &mut self.position);
     }
 
     #[inline(always)]
@@ -860,16 +1132,9 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn consume_literal(&mut self, literal: &[u8]) -> ThrowCompletionOr<()> {
-        let Some(slice) = self.units.get(self.position..self.position + literal.len()) else {
-            return json_malformed(self.vm);
-        };
-        if !C::equals_byte_slice(slice, literal) {
-            return json_malformed(self.vm);
-        }
-        self.position += literal.len();
-        Ok(())
+        consume_literal_at(self.vm, self.units, &mut self.position, literal)
     }
 
     fn parse_text(mut self) -> ThrowCompletionOr<Value> {
@@ -889,10 +1154,9 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             Some(0x22) => {
                 let token = self.scan_string()?;
                 if !token.has_escapes {
-                    return Ok(Value::from_string(self.make_unescaped_primitive_string(
-                        &self.units[token.start..token.end],
-                        token.width,
-                    )));
+                    return Ok(Value::from_string(
+                        self.make_unescaped_primitive_string(&self.units[token.start..token.end]),
+                    ));
                 }
                 Ok(Value::from_string(PrimitiveString::create(
                     self.vm,
@@ -940,8 +1204,81 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
         // KeyCache lookups, ShapeCache hashing, and PropertyKey refcount churn.
         let mut predicted = self.tables.shapes.predicted_entry(self.realm);
         let mut predicted_matched = 0usize;
+        let mut finished_object = false;
 
-        loop {
+        if let Some((slot, generation, key_count, true)) = predicted
+            && let Some(entry) = &self.tables.shapes.entries[slot]
+            && entry.generation == generation
+            && let Some(ref simple_keys) = entry.simple_byte_keys
+        {
+            match try_parse_predicted_flat_object(
+                self.vm,
+                self.units,
+                &mut self.position,
+                self.values,
+                self.string_values,
+                simple_keys,
+            )? {
+                PredictedFlatOutcome::Complete => {
+                    if let Some(entry) = &self.tables.shapes.entries[slot]
+                        && entry.generation == generation
+                        && let Some(shape) = entry.shape.get()
+                        && shape.realm() == self.realm
+                    {
+                        self.tables.shapes.last_slot = Some(slot);
+                        let object = Object::create_with_premade_shape_from_values(self.vm, shape, self.values, first_value);
+                        self.values.truncate(first_value);
+                        return Ok(Value::from_object(object));
+                    }
+                    predicted_matched = key_count;
+                    finished_object = true;
+                }
+                PredictedFlatOutcome::EarlyClose { matched } => {
+                    predicted_matched = matched;
+                    finished_object = true;
+                }
+                PredictedFlatOutcome::FallbackAtKey { matched } => {
+                    predicted_matched = matched;
+                }
+                PredictedFlatOutcome::FallbackAtNestedValue { matched } => {
+                    predicted_matched = matched;
+                    let pin = self.tables.shapes.pin_counts[slot];
+                    if pin < u8::MAX {
+                        self.tables.shapes.pin_counts[slot] = pin + 1;
+                        let result = self.parse_value();
+                        self.tables.shapes.pin_counts[slot] = pin;
+                        let value = result?;
+                        self.values.push(value);
+                        predicted_matched += 1;
+                    } else {
+                        predicted = None;
+                        let entry = self.tables.shapes.entries[slot]
+                            .as_ref()
+                            .expect("predicted shape entry must remain live");
+                        debug_assert_eq!(entry.generation, generation);
+                        self.tables
+                            .property_keys
+                            .extend(entry.keys[..=predicted_matched].iter().cloned());
+                        let value = self.parse_value()?;
+                        self.values.push(value);
+                    }
+                    self.skip_whitespace();
+                    match self.peek() {
+                        Some(0x2C) => {
+                            self.position += 1;
+                            self.skip_whitespace();
+                        }
+                        Some(0x7D) => {
+                            self.position += 1;
+                            finished_object = true;
+                        }
+                        _ => return json_malformed(self.vm),
+                    }
+                }
+            }
+        }
+
+        while !finished_object {
             if self.peek() != Some(0x22) {
                 return json_malformed(self.vm);
             }
@@ -1053,7 +1390,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 let key = if token.has_escapes {
                     NonSymbolPropertyKey::from(&self.make_string(&token)?)
                 } else {
-                    self.tables.keys.key(&self.units[token.start..token.end], token.width)
+                    self.tables.keys.key(&self.units[token.start..token.end])
                 };
                 self.skip_whitespace();
                 self.consume(b':')?;
@@ -1164,174 +1501,14 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
 
     /// Finds the end of the string whose opening quote is at the current position, and moves past its closing quote.
     fn scan_string(&mut self) -> ThrowCompletionOr<StringToken> {
-        let start = self.position + 1;
-        let mut position = start;
-        let mut has_escapes = false;
-        let mut width = StringWidth::Ascii;
-        loop {
-            position = C::skip_ordinary_string_units(self.units, position, &mut width);
-            let Some(unit) = self.units.get(position).map(|unit| (*unit).into()) else {
-                return json_malformed(self.vm);
-            };
-            match unit {
-                0x22 => break,
-                0x5C => {
-                    has_escapes = true;
-                    position += 2;
-                }
-                0x00..=0x1F => return json_malformed(self.vm),
-                _ => unreachable!("skip_ordinary_string_units stops only on special JSON code units"),
-            }
-        }
-        self.position = position + 1;
-        Ok(StringToken {
-            start,
-            end: position,
-            has_escapes,
-            width,
-        })
+        scan_string_at(self.vm, self.units, &mut self.position)
     }
 
     fn make_string(&self, token: &StringToken) -> ThrowCompletionOr<Utf16String> {
-        let units = &self.units[token.start..token.end];
-        if !token.has_escapes {
-            return Ok(C::make_string(units));
-        }
-
-        let mut code_units: Vec<u16> = Vec::with_capacity(units.len());
-        let mut index = 0;
-        while index < units.len() {
-            let unit: u32 = units[index].into();
-            index += 1;
-            if unit != 0x5C {
-                code_units.push(unit as u16);
-                continue;
-            }
-            let Some(escaped) = units.get(index).map(|unit| (*unit).into()) else {
-                return json_malformed(self.vm);
-            };
-            index += 1;
-            let code_unit = match escaped {
-                0x22 => 0x22,
-                0x5C => 0x5C,
-                0x2F => 0x2F,
-                0x62 => 0x08,
-                0x66 => 0x0C,
-                0x6E => 0x0A,
-                0x72 => 0x0D,
-                0x74 => 0x09,
-                0x75 => {
-                    let Some(hex_digits) = units.get(index..index + 4) else {
-                        return json_malformed(self.vm);
-                    };
-                    index += 4;
-                    let mut code_unit: u32 = 0;
-                    for digit in hex_digits {
-                        let Some(value) = char::from_u32((*digit).into()).and_then(|digit| digit.to_digit(16)) else {
-                            return json_malformed(self.vm);
-                        };
-                        code_unit = (code_unit << 4) | value;
-                    }
-                    code_unit
-                }
-                _ => return json_malformed(self.vm),
-            };
-            code_units.push(code_unit as u16);
-        }
-        Ok(Utf16String::from_utf16(&code_units))
+        make_string_from(self.vm, self.units, token)
     }
 
     fn parse_number(&mut self) -> ThrowCompletionOr<Value> {
-        let start = self.position;
-        let is_digit = |unit: Option<u32>| unit.is_some_and(|unit| (0x30..=0x39).contains(&unit));
-
-        let is_negative = self.peek() == Some(0x2D);
-        if is_negative {
-            self.position += 1;
-        }
-
-        // Integer part: 0, or a digit other than 0 followed by digits.
-        let integer_start = self.position;
-        let mut integer_value: u64 = 0;
-        match self.peek() {
-            Some(0x30) => self.position += 1,
-            Some(first @ 0x31..=0x39) => {
-                integer_value = u64::from(first - 0x30);
-                self.position += 1;
-                while let Some(&unit) = self.units.get(self.position) {
-                    let digit = unit.into().wrapping_sub(0x30);
-                    if digit >= 10 {
-                        break;
-                    }
-                    integer_value = integer_value.wrapping_mul(10).wrapping_add(u64::from(digit));
-                    self.position += 1;
-                }
-            }
-            _ => return json_malformed(self.vm),
-        }
-        let integer_digits = self.position - integer_start;
-
-        let mut is_integer = true;
-        if self.peek() == Some(0x2E) {
-            is_integer = false;
-            self.position += 1;
-            if !is_digit(self.peek()) {
-                return json_malformed(self.vm);
-            }
-            while is_digit(self.peek()) {
-                self.position += 1;
-            }
-        }
-        if matches!(self.peek(), Some(0x45 | 0x65)) {
-            is_integer = false;
-            self.position += 1;
-            if matches!(self.peek(), Some(0x2B | 0x2D)) {
-                self.position += 1;
-            }
-            if !is_digit(self.peek()) {
-                return json_malformed(self.vm);
-            }
-            while is_digit(self.peek()) {
-                self.position += 1;
-            }
-        }
-
-        // OPTIMIZATION: Every integer up to 15 digits is below 2^53 and converts exactly to i32 or f64 with no
-        //               decimal string float parsing.
-        if is_integer && integer_digits <= 15 {
-            if is_negative {
-                if integer_value == 0 {
-                    return Ok(Value::from_f64(-0.0));
-                }
-                if integer_value <= (i32::MAX as u64) + 1 {
-                    return Ok(Value::from_i32(integer_value.wrapping_neg() as i32));
-                }
-                return Ok(Value::from_f64(-(integer_value as f64)));
-            }
-            if integer_value <= i32::MAX as u64 {
-                return Ok(Value::from_i32(integer_value as i32));
-            }
-            return Ok(Value::from_f64(integer_value as f64));
-        }
-
-        // NB: The units of a number are ASCII digits and signs, so each one is a byte of its literal.
-        let units = &self.units[start..self.position];
-        let mut buffer = [0u8; 64];
-        let mut long_literal = Vec::new();
-        let literal = match buffer.get_mut(..units.len()) {
-            Some(bytes) => bytes,
-            None => {
-                long_literal.resize(units.len(), 0);
-                &mut long_literal[..]
-            }
-        };
-        for (byte, unit) in literal.iter_mut().zip(units) {
-            *byte = (*unit).into() as u8;
-        }
-        let value: f64 = core::str::from_utf8(literal)
-            .ok()
-            .and_then(|literal| literal.parse().ok())
-            .expect("a JSON number is a valid float literal");
-        Ok(Value::from_f64(value))
+        parse_number_at(self.vm, self.units, &mut self.position)
     }
 }
