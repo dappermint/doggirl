@@ -329,6 +329,23 @@ impl Path {
             .elliptical_arc_to(point, (radii.width, radii.height), x_axis_rotation, large_arc, sweep);
     }
 
+    pub fn append_full_ellipse(
+        &mut self,
+        center: FloatPoint,
+        radii: FloatSize,
+        x_axis_rotation: f32,
+        start_angle: f32,
+        counterclockwise: bool,
+    ) {
+        self.geometry_mut().append_full_ellipse(
+            center,
+            (radii.width, radii.height),
+            x_axis_rotation,
+            start_angle,
+            counterclockwise,
+        );
+    }
+
     pub fn arc_to(&mut self, point: FloatPoint, radius: f32, large_arc: bool, sweep: bool) {
         self.geometry_mut().arc_to(point, radius, large_arc, sweep);
     }
@@ -415,6 +432,14 @@ impl Path {
 
     pub fn serialize_into(&self, bytes: &mut Vec<u8>) {
         encoding::encode_into(&self.geometry, bytes);
+    }
+
+    pub fn serialize_append_to(&self, bytes: &mut Vec<u8>) {
+        encoding::encode_append_to(&self.geometry, bytes);
+    }
+
+    pub fn serialize_rect_append_to(x: f32, y: f32, width: f32, height: f32, closed: bool, bytes: &mut Vec<u8>) {
+        encoding::encode_rect_append_to(x, y, width, height, closed, bytes);
     }
 
     /// The path that the bytes describe. Bytes that describe no path give an empty path.

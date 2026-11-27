@@ -72,6 +72,17 @@ pub(crate) trait PathSink {
         sweep: bool,
     );
     fn arc_to(&mut self, point: FloatPoint, radius: f32, large_arc: bool, sweep: bool);
+    fn append_full_ellipse(
+        &mut self,
+        center: FloatPoint,
+        radii: FloatSize,
+        x_axis_rotation: f32,
+        start_angle: f32,
+        counterclockwise: bool,
+    ) -> bool {
+        let _ = (center, radii, x_axis_rotation, start_angle, counterclockwise);
+        false
+    }
     fn close(&mut self);
 }
 
@@ -113,6 +124,18 @@ impl PathSink for libgfx_rust::path::Path {
 
     fn arc_to(&mut self, point: FloatPoint, radius: f32, large_arc: bool, sweep: bool) {
         self.arc_to(point, radius, large_arc, sweep);
+    }
+
+    fn append_full_ellipse(
+        &mut self,
+        center: FloatPoint,
+        radii: FloatSize,
+        x_axis_rotation: f32,
+        start_angle: f32,
+        counterclockwise: bool,
+    ) -> bool {
+        self.append_full_ellipse(center, radii, x_axis_rotation, start_angle, counterclockwise);
+        true
     }
 
     fn close(&mut self) {
@@ -350,7 +373,16 @@ pub(crate) fn ellipse(
         clippy::cast_possible_truncation,
         reason = "the angles of an arc of a path are floats"
     )]
-    let (start_angle, end_angle) = ((start_angle as f32) % tau, (end_angle as f32) % tau);
+    let start_angle = (start_angle as f32) % tau;
+
+    let radii = FloatSize {
+        width: radius_x,
+        height: radius_y,
+    };
+
+    if is_whole_circumference && path.append_full_ellipse(point(x, y), radii, rotation, start_angle, counterclockwise) {
+        return Ok(());
+    }
 
     // Then, figure out where the ends of the arc are.
     // To do so, we can pretend that the center of this ellipse is at (0, 0), and the whole coordinate system is
@@ -358,31 +390,50 @@ pub(crate) fn ellipse(
     // positions is just whether our angle is on one of the left quadrants.
     // NB: The C++ took the sine and the cosine of the rotation with the x87 instruction, in extended precision. Taken
     //     in double precision, they round to the same floats but in rare cases.
-    let (sin_rotation, cos_rotation) = math::sincos(f64::from(rotation));
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "the C++ kept the sine and the cosine in floats"
-    )]
-    let (sin_rotation, cos_rotation) = (sin_rotation as f32, cos_rotation as f32);
+    let (sin_rotation, cos_rotation) = if rotation == 0.0 {
+        (0.0f32, 1.0f32)
+    } else {
+        let (sin_rotation, cos_rotation) = math::sincos(f64::from(rotation));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the C++ kept the sine and the cosine in floats"
+        )]
+        (sin_rotation as f32, cos_rotation as f32)
+    };
 
     let resolve_point_with_angle = |angle: f32| {
-        let tan_relative = math::tan(angle);
-        let tan2 = tan_relative * tan_relative;
+        let (relative_x_position, relative_y_position) = if angle == 0.0 {
+            (radius_x, 0.0)
+        } else if radius_x == radius_y {
+            let (sin_a, cos_a) = math::sincos(f64::from(angle));
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a point of a path is in floats"
+            )]
+            (
+                (f64::from(radius_x) * cos_a) as f32,
+                (f64::from(radius_y) * sin_a) as f32,
+            )
+        } else {
+            let tan_relative = math::tan(angle);
+            let tan2 = tan_relative * tan_relative;
 
-        let ab = radius_x * radius_y;
-        let a2 = radius_x * radius_x;
-        let b2 = radius_y * radius_y;
-        let sqrt = (b2 + a2 * tan2).sqrt();
+            let ab = radius_x * radius_y;
+            let a2 = radius_x * radius_x;
+            let b2 = radius_y * radius_y;
+            let sqrt = (b2 + a2 * tan2).sqrt();
 
-        let mut relative_x_position = ab / sqrt;
-        let mut relative_y_position = ab * tan_relative / sqrt;
+            let mut relative_x_position = ab / sqrt;
+            let mut relative_y_position = ab * tan_relative / sqrt;
 
-        // Make sure to set the correct sign
-        // -1 if 0 ≤ θ < 90° or 270°< θ ≤ 360°
-        //  1 if 90° < θ< 270°
-        let sn = if math::cos(angle) >= 0.0 { 1.0 } else { -1.0 };
-        relative_x_position *= sn;
-        relative_y_position *= sn;
+            // Make sure to set the correct sign
+            // -1 if 0 ≤ θ < 90° or 270°< θ ≤ 360°
+            //  1 if 90° < θ< 270°
+            let sn = if math::cos(angle) >= 0.0 { 1.0 } else { -1.0 };
+            relative_x_position *= sn;
+            relative_y_position *= sn;
+            (relative_x_position, relative_y_position)
+        };
 
         // Now rotate it (back) around the center point by 'rotation' radians, then move it back to our actual origin.
         let relative_rotated_x_position = relative_x_position * cos_rotation - relative_y_position * sin_rotation;
@@ -391,26 +442,10 @@ pub(crate) fn ellipse(
     };
 
     let start_point = resolve_point_with_angle(start_angle);
-    let end_point = resolve_point_with_angle(end_angle);
-
-    let mut delta_theta = if counterclockwise {
-        start_angle - end_angle
-    } else {
-        end_angle - start_angle
-    };
-
-    if delta_theta < 0.0 {
-        delta_theta += core::f32::consts::PI * 2.0;
-    }
 
     // 3. If canvasPath's path has any subpaths, then add a straight line from the last point in the subpath to the
     //    start point of the arc.
     add_line_to_start_point(path, start_point);
-
-    let radii = FloatSize {
-        width: radius_x,
-        height: radius_y,
-    };
 
     // NB: The whole circumference starts and ends at the start point, so it is added as two halves.
     if is_whole_circumference {
@@ -423,6 +458,23 @@ pub(crate) fn ellipse(
         path.elliptical_arc_to(opposite_point, radii, rotation, false, !counterclockwise);
         path.elliptical_arc_to(start_point, radii, rotation, false, !counterclockwise);
         return Ok(());
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the angles of an arc of a path are floats"
+    )]
+    let end_angle = (end_angle as f32) % tau;
+    let end_point = resolve_point_with_angle(end_angle);
+
+    let mut delta_theta = if counterclockwise {
+        start_angle - end_angle
+    } else {
+        end_angle - start_angle
+    };
+
+    if delta_theta < 0.0 {
+        delta_theta += core::f32::consts::PI * 2.0;
     }
 
     // 4. Add the start and end points of the arc to the subpath, and connect them with an arc.

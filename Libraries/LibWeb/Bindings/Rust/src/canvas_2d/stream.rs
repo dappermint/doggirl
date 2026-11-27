@@ -52,26 +52,39 @@ impl Batch {
 
 impl Canvas2DStream {
     pub(crate) fn append_command(&mut self, connection_serial: u64, canvas_id: CanvasId, record: &[u8]) {
+        self.append_command_with(connection_serial, canvas_id, |tape| tape.extend_from_slice(record));
+    }
+
+    pub(crate) fn append_command_with(
+        &mut self,
+        connection_serial: u64,
+        canvas_id: CanvasId,
+        write: impl FnOnce(&mut Vec<u8>),
+    ) {
         // A presented segment must keep its position in the stream, so recording after a present marker starts a new
         // segment for the same canvas.
         let segments = &mut self.pending.segments;
-        match segments.last_mut() {
+        let tape = match segments.last_mut() {
             Some(pending)
                 if pending.connection_serial == connection_serial
                     && pending.segment.canvas_id == canvas_id
                     && !pending.segment.present =>
             {
-                pending.segment.tape.extend_from_slice(record);
+                &mut pending.segment.tape
             }
-            _ => segments.push(PendingSegment {
-                connection_serial,
-                segment: Compositing_Canvas2DCommandStreamSegment {
-                    canvas_id,
-                    tape: record.to_vec(),
-                    present: false,
-                },
-            }),
-        }
+            _ => {
+                segments.push(PendingSegment {
+                    connection_serial,
+                    segment: Compositing_Canvas2DCommandStreamSegment {
+                        canvas_id,
+                        tape: Vec::with_capacity(512),
+                        present: false,
+                    },
+                });
+                &mut segments.last_mut().expect("segment was just pushed").segment.tape
+            }
+        };
+        write(tape);
         self.pending.command_count += 1;
     }
 
