@@ -483,6 +483,13 @@ fn finish_compile(
     }
 }
 
+/// Whether JIT compilation and exit recording share non-GC feedback and speculation hints across realms sharing an
+/// `ExecutableData`. Disabled for synchronous compiles, feedback dumps, random thresholds, and stress-exit runs so
+/// deterministic tests and diagnostics observe per-executable behaviour in isolation.
+pub(crate) fn uses_shared_jit_learning(options: &Options, sync: bool) -> bool {
+    !sync && !options.sync && !options.dump_feedback && !options.random_thresholds && options.stress_exits == 0
+}
+
 /// Compiles `executable`, whose frames run `function`, or top-level code without one, in the running frame:
 /// right away if `sync`, otherwise on a compile thread, whose code a later tier-up check installs.
 fn compile(
@@ -508,13 +515,14 @@ fn compile(
 
     // NB: Nothing may collect the cells the snapshot captured before something keeps them alive.
     let defer_gc = DeferGc::new(vm);
+    let use_shared_learning = uses_shared_jit_learning(&vm.jit.options, sync);
     let CapturedSnapshot {
         snapshot,
         bytecode_owners,
         cells,
         snapshot_executables,
         sample_slots,
-    } = capture_snapshot(vm, executable, function, realm, osr_pc, &defer_gc);
+    } = capture_snapshot(vm, executable, function, realm, osr_pc, use_shared_learning, &defer_gc);
     if sync {
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
         let result = super::compile_queue::compile(&snapshot);
