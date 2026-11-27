@@ -604,7 +604,7 @@ impl PrimitiveString {
     }
 
     #[inline]
-    fn resolved_utf16_string(&self) -> Option<&Utf16String> {
+    pub(crate) fn resolved_utf16_string(&self) -> Option<&Utf16String> {
         // SAFETY: The slot is only written while it is empty, so a string read out of it is never replaced.
         unsafe { (*self.utf16_string.0.get()).as_ref() }
     }

@@ -12,14 +12,18 @@
 use libjs_jit::snapshot::Intrinsic;
 use libjs_runtime_macros::{jit_abi, jit_function_address};
 
+use crate::bytecode::executable::PropertyLookupCacheEntryType;
 use crate::interpreter::vm::Vm;
+use crate::layout::object::IndexedStorageKind;
 use crate::layout::value::Value;
 use crate::runtime::array::Array;
 use crate::runtime::keyed_collections::canonicalize_keyed_collection_key;
 use crate::runtime::map::Map;
+use crate::runtime::object::ORDINARY_OBJECT_METHODS;
 use crate::runtime::object_constructor::object_assign_running_no_code;
 use crate::runtime::regexp_prototype::{regexp_builtin_exec_running_no_code, regexp_builtin_test_running_no_code};
 use crate::runtime::set::Set;
+use crate::runtime::shape::ShapeKey;
 use crate::runtime::string_prototype::{StringPrototype, trim_primitive_string};
 use crate::runtime::value::same_value;
 use crate::utf16::TrimMode;
@@ -50,6 +54,7 @@ pub fn address(intrinsic: Intrinsic) -> u64 {
         Intrinsic::ObjectIs => jit_function_address!(object_is),
         Intrinsic::ObjectKeys => jit_function_address!(object_keys),
         Intrinsic::ObjectAssign => jit_function_address!(object_assign),
+        Intrinsic::ReflectGet => jit_function_address!(reflect_get),
         Intrinsic::FunctionPrototypeApply
         | Intrinsic::FunctionPrototypeCall
         | Intrinsic::ArrayPrototypePush
@@ -304,4 +309,99 @@ extern "C" fn object_assign(vm: &Vm, _receiver: u64, target: u64, src1: u64, src
         Value::from_bits(src3),
     )
     .map_or(Value::EMPTY.0, |result| result.0)
+}
+
+/// `Reflect.get(target, key [, receiver])` for ordinary packed array indices and VM-cached non-accessor string
+/// lookups without running any JS code; declines with empty otherwise so the slow path runs with all arguments.
+#[jit_abi]
+extern "C" fn reflect_get(vm: &Vm, _this: u64, target: u64, key: u64) -> u64 {
+    let target = Value::from_bits(target);
+    if !target.is_object() {
+        return Value::EMPTY.0;
+    }
+    let target_object = target.as_object();
+    if !core::ptr::fn_addr_eq(target_object.methods().internal_get, ORDINARY_OBJECT_METHODS.internal_get) {
+        return Value::EMPTY.0;
+    }
+    let key = Value::from_bits(key);
+    if key.is_non_negative_int32() {
+        if !target_object.may_interfere_with_indexed_property_access()
+            && target_object.indexed_storage_kind() == IndexedStorageKind::Packed
+        {
+            let index = key.as_i32() as u32;
+            if index < target_object.indexed_packed_element_count() {
+                return target_object.indexed_element(index).0;
+            }
+        }
+        return Value::EMPTY.0;
+    }
+    if !key.is_string() || !target_object.is_cacheable_across_realms() {
+        return Value::EMPTY.0;
+    }
+    let is_array = target_object.is::<Array>();
+    if !is_array
+        && !core::ptr::fn_addr_eq(
+            target_object.methods().internal_get_own_property,
+            ORDINARY_OBJECT_METHODS.internal_get_own_property,
+        )
+    {
+        return Value::EMPTY.0;
+    }
+    let key_string = key.as_string();
+    let Some(resolved) = key_string.resolved_utf16_string() else {
+        return Value::EMPTY.0;
+    };
+    let name_identity = resolved.raw_identity();
+    if is_array && name_identity == vm.names.length.as_string().raw_identity() {
+        return Value::from_f64(f64::from(target_object.indexed_array_like_size())).0;
+    }
+    let shape = target_object.shape();
+    let Some((entry, _)) = vm
+        .keyed_property_lookup_cache()
+        .lookup_by_name_identity_with_getter(shape, name_identity)
+    else {
+        return Value::EMPTY.0;
+    };
+    if entry.shape_key() != Some(ShapeKey::of(shape)) {
+        return Value::EMPTY.0;
+    }
+    match entry.entry_type {
+        PropertyLookupCacheEntryType::GetOwnProperty => {
+            let value = target_object.get_direct(entry.property_offset);
+            if !value.is_accessor() {
+                return value.0;
+            }
+            if value.as_accessor().getter().is_none() {
+                return Value::UNDEFINED.0;
+            }
+            Value::EMPTY.0
+        }
+        PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
+            if !entry
+                .prototype_chain_validity
+                .is_some_and(|validity| validity.is_valid())
+            {
+                return Value::EMPTY.0;
+            }
+            let prototype = entry.prototype.expect("an inherited property has a holder");
+            let value = prototype.get_direct(entry.property_offset);
+            if !value.is_accessor() {
+                return value.0;
+            }
+            if value.as_accessor().getter().is_none() {
+                return Value::UNDEFINED.0;
+            }
+            Value::EMPTY.0
+        }
+        PropertyLookupCacheEntryType::GetMissingProperty
+            if target_object.is_cacheable_for_property_absence()
+                && (shape.prototype().is_none()
+                    || entry
+                        .prototype_chain_validity
+                        .is_some_and(|validity| validity.is_valid())) =>
+        {
+            Value::UNDEFINED.0
+        }
+        _ => Value::EMPTY.0,
+    }
 }

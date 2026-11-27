@@ -3108,6 +3108,8 @@ fn object_is_and_collection_helper_intrinsics_lower_and_verify() {
         (Intrinsic::MapPrototypeSet, 2),
         (Intrinsic::SetPrototypeHas, 1),
         (Intrinsic::SetPrototypeAdd, 1),
+        (Intrinsic::ReflectGet, 2),
+        (Intrinsic::ReflectGet, 3),
     ] {
         let ir = build_intrinsic_call(intrinsic, argc);
         assert!(ir.contains(&format!("CallIntrinsic {intrinsic:?}")), "{ir}");

@@ -328,6 +328,8 @@ void HTMLCollection::update_cache_if_needed() const
     m_cached_name_to_element_mappings = nullptr;
     if (m_sort) {
         GC::RootVector<GC::Ref<Element>> elements;
+        if (m_last_cached_size > 0)
+            elements.ensure_capacity(m_last_cached_size);
         collect_elements_into(elements);
         insertion_sort(elements, [this](auto const& a, auto const& b) {
             return (*this->m_sort)(*a, *b);
@@ -335,8 +337,11 @@ void HTMLCollection::update_cache_if_needed() const
         m_cached_elements = GC::WeakVector<Element> { elements };
     } else {
         m_cached_elements.clear_with_capacity();
+        if (m_last_cached_size > m_cached_elements.capacity())
+            m_cached_elements.ensure_capacity(m_last_cached_size);
         collect_elements_into_weak_vector(m_cached_elements);
     }
+    m_last_cached_size = static_cast<u32>(min<size_t>(m_cached_elements.size(), NumericLimits<u32>::max()));
 
     m_cached_document = document;
     m_cached_invalidation_version = invalidation_version;

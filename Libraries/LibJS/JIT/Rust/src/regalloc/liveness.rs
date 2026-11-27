@@ -30,6 +30,10 @@ use crate::tables::Run;
 const DEAD_OUTPUT: u8 = 1 << 0;
 /// A value that must have a stack slot that holds it from its definition on.
 const NEEDS_SPILL: u8 = 1 << 1;
+/// A node that is an allocated SSA value (`is_allocated_value`).
+const ALLOCATED_VALUE: u8 = 1 << 2;
+/// A node whose representation is `Repr::Float64`.
+const IS_FLOAT64: u8 = 1 << 3;
 
 /// In place of the frame state uses of a frame state: they are not listed yet.
 const NOT_LISTED: Run = Run::NOT_WRITTEN;
@@ -248,7 +252,7 @@ impl<'w> ValueLiveness<'w> {
             let start = self.frame_uses.len();
             self.frame_uses.reserve(own_values.len());
             for &(_, value) in own_values {
-                if is_allocated_value(graph, value) {
+                if self.flags[value.index()] & ALLOCATED_VALUE != 0 {
                     self.frame_uses.push(value);
                 }
             }
@@ -257,7 +261,7 @@ impl<'w> ValueLiveness<'w> {
         }
         let start = self.frame_uses.len();
         for (_, value) in graph.frame_state_values(frame, work) {
-            if is_allocated_value(graph, value) {
+            if self.flags[value.index()] & ALLOCATED_VALUE != 0 {
                 self.frame_uses.push(value);
             }
         }
@@ -294,10 +298,24 @@ impl<'w> ValueLiveness<'w> {
     fn fill(&mut self, graph: &Graph, work: &Zone) -> Result<(), CompileFailure> {
         let block_count = graph.blocks.len();
         let node_count = graph.nodes.len();
-        let has_virtual_objects = graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, Op::VirtualObject { .. }));
+        let mut has_virtual_objects = false;
+        for (node_index, node) in graph.nodes.iter().enumerate() {
+            match &node.op {
+                Op::VirtualObject { .. } => {
+                    has_virtual_objects = true;
+                }
+                Op::Constant(_) => {}
+                _ => {
+                    if let Some(repr) = node.repr {
+                        let mut flag = ALLOCATED_VALUE;
+                        if repr == crate::code::Repr::Float64 {
+                            flag |= IS_FLOAT64;
+                        }
+                        self.flags[node_index] = flag;
+                    }
+                }
+            }
+        }
 
         self.successors.begin();
         let mut position = 0;
@@ -321,7 +339,7 @@ impl<'w> ValueLiveness<'w> {
                 let node = graph.node(*node_id);
                 let position = self.positions[node_id.index()];
                 for input in &node.inputs {
-                    if is_allocated_value(graph, *input) {
+                    if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
                         self.use_pairs.push(pair(input.0, position));
                         self.use_counts[input.index()] += 1;
                         self.add_seed(*input, index, false)?;
@@ -357,7 +375,7 @@ impl<'w> ValueLiveness<'w> {
             for successor_index in 0..self.successors.get(index).len() {
                 let successor = self.successors.get(index)[successor_index];
                 for (_, input) in phi_inputs_from(graph, block_id, successor) {
-                    if is_allocated_value(graph, input) {
+                    if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
                         self.use_pairs.push(pair(input.0, end));
                         self.use_counts[input.index()] += 1;
                         self.add_seed(input, index, true)?;
@@ -466,7 +484,7 @@ impl<'w> ValueLiveness<'w> {
             let block_id = BlockId::from_index(index);
             let block_start = clobbers;
             let check_spill = |flags: &mut [u8], since: Clobbers, clobbers: Clobbers, value: usize| {
-                let is_float = graph.nodes[value].repr == Some(crate::code::Repr::Float64);
+                let is_float = flags[value] & IS_FLOAT64 != 0;
                 if clobbers.calls != since.calls || (is_float && clobbers.float_clobbers != since.float_clobbers) {
                     flags[value] |= NEEDS_SPILL;
                 }
@@ -497,7 +515,7 @@ impl<'w> ValueLiveness<'w> {
                         clobbers,
                         node_id.index(),
                     );
-                } else if is_allocated_value(graph, *node_id) {
+                } else if self.flags[node_id.index()] & ALLOCATED_VALUE != 0 {
                     self.flags[node_id.index()] |= DEAD_OUTPUT;
                 }
                 let (is_call, clobbers_floats) = match lowering_clobbers(node) {
@@ -510,9 +528,9 @@ impl<'w> ValueLiveness<'w> {
                     clobbers.float_clobbers += 1;
                     clobbers.calls += u32::from(is_call);
                     for value in &self.frame_uses[frame_uses.clone()] {
-                        let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
-                        if value != node_id && (is_call || is_float) {
-                            self.flags[value.index()] |= NEEDS_SPILL;
+                        let flag = &mut self.flags[value.index()];
+                        if value != node_id && (is_call || (*flag & IS_FLOAT64 != 0)) {
+                            *flag |= NEEDS_SPILL;
                         }
                     }
                     if !has_virtual_objects && let Some(frame) = node.frame_state {
@@ -522,9 +540,9 @@ impl<'w> ValueLiveness<'w> {
                                 break;
                             }
                             for value in &self.frame_uses[self.frame_runs[id.index()].range()] {
-                                let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
-                                if value != node_id && (is_call || is_float) {
-                                    self.flags[value.index()] |= NEEDS_SPILL;
+                                let flag = &mut self.flags[value.index()];
+                                if value != node_id && (is_call || (*flag & IS_FLOAT64 != 0)) {
+                                    *flag |= NEEDS_SPILL;
                                 }
                             }
                             parent = graph.frame_state(id).parent;
@@ -553,7 +571,7 @@ impl<'w> ValueLiveness<'w> {
                     }
                 };
                 for &input in &node.inputs {
-                    if is_allocated_value(graph, input) {
+                    if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
                         mark_use(input);
                     }
                 }

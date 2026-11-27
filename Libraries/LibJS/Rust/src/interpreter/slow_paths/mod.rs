@@ -545,7 +545,29 @@ impl RuntimeFunctions for Runtime {
         instruction: &op::GetByValue,
         values: &mut op::GetByValueValues,
     ) -> SlowPathControl {
-        if property_access::try_get_by_value_cache(vm, instruction, values) {
+        if values.base.is_object() {
+            let object = values.base.as_object();
+            if values.property.is_non_negative_int32() {
+                if let Some(result) = crate::embedding::host::host_object::try_get_indexed_value_hook_fast(
+                    &object,
+                    values.property.as_i32() as u32,
+                ) {
+                    return match result {
+                        Ok(value) => {
+                            values.dst = value;
+                            SlowPathControl::continue_at(pc + op::GetByValue::LENGTH)
+                        }
+                        Err(throw) => handle_asm_exception(vm, pc, throw.value()),
+                    };
+                }
+            } else if object.is_proxy_object() {
+                if let Some(control) = crate::jit::calls::get_by_value_proxy_from_jit(vm, pc, instruction, values) {
+                    return control;
+                }
+            } else if property_access::try_get_by_value_cache(vm, instruction, values) {
+                return SlowPathControl::continue_at(pc + op::GetByValue::LENGTH);
+            }
+        } else if property_access::try_get_by_value_cache(vm, instruction, values) {
             return SlowPathControl::continue_at(pc + op::GetByValue::LENGTH);
         }
         property_access::get_by_value(vm, pc, instruction, values, KeyedSiteCache::Use)

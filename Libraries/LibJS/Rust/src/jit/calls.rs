@@ -61,6 +61,9 @@ use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFun
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
+use crate::runtime::proxy_object::{
+    ProxyObject, get_proxy_trap_inline, limit_proxy_recursion_depth, verify_proxy_get_invariant,
+};
 use crate::runtime::shared_function_instance_data::{ConstructorKind, FunctionKind, ThisMode};
 use crate::runtime::value_conversions;
 
@@ -1622,6 +1625,136 @@ fn try_read_direct_getter_inline(getter: &DirectGetterFunction, receiver: Gc<Obj
     }
 }
 
+/// Runs an inlineable ECMAScript `"get"` trap of a non-revoked `ProxyObject` directly through the JIT call path,
+/// bypassing `ProxyObject::internal_get`'s generic native-to-JS call machinery.
+fn try_get_by_id_proxy_from_jit(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetById,
+    values: &mut op::GetByIdValues,
+    object: Gc<Object>,
+) -> Option<SlowPathControl> {
+    let proxy = cast_ref::<Object, ProxyObject>(&object);
+    if proxy.is_revoked() {
+        return None;
+    }
+    let handler = proxy.handler();
+    let Some(Some(trap)) = get_proxy_trap_inline(handler, &vm.names.get) else {
+        return None;
+    };
+    let function = as_ecmascript_function_object(trap)
+        .filter(|function| function.can_inline_call() && ecmascript_function_is_in_current_realm(vm, *function))?;
+    let _recursion_depth_updater = match limit_proxy_recursion_depth(vm) {
+        Ok(updater) => updater,
+        Err(throw) => return Some(handle_asm_exception(vm, pc, throw.value())),
+    };
+    if vm.did_reach_stack_space_limit() {
+        return Some(throw_call_stack_size_exceeded(vm, pc));
+    }
+    let target = proxy.target();
+    let receiver = values.base;
+    let key_value = {
+        let executable = vm.current_executable();
+        executable.get_property_key(&instruction.property).to_value(vm)
+    };
+    let frame = vm.running_execution_context().expect("a frame is running");
+    let dst_slot = instruction.dst.0 as usize;
+    let previous_dst = frame_of(frame).slots()[dst_slot].get();
+    let site = JitCallSite {
+        frame,
+        pc,
+        return_pc: pc + op::GetById::LENGTH,
+        dst: instruction.dst.0.into(),
+    };
+    let control = call_ecmascript_function_from_jit(
+        vm,
+        &site,
+        function,
+        Value::from_object(handler),
+        &[Value::from_object(target), key_value, receiver],
+    );
+    if control.continues_in_frame() {
+        let trap_result = frame_of(frame).slots()[dst_slot].get();
+        let executable = vm.current_executable();
+        let property_key = executable.get_property_key(&instruction.property);
+        match verify_proxy_get_invariant(vm, target, property_key, trap_result) {
+            Ok(result) => {
+                values.dst = result;
+            }
+            Err(throw) => {
+                frame_of(frame).slots()[dst_slot].set(previous_dst);
+                return Some(handle_asm_exception(vm, pc, throw.value()));
+            }
+        }
+    }
+    Some(control)
+}
+
+/// Fast path for `GetByValue` on a `ProxyObject` with a string or symbol key from JIT code.
+pub fn get_by_value_proxy_from_jit(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::GetByValue,
+    values: &mut op::GetByValueValues,
+) -> Option<SlowPathControl> {
+    let key_value = values.property;
+    if !key_value.is_string() && !key_value.is_symbol() {
+        return None;
+    }
+    let object = values.base.as_object();
+    let proxy = cast_ref::<Object, ProxyObject>(&object);
+    if proxy.is_revoked() {
+        return None;
+    }
+    let handler = proxy.handler();
+    let Some(Some(trap)) = get_proxy_trap_inline(handler, &vm.names.get) else {
+        return None;
+    };
+    let function = as_ecmascript_function_object(trap)
+        .filter(|function| function.can_inline_call() && ecmascript_function_is_in_current_realm(vm, *function))?;
+    let _recursion_depth_updater = match limit_proxy_recursion_depth(vm) {
+        Ok(updater) => updater,
+        Err(throw) => return Some(handle_asm_exception(vm, pc, throw.value())),
+    };
+    if vm.did_reach_stack_space_limit() {
+        return Some(throw_call_stack_size_exceeded(vm, pc));
+    }
+    let target = proxy.target();
+    let receiver = values.base;
+    let frame = vm.running_execution_context().expect("a frame is running");
+    let dst_slot = instruction.dst.0 as usize;
+    let previous_dst = frame_of(frame).slots()[dst_slot].get();
+    let site = JitCallSite {
+        frame,
+        pc,
+        return_pc: pc + op::GetByValue::LENGTH,
+        dst: instruction.dst.0.into(),
+    };
+    let control = call_ecmascript_function_from_jit(
+        vm,
+        &site,
+        function,
+        Value::from_object(handler),
+        &[Value::from_object(target), key_value, receiver],
+    );
+    if control.continues_in_frame() {
+        let trap_result = frame_of(frame).slots()[dst_slot].get();
+        let property_key = key_value
+            .to_property_key(vm)
+            .expect("ToPropertyKey on a string or symbol cannot throw");
+        match verify_proxy_get_invariant(vm, target, &property_key, trap_result) {
+            Ok(result) => {
+                values.dst = result;
+            }
+            Err(throw) => {
+                frame_of(frame).slots()[dst_slot].set(previous_dst);
+                return Some(handle_asm_exception(vm, pc, throw.value()));
+            }
+        }
+    }
+    Some(control)
+}
+
 /// The GetById slow path of JIT code, before the full one. Generic GetById nodes have no inline cache check, so this
 /// tries the property lookup cache first, like the interpreter's GetById does. Getters found there are called the way
 /// calls from JIT code call their callees. Returns nothing if the full slow path should run.
@@ -1635,6 +1768,9 @@ pub fn get_by_id_from_jit(
         return None;
     }
     let object = values.base.as_object();
+    if object.is_proxy_object() {
+        return try_get_by_id_proxy_from_jit(vm, pc, instruction, values, object);
+    }
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     let (value, direct_getter_validated) = match cached_property_slot_and_getter_validated(object, cache, 0) {
