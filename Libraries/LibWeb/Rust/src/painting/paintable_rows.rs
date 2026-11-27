@@ -275,21 +275,30 @@ pub(crate) struct PaintableRowStore {
 pub(crate) type VisualContextNodeHandleColumn =
     CowColumn<Option<Arc<BoxVisualContextNodeHandles>>, PAINTABLE_SLOTS_PER_CHUNK>;
 
-/// Sets a row's node handles, copying its chunk only when they change.
+/// Sets a row's node handles, copying its chunk only when they change and sharing one
+/// static empty `Arc` for boxes that own no visual context nodes.
 fn set_visual_context_node_handles(
     column: &mut VisualContextNodeHandleColumn,
     index: usize,
     handles: Option<BoxVisualContextNodeHandles>,
 ) {
+    static EMPTY_HANDLES_ARC: std::sync::LazyLock<Arc<BoxVisualContextNodeHandles>> =
+        std::sync::LazyLock::new(|| Arc::new(BoxVisualContextNodeHandles::default()));
+
     if column
         .get(index)
         .is_none_or(|current| current.as_deref() == handles.as_ref())
     {
         return;
     }
-    column
-        .set(index, handles.map(Arc::new))
-        .expect("the row is in the column");
+    let stored = handles.map(|handles| {
+        if handles.is_empty() {
+            Arc::clone(&EMPTY_HANDLES_ARC)
+        } else {
+            Arc::new(handles)
+        }
+    });
+    column.set(index, stored).expect("the row is in the column");
 }
 
 pub(crate) struct PaintableRows<Arena> {
@@ -946,14 +955,23 @@ impl LayoutNodeArena {
                 crate::painting::style_queries::z_index(self, id),
             )
         });
+        let index = id.slot_index() as usize;
         set_visual_context_node_handles(
             &mut self.paintable_rows.visual_context_node_handles,
-            id.slot_index() as usize,
+            index,
             Some(node_handles),
         );
-        self.paintable_rows
+        if self
+            .paintable_rows
             .visual_context_records
-            .set(id.slot_index() as usize, Some(Box::new(record)));
+            .get(index)
+            .and_then(|current| current.as_deref())
+            != Some(&record)
+        {
+            self.paintable_rows
+                .visual_context_records
+                .set(index, Some(Box::new(record)));
+        }
         if let Some(inputs) = inputs {
             if self.update_paint_order_inputs(id, inputs) {
                 self.note_paint_order_changed(id);

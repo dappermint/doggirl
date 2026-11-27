@@ -144,6 +144,23 @@ impl RecordedWindow {
             device_viewport_size.width as f32 + 2.0 * keep_ahead.width,
             device_viewport_size.height as f32 + 2.0 * keep_ahead.height,
         );
+        if self.rect.contains_rect(shown)
+            && spaces_place_alike(tree_of_recording, tree_now)
+            && tree_of_recording.visual_animations() == tree_now.visual_animations()
+            && tree_now
+                .spatial_nodes
+                .iter()
+                .enumerate()
+                .all(|(index, node)| match &node.data {
+                    SpatialData::Scroll(scroll) => {
+                        let node_index = SpatialNodeIndex(index as u32);
+                        live_scroll_offset(node_index, scroll) == self.placed_offset_of(node_index)
+                    }
+                    _ => true,
+                })
+        {
+            return true;
+        }
         let placed = self.placed_spaces(tree_of_recording);
         let live = PlacedSpaces::new(tree_now, live_scroll_offset);
         (0..tree_now.spatial_nodes.len()).all(|index| {
@@ -188,7 +205,7 @@ pub fn spaces_place_alike(first: &VisualContextTree, second: &VisualContextTree)
 /// The spaces of a tree, with its scrollers where a window was placed or where they are now.
 pub struct PlacedSpaces<'a> {
     tree: &'a VisualContextTree,
-    world: WorldTransforms,
+    world: Arc<WorldTransforms>,
     moves_without_a_recording: Vec<bool>,
 }
 
@@ -238,13 +255,17 @@ impl<'a> PlacedSpaces<'a> {
         }
         Self {
             tree,
-            world,
+            world: Arc::new(world),
             moves_without_a_recording,
         }
     }
 
     pub fn tree(&self) -> &'a VisualContextTree {
         self.tree
+    }
+
+    pub fn world(&self) -> &Arc<WorldTransforms> {
+        &self.world
     }
 
     /// Whether something above `node`, or `node` itself, moves what it holds without the document being recorded again.

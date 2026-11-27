@@ -341,7 +341,7 @@ pub(crate) fn pending_preparation(read: &BegunRead, host: &DocumentHost) -> Opti
     {
         return None;
     }
-    host.ask(read, |state| rendering_preparation_pending(state.arena_mut()))
+    host.ask_shallow(read, |state| rendering_preparation_pending(state.arena_mut()))
 }
 
 /// What the next preparation of a document's paint and hit testing properties owes, and what the ones before left for
@@ -360,6 +360,132 @@ fn committed_viewport(arena: &LayoutNodeArena) -> Option<NodeSlotId> {
     arena.paintable_row_is_populated(viewport).then_some(viewport)
 }
 
+enum FusedPaintPrepStep {
+    Done {
+        prep_outcome: Option<RenderingPreparationOutcome>,
+        vc_outcome: Option<(VisualContextUpdateOutcome, Option<std::time::Instant>)>,
+        refreshed: Option<(Option<Vec<FloatPoint>>, CompositorScrollRefreshOutcome)>,
+    },
+    PausedForClampedScrolls {
+        prep_outcome: RenderingPreparationOutcome,
+        clamped_scroll_offsets: Vec<(NodeSlotId, CssPixelPoint)>,
+        visual_contexts_need_update: bool,
+    },
+    PausedForSvgResources {
+        prep_outcome: Option<RenderingPreparationOutcome>,
+        requests: Vec<SvgPaintResourceRequest>,
+    },
+}
+
+fn finish_scroll_state_refresh(
+    main_thread: &MainThread,
+    host: &DocumentHost,
+    callbacks: &FfiPaintPreparationHostCallbacks,
+    refreshed: Option<(Option<Vec<FloatPoint>>, CompositorScrollRefreshOutcome)>,
+) {
+    let Some((device_offsets, outcome)) = refreshed else {
+        return;
+    };
+    if let Some(device_offsets) = device_offsets {
+        host.refresh_scroll_state(device_offsets);
+    }
+    if outcome.table_changed {
+        host.paint_preparation()
+            .visual_context_tree_needs_compositor_update
+            .set(true);
+    }
+    if outcome.requires_display_list_recording {
+        callbacks.require_display_list_recording(main_thread, true);
+    }
+}
+
+fn apply_prep_outcome(
+    main_thread: &MainThread,
+    host: &DocumentHost,
+    callbacks: &FfiPaintPreparationHostCallbacks,
+    outcome: &RenderingPreparationOutcome,
+) {
+    let notes = host.paint_preparation();
+    if outcome.visual_context_values_changed {
+        notes.visual_context_tree_needs_compositor_update.set(true);
+    }
+    if outcome.requires_display_list_recording {
+        callbacks.require_display_list_recording(main_thread, true);
+    }
+}
+
+fn apply_vc_outcome(
+    main_thread: &MainThread,
+    host: &DocumentHost,
+    callbacks: &FfiPaintPreparationHostCallbacks,
+    outcome: VisualContextUpdateOutcome,
+    started: Option<std::time::Instant>,
+    svg_paint_resources_changed: bool,
+) {
+    if let Some(started) = started {
+        eprintln!(
+            "AVC_UPDATE rust={} µs {}",
+            started.elapsed().as_micros(),
+            if outcome.performed_full_build {
+                "full"
+            } else {
+                "incremental"
+            }
+        );
+    }
+    let notes = host.paint_preparation();
+    if outcome.requires_display_list_recording || svg_paint_resources_changed {
+        callbacks.require_display_list_recording(main_thread, false);
+    }
+    if outcome.values_may_have_changed {
+        notes.visual_context_tree_needs_compositor_update.set(true);
+    }
+}
+
+fn resolve_svg_paint_resource_requests(
+    main_thread: &MainThread,
+    read: &BegunRead,
+    callbacks: &FfiPaintPreparationHostCallbacks,
+    requests: Vec<SvgPaintResourceRequest>,
+) -> Vec<ResolvedSvgPaintResource> {
+    requests
+        .into_iter()
+        .map(|request| match request {
+            SvgPaintResourceRequest::PaintServer { slot, kind } => {
+                let mut published = PublishedSvgPaintServer::None;
+                callbacks.resolve_svg_paint_server(
+                    main_thread,
+                    read,
+                    slot,
+                    kind == SvgPaintResourceKind::Stroke,
+                    &mut published,
+                );
+                ResolvedSvgPaintResource::PaintServer { slot, kind, published }
+            }
+            SvgPaintResourceRequest::Filter { slot, kind, urls } => {
+                let mut published = PublishedSvgFilter::default();
+                for url in &urls {
+                    let mut candidate = PublishedSvgFilter::default();
+                    let found =
+                        callbacks.resolve_svg_filter(main_thread, read, slot, url.pointer().cast(), &mut candidate);
+                    published = if found {
+                        candidate
+                    } else {
+                        PublishedSvgFilter {
+                            failed: true,
+                            ..Default::default()
+                        }
+                    };
+                    if published.failed {
+                        break;
+                    }
+                }
+                ResolvedSvgPaintResource::Filter { slot, kind, published }
+            }
+        })
+        .collect()
+}
+
 /// Brings the paint and hit testing properties of `host`'s document up to date with its render state in `read`: the
 /// scrollable overflow and root background, the visual contexts and the scroll state. Every entry that hands the host
 /// what they are prepared into calls this first, and it returns at once where nothing was written to the render state
@@ -375,34 +501,131 @@ pub(crate) fn prepare_paint_properties(main_thread: &MainThread, host: &Document
     // What the passes prepare stays current until something is written to the render state, from here on as well.
     host.note_paint_preparation_is_current();
 
-    settle_scrollable_overflow_and_root_background(main_thread, host, read, &callbacks);
-
-    if notes.visual_contexts_need_update.replace(false) {
-        update_visual_contexts(main_thread, host, read, &callbacks);
-    }
-
-    // Scroll nodes are (re)created by the visual context tree build above, so scroll offsets and the snapshot must be
-    // derived only after structure work is done.
     let viewport = callbacks.viewport(main_thread);
-    let refreshed = run(read, host, PassEffect::RewritesRows, |arena| {
-        committed_viewport(arena)?;
-        Some(refresh_scroll_state(
-            arena,
-            viewport.visual_context_tree_inputs.device_pixels_per_css_pixel,
-            viewport.device_viewport_size,
-        ))
+    let inputs = viewport.visual_context_tree_inputs;
+    let device_viewport_size = viewport.device_viewport_size;
+    let initial_vc_update = notes.visual_contexts_need_update.replace(false);
+    let check_pending_prep = !host
+        .known_arena_facts()
+        .is_some_and(|facts| !facts.rendering_preparation_pending);
+    let check_svg = host.svg_paint_resources_may_be_enrolled();
+
+    // Fuse overflow/root-background settling, visual context updates, and scroll-state refresh into
+    // a single render-owner turn on the common path where no scroll offsets clamp and no SVG paint
+    // resources require main-thread DOM resolution.
+    let step = run(read, host, PassEffect::RewritesRows, move |arena| {
+        let mut visual_contexts_need_update = initial_vc_update;
+        let mut prep_outcome = None;
+        if check_pending_prep && let Some(pending) = rendering_preparation_pending(arena) {
+            let prepared = pending.prepare(arena, (!visual_contexts_need_update).then_some(&inputs));
+            visual_contexts_need_update |= prepared.outcome.requires_visual_context_update;
+            if !prepared.clamped_scroll_offsets.is_empty() {
+                return FusedPaintPrepStep::PausedForClampedScrolls {
+                    prep_outcome: prepared.outcome,
+                    clamped_scroll_offsets: prepared.clamped_scroll_offsets,
+                    visual_contexts_need_update,
+                };
+            }
+            prep_outcome = Some(prepared.outcome);
+        }
+
+        let mut vc_outcome = None;
+        if visual_contexts_need_update {
+            if let Some(viewport_slot) = committed_viewport(arena) {
+                if check_svg && let Some(requests) = svg_paint_resource_requests(arena) {
+                    return FusedPaintPrepStep::PausedForSvgResources { prep_outcome, requests };
+                }
+                let started = painting_timing_enabled().then(std::time::Instant::now);
+                let outcome = update_accumulated_visual_contexts(arena, viewport_slot, inputs);
+                vc_outcome = Some((outcome, started));
+            }
+        }
+
+        let refreshed = committed_viewport(arena).map(|_| {
+            refresh_scroll_state(
+                arena,
+                inputs.device_pixels_per_css_pixel,
+                device_viewport_size,
+            )
+        });
+        FusedPaintPrepStep::Done {
+            prep_outcome,
+            vc_outcome,
+            refreshed,
+        }
     });
-    let Some((device_offsets, outcome)) = refreshed else {
-        return;
-    };
-    if let Some(device_offsets) = device_offsets {
-        host.refresh_scroll_state(device_offsets);
-    }
-    if outcome.table_changed {
-        notes.visual_context_tree_needs_compositor_update.set(true);
-    }
-    if outcome.requires_display_list_recording {
-        callbacks.require_display_list_recording(main_thread, true);
+
+    match step {
+        FusedPaintPrepStep::Done {
+            prep_outcome,
+            vc_outcome,
+            refreshed,
+        } => {
+            if let Some(outcome) = &prep_outcome {
+                apply_prep_outcome(main_thread, host, &callbacks, outcome);
+            }
+            if let Some((outcome, started)) = vc_outcome {
+                apply_vc_outcome(main_thread, host, &callbacks, outcome, started, false);
+            }
+            finish_scroll_state_refresh(main_thread, host, &callbacks, refreshed);
+        }
+        FusedPaintPrepStep::PausedForClampedScrolls {
+            prep_outcome,
+            clamped_scroll_offsets,
+            visual_contexts_need_update,
+        } => {
+            if let Some(geometry_host) = host.host_tables().geometry_host.get() {
+                for (slot, offset) in clamped_scroll_offsets {
+                    geometry_host.set_scroll_offset(main_thread, read, slot, offset.into());
+                }
+            }
+            apply_prep_outcome(main_thread, host, &callbacks, &prep_outcome);
+            if visual_contexts_need_update {
+                update_visual_contexts(main_thread, host, read, &callbacks);
+            }
+            let refreshed = run(read, host, PassEffect::RewritesRows, |arena| {
+                committed_viewport(arena)?;
+                Some(refresh_scroll_state(
+                    arena,
+                    inputs.device_pixels_per_css_pixel,
+                    device_viewport_size,
+                ))
+            });
+            finish_scroll_state_refresh(main_thread, host, &callbacks, refreshed);
+        }
+        FusedPaintPrepStep::PausedForSvgResources { prep_outcome, requests } => {
+            if let Some(outcome) = &prep_outcome {
+                apply_prep_outcome(main_thread, host, &callbacks, outcome);
+            }
+            let resolved = resolve_svg_paint_resource_requests(main_thread, read, &callbacks, requests);
+            let svg_paint_resources_changed = run(read, host, PassEffect::StalesPaintPreparation, |arena| {
+                publish_resolved_svg_paint_resources(arena, resolved)
+            });
+            let started = painting_timing_enabled().then(std::time::Instant::now);
+            let (vc_outcome, refreshed) = run(read, host, PassEffect::RewritesRows, |arena| {
+                let Some(viewport_slot) = committed_viewport(arena) else {
+                    return (None, None);
+                };
+                let outcome = update_accumulated_visual_contexts(arena, viewport_slot, inputs);
+                let refreshed = refresh_scroll_state(
+                    arena,
+                    inputs.device_pixels_per_css_pixel,
+                    device_viewport_size,
+                );
+                (Some(outcome), Some(refreshed))
+            });
+            if let Some(outcome) = vc_outcome {
+                apply_vc_outcome(
+                    main_thread,
+                    host,
+                    &callbacks,
+                    outcome,
+                    started,
+                    svg_paint_resources_changed,
+                );
+            }
+            finish_scroll_state_refresh(main_thread, host, &callbacks, refreshed);
+        }
     }
 }
 
@@ -438,12 +661,7 @@ fn settle_scrollable_overflow_and_root_background(
     if prepared.outcome.requires_visual_context_update {
         notes.visual_contexts_need_update.set(true);
     }
-    if prepared.outcome.visual_context_values_changed {
-        notes.visual_context_tree_needs_compositor_update.set(true);
-    }
-    if prepared.outcome.requires_display_list_recording {
-        callbacks.require_display_list_recording(main_thread, true);
-    }
+    apply_prep_outcome(main_thread, host, callbacks, &prepared.outcome);
 }
 
 /// Brings the visual context tree of `host`'s document up to date, with the SVG paint resources it is built from, where
@@ -454,8 +672,13 @@ fn update_visual_contexts(
     read: &BegunRead,
     callbacks: &FfiPaintPreparationHostCallbacks,
 ) {
-    let Some(svg_paint_resources_changed) = sync_svg_paint_resources(main_thread, host, read, callbacks) else {
-        return;
+    let svg_paint_resources_changed = if host.svg_paint_resources_may_be_enrolled() {
+        let Some(changed) = sync_svg_paint_resources(main_thread, host, read, callbacks) else {
+            return;
+        };
+        changed
+    } else {
+        false
     };
     let inputs = callbacks.viewport(main_thread).visual_context_tree_inputs;
     let started = painting_timing_enabled().then(std::time::Instant::now);
@@ -465,24 +688,14 @@ fn update_visual_contexts(
     let Some(outcome) = outcome else {
         return;
     };
-    if let Some(started) = started {
-        eprintln!(
-            "AVC_UPDATE rust={} µs {}",
-            started.elapsed().as_micros(),
-            if outcome.performed_full_build {
-                "full"
-            } else {
-                "incremental"
-            }
-        );
-    }
-    let notes = host.paint_preparation();
-    if outcome.requires_display_list_recording || svg_paint_resources_changed {
-        callbacks.require_display_list_recording(main_thread, false);
-    }
-    if outcome.values_may_have_changed {
-        notes.visual_context_tree_needs_compositor_update.set(true);
-    }
+    apply_vc_outcome(
+        main_thread,
+        host,
+        callbacks,
+        outcome,
+        started,
+        svg_paint_resources_changed,
+    );
 }
 
 fn painting_timing_enabled() -> bool {
@@ -508,42 +721,7 @@ fn sync_svg_paint_resources(
     let Some(requests) = requests else {
         return Some(false);
     };
-    let resolved = requests
-        .into_iter()
-        .map(|request| match request {
-            SvgPaintResourceRequest::PaintServer { slot, kind } => {
-                let mut published = PublishedSvgPaintServer::None;
-                callbacks.resolve_svg_paint_server(
-                    main_thread,
-                    read,
-                    slot,
-                    kind == SvgPaintResourceKind::Stroke,
-                    &mut published,
-                );
-                ResolvedSvgPaintResource::PaintServer { slot, kind, published }
-            }
-            SvgPaintResourceRequest::Filter { slot, kind, urls } => {
-                let mut published = PublishedSvgFilter::default();
-                for url in &urls {
-                    let mut candidate = PublishedSvgFilter::default();
-                    let found =
-                        callbacks.resolve_svg_filter(main_thread, read, slot, url.pointer().cast(), &mut candidate);
-                    published = if found {
-                        candidate
-                    } else {
-                        PublishedSvgFilter {
-                            failed: true,
-                            ..Default::default()
-                        }
-                    };
-                    if published.failed {
-                        break;
-                    }
-                }
-                ResolvedSvgPaintResource::Filter { slot, kind, published }
-            }
-        })
-        .collect();
+    let resolved = resolve_svg_paint_resource_requests(main_thread, read, callbacks, requests);
     Some(run(read, host, PassEffect::StalesPaintPreparation, |arena| {
         publish_resolved_svg_paint_resources(arena, resolved)
     }))

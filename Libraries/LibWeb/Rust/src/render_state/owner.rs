@@ -175,12 +175,56 @@ thread_local! {
     /// How many holds of the slot the calling thread is in, which a host callback of a job takes again.
     static HOLDS: Cell<u32> = const { Cell::new(0) };
     /// What the calling thread let go of while it held the slot, which it drops once it no longer holds it.
-    static DROPPED_AFTER_HOLD: RefCell<Vec<Box<dyn std::any::Any>>> = const { RefCell::new(Vec::new()) };
+    static DROPPED_AFTER_HOLD: RefCell<Vec<Box<dyn std::any::Any + Send>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops heavy owned render-state objects (`RenderFork`, `Lanes`, retired `RenderState`) on a
+/// dedicated background thread so the `Render` stage thread finishes its job immediately and does
+/// not block main-thread inline `on_render_side` execution.
+#[cfg(not(test))]
+fn offload_drop(dropped: Vec<Box<dyn std::any::Any + Send>>) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    static DROP_TX: std::sync::OnceLock<mpsc::Sender<Vec<Box<dyn std::any::Any + Send>>>> = std::sync::OnceLock::new();
+    let tx = DROP_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Vec<Box<dyn std::any::Any + Send>>>();
+        let _ = std::thread::Builder::new()
+            .name("RenderDrop".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                crate::stage_thread::run_thread_setup();
+                let mut release_pending = false;
+                loop {
+                    let received = if release_pending {
+                        rx.recv_timeout(Duration::from_secs(1))
+                    } else {
+                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    };
+                    match received {
+                        Ok(batch) => {
+                            drop(batch);
+                            release_pending = true;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            #[cfg(feature = "allocator")]
+                            ak::release_unused_allocator_memory();
+                            release_pending = false;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+        tx
+    });
+    if let Err(mpsc::SendError(batch)) = tx.send(dropped) {
+        drop(batch);
+    }
 }
 
 /// Drops `value`, which the calling thread let go of while it holds the slot, once its outermost hold ends: a value
 /// that takes long to drop, such as a fork of a whole render state, does not keep the threads waiting for the slot.
-pub(super) fn drop_after_hold(value: impl std::any::Any) {
+pub(super) fn drop_after_hold(value: impl std::any::Any + Send + 'static) {
     debug_assert!(is_held_here(), "only a thread holding the slot defers a drop past it");
     DROPPED_AFTER_HOLD.with_borrow_mut(|values| values.push(Box::new(value)));
 }
@@ -206,11 +250,17 @@ pub(super) fn hold<R>(job: impl FnOnce() -> R) -> R {
             SLOT.held.end();
             // NB: Taken out before dropping them, since a drop may hold the slot again.
             let dropped = DROPPED_AFTER_HOLD.take();
+            if dropped.is_empty() {
+                return;
+            }
             // A lane's drop resumes the panic of the recording it waits for, which a thread that is already unwinding
             // cannot survive: such a thread leaks what it let go of instead.
             if std::thread::panicking() {
                 std::mem::forget(dropped);
             } else {
+                #[cfg(not(test))]
+                offload_drop(dropped);
+                #[cfg(test)]
                 drop(dropped);
             }
         }
@@ -309,7 +359,8 @@ pub(super) fn retire(document: DocumentId) {
         if let Some(entry) = with_states(|states| states.remove(&document)) {
             let DocumentEntry { state, lanes, .. } = *entry;
             super::clock::retire_slot(lanes.into_inner());
-            state.into_inner().retire();
+            let retired = state.into_inner().prepare_retire();
+            drop_after_hold(retired);
         }
     });
 }

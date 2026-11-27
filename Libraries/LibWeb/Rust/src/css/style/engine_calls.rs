@@ -149,9 +149,9 @@ pub(crate) struct HostPublication {
 }
 
 impl HostPublication {
-    /// How many elements' links the publication wrote, each of which may deepen the tree by a level.
-    pub(crate) fn link_rows_written(&self) -> usize {
-        self.projection.link_rows_written()
+    /// Upper-bound tree depth contributions from this publication's link writes.
+    pub(crate) fn link_depth_bounds(&self) -> (u32, u32) {
+        self.projection.link_depth_bounds()
     }
 }
 
@@ -732,6 +732,15 @@ pub(crate) unsafe fn document_host<'a>(host: *const DocumentHost) -> &'a Documen
 /// for the call alone, so a host callback that reaches the engine again runs after it.
 pub(crate) fn with_engine<R>(read: &BegunRead, host: &DocumentHost, call: impl FnOnce(&mut StyleEngine) -> R) -> R {
     with_engine_and_arena(read, host, |engine, _| call(engine))
+}
+
+/// Like [`with_engine`], for O(1) non-recursive queries that do not walk the style tree.
+pub(crate) fn with_engine_shallow<R>(
+    read: &BegunRead,
+    host: &DocumentHost,
+    call: impl FnOnce(&mut StyleEngine) -> R,
+) -> R {
+    host.ask_shallow(read, |state| call(state.engine_mut()))
 }
 
 /// Like [`with_engine`], with the document's layout arena beside the engine, as of the same writes.
@@ -1329,7 +1338,7 @@ pub extern "C" fn style_engine_end_composition_settling(host: &DocumentHost, rea
 pub extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read: &BegunRead) -> bool {
     match host.known_engine_facts() {
         Some(facts) => facts.has_pending_style_update,
-        None => with_engine(read, host, |engine| engine.has_pending_transaction()),
+        None => with_engine_shallow(read, host, |engine| engine.has_pending_transaction()),
     }
 }
 
@@ -1352,7 +1361,7 @@ pub extern "C" fn style_engine_relational_arrival_keys(
     read: &BegunRead,
 ) -> FfiRelationalArrivalKeys {
     let (version, keys) = host.known_relational_arrival_keys().unwrap_or_else(|| {
-        with_engine(read, host, |engine| {
+        with_engine_shallow(read, host, |engine| {
             engine.resolve_relational_arrival_keys();
             (
                 engine.relational_arrival_keys_version(),
@@ -1384,7 +1393,7 @@ pub extern "C" fn style_engine_knows_engine_facts(host: &DocumentHost) -> bool {
 pub extern "C" fn style_engine_has_deferred_element_style_inputs(host: &DocumentHost, read: &BegunRead) -> bool {
     match host.known_engine_facts() {
         Some(facts) => facts.has_deferred_element_style_inputs,
-        None => with_engine(read, host, |engine| engine.has_deferred_element_style_inputs()),
+        None => with_engine_shallow(read, host, |engine| engine.has_deferred_element_style_inputs()),
     }
 }
 
@@ -1397,7 +1406,7 @@ pub(crate) fn has_deferred_element_style_input(host: &DocumentHost, read: &Begun
             return deferred.search(style_node).is_ok();
         }
     }
-    with_engine(read, host, |engine| engine.has_deferred_element_style_input(style_node))
+    with_engine_shallow(read, host, |engine| engine.has_deferred_element_style_input(style_node))
 }
 
 /// Whether a size container waits for layout to be evaluated, which the host knows without asking where it wrote
@@ -1409,7 +1418,7 @@ pub extern "C" fn style_engine_has_size_containers_needing_evaluation_after_layo
 ) -> bool {
     match host.known_engine_facts() {
         Some(facts) => facts.has_size_containers_needing_evaluation_after_layout,
-        None => with_engine(read, host, |engine| {
+        None => with_engine_shallow(read, host, |engine| {
             engine.has_size_containers_needing_evaluation_after_layout()
         }),
     }

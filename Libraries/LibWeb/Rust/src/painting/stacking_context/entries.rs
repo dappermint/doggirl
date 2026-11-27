@@ -120,21 +120,38 @@ impl LayoutNodeArena {
             return;
         };
         // Find the box's place in order-modified document order before writing the table.
+        // Boxes usually arrive in document order, so check the end of the sorted list in O(1) first.
         let nonzero_z_index_insertion = facts.nonzero_z_index_child_contribution().map(|z_index| {
-            let position = entries.child_contexts_with_nonzero_z_index.partition_point(|entry| {
-                entry
-                    .z_index
+            let list = &entries.child_contexts_with_nonzero_z_index;
+            let position = if list.last().is_none_or(|last| {
+                last.z_index
                     .cmp(&z_index)
-                    .then_with(|| self.compare_order_modified_document_order(entry.slot, slot))
+                    .then_with(|| self.compare_order_modified_document_order(last.slot, slot))
                     .is_lt()
-            });
+            }) {
+                list.len()
+            } else {
+                list.partition_point(|entry| {
+                    entry
+                        .z_index
+                        .cmp(&z_index)
+                        .then_with(|| self.compare_order_modified_document_order(entry.slot, slot))
+                        .is_lt()
+                })
+            };
             (position, z_index)
         });
         let stack_level_zero_position =
             (nonzero_z_index_insertion.is_none() && facts.contributes_to_stack_level_zero()).then(|| {
-                entries
-                    .stack_level_zero_boxes
-                    .partition_point(|entry| self.compare_order_modified_document_order(*entry, slot).is_lt())
+                let list = &entries.stack_level_zero_boxes;
+                if list
+                    .last()
+                    .is_none_or(|last| self.compare_order_modified_document_order(*last, slot).is_lt())
+                {
+                    list.len()
+                } else {
+                    list.partition_point(|entry| self.compare_order_modified_document_order(*entry, slot).is_lt())
+                }
             });
         let Some(mut table) = table_mut(&mut self.paintable_rows.stacking_context_entries, enclosing) else {
             return;

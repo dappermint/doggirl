@@ -394,6 +394,9 @@ pub(crate) enum LayoutWrite<'a> {
     PropagateRootStylesToViewport,
     /// Prepares every row of the subtree the row heads for leaving the layout tree.
     PrepareSubtreeForDetach { root: NodeSlotId },
+    /// Prepares every row of the subtree `root` heads for leaving the layout tree, detaches it
+    /// from its parent, and frees it in a single render-owner turn.
+    PrepareAndDropSubtree { root: NodeSlotId },
 }
 
 /// What a write answers: whether the subtree it dropped was attached, and what it owes the host.
@@ -460,6 +463,16 @@ impl LayoutWrite<'_> {
                 super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena, root);
                 false
             }
+            Self::PrepareAndDropSubtree { root } => {
+                if arena.slot_is_live(root) {
+                    super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena, root);
+                    let was_attached = arena.detach_from_parent(root);
+                    host_calls.free_subtree(arena, root);
+                    was_attached
+                } else {
+                    false
+                }
+            }
         };
         LayoutWritten {
             was_attached,
@@ -511,7 +524,7 @@ pub extern "C" fn render_state_detach_remaining_rows_for_removal(host: &Document
     if style_nodes.is_empty() {
         return;
     }
-    host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
+    host.queue_change(ArenaChange::DetachForRemoval(style_nodes.to_vec()));
 }
 
 /// Marks for layout every box whose text renders in one of the font cascades of `font_lists`, which loads filled faces

@@ -167,6 +167,14 @@ impl<'a> WindowSpaces<'a> {
         Self { window, spaces }
     }
 
+    pub(crate) fn unscrolled_world(&self) -> Option<&Arc<crate::painting::visual_context::WorldTransforms>> {
+        self.window
+            .scroll_offsets
+            .iter()
+            .all(|offset| offset.x == 0.0 && offset.y == 0.0)
+            .then(|| self.spaces.world())
+    }
+
     /// The rects of the bound in the space of the visual viewport, or none where one lies in a space that moves
     /// without a recording.
     fn rects_in_root(&self, bound: &InkBound) -> Option<SmallVec<[FloatRect; 2]>> {
