@@ -1163,13 +1163,14 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                         bool can_fast_insert = fast_kind == Element::TreeMutationFastPath::PlainHTML;
                         if (!can_fast_insert && doc_has_no_form_or_fieldset) {
                             if (fast_kind == Element::TreeMutationFastPath::Button) {
-                                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
-                                can_fast_insert = !button.form() && !button.has_form_associated_rare_data();
+                                // NB: `element.rare_data()` is already verified null above, and `HTMLElement::form_associated_rare_data()` returns `rare_data()`.
+                                ASSERT(!static_cast<HTML::HTMLButtonElement const&>(element).form()
+                                    && !static_cast<HTML::HTMLButtonElement const&>(element).has_form_associated_rare_data());
+                                can_fast_insert = true;
                             } else if (fast_kind == Element::TreeMutationFastPath::Input) {
                                 auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
-                                can_fast_insert = !input.form()
-                                    && !input.has_form_associated_rare_data()
-                                    && input.type_state() != HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                                ASSERT(!input.form() && !input.has_form_associated_rare_data());
+                                can_fast_insert = input.type_state() != HTML::HTMLInputElement::TypeAttributeState::RadioButton
                                     && !input.has_rare_input_data();
                             }
                         }
@@ -1255,7 +1256,7 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
 
     // NB: The marks are set before the post-connection steps, since those can run script that reads layout geometry
     //     and must find the inserted nodes waiting for their boxes.
-    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !may_have_layout_box();
+    auto is_boxless_style_element = (is_html_style_element() || (!is_html_element() && is_svg_style_element())) && !may_have_layout_box();
     if (is_connected() && !is_boxless_style_element) {
         // NB: Called during DOM insertion, layout is not up to date. The element's installed style is read.
         auto is_display_contents = [&] {
@@ -1628,11 +1629,34 @@ void Node::assign_slottables_after_removal(Node& parent, Node& parent_root, Read
     }
 }
 
-void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root)
+Node::RemovingStepsContext Node::make_removing_steps_context(Node& parent, Node& parent_root) const
 {
     auto& doc = document();
-    bool const doc_has_auto_dir = doc.has_element_with_auto_directionality();
-    Node const* focused_area = doc.focused_area().ptr();
+    return RemovingStepsContext {
+        .focused_area = doc.focused_area().ptr(),
+        .doc_has_auto_dir = doc.has_element_with_auto_directionality(),
+        .fast_plain_remove_base = !doc.has_inert_element()
+            && !doc.has_render_blocking_elements()
+            && !doc.fullscreen_element()
+            && !doc.has_anchor_names()
+            && !doc.page().accessibility_interested()
+            && doc.timeline_declarations_generation() == 0
+            && !parent_root.is_shadow_root(),
+        .doc_has_no_form_or_fieldset = !doc.has_form_or_fieldset_element() && !doc.has_form_element(),
+        .is_parent_connected = parent.is_connected(),
+    };
+}
+
+void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root)
+{
+    auto context = make_removing_steps_context(parent, parent_root);
+    run_removing_steps_with_context(parent, parent_root, was_tracked_by_style_engine, defer_subtree_root, context);
+}
+
+void Node::run_removing_steps_with_context(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root, RemovingStepsContext const& context)
+{
+    bool const doc_has_auto_dir = context.doc_has_auto_dir;
+    Node const* focused_area = context.focused_area;
     if (is_exclusive_text() && !doc_has_auto_dir && focused_area != this) {
         m_is_connected = false;
         m_in_editable_subtree = false;
@@ -1640,14 +1664,8 @@ void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_
     }
 
     bool subtree_root_deferred = defer_subtree_root && has_children();
-    bool const fast_plain_remove_base = !doc.has_inert_element()
-        && !doc.has_render_blocking_elements()
-        && !doc.fullscreen_element()
-        && !doc.has_anchor_names()
-        && !doc.page().accessibility_interested()
-        && doc.timeline_declarations_generation() == 0
-        && !parent_root.is_shadow_root();
-    bool const doc_has_no_form_or_fieldset = !doc.has_form_or_fieldset_element() && !doc.has_form_element();
+    bool const fast_plain_remove_base = context.fast_plain_remove_base;
+    bool const doc_has_no_form_or_fieldset = context.doc_has_no_form_or_fieldset;
 
     auto try_fast_remove_plain_html_element = [&](Element& element) -> bool {
         if (!fast_plain_remove_base || focused_area == &element)
@@ -1668,14 +1686,13 @@ void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_
             if (!doc_has_no_form_or_fieldset)
                 return false;
             if (fast_kind == Element::TreeMutationFastPath::Button) {
-                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
-                if (button.form() || button.has_form_associated_rare_data())
-                    return false;
+                // NB: `element.rare_data()` is already verified null above, and `HTMLElement::form_associated_rare_data()` returns `rare_data()`.
+                ASSERT(!static_cast<HTML::HTMLButtonElement const&>(element).form()
+                    && !static_cast<HTML::HTMLButtonElement const&>(element).has_form_associated_rare_data());
             } else if (fast_kind == Element::TreeMutationFastPath::Input) {
                 auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
-                if (input.form()
-                    || input.has_form_associated_rare_data()
-                    || input.type_state() == HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                ASSERT(!input.form() && !input.has_form_associated_rare_data());
+                if (input.type_state() == HTML::HTMLInputElement::TypeAttributeState::RadioButton
                     || input.has_rare_input_data()) {
                     return false;
                 }
@@ -1685,13 +1702,12 @@ void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_
             element.m_root = *this;
         element.m_is_connected = false;
         element.m_in_editable_subtree = false;
-        if (element.has_style())
-            element.clear_installed_style_for_disconnected_element();
+        element.clear_installed_style_for_disconnected_element();
         return true;
     };
 
     auto* root_element = as_if<DOM::Element>(*this);
-    bool const is_parent_connected = parent.is_connected();
+    bool const is_parent_connected = context.is_parent_connected;
     if (root_element && try_fast_remove_plain_html_element(*root_element)) {
         // Fast-removed root element cannot be custom or have a shadow root.
         if (!has_children())
@@ -3289,6 +3305,7 @@ void Node::remove_all_children(bool suppress_observers)
         begin_child_index_generation();
 
     SubtreeRemovalScope subtree_removal_scope { *this };
+    auto removing_steps_context = make_removing_steps_context(*this, parent_root);
 
     while (GC::Ptr<Node> child = first_child()) {
         if (tracks_keyboard_scroll)
@@ -3354,7 +3371,7 @@ void Node::remove_all_children(bool suppress_observers)
         // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with
         //     node, callback name "disconnectedCallback", and an empty argument list.
         // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-        child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine, defer_subtree_root);
+        child->run_removing_steps_with_context(*this, parent_root, was_tracked_by_style_engine, defer_subtree_root, removing_steps_context);
 
         // 15. Add transient registered observers given node and parent.
         if (has_subtree_mutation_observer)

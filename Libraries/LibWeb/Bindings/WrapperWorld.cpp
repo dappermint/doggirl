@@ -16,11 +16,11 @@ namespace Web::Bindings {
 
 GC_DEFINE_ALLOCATOR(WrapperWorld);
 
-static void verify_cache_entry(WrapperWorld const& world, Wrappable const& wrappable, JS::HostObject const& wrapper)
+static void verify_cache_entry([[maybe_unused]] WrapperWorld const& world, [[maybe_unused]] Wrappable const& wrappable, [[maybe_unused]] JS::HostObject const& wrapper)
 {
-    VERIFY(wrapper.shape().realm().host_defined());
-    VERIFY(&host_defined_wrapper_world(wrapper.shape().realm()) == &world);
-    VERIFY(wrappable_impl_from(&wrapper) == &wrappable);
+    ASSERT(wrapper.shape().realm().host_defined());
+    ASSERT(&host_defined_wrapper_world(wrapper.shape().realm()) == &world);
+    ASSERT(wrappable_impl_from(&wrapper) == &wrappable);
 }
 
 WrapperWorld::WrapperWorld(Type type)

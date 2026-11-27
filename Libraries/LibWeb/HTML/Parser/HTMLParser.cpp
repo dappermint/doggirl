@@ -2035,7 +2035,7 @@ private:
             HotAttributeTable table;
             auto set = [&](RustFfiHtmlFragmentAttributeKind kind, Utf16FlyString const& name) {
                 table[to_underlying(kind)] = {
-                    DOM::QualifiedName { name, {}, {} },
+                    DOM::QualifiedName::make_immortal(name, {}, {}),
                     DOM::Element::name_filter_bit(name),
                     DOM::Element::attribute_filter_bits(name),
                 };
@@ -2074,7 +2074,7 @@ private:
             auto& cache = *s_known_attribute_qualified_names;
             if (auto it = cache.find(raw); it != cache.end())
                 return it->value;
-            DOM::QualifiedName qualified_name { Utf16FlyString::from_raw(raw), {}, {} };
+            DOM::QualifiedName qualified_name = DOM::QualifiedName::make_immortal(Utf16FlyString::from_raw(raw), {}, {});
             cache.set(raw, qualified_name);
             return qualified_name;
         }

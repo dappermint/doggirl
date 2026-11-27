@@ -86,11 +86,11 @@ void GCAllocatedWrappable::visit_edges(GC::Cell::Visitor& visitor)
     }
 }
 
-GC::Ptr<JS::HostObject> Wrappable::cached_main_world_wrapper(WrapperWorld const& world) const
+GC::Ptr<JS::HostObject> Wrappable::cached_main_world_wrapper([[maybe_unused]] WrapperWorld const& world) const
 {
     // NB: set_cached_main_world_wrapper() verified that the wrapper belongs to the main world when it cached it, so a
     //     read only walks to the wrapper's realm again in debug builds.
-    VERIFY(world.is_main_world());
+    ASSERT(world.is_main_world());
     ASSERT(!m_main_world_wrapper || &host_defined_wrapper_world(m_main_world_wrapper->shape().realm()) == &world);
     return m_main_world_wrapper.ptr();
 }
@@ -102,11 +102,10 @@ GC::Ptr<JS::HostObject> Wrappable::cached_main_world_wrapper() const
 
 void Wrappable::set_cached_main_world_wrapper(JS::HostObject& wrapper)
 {
-    VERIFY(wrapper.shape().realm().host_defined());
-    auto& wrapper_world = host_defined_wrapper_world(wrapper.shape().realm());
-    VERIFY(wrapper_world.is_main_world());
+    ASSERT(wrapper.shape().realm().host_defined());
+    ASSERT(host_defined_wrapper_world(wrapper.shape().realm()).is_main_world());
     if (m_main_world_wrapper) {
-        VERIFY(&host_defined_wrapper_world(m_main_world_wrapper->shape().realm()) == &wrapper_world);
+        ASSERT(&host_defined_wrapper_world(m_main_world_wrapper->shape().realm()) == &host_defined_wrapper_world(wrapper.shape().realm()));
         VERIFY(m_main_world_wrapper.ptr().ptr() == &wrapper);
         return;
     }

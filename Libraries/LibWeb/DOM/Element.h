@@ -261,9 +261,30 @@ public:
     void append_attribute(Attr&);
     void append_attribute(QualifiedName, Utf16String value);
     void append_attribute_from_detached_parser(QualifiedName, Utf16String value, bool skip_observer_checks = false, Utf16FlyString const* preinterned_single_class = nullptr);
-    void append_single_class_attribute_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits, Utf16FlyString const& single_class, u64 single_class_filter_bit);
-    void append_attribute_without_callbacks_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits);
-    void append_id_attribute_from_detached_parser(QualifiedName const&, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits);
+    ALWAYS_INLINE void append_single_class_attribute_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits, Utf16FlyString const& single_class, u64 single_class_filter_bit)
+    {
+        ASSERT(!is_connected() && !parent() && !is_custom() && is_html_element());
+        m_subtree_name_filter |= name_filter_bit | single_class_filter_bit;
+        m_subtree_attribute_filter |= attribute_filter_bits;
+        (void)append_raw_attribute_fast(name, move(value));
+        m_classes.append(single_class);
+    }
+    ALWAYS_INLINE void append_attribute_without_callbacks_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits)
+    {
+        ASSERT(!is_connected() && !parent() && !is_custom() && is_html_element());
+        m_subtree_name_filter |= name_filter_bit;
+        m_subtree_attribute_filter |= attribute_filter_bits;
+        (void)append_raw_attribute_fast(name, move(value));
+    }
+    ALWAYS_INLINE void append_id_attribute_from_detached_parser(QualifiedName const& name, Utf16String value, u64 name_filter_bit, u32 attribute_filter_bits)
+    {
+        ASSERT(!is_connected() && !parent() && !is_custom() && is_html_element());
+        m_subtree_name_filter |= name_filter_bit;
+        m_subtree_attribute_filter |= attribute_filter_bits;
+        auto& attribute = append_raw_attribute_fast(name, move(value));
+        if (!attribute.value.is_empty())
+            m_id = Utf16FlyString { attribute.value };
+    }
     void ensure_attribute_capacity(size_t);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
@@ -480,7 +501,12 @@ public:
     [[nodiscard]] CSS::StyleRecordID style_record_identity(Optional<CSS::PseudoElement> pseudo_element = {}) const { return installed_style(pseudo_element).record(); }
     u64 animation_style_generation() const { return m_animation_style_generation; }
     u64 animation_subtree_style_generation() const { return m_animation_subtree_style_generation; }
-    [[nodiscard]] bool has_style(Optional<CSS::PseudoElement> pseudo_element = {}) const { return !!style_record_identity(pseudo_element); }
+    [[nodiscard]] bool has_style(Optional<CSS::PseudoElement> pseudo_element = {}) const
+    {
+        if (!pseudo_element.has_value())
+            return m_installed_style ? !!m_installed_style.record() : false;
+        return !!style_record_identity(pseudo_element);
+    }
     [[nodiscard]] CSS::ComputedValuesFFI::StyleRecordGroups const* style_record_groups(Optional<CSS::PseudoElement> pseudo_element = {}) const { return installed_style(pseudo_element).groups(); }
     template<typename StyleGroup>
     StyleGroup const* style_group(Optional<CSS::PseudoElement> pseudo_element = {}) const
@@ -1096,6 +1122,19 @@ private:
     Attribute& raw_attribute_at(size_t index) { return raw_attribute_span()[index]; }
     Attribute const& raw_attribute_at(size_t index) const { return raw_attribute_span()[index]; }
     Attribute& append_raw_attribute(QualifiedName, Utf16String value);
+    ALWAYS_INLINE Attribute& append_raw_attribute_fast(QualifiedName const& name, Utf16String&& value)
+    {
+        if (m_attribute_mode < inline_attribute_capacity) {
+            auto* slot = &inline_attributes()[m_attribute_mode++];
+            new (slot) Attribute { name, move(value) };
+            return *slot;
+        }
+        if (has_heap_attributes() && m_attribute_storage.heap->size() < m_attribute_storage.heap->capacity()) {
+            m_attribute_storage.heap->unchecked_append(name, move(value));
+            return m_attribute_storage.heap->last();
+        }
+        return append_raw_attribute(name, move(value));
+    }
     void remove_raw_attribute_at(size_t index);
 
     void append_to_attribute_list(QualifiedName, Utf16String value);
@@ -1218,7 +1257,11 @@ public:
     bool has_no_raw_attributes() const { return !has_raw_attributes(); }
     bool has_name_attribute() const { return m_has_name; }
     bool has_style_attribute_pending_work() const { return m_style_attribute_is_dirty || m_style_attribute_awaits_content_security_policy_check; }
-    void clear_installed_style_for_disconnected_element() { m_installed_style = {}; }
+    void clear_installed_style_for_disconnected_element()
+    {
+        if (m_installed_style)
+            m_installed_style = {};
+    }
 
 private:
     TreeMutationFastPath m_tree_mutation_fast_path : 2 { TreeMutationFastPath::None };
