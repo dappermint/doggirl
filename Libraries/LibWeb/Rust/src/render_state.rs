@@ -967,8 +967,9 @@ pub(crate) enum FrameJob {
 pub(crate) fn fly(host: &DocumentHost, job: FrameJob, _license: &crate::painting::recording_slot::FlightLicense) {
     let with_style = matches!(job, FrameJob::Style(_));
     let mut changes = host.take_queued_changes_for_flight(with_style);
-    // The round writes the rows the host has, which it copies rather than writes in place while the host holds them.
-    if !with_style {
+    // The round (or a queued change that writes paintable rows, such as DetachForRemoval) writes
+    // the rows the host has, which it copies rather than writes in place while the host holds them.
+    if !with_style || changes.iter().any(|change| change.row_write() != RowWrite::None) {
         host.let_go_of_rows();
     }
     #[cfg(not(test))]

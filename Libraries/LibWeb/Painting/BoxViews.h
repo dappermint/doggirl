@@ -122,6 +122,8 @@ WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvali
 
 WEB_API Vector<CSSPixelRect> client_rects(Layout::Node const&, Layout::RustFFI::FfiViewportMapping const&);
 WEB_API CSSPixelRect bounding_client_rect(Layout::Node const&, Layout::RustFFI::FfiViewportMapping const&);
+WEB_API Optional<Vector<CSSPixelRect>> try_direct_client_rects(Layout::Node const&, CSSPixelPoint viewport_scroll_offset, double device_pixels_per_css_pixel);
+WEB_API Optional<CSSPixelRect> try_direct_bounding_client_rect(Layout::Node const&, CSSPixelPoint viewport_scroll_offset, double device_pixels_per_css_pixel);
 WEB_API bool has_sticky_positioned_inclusive_ancestor(Layout::Node const&);
 WEB_API CSSPixelPoint accumulated_sticky_offset(Layout::Node const&);
 

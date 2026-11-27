@@ -75,6 +75,54 @@ pub extern "C" fn layout_script_bounding_client_rect(
 
 /// # Safety
 ///
+/// The callback must be sound to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_script_try_direct_client_rects(
+    host: &DocumentHost,
+    layout_node: NodeSlotId,
+    viewport_scroll_offset: FfiCssPixelPoint,
+    device_pixels_per_css_pixel: f32,
+    context: *mut c_void,
+    push_rect: unsafe extern "C" fn(*mut c_void, FfiCssPixelRect),
+) -> bool {
+    read_rows(host, |arena| {
+        crate::painting::client_rects::try_for_each_direct_client_rect(
+            arena,
+            layout_node,
+            viewport_scroll_offset.into(),
+            device_pixels_per_css_pixel,
+            |rect| {
+                // SAFETY: The consumer copies the plain-data rect synchronously.
+                unsafe { push_rect(context, rect.into()) };
+            },
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_try_direct_bounding_client_rect(
+    host: &DocumentHost,
+    layout_node: NodeSlotId,
+    viewport_scroll_offset: FfiCssPixelPoint,
+    device_pixels_per_css_pixel: f32,
+    out: &mut FfiCssPixelRect,
+) -> bool {
+    read_rows(host, |arena| {
+        let Some(rect) = crate::painting::client_rects::try_direct_bounding_client_rect(
+            arena,
+            layout_node,
+            viewport_scroll_offset.into(),
+            device_pixels_per_css_pixel,
+        ) else {
+            return false;
+        };
+        *out = rect.into();
+        true
+    })
+}
+
+/// # Safety
+///
 /// A supplied callback must be sound to call with `context`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_script_transform_subtree_is_clipped_outside(

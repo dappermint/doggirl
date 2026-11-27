@@ -2276,11 +2276,15 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
 
     if (has_flag(effects, CSS::MainEffects::SvgReferences)) {
         // The resources an SVG graphics element's `mask`, `clip-path`, `fill` and `stroke` name are published beside its
-        // attributes for the layout tree build to resolve, so they follow every record the element takes.
+        // attributes for the layout tree build to resolve, so they follow every record the element takes. Skip
+        // republishing when the element already had a style and none of its resource references changed.
         if (is<SVG::SVGGraphicsElement>(*this)) {
-            Layout::publish_svg_style_references(*this);
-            if (old_style && Layout::svg_style_references_differ(old_style, m_installed_style))
+            if (!old_style) {
+                Layout::publish_svg_style_references(*this);
+            } else if (Layout::svg_style_references_differ(old_style, m_installed_style)) {
+                Layout::publish_svg_style_references(*this);
                 set_needs_layout_tree_rebuild(read, SetNeedsLayoutTreeUpdateReason::SVGResourceReferenceChange, CSS::LayoutTreeRebuildRoot::Self);
+            }
         }
         if (auto* svg_element = as_if<SVG::SVGElement>(*this))
             svg_element->note_svg_paint_resource_description_may_have_changed();
@@ -2994,10 +2998,11 @@ bool Element::serializes_as_void() const
 }
 
 template<typename QueryResult>
-static QueryResult query_client_rects_after_layout_update(Element const& element, auto&& query)
+static QueryResult query_client_rects_after_layout_update(Element const& element, auto&& try_direct, auto&& query)
 {
     auto& document = element.document();
-    if (!document.navigable())
+    auto navigable = document.navigable();
+    if (!navigable)
         return QueryResult {};
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
@@ -3012,8 +3017,10 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
     if (!layout_node)
         return QueryResult {};
 
-    if (document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node))
-        return query(*layout_node, Layout::RustFFI::FfiViewportMapping {});
+    if (document.has_layout_box() && Layout::RustFFI::document_host_visual_contexts_need_update(layout_node->document_host())) {
+        if (auto direct = try_direct(*layout_node, navigable->viewport_scroll_offset(), document.page().client().device_pixels_per_css_pixel()); direct.has_value())
+            return direct.release_value();
+    }
     return query(*layout_node, Painting::viewport_mapping(document));
 }
 
@@ -3021,29 +3028,42 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
 CSSPixelRect Element::get_bounding_client_rect() const
 {
     // 1. Let list be the result of invoking getClientRects() on element.
-    return query_client_rects_after_layout_update<CSSPixelRect>(*this, [](Layout::Node const& layout_node, auto const& viewport_mapping) {
-        return Painting::bounding_client_rect(layout_node, viewport_mapping);
-    });
+    return query_client_rects_after_layout_update<CSSPixelRect>(
+        *this,
+        [](Layout::Node const& layout_node, CSSPixelPoint scroll_offset, double pixel_ratio) {
+            return Painting::try_direct_bounding_client_rect(layout_node, scroll_offset, pixel_ratio);
+        },
+        [](Layout::Node const& layout_node, auto const& viewport_mapping) {
+            return Painting::bounding_client_rect(layout_node, viewport_mapping);
+        });
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
 Vector<CSSPixelRect> Element::get_client_rects() const
 {
-    return query_client_rects_after_layout_update<Vector<CSSPixelRect>>(*this, [](Layout::Node const& layout_node, auto const& viewport_mapping) {
-        return Painting::client_rects(layout_node, viewport_mapping);
-    });
+    return query_client_rects_after_layout_update<Vector<CSSPixelRect>>(
+        *this,
+        [](Layout::Node const& layout_node, CSSPixelPoint scroll_offset, double pixel_ratio) {
+            return Painting::try_direct_client_rects(layout_node, scroll_offset, pixel_ratio);
+        },
+        [](Layout::Node const& layout_node, auto const& viewport_mapping) {
+            return Painting::client_rects(layout_node, viewport_mapping);
+        });
 }
 
 CSSPixelRect Element::bounding_client_rect_assuming_layout_clean() const
 {
     Layout::ForcedReadScope read { document() };
-    if (!document().navigable())
+    auto navigable = document().navigable();
+    if (!navigable)
         return {};
     auto const* layout_node = principal_layout_node(read);
     if (!layout_node)
         return {};
-    if (document().can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node))
-        return Painting::bounding_client_rect(*layout_node, Layout::RustFFI::FfiViewportMapping {});
+    if (document().has_layout_box() && Layout::RustFFI::document_host_visual_contexts_need_update(layout_node->document_host())) {
+        if (auto direct = Painting::try_direct_bounding_client_rect(*layout_node, navigable->viewport_scroll_offset(), document().page().client().device_pixels_per_css_pixel()); direct.has_value())
+            return direct.release_value();
+    }
     return Painting::bounding_client_rect(*layout_node, Painting::viewport_mapping(document()));
 }
 

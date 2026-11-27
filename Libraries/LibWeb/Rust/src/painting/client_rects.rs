@@ -4,16 +4,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::layout::inline_content::InlineBoxPieceRecord;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::node_painting;
+use crate::painting::paint_order;
 use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::with_inline_pieces;
 use crate::painting::style_queries;
 use crate::painting::viewport_mapping::{ViewportMapping, ViewportSpace};
+use libcompositing_rust::visual_context::world_transforms::{RectMapping, translation_on_whole_device_pixels};
+use libgfx_rust::{FloatMatrix4x4, FloatPoint, FloatRect, translation_matrix};
+use smallvec::SmallVec;
 
 pub(crate) fn can_compute_client_rects_without_visual_context_update(
     arena: &impl PaintRead,
@@ -415,4 +419,246 @@ pub(crate) fn bounding_client_rect(
     // 4. Otherwise, return a DOMRect object describing the smallest rectangle that includes all of the rectangles in
     //    list of which the height or width is not zero.
     union_of_rects_with_nonzero_width_and_height.unwrap_or(first_rect)
+}
+
+/// Computes the `LayoutViewport` transform matrix (in device pixels, matching
+/// `WorldTransforms::to_viewport_matrix(..., IncludeVisualViewportTransform::No)`)
+/// directly along `layout_node`'s paint-parent chain in O(depth), without building
+/// a full-document visual context tree. Returns `None` for cases that require the
+/// full visual context tree (sticky positioning, perspective, preserve-3d, offset-path,
+/// anchor scroll shifts, non-viewport scroll offsets, SVG foreignObject/resources,
+/// `BreakNode`, or active compositor visual animations).
+fn direct_layout_viewport_matrix(
+    arena: &impl PaintRead,
+    layout_node: NodeSlotId,
+    viewport_scroll_offset: CssPixelPoint,
+    device_pixels_per_css_pixel: f32,
+) -> Option<FloatMatrix4x4> {
+    if arena.node_kind_if_live(layout_node) == Some(NodeKind::BreakNode) {
+        return None;
+    }
+    if !arena.paintable_row_is_populated(layout_node) {
+        return Some(FloatMatrix4x4::identity());
+    }
+
+    let mut ancestors: SmallVec<[NodeSlotId; 32]> = SmallVec::new();
+    let mut cur = Some(layout_node);
+    while let Some(node) = cur {
+        ancestors.push(node);
+        cur = paint_order::paint_parent(arena, node);
+    }
+    if ancestors.last().and_then(|&root| arena.node_kind_if_live(root)) != Some(NodeKind::Viewport) {
+        return None;
+    }
+    if ancestors.len() == 1 {
+        return Some(FloatMatrix4x4::identity());
+    }
+
+    let scroll_device = FloatPoint {
+        x: -viewport_scroll_offset.x.to_float() * device_pixels_per_css_pixel,
+        y: -viewport_scroll_offset.y.to_float() * device_pixels_per_css_pixel,
+    };
+    let snapped = translation_on_whole_device_pixels(scroll_device, None);
+    let scrolled_matrix = if snapped.x == 0.0 && snapped.y == 0.0 {
+        FloatMatrix4x4::identity()
+    } else {
+        translation_matrix(snapped.x, snapped.y, 0.0)
+    };
+
+    let mut normal = scrolled_matrix;
+    let mut abspos = scrolled_matrix;
+    let mut fixed = FloatMatrix4x4::identity();
+    let pixel_ratio_f64 = f64::from(device_pixels_per_css_pixel);
+
+    let unsupported_flags = NodeFlag::CompensatesForHorizontalScroll as u32
+        | NodeFlag::CompensatesForVerticalScroll as u32
+        | NodeFlag::HasPreserve3dTransformStyle as u32;
+
+    for &node in ancestors[..ancestors.len() - 1].iter().rev() {
+        let row = arena.node(node)?;
+        let (kind, flags) = (row.kind(), row.flags());
+        if kind == NodeKind::SVGForeignObjectBox
+            || node_facts::kind_is_svg_resource_box(kind)
+            || flags & unsupported_flags != 0
+            || row.compositor_animation_frame_kinds() != 0
+        {
+            return None;
+        }
+        if node != layout_node && flags & NodeFlag::HasScrollOffset as u32 != 0 {
+            return None;
+        }
+        let style = row.style();
+        if let Some(style) = style
+            && (style.transform().has_perspective
+                || style.transform().has_offset_path
+                || style_queries::is_sticky_position(style))
+        {
+            return None;
+        }
+
+        let position = style_queries::position(arena, node);
+        let mut own = if position == crate::css::css_enums::positioning::FIXED {
+            fixed
+        } else if position == crate::css::css_enums::positioning::ABSOLUTE {
+            abspos
+        } else {
+            normal
+        };
+
+        if let Some(style) = style {
+            let transform_values = style.transform();
+            let may_have_transform = transform_values.resolved_transforms.length != 0
+                || style_queries::kind_is_svg_element_box(kind)
+                || style_queries::will_change_promotes_transform_node(style);
+            if may_have_transform
+                && let Some((transform_data, _)) =
+                    crate::painting::visual_context::node_values::compute_transform(arena, node, pixel_ratio_f64)
+            {
+                // With no preserve-3d or perspective on this chain, every transform node flattens its inherited
+                // transform, matching `box_build::build_box_visual_context_nodes`.
+                own = own.flattened().multiplied(transform_data.matrix_including_origin());
+            }
+        }
+
+        if node == layout_node {
+            return Some(own);
+        }
+
+        let for_positioned = own;
+        let mut for_descendants = own;
+        if let Some(svg_viewport_transform) =
+            crate::painting::visual_context::build::svg_viewport_transform_of(arena, node)
+        {
+            let viewport_transform_data = crate::painting::visual_context::build::compute_svg_viewport_transform_data(
+                arena,
+                node,
+                svg_viewport_transform,
+                pixel_ratio_f64,
+            );
+            for_descendants = for_descendants
+                .flattened()
+                .multiplied(viewport_transform_data.matrix_including_origin());
+        }
+        normal = for_descendants;
+        let (establishes_absolute, establishes_fixed) =
+            style_queries::establishes_positioning_containing_blocks(arena, node);
+        if establishes_absolute {
+            abspos = for_positioned;
+        }
+        if establishes_fixed {
+            fixed = for_positioned;
+        }
+    }
+    None
+}
+
+fn map_css_rect_with_direct_matrix(
+    rect: CssPixelRect,
+    is_identity: bool,
+    rect_mapping: RectMapping,
+    pixel_ratio: f32,
+    inverse_pixel_ratio: f32,
+) -> CssPixelRect {
+    if is_identity {
+        return rect;
+    }
+    let device_rect = FloatRect {
+        x: rect.x.to_float() * pixel_ratio,
+        y: rect.y.to_float() * pixel_ratio,
+        width: rect.width.to_float() * pixel_ratio,
+        height: rect.height.to_float() * pixel_ratio,
+    };
+    let mapped = rect_mapping.map_rect(device_rect);
+    CssPixelRect {
+        x: CssPixels::nearest_value_for_f32(mapped.x * inverse_pixel_ratio),
+        y: CssPixels::nearest_value_for_f32(mapped.y * inverse_pixel_ratio),
+        width: CssPixels::nearest_value_for_f32(mapped.width * inverse_pixel_ratio),
+        height: CssPixels::nearest_value_for_f32(mapped.height * inverse_pixel_ratio),
+    }
+}
+
+pub(crate) fn try_for_each_direct_client_rect(
+    arena: &impl PaintRead,
+    layout_node: NodeSlotId,
+    viewport_scroll_offset: CssPixelPoint,
+    device_pixels_per_css_pixel: f32,
+    mut push_rect: impl FnMut(CssPixelRect),
+) -> bool {
+    let Some(matrix) = direct_layout_viewport_matrix(
+        arena,
+        layout_node,
+        viewport_scroll_offset,
+        device_pixels_per_css_pixel,
+    ) else {
+        return false;
+    };
+    if !arena.paintable_row_is_populated(layout_node) {
+        return true;
+    }
+    let is_identity = matrix == FloatMatrix4x4::identity();
+    let rect_mapping = RectMapping::new(matrix);
+    let inverse_pixel_ratio = 1.0 / device_pixels_per_css_pixel;
+    let mut push_mapped = |rect: CssPixelRect| {
+        push_rect(map_css_rect_with_direct_matrix(
+            rect,
+            is_identity,
+            rect_mapping,
+            device_pixels_per_css_pixel,
+            inverse_pixel_ratio,
+        ));
+    };
+
+    if node_painting::is_fragmented_inline(arena, layout_node) {
+        let mut pushed_a_piece_rect = false;
+        for_each_inline_fragment_border_box_rect(arena, layout_node, |piece_border_box_rect| {
+            pushed_a_piece_rect = true;
+            push_mapped(piece_border_box_rect);
+        });
+        if !pushed_a_piece_rect {
+            push_mapped(paintable_geometry::absolute_border_box_rect(arena, layout_node));
+        }
+        return true;
+    }
+
+    for index in 0..paintable_geometry::fragment_count(arena, layout_node) {
+        push_mapped(paintable_geometry::absolute_fragment_border_box_rect(
+            arena,
+            layout_node,
+            index,
+        ));
+    }
+    true
+}
+
+pub(crate) fn try_direct_bounding_client_rect(
+    arena: &impl PaintRead,
+    layout_node: NodeSlotId,
+    viewport_scroll_offset: CssPixelPoint,
+    device_pixels_per_css_pixel: f32,
+) -> Option<CssPixelRect> {
+    let zero = CssPixels::from_integer(0);
+    let mut first_rect = None;
+    let mut union_of_rects_with_nonzero_width_and_height: Option<CssPixelRect> = None;
+    if !try_for_each_direct_client_rect(
+        arena,
+        layout_node,
+        viewport_scroll_offset,
+        device_pixels_per_css_pixel,
+        |rect| {
+            first_rect.get_or_insert(rect);
+            if rect.width == zero || rect.height == zero {
+                return;
+            }
+            match &mut union_of_rects_with_nonzero_width_and_height {
+                None => union_of_rects_with_nonzero_width_and_height = Some(rect),
+                Some(union) => union.unite(rect),
+            }
+        },
+    ) {
+        return None;
+    }
+    let Some(first_rect) = first_rect else {
+        return Some(CssPixelRect::default());
+    };
+    Some(union_of_rects_with_nonzero_width_and_height.unwrap_or(first_rect))
 }
