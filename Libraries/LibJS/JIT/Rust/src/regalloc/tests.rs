@@ -1341,3 +1341,47 @@ fn cold_block_calls_do_not_claim_callee_saved_registers() {
         other => panic!("expected caller-saved register output, got {other:?}"),
     }
 }
+
+#[test]
+fn loop_carried_value_evicted_inside_loop_reloads_on_back_edge() {
+    // A computed value carried through a loop (never used inside the loop body) starts in a register without an
+    // initial spill slot, then gets evicted inside the loop body under register pressure. The back edge must still
+    // reload it to match the loop header's entry register map.
+    let program = assemble(|label| {
+        vec![
+            Instruction::Enter,
+            Instruction::Add {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: c(1),
+            },
+            Instruction::Mov { dst: l(0), src: c(0) },
+            Instruction::JumpLessThan {
+                arith_feedback: 1,
+                lhs: l(0),
+                rhs: a(0),
+                true_target: label(4),
+                false_target: label(11),
+            },
+            // High register pressure inside the loop body to evict `r(5)`.
+            Instruction::Add { arith_feedback: 2, dst: r(6), lhs: l(0), rhs: c(1) },
+            Instruction::Add { arith_feedback: 3, dst: r(7), lhs: r(6), rhs: c(1) },
+            Instruction::Add { arith_feedback: 4, dst: l(1), lhs: r(7), rhs: c(1) },
+            Instruction::Add { arith_feedback: 5, dst: r(6), lhs: r(6), rhs: r(7) },
+            Instruction::Add { arith_feedback: 6, dst: r(7), lhs: r(6), rhs: l(1) },
+            Instruction::Add { arith_feedback: 7, dst: l(0), lhs: l(0), rhs: r(7) },
+            Instruction::Jump { target: label(3) },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::INT32; 8]);
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let mut registers = RegisterSet::test_configuration();
+    registers.allocatable_gprs = RegisterMask(0b0000_1111);
+    let allocation = allocate_with(&graph, &registers);
+    if let Err(errors) = verify(&graph, &registers, &allocation, crate::test_zone()) {
+        panic!("{errors}\n{}", dump_allocation(&graph, &allocation));
+    }
+}

@@ -1481,6 +1481,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             self.branch_unless_prototype_chain_valid(shape, slow);
             self.masm
                 .load64(object, &Address::new(entry, layout.keyed_lookup_cache_prototype as i32));
+            self.masm.branch_test64(Condition::Zero, object, u64::MAX, slow);
             self.masm.bind(vm_own);
             self.masm.load32(
                 scratch,
