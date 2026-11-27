@@ -86,11 +86,14 @@ private:
     bool would_create_circular_reference_impl(Element const& target, GC::HeapHashTable<GC::Ref<Element const>>& visited) const;
     void register_for_referenced_element_changes();
     void unregister_for_referenced_element_changes();
+    void set_href(Optional<URL::URL>);
 
     bool m_needs_parsing_complete_reclone { false };
     bool m_reclone_pending { false };
+    bool m_registered_in_fragment_id_map { false };
 
     Optional<URL::URL> m_href;
+    Optional<Utf16FlyString> m_cached_fragment_id;
 
     GC::Ptr<DOM::DocumentObserver> m_document_observer;
     GC::Ptr<SVGResourceDocument> m_resource_document;

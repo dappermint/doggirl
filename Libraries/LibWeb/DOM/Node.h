@@ -746,7 +746,7 @@ private:
     void update_layout_tree_for_removal(Node& parent);
     GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
-    void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
+    void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root = false);
     void add_transient_registered_observers(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 
@@ -755,13 +755,13 @@ private:
     void live_range_pre_remove();
     void live_range_pre_remove_all_children();
 
-    void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
+    void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child, bool defer_subtree_root = false);
     void adjust_live_ranges_for_insertion(Node& child, size_t count);
-    void insert_node_into_children(GC::Ref<Node>, GC::Ptr<Node> child);
+    void insert_node_into_children(GC::Ref<Node>, GC::Ptr<Node> child, bool defer_subtree_root = false);
     void insert_nodes_before(ReadonlySpan<GC::Ref<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
-    void append_child_impl(GC::Ref<Node>);
+    void append_child_impl(GC::Ref<Node>, bool defer_subtree_root = false);
     void remove_child_impl(GC::Ref<Node>);
-    void remove_child_for_remove_all_impl(GC::Ref<Node>);
+    void remove_child_for_remove_all_impl(GC::Ref<Node>, bool defer_subtree_root = false);
     void begin_child_index_generation();
     void set_root_for_subtree(Node&);
 

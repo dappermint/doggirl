@@ -335,6 +335,7 @@ public:
     virtual bool uses_button_layout() const override;
     virtual bool is_devolvable_widget() const override;
     bool is_allowed_to_be_readonly() const;
+    bool has_rare_input_data() const { return static_cast<bool>(m_rare_input_data); }
 
 private:
     HTMLInputElement(DOM::Document&, DOM::QualifiedName);

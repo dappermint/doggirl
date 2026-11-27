@@ -1896,41 +1896,75 @@ private:
                 Optional<size_t> detached_input_value_attr_index;
                 for (auto const& attribute : attributes.slice(operation.start, operation.length)) {
                     auto const hot_kind = attribute.hot_kind;
+                    if (skip_observer_checks) {
+                        if (is_input && hot_kind == RustFfiHtmlFragmentAttributeKind::Type) {
+                            if (attribute.input_type == RustFfiHtmlFragmentInputType::Checkbox) {
+                                static NeverDestroyed<Utf16String> s_checkbox = "checkbox"_utf16;
+                                auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Type)];
+                                element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, *s_checkbox, hot.name_filter_bit, hot.attribute_filter_bits);
+                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
+                                continue;
+                            }
+                            if (attribute.input_type == RustFfiHtmlFragmentInputType::Text) {
+                                static NeverDestroyed<Utf16String> s_text = "text"_utf16;
+                                auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Type)];
+                                element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, *s_text, hot.name_filter_bit, hot.attribute_filter_bits);
+                                as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
+                                continue;
+                            }
+                        } else if (is_input && hot_kind == RustFfiHtmlFragmentAttributeKind::Checked && attribute.value_length == 0) {
+                            auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Checked)];
+                            element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, Utf16String {}, hot.name_filter_bit, hot.attribute_filter_bits);
+                            as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
+                            continue;
+                        } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Class && attribute.value_length == 0) {
+                            auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Class)];
+                            element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, Utf16String {}, hot.name_filter_bit, hot.attribute_filter_bits);
+                            continue;
+                        }
+                    }
                     bool const is_class = hot_kind == RustFfiHtmlFragmentAttributeKind::Class;
                     Utf16FlyString const* preinterned_single_class = nullptr;
                     u64 single_class_filter_bit = 0;
-                    auto value_code_units = input_span.slice(attribute.value_start, attribute.value_length);
-                    auto value = attribute.value_is_ascii
-                        ? cached_ascii_attribute_value(caches.attribute_values, value_code_units, is_class, preinterned_single_class, single_class_filter_bit)
-                        : utf16_string_from_span(value_code_units, IsKnownToBeASCII::No);
+                    Utf16String value;
+                    if (attribute.value_length != 0) {
+                        auto value_code_units = input_span.slice(attribute.value_start, attribute.value_length);
+                        value = attribute.value_is_ascii
+                            ? cached_ascii_attribute_value(caches.attribute_values, value_code_units, is_class, preinterned_single_class, single_class_filter_bit)
+                            : utf16_string_from_span(value_code_units, IsKnownToBeASCII::No);
+                    }
                     if (skip_observer_checks) {
                         if (is_class && preinterned_single_class) {
-                            element->append_single_class_attribute_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value), *preinterned_single_class, single_class_filter_bit);
+                            auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Class)];
+                            element->append_single_class_attribute_from_detached_parser(*hot.qualified_name, move(value), hot.name_filter_bit, hot.attribute_filter_bits, *preinterned_single_class, single_class_filter_bit);
                             continue;
                         }
-                        if (hot_kind == RustFfiHtmlFragmentAttributeKind::DataId || hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData) {
-                            element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
+                        if (hot_kind == RustFfiHtmlFragmentAttributeKind::DataId) {
+                            auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::DataId)];
+                            element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, move(value), hot.name_filter_bit, hot.attribute_filter_bits);
+                            continue;
+                        }
+                        if (hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData) {
+                            auto const& name_entry = cached_custom_attribute_name_entry(input_span.slice(attribute.name_start, attribute.name_length));
+                            element->append_attribute_without_callbacks_from_detached_parser(*name_entry.qualified_name, move(value), name_entry.name_filter_bit, name_entry.attribute_filter_bits);
+                            continue;
+                        }
+                        if (hot_kind == RustFfiHtmlFragmentAttributeKind::Id) {
+                            // NB: None of the 28 tags accepted by fragment.rs is <datalist>, <map>, or <track>.
+                            auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Id)];
+                            element->append_id_attribute_from_detached_parser(*hot.qualified_name, move(value), hot.name_filter_bit, hot.attribute_filter_bits);
                             continue;
                         }
                         if (is_input) {
-                            if (hot_kind == RustFfiHtmlFragmentAttributeKind::Type) {
-                                if (attribute.input_type == RustFfiHtmlFragmentInputType::Checkbox) {
-                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
-                                    as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Checkbox);
-                                    continue;
-                                }
-                                if (attribute.input_type == RustFfiHtmlFragmentInputType::Text) {
-                                    element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
-                                    as<HTMLInputElement>(*element).set_type_state_from_detached_fragment(HTMLInputElement::TypeAttributeState::Text);
-                                    continue;
-                                }
-                            } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Checked) {
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
+                            if (hot_kind == RustFfiHtmlFragmentAttributeKind::Checked) {
+                                auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Checked)];
+                                element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, move(value), hot.name_filter_bit, hot.attribute_filter_bits);
                                 as<HTMLInputElement>(*element).set_checked_from_detached_fragment(true);
                                 continue;
                             } else if (hot_kind == RustFfiHtmlFragmentAttributeKind::Value) {
+                                auto const& hot = hot_attr_names[to_underlying(RustFfiHtmlFragmentAttributeKind::Value)];
                                 detached_input_value_attr_index = element->attribute_list_size();
-                                element->append_attribute_without_callbacks_from_detached_parser(attribute_qualified_name(hot_attr_names, input_span, attribute), move(value));
+                                element->append_attribute_without_callbacks_from_detached_parser(*hot.qualified_name, move(value), hot.name_filter_bit, hot.attribute_filter_bits);
                                 continue;
                             }
                         }
@@ -1986,15 +2020,25 @@ private:
     {
     }
 
+    struct HotAttributeEntry {
+        Optional<DOM::QualifiedName> qualified_name;
+        u64 name_filter_bit { 0 };
+        u32 attribute_filter_bits { 0 };
+    };
+
     static constexpr size_t hot_attribute_table_size = to_underlying(RustFfiHtmlFragmentAttributeKind::DataId) + 1;
-    using HotAttributeTable = Array<Optional<DOM::QualifiedName>, hot_attribute_table_size>;
+    using HotAttributeTable = Array<HotAttributeEntry, hot_attribute_table_size>;
 
     static HotAttributeTable const& hot_attribute_qualified_names()
     {
         static NeverDestroyed<HotAttributeTable> s_table = [] {
             HotAttributeTable table;
             auto set = [&](RustFfiHtmlFragmentAttributeKind kind, Utf16FlyString const& name) {
-                table[to_underlying(kind)] = DOM::QualifiedName { name, {}, {} };
+                table[to_underlying(kind)] = {
+                    DOM::QualifiedName { name, {}, {} },
+                    DOM::Element::name_filter_bit(name),
+                    DOM::Element::attribute_filter_bits(name),
+                };
             };
             set(RustFfiHtmlFragmentAttributeKind::Class, AttributeNames::class_);
             set(RustFfiHtmlFragmentAttributeKind::Id, AttributeNames::id);
@@ -2024,7 +2068,7 @@ private:
     {
         auto kind_index = to_underlying(attribute.hot_kind);
         if (kind_index > 0 && kind_index < hot_attribute_table_size)
-            return *hot_names[kind_index];
+            return *hot_names[kind_index].qualified_name;
         if (auto raw = attribute.known_name) {
             static NeverDestroyed<HashMap<FlatPtr, DOM::QualifiedName>> s_known_attribute_qualified_names;
             auto& cache = *s_known_attribute_qualified_names;
@@ -2034,12 +2078,14 @@ private:
             cache.set(raw, qualified_name);
             return qualified_name;
         }
-        return cached_custom_attribute_qualified_name(input_span.slice(attribute.name_start, attribute.name_length));
+        return *cached_custom_attribute_name_entry(input_span.slice(attribute.name_start, attribute.name_length)).qualified_name;
     }
 
     struct CachedCustomName {
         u32 hash { 0 };
         Optional<DOM::QualifiedName> qualified_name;
+        u64 name_filter_bit { 0 };
+        u32 attribute_filter_bits { 0 };
     };
 
     static Array<CachedCustomName, 64>& custom_attribute_name_cache()
@@ -2049,14 +2095,16 @@ private:
     }
 
     template<typename CodeUnit>
-    static DOM::QualifiedName cached_custom_attribute_qualified_name(ReadonlySpan<CodeUnit> name)
+    static CachedCustomName cached_custom_attribute_name_entry(ReadonlySpan<CodeUnit> name)
     {
         auto const length = name.size();
         if (length == 0 || length > 32) {
+            Utf16FlyString fly_name;
             if constexpr (sizeof(CodeUnit) == 1)
-                return DOM::QualifiedName { Utf16FlyString::from_utf8_without_validation({ name.data(), length }), {}, {} };
+                fly_name = Utf16FlyString::from_utf8_without_validation({ name.data(), length });
             else
-                return DOM::QualifiedName { Utf16FlyString::from_utf16({ name.data(), length }), {}, {} };
+                fly_name = Utf16FlyString::from_utf16({ name.data(), length });
+            return { 0, DOM::QualifiedName { fly_name, {}, {} }, DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
         }
 
         u32 hash = static_cast<u32>(length) * 2654435761u;
@@ -2083,7 +2131,7 @@ private:
                     }
                 }
                 if (matches)
-                    return *entry.qualified_name;
+                    return entry;
             }
         }
 
@@ -2093,8 +2141,8 @@ private:
         else
             fly_name = Utf16FlyString::from_utf16({ name.data(), length });
         DOM::QualifiedName qualified_name { fly_name, {}, {} };
-        entry = { hash, qualified_name };
-        return qualified_name;
+        entry = { hash, qualified_name, DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
+        return entry;
     }
 
     Utf16View m_input;
