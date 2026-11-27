@@ -178,7 +178,7 @@ impl PrimitiveString {
             return Self::create_from_non_trivial_fly_string(vm, &to_utf16_fly_string(&string));
         }
 
-        vm.heap().allocate(|_| Self::new(string))
+        Self::allocate_resolved(vm.heap(), string)
     }
 
     /// Creates a string of ASCII characters.
@@ -248,7 +248,7 @@ impl PrimitiveString {
             return interned_string;
         }
 
-        let new_string = vm.heap().allocate(|_| Self::new(Utf16String::from(string)));
+        let new_string = Self::allocate_resolved(vm.heap(), Utf16String::from(string));
         cache_slot.set(Some(new_string));
         new_string
     }
@@ -285,7 +285,7 @@ impl PrimitiveString {
             {
                 cached_string
             }
-            _ => vm.heap().allocate(|_| Self::new(Utf16String::from(string))),
+            _ => Self::allocate_resolved(vm.heap(), Utf16String::from(string)),
         };
         interned_string.set_interned();
         vm.interned_strings()
@@ -441,7 +441,16 @@ impl PrimitiveString {
         }
     }
 
-    pub(crate) fn new(string: Utf16String) -> Self {
+    pub(crate) fn allocate_resolved(heap: &crate::gc::heap::Heap, string: Utf16String) -> Gc<PrimitiveString> {
+        let needs_destruction = !has_short_ascii_storage(&string);
+        let cell = heap.allocate(|_| Self::new(string));
+        if needs_destruction {
+            crate::gc::heap::mark_cell_needs_destruction(&*cell);
+        }
+        cell
+    }
+
+    fn new(string: Utf16String) -> Self {
         let length_in_utf16_code_units = Utf16View::of_string(&string).length_in_code_units() as u32;
         Self {
             header: CellHeader::for_class(Self::CLASS),
@@ -602,8 +611,12 @@ impl PrimitiveString {
 
     fn set_resolved_utf16_string(&self, string: Utf16String) {
         assert!(!self.has_utf16_string());
+        let needs_destruction = !has_short_ascii_storage(&string);
         // SAFETY: The slot is empty, so nothing borrows the string it holds.
         unsafe { *self.utf16_string.0.get() = Some(string) };
+        if needs_destruction {
+            crate::gc::heap::mark_cell_needs_destruction(self);
+        }
     }
 
     #[inline]

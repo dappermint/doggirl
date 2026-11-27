@@ -286,6 +286,12 @@ impl BindingValues<'_> {
         }
         self.environment.binding_values.set(new_data);
         self.environment.inline_binding_capacity.set(0);
+        if !new_data.is_null()
+            // SAFETY: `new_data` was just returned by `value_storage::allocate()`.
+            && unsafe { value_storage::kind(new_data) } == value_storage::ValueStorageKind::Malloc
+        {
+            crate::gc::heap::mark_cell_needs_finalization(self.environment);
+        }
     }
 }
 
