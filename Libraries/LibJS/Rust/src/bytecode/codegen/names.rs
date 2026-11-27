@@ -427,7 +427,7 @@ impl NameTables {
 
     /// How much of a block the table that only linking reads takes.
     pub(super) fn room_for_link_tables(&self) -> usize {
-        SliceBlock::room_for::<Utf16FlyString>(self.property_keys.entries.len())
+        SliceBlock::room_for::<crate::runtime::property_key::NonSymbolPropertyKey>(self.property_keys.entries.len())
     }
 
     /// Hands out the tables, as an executable keeps them: identifiers from `block`, property keys from `link_block`, and
@@ -439,7 +439,7 @@ impl NameTables {
         link_block: &mut SliceBlockBuilder,
     ) -> (
         BlockSlice<Utf16FlyString>,
-        BlockSlice<Utf16FlyString>,
+        BlockSlice<crate::runtime::property_key::NonSymbolPropertyKey>,
         Box<[Utf16FlyString]>,
     ) {
         let script_names = &mut self.script_names;
@@ -449,7 +449,12 @@ impl NameTables {
         };
         (
             block.slice(self.identifiers.entries.iter().map(&mut fly_string_of)),
-            link_block.slice(self.property_keys.entries.iter().map(&mut fly_string_of)),
+            link_block.slice(self.property_keys.entries.iter().map(|entry| {
+                crate::runtime::property_key::NonSymbolPropertyKey::new(
+                    crate::runtime::property_key::PropertyKey::from(fly_string_of(entry)),
+                )
+                .expect("property key table entries are never symbols")
+            })),
             self.strings.entries.iter().map(&mut fly_string_of).collect(),
         )
     }

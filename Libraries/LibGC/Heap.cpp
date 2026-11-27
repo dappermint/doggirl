@@ -38,6 +38,7 @@
 #include <LibGC/HeapAccess.h>
 #include <LibGC/HeapBlock.h>
 #include <LibGC/NanBoxedValue.h>
+#include <LibGC/PrimitiveStorage.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <setjmp.h>
@@ -2381,9 +2382,9 @@ void Heap::sweep_in_step_with_allocation()
     if (m_blocks_swept >= blocks_due && blocks_due < m_blocks_to_sweep)
         return;
 
-    // Batch at least 16 blocks per allocation-driven sweep step so we amortise clock calls, FFI crossings, and
-    // per-batch bookkeeping across multiple blocks instead of sweeping one block at a time.
-    static constexpr size_t MIN_ALLOCATION_SWEEP_BATCH = 16;
+    // Batch at least 64 blocks per allocation-driven sweep step so we amortise clock calls, FFI crossings, and
+    // per-batch bookkeeping across multiple blocks while keeping each step sub-millisecond.
+    static constexpr size_t MIN_ALLOCATION_SWEEP_BATCH = 64;
     bool const finish_all = blocks_due >= m_blocks_to_sweep;
     size_t const target_swept = finish_all
         ? NumericLimits<size_t>::max()
@@ -2622,6 +2623,7 @@ void Heap::collect_garbage_and_return_memory_to_system()
     }
     for (auto& allocator : m_all_cell_allocators)
         allocator.block_allocator().return_freed_blocks_to_system();
+    PrimitiveStorage::the().release_pooled_large_ranges();
     ak_kmalloc_collect();
 }
 

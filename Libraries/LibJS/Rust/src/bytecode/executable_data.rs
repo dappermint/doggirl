@@ -239,52 +239,62 @@ impl SharedJitLearning {
             self.has_feedback = true;
 
             let arith = feedback.arith();
-            if self.arith.len() < arith.len() {
-                self.arith.resize(arith.len(), 0);
-            }
-            // SAFETY: `Cell<u8>` is `#[repr(transparent)]` over `u8` and no concurrent mutation occurs on this VM thread.
-            let arith_vals = unsafe { ak::slice_from_raw_parts(arith.as_ptr().cast::<u8>(), arith.len()) };
-            for (dst, &src) in self.arith.iter_mut().zip(arith_vals) {
-                *dst |= src;
+            if !arith.is_empty() {
+                if self.arith.len() < arith.len() {
+                    self.arith.resize(arith.len(), 0);
+                }
+                // SAFETY: `Cell<u8>` is `#[repr(transparent)]` over `u8` and no concurrent mutation occurs on this VM thread.
+                let arith_vals = unsafe { ak::slice_from_raw_parts(arith.as_ptr().cast::<u8>(), arith.len()) };
+                for (dst, &src) in self.arith.iter_mut().zip(arith_vals) {
+                    *dst |= src;
+                }
             }
 
             let value = feedback.value();
-            if self.value.len() < value.len() {
-                self.value.resize(value.len(), 0);
-            }
-            // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
-            let value_vals = unsafe { ak::slice_from_raw_parts(value.as_ptr().cast::<u16>(), value.len()) };
-            for (dst, &src) in self.value.iter_mut().zip(value_vals) {
-                *dst |= src;
+            if !value.is_empty() {
+                if self.value.len() < value.len() {
+                    self.value.resize(value.len(), 0);
+                }
+                // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
+                let value_vals = unsafe { ak::slice_from_raw_parts(value.as_ptr().cast::<u16>(), value.len()) };
+                for (dst, &src) in self.value.iter_mut().zip(value_vals) {
+                    *dst |= src;
+                }
             }
 
             let cache_value = feedback.cache_value();
-            if self.cache_value.len() < cache_value.len() {
-                self.cache_value.resize(cache_value.len(), 0);
-            }
-            // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
-            let cache_value_vals =
-                unsafe { ak::slice_from_raw_parts(cache_value.as_ptr().cast::<u16>(), cache_value.len()) };
-            for (dst, &src) in self.cache_value.iter_mut().zip(cache_value_vals) {
-                *dst |= src;
+            if !cache_value.is_empty() {
+                if self.cache_value.len() < cache_value.len() {
+                    self.cache_value.resize(cache_value.len(), 0);
+                }
+                // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
+                let cache_value_vals =
+                    unsafe { ak::slice_from_raw_parts(cache_value.as_ptr().cast::<u16>(), cache_value.len()) };
+                for (dst, &src) in self.cache_value.iter_mut().zip(cache_value_vals) {
+                    *dst |= src;
+                }
             }
 
             let keyed = feedback.keyed();
-            if self.keyed_bits.len() < keyed.len() {
-                self.keyed_bits.resize(keyed.len(), 0);
-            }
-            for (dst, src) in self.keyed_bits.iter_mut().zip(keyed) {
-                *dst |= src.bits.get();
+            if !keyed.is_empty() {
+                if self.keyed_bits.len() < keyed.len() {
+                    self.keyed_bits.resize(keyed.len(), 0);
+                }
+                for (dst, src) in self.keyed_bits.iter_mut().zip(keyed) {
+                    *dst |= src.bits.get();
+                }
             }
 
             let calls = feedback.call();
-            if self.call_flags.len() < calls.len() {
-                self.call_flags.resize(calls.len(), 0);
-                self.call_value.resize(calls.len(), 0);
-            }
-            for ((dst_flags, dst_value), src) in self.call_flags.iter_mut().zip(&mut self.call_value).zip(calls) {
-                *dst_flags |= src.flags.get() & SHARED_CALL_FLAGS_MASK;
-                *dst_value |= src.value.get();
+            if !calls.is_empty() {
+                if self.call_flags.len() < calls.len() {
+                    self.call_flags.resize(calls.len(), 0);
+                    self.call_value.resize(calls.len(), 0);
+                }
+                for ((dst_flags, dst_value), src) in self.call_flags.iter_mut().zip(&mut self.call_value).zip(calls) {
+                    *dst_flags |= src.flags.get() & SHARED_CALL_FLAGS_MASK;
+                    *dst_value |= src.value.get();
+                }
             }
         }
 
@@ -379,7 +389,7 @@ pub struct ExecutableData {
     #[cfg(all(not(test), feature = "jit"))]
     shared_jit_learning: AtomicPtr<Mutex<SharedJitLearning>>,
     /// What linking reads, and nothing after it (see [`ExecutableData::release_link_inputs()`]).
-    pub property_key_table: BlockSlice<ak::Utf16FlyString>,
+    pub property_key_table: BlockSlice<crate::runtime::property_key::NonSymbolPropertyKey>,
     pub constants: BlockSlice<ConstantValue>,
     pub shared_function_data: BlockSlice<PendingSharedFunctionData>,
     pub class_blueprints: BlockSlice<PendingClassBlueprint>,
@@ -486,7 +496,7 @@ impl ExecutableData {
         variable_names: BlockSlice<ak::Utf16FlyString>,
         local_variable_metadata: BlockSlice<LocalVariableMetadata>,
         length_identifier: Option<PropertyKeyTableIndex>,
-        property_key_table: BlockSlice<ak::Utf16FlyString>,
+        property_key_table: BlockSlice<crate::runtime::property_key::NonSymbolPropertyKey>,
         constants: BlockSlice<ConstantValue>,
         shared_function_data: BlockSlice<PendingSharedFunctionData>,
         class_blueprints: BlockSlice<PendingClassBlueprint>,
@@ -666,7 +676,9 @@ impl ExecutableData {
         let has_non_empty_cache = property_caches
             .iter()
             .any(|cache| crate::jit::code::speculated_cache_size(cache) > 0);
-        if feedback.is_none() && !has_non_empty_cache {
+        if !has_non_empty_cache
+            && !feedback.is_some_and(crate::bytecode::feedback::ExecutableFeedback::has_any_shared_learning)
+        {
             return;
         }
         let mut learning = self

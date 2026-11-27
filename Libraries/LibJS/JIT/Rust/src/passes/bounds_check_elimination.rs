@@ -534,7 +534,7 @@ pub fn run(graph: &mut Graph, work: &Zone) {
     run_with_dominators(graph, work, &mut dominators);
 }
 
-pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) -> bool {
     let mut phi_blocks = ZoneMap::new_in(work);
     let mut checks = ZoneVec::new_in(work);
     let mut shifts = ZoneVec::new_in(work);
@@ -587,10 +587,14 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
     checks.retain(|check| graph.int32_constant(graph.node(*check).inputs[1]).is_some());
     arithmetic.retain(|(node, ..)| graph.node(*node).inputs.iter().all(|input| may_have_range(*input)));
     if checks.is_empty() && shifts.is_empty() && arithmetic.is_empty() {
-        return;
+        return false;
     }
     let dominators = dominators.get_or_compute(graph);
-    let entering = entering_counters(graph, dominators, &phi_blocks, work);
+    let entering = if graph.osr_entries.is_empty() {
+        ZoneMap::new_in(work)
+    } else {
+        entering_counters(graph, dominators, &phi_blocks, work)
+    };
     let mut ranges = Ranges {
         graph,
         dominators,
@@ -666,7 +670,7 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
         }
     }
     if passing.is_empty() && scaled.is_empty() && exact.is_empty() {
-        return;
+        return false;
     }
     // NB: Only the entering counters that the removed checks, the
     //     rewritten shifts and the operations that stop checking for overflow
@@ -757,4 +761,5 @@ pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut Cach
         graph.nodes[guard.index()].inputs[0] = value;
     }
     super::edit::remove_nodes(graph, &removed);
+    !passing.is_empty() || !scaled.is_empty() || !exact.is_empty()
 }

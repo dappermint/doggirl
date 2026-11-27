@@ -1098,6 +1098,7 @@ pub fn concatenate(views: &[Utf16View<'_>]) -> Utf16String {
     let mut length = 0;
     let mut all_latin1 = true;
     let mut all_ascii = true;
+    let mut any_non_latin1 = false;
     for view in views {
         match view {
             Utf16View::Ascii(units) => length += units.len(),
@@ -1110,7 +1111,15 @@ pub fn concatenate(views: &[Utf16View<'_>]) -> Utf16String {
             Utf16View::Utf16(units) => {
                 length += units.len();
                 all_latin1 = false;
-                all_ascii = false;
+                if !any_non_latin1 {
+                    let max_bits = Utf16String::utf16_max_code_unit_bits(units);
+                    if max_bits > 0xff {
+                        any_non_latin1 = true;
+                        all_ascii = false;
+                    } else if max_bits > 0x7f {
+                        all_ascii = false;
+                    }
+                }
             }
         }
     }
@@ -1124,6 +1133,35 @@ pub fn concatenate(views: &[Utf16View<'_>]) -> Utf16String {
             }),
         );
     }
+    if any_non_latin1 {
+        // SAFETY: `any_non_latin1` guarantees at least one code unit is > 0xFF and all `length` units are written.
+        return unsafe {
+            Utf16String::from_utf16_known_non_latin1_with(length, |storage| {
+                let mut offset = 0usize;
+                for view in views {
+                    match view {
+                        Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+                            for (dst, &byte) in storage[offset..offset + bytes.len()].iter_mut().zip(*bytes) {
+                                dst.write(u16::from(byte));
+                            }
+                            offset += bytes.len();
+                        }
+                        Utf16View::Utf16(units) => {
+                            // SAFETY: `units` and `storage[offset..]` are non-overlapping valid ranges of `units.len()`.
+                            core::ptr::copy_nonoverlapping(
+                                units.as_ptr(),
+                                storage.as_mut_ptr().add(offset).cast::<u16>(),
+                                units.len(),
+                            );
+                            offset += units.len();
+                        }
+                    }
+                }
+                debug_assert_eq!(offset, length);
+            })
+        };
+    }
+    // Every `Utf16` slice happened to contain only code units <= 0xFF (e.g. a substring of a UTF-16 string).
     let mut code_units = Vec::with_capacity(length);
     for view in views {
         view.append_to(&mut code_units);

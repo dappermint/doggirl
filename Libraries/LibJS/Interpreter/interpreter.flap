@@ -461,7 +461,9 @@ inline fn return_to_caller(
     let destination_index = exec_ctx.caller_dst_raw;
     let returns_to_native_caller = exec_ctx.returns_to_native_caller;
     caller_frame.program_counter = return_pc;
-    caller_frame.slots[destination_index] = result;
+    if destination_index != 0xffffffff {
+        caller_frame.slots[destination_index] = result;
+    }
     let vm = current_vm();
     vm.running_execution_context = caller_frame;
     vm.interpreter_stack_top = alias(exec_ctx);

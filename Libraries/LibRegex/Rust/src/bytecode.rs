@@ -270,6 +270,7 @@ pub enum SimpleMatch {
 pub struct CharRanges {
     ranges: Vec<CharRange>,
     ascii: [u64; 2],
+    ascii_ignore_case: [u64; 2],
     #[cfg(target_arch = "aarch64")]
     ascii_nibble_lo: [u8; 16],
     #[cfg(target_arch = "aarch64")]
@@ -279,11 +280,20 @@ pub struct CharRanges {
 impl CharRanges {
     pub fn new(ranges: Vec<CharRange>) -> Self {
         let mut ascii = [0u64; 2];
+        let mut ascii_ignore_case = [0u64; 2];
         #[cfg(target_arch = "aarch64")]
         let mut ascii_nibble_lo = [0u8; 16];
         for range in &ranges {
             for code_point in range.start..=range.end.min(0x7F) {
                 ascii[(code_point / 64) as usize] |= 1 << (code_point % 64);
+                ascii_ignore_case[(code_point / 64) as usize] |= 1 << (code_point % 64);
+                if (b'A' as u32..=b'Z' as u32).contains(&code_point) {
+                    let lower = code_point + 32;
+                    ascii_ignore_case[(lower / 64) as usize] |= 1 << (lower % 64);
+                } else if (b'a' as u32..=b'z' as u32).contains(&code_point) {
+                    let upper = code_point - 32;
+                    ascii_ignore_case[(upper / 64) as usize] |= 1 << (upper % 64);
+                }
                 #[cfg(target_arch = "aarch64")]
                 {
                     ascii_nibble_lo[(code_point & 0x0F) as usize] |= 1u8 << (code_point >> 4);
@@ -295,6 +305,7 @@ impl CharRanges {
         Self {
             ranges,
             ascii,
+            ascii_ignore_case,
             #[cfg(target_arch = "aarch64")]
             ascii_nibble_lo,
             #[cfg(target_arch = "aarch64")]
@@ -309,6 +320,15 @@ impl CharRanges {
             return self.ascii[(code_point / 64) as usize] & (1 << (code_point % 64)) != 0;
         }
         crate::vm::char_in_ranges(code_point, &self.ranges)
+    }
+
+    /// Whether `code_point` matches this class under non-Unicode case-insensitive matching.
+    #[inline(always)]
+    pub fn contains_ignore_case_non_unicode(&self, code_point: u32) -> bool {
+        if code_point < 0x80 {
+            return self.ascii_ignore_case[(code_point / 64) as usize] & (1 << (code_point % 64)) != 0;
+        }
+        crate::vm::match_char_class(code_point, self, true, false, false)
     }
 
     #[cfg(target_arch = "aarch64")]

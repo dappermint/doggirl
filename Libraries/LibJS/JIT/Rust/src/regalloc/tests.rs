@@ -1254,3 +1254,90 @@ fn float64_values_get_floating_point_registers() {
     }
     assert!(floats >= 2, "{}", dump_allocation(&graph, &allocation));
 }
+
+#[test]
+fn callee_saved_gprs_avoid_spilling_across_hot_calls() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
+            },
+            Instruction::Mov { dst: a(0), src: r(7) },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let graph = build(&program);
+    let mut registers = RegisterSet::test_configuration();
+    // Mark r4 and r5 as callee-saved (allocatable but not in caller_saved_gprs).
+    registers.caller_saved_gprs = RegisterMask(0b0000_1111);
+    let allocation = allocate_with(&graph, &registers);
+    if let Err(errors) = verify(&graph, &registers, &allocation, crate::test_zone()) {
+        panic!("{errors}\n{}", dump_allocation(&graph, &allocation));
+    }
+    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
+    let node_alloc = allocation.node(argument);
+    assert_eq!(node_alloc.spill_slot, None, "{}", dump_allocation(&graph, &allocation));
+    match node_alloc.output {
+        Some(Location::Register(reg)) => {
+            assert!(
+                !registers.caller_saved_gprs.contains(reg),
+                "expected callee-saved register, got r{reg}\n{}",
+                dump_allocation(&graph, &allocation)
+            );
+        }
+        other => panic!("expected callee-saved register output, got {other:?}"),
+    }
+}
+
+#[test]
+fn cold_block_calls_do_not_claim_callee_saved_registers() {
+    let program = assemble(|labels| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::JumpNullish {
+                condition: r(5),
+                true_target: labels(2),
+                false_target: labels(4),
+            },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
+            },
+            Instruction::Mov { dst: a(0), src: r(7) },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut graph = build(&program);
+    let cold_block = (0..graph.blocks.len())
+        .map(|index| BlockId(u32::try_from(index).unwrap()))
+        .find(|block| graph.block(*block).bytecode_start == Some(program.offsets[2]))
+        .expect("the false branch has a block");
+    make_cold(&mut graph, &[cold_block]);
+    let mut registers = RegisterSet::test_configuration();
+    registers.caller_saved_gprs = RegisterMask(0b0000_1111);
+    let allocation = allocate_with(&graph, &registers);
+    if let Err(errors) = verify(&graph, &registers, &allocation, crate::test_zone()) {
+        panic!("{errors}\n{}", dump_allocation(&graph, &allocation));
+    }
+    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
+    match allocation.node(argument).output {
+        Some(Location::Register(reg)) => {
+            assert!(
+                registers.caller_saved_gprs.contains(reg),
+                "expected caller-saved register when only cold block calls, got r{reg}\n{}",
+                dump_allocation(&graph, &allocation)
+            );
+        }
+        other => panic!("expected caller-saved register output, got {other:?}"),
+    }
+}

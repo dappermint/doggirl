@@ -327,6 +327,51 @@ fn has_property_through_hook(object: &Object, _vm: &Vm, key: &PropertyKey) -> Th
     bool_completion_from_hook(unsafe { hook(lend_object_to_hook(object), lend_property_key_to_abi(key)) })
 }
 
+/// Fast path for `[[Get]]` of a non-negative int32 index on a `HostObject` with a `get_indexed_value` hook.
+/// Returns `Some(Ok(value))` when the hook answers or when out-of-bounds absence is guaranteed across the object
+/// and its ordinary prototype chain, `Some(Err(throw))` on exception, or `None` when full `OrdinaryGet` is needed.
+#[inline]
+pub(crate) fn try_get_indexed_value_hook_fast(object: &Object, index: u32) -> Option<ThrowCompletionOr<Value>> {
+    if object.class().id != ClassId::HostObject {
+        return None;
+    }
+    let hook = hooks_of(object).get_indexed_value?;
+    // SAFETY: The hook takes an object of its class and an index.
+    match completion_from_abi(unsafe { hook(lend_object_to_hook(object), index) }) {
+        Ok(value) if !value.is_empty() => Some(Ok(value)),
+        Ok(_) => {
+            if indexed_property_guaranteed_absent_on_chain(object) {
+                Some(Ok(Value::UNDEFINED))
+            } else {
+                None
+            }
+        }
+        Err(throw) => Some(Err(throw)),
+    }
+}
+
+/// Whether an array index not answered by `get_indexed_value` is guaranteed absent on `object` and its entire
+/// prototype chain (WebIDL `LegacyPlatformObjectGetOwnProperty` step 1.3 sets `ignoreNamedProps = true` for array
+/// indices, so only ordinary indexed storage on `object` or a prototype could still supply a value).
+#[inline]
+fn indexed_property_guaranteed_absent_on_chain(object: &Object) -> bool {
+    if object.indexed_storage_kind() != crate::layout::object::IndexedStorageKind::None {
+        return false;
+    }
+    let mut proto = object.shape().prototype();
+    while let Some(current) = proto {
+        if !core::ptr::fn_addr_eq(
+            current.methods().internal_get_own_property,
+            ORDINARY_OBJECT_METHODS.internal_get_own_property,
+        ) || current.indexed_storage_kind() != crate::layout::object::IndexedStorageKind::None
+        {
+            return false;
+        }
+        proto = current.shape().prototype();
+    }
+    true
+}
+
 /// [[Get]] of a class with a get_indexed_value hook: the hook's value for an array index it answers, and otherwise
 /// OrdinaryGet.
 fn get_through_indexed_value_hook(
@@ -345,6 +390,9 @@ fn get_through_indexed_value_hook(
         let value = completion_from_abi(unsafe { hook(lend_object_to_hook(object), key.as_number()) })?;
         if !value.is_empty() {
             return Ok(value);
+        }
+        if indexed_property_guaranteed_absent_on_chain(object) {
+            return Ok(Value::UNDEFINED);
         }
     }
     object.ordinary_get(vm, key, receiver, cacheable_metadata, phase)
@@ -486,7 +534,10 @@ impl HostObject {
             host_object.host_data.set(host_data);
         }
         let host_object = allocate_object_in(vm, allocator, |_| host_object);
-        host_object.initialize(vm, realm);
+        debug_assert!(core::ptr::fn_addr_eq(
+            host_object.methods().initialize,
+            ORDINARY_OBJECT_METHODS.initialize
+        ));
         host_object
     }
 
@@ -499,7 +550,7 @@ impl HostObject {
     /// belong to `realm`, and `wrappable` and `host_data` must be absent or live cells of the VM's heap.
     pub unsafe fn create_with_shape(
         vm: &Vm,
-        realm: Gc<Realm>,
+        _realm: Gc<Realm>,
         table: &'static JSHostClass,
         shape: Gc<Shape>,
         wrappable: Option<NonNull<c_void>>,
@@ -521,7 +572,10 @@ impl HostObject {
             host_object.host_data.set(host_data);
         }
         let host_object = allocate_object_in(vm, allocator, |_| host_object);
-        host_object.initialize(vm, realm);
+        debug_assert!(core::ptr::fn_addr_eq(
+            host_object.methods().initialize,
+            ORDINARY_OBJECT_METHODS.initialize
+        ));
         host_object
     }
 }

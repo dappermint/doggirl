@@ -1028,6 +1028,25 @@ impl ArrayPrototype {
 
         let count = max(final_ - actual_start, 0.0);
 
+        // OPTIMIZATION: Fast path for packed or empty arrays with unchanged Array species, skipping
+        // ArraySpeciesCreate and copying the sliced range in one bulk allocation.
+        if let Some(array) = this_object.downcast::<Array>()
+            && can_use_packed_or_empty_array_fast_path(&array)
+            && u64::from(array.indexed_array_like_size()) == initial_length
+            && let Some(realm) = vm.current_realm()
+            && array.shape().prototype() == Some(realm.array_prototype())
+            && array.shape().lookup(&vm.names.constructor).is_none()
+            && realm_watchpoints::array_species_is_unchanged(vm, realm)
+        {
+            let start = actual_start as u32;
+            let end = final_ as u32;
+            let result_array = Array::create_empty(vm, realm);
+            if start < end {
+                array.copy_packed_elements_range_to(start, end, &result_array);
+            }
+            return Ok(Value::from_object(result_array));
+        }
+
         let new_array = array_species_create(vm, &this_object, count as u64)?;
 
         // OPTIMIZATION: Fast path for packed arrays when ArraySpeciesCreate
@@ -1043,18 +1062,8 @@ impl ArrayPrototype {
             // NB: The result ends up with exactly the elements of the slice, as packed data properties with the
             //     default attributes: a species constructor can return an array with more elements, which setting
             //     the length at the end removes, and its storage holds no other attributes.
-            let result_length = end.saturating_sub(start);
-            result_array.set_indexed_property_elements_to_undefined(result_length);
-            for i in start..end {
-                result_array.set_packed_indexed_element(
-                    i - start,
-                    array
-                        .indexed_get(i)
-                        .expect("a packed array has every element below its size")
-                        .value,
-                );
-            }
-            if result_length == 0 {
+            array.copy_packed_elements_range_to(start, end, &result_array);
+            if start >= end {
                 assert!(result_array.set_indexed_array_like_size(0));
             }
             return Ok(Value::from_object(result_array));
@@ -2096,6 +2105,95 @@ fn merge_sort_range(
     }
 
     Ok(())
+}
+
+/// Stable in-place insertion sort over a plain `Value` slice (caller guarantees no elements are GC cells).
+fn insertion_sort_value_slice(
+    arr: &mut [Value],
+    start: usize,
+    end: usize,
+    compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
+) -> ThrowCompletionOr<()> {
+    for i in (start + 1)..end {
+        let key = arr[i];
+        let mut j = i;
+        while j > start {
+            let prev = arr[j - 1];
+            if compare_func(key, prev)? < 0.0 {
+                arr[j] = prev;
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        if j != i {
+            arr[j] = key;
+        }
+    }
+    Ok(())
+}
+
+fn merge_sort_value_slice(
+    arr: &mut [Value],
+    scratch: &mut [Value],
+    start: usize,
+    end: usize,
+    compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
+) -> ThrowCompletionOr<()> {
+    const INSERTION_SORT_THRESHOLD: usize = 16;
+    let len = end - start;
+    if len <= INSERTION_SORT_THRESHOLD {
+        return insertion_sort_value_slice(arr, start, end, compare_func);
+    }
+
+    let mid = start + len / 2;
+    merge_sort_value_slice(arr, scratch, start, mid, compare_func)?;
+    merge_sort_value_slice(arr, scratch, mid, end, compare_func)?;
+
+    if compare_func(arr[mid], arr[mid - 1])? >= 0.0 {
+        return Ok(());
+    }
+
+    let left_len = mid - start;
+    scratch[..left_len].copy_from_slice(&arr[start..mid]);
+
+    let mut left_index = 0;
+    let mut right_index = mid;
+    let mut out = start;
+    while left_index < left_len && right_index < end {
+        let x = scratch[left_index];
+        let y = arr[right_index];
+        if compare_func(y, x)? < 0.0 {
+            arr[out] = y;
+            right_index += 1;
+        } else {
+            arr[out] = x;
+            left_index += 1;
+        }
+        out += 1;
+    }
+
+    if left_index < left_len {
+        arr[out..out + (left_len - left_index)].copy_from_slice(&scratch[left_index..left_len]);
+    }
+
+    Ok(())
+}
+
+/// Stable merge sort over non-cell `Value` slices (e.g. numeric typed arrays), avoiding GC root list overhead.
+pub fn value_slice_merge_sort(
+    arr_to_sort: &mut [Value],
+    compare_func: &dyn Fn(Value, Value) -> ThrowCompletionOr<f64>,
+) -> ThrowCompletionOr<()> {
+    let size = arr_to_sort.len();
+    if size <= 1 {
+        return Ok(());
+    }
+    if size <= 16 {
+        return insertion_sort_value_slice(arr_to_sort, 0, size, compare_func);
+    }
+    let mut scratch = vec![Value::UNDEFINED; size / 2];
+    merge_sort_value_slice(arr_to_sort, &mut scratch, 0, size, compare_func)
 }
 
 /// Sorts `arr_to_sort` in place with a stable merge sort, stopping at the first comparison that throws.

@@ -43,7 +43,7 @@ use crate::runtime::value::same_value;
 
 const MAX_PROXY_RECURSION_DEPTH: u32 = 10000;
 
-struct RecursionDepthUpdater<'vm> {
+pub(crate) struct RecursionDepthUpdater<'vm> {
     depth: &'vm Cell<u32>,
 }
 
@@ -70,12 +70,37 @@ impl Drop for RecursionDepthUpdater<'_> {
 
 /// LIMIT_PROXY_RECURSION_DEPTH(): counts the running trap for as long as the returned updater lives.
 #[inline(always)]
-fn limit_proxy_recursion_depth(vm: &Vm) -> ThrowCompletionOr<RecursionDepthUpdater<'_>> {
+pub(crate) fn limit_proxy_recursion_depth(vm: &Vm) -> ThrowCompletionOr<RecursionDepthUpdater<'_>> {
     let (recursion_depth_updater, depth) = RecursionDepthUpdater::new(vm);
     if depth >= MAX_PROXY_RECURSION_DEPTH {
         return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
     }
     Ok(recursion_depth_updater)
+}
+
+/// Inline lookup for an own non-accessor proxy trap on an ordinary handler object.
+/// Returns `Some(Some(fn))` for a function trap, `Some(None)` for a nullish trap, or `None` to fall back to `GetMethod`.
+#[inline]
+pub(crate) fn get_proxy_trap_inline(
+    handler: Gc<Object>,
+    trap_name: &PropertyKey,
+) -> Option<Option<Gc<FunctionObject>>> {
+    if core::ptr::fn_addr_eq(handler.methods().internal_get, ORDINARY_OBJECT_METHODS.internal_get)
+        && handler.own_string_keyed_properties_are_in_shape()
+        && !handler.has_intrinsic_accessors()
+        && let Some(metadata) = handler.shape().lookup(trap_name)
+    {
+        let value = handler.get_direct(metadata.offset);
+        if !value.is_accessor() {
+            if value.is_function() {
+                return Some(Some(value.as_function()));
+            }
+            if value.is_nullish() {
+                return Some(None);
+            }
+        }
+    }
+    None
 }
 
 /// Fast path for `GetMethod(handler, trap_name)` when `handler` is an ordinary object holding the trap as an own
@@ -86,22 +111,48 @@ fn get_proxy_trap(
     handler: Gc<Object>,
     trap_name: &PropertyKey,
 ) -> ThrowCompletionOr<Option<Gc<FunctionObject>>> {
-    if core::ptr::fn_addr_eq(handler.methods().internal_get, ORDINARY_OBJECT_METHODS.internal_get)
-        && handler.own_string_keyed_properties_are_in_shape()
-        && !handler.has_intrinsic_accessors()
-        && let Some(metadata) = handler.shape().lookup(trap_name)
+    if let Some(trap) = get_proxy_trap_inline(handler, trap_name) {
+        return Ok(trap);
+    }
+    Value::from_object(handler).get_method(vm, trap_name)
+}
+
+/// Steps 8-10 of Proxy `[[Get]]`: verifies target property invariants on `trap_result`.
+#[inline]
+pub(crate) fn verify_proxy_get_invariant(
+    vm: &Vm,
+    target: Gc<Object>,
+    property_key: &PropertyKey,
+    trap_result: Value,
+) -> ThrowCompletionOr<Value> {
+    // 8. Let targetDesc be ? target.[[GetOwnProperty]](P).
+    // 9. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
+    if target_own_property_is_absent_or_configurable(vm, target, property_key) {
+        return Ok(trap_result);
+    }
+    let target_descriptor = target.internal_get_own_property(vm, property_key)?;
+
+    if let Some(target_descriptor) = target_descriptor
+        && !fully_populated(target_descriptor.configurable)
     {
-        let value = handler.get_direct(metadata.offset);
-        if !value.is_accessor() {
-            if value.is_function() {
-                return Ok(Some(value.as_function()));
+        // a. If IsDataDescriptor(targetDesc) is true and targetDesc.[[Writable]] is false, then
+        if target_descriptor.is_data_descriptor() && !fully_populated(target_descriptor.writable) {
+            // i. If SameValue(trapResult, targetDesc.[[Value]]) is false, throw a TypeError exception.
+            if !same_value(trap_result, fully_populated(target_descriptor.value)) {
+                return vm.throw_completion(ErrorKind::TypeError, ErrorType::ProxyGetImmutableDataProperty, &[]);
             }
-            if value.is_nullish() {
-                return Ok(None);
+        }
+        // b. If IsAccessorDescriptor(targetDesc) is true and targetDesc.[[Get]] is undefined, then
+        if target_descriptor.is_accessor_descriptor() && fully_populated(target_descriptor.get).is_none() {
+            // i. If trapResult is not undefined, throw a TypeError exception.
+            if !trap_result.is_undefined() {
+                return vm.throw_completion(ErrorKind::TypeError, ErrorType::ProxyGetNonConfigurableAccessor, &[]);
             }
         }
     }
-    Value::from_object(handler).get_method(vm, trap_name)
+
+    // 10. Return trapResult.
+    Ok(trap_result)
 }
 
 /// Returns true if `target.[[GetOwnProperty]](property_key)` is guaranteed either absent or configurable, so no
@@ -853,34 +904,7 @@ impl ProxyObject {
             &[Value::from_object(target), property_key.to_value(vm), receiver],
         )?;
 
-        // 8. Let targetDesc be ? target.[[GetOwnProperty]](P).
-        // 9. If targetDesc is not undefined and targetDesc.[[Configurable]] is false, then
-        if target_own_property_is_absent_or_configurable(vm, target, property_key) {
-            return Ok(trap_result);
-        }
-        let target_descriptor = target.internal_get_own_property(vm, property_key)?;
-
-        if let Some(target_descriptor) = target_descriptor
-            && !fully_populated(target_descriptor.configurable)
-        {
-            // a. If IsDataDescriptor(targetDesc) is true and targetDesc.[[Writable]] is false, then
-            if target_descriptor.is_data_descriptor() && !fully_populated(target_descriptor.writable) {
-                // i. If SameValue(trapResult, targetDesc.[[Value]]) is false, throw a TypeError exception.
-                if !same_value(trap_result, fully_populated(target_descriptor.value)) {
-                    return vm.throw_completion(ErrorKind::TypeError, ErrorType::ProxyGetImmutableDataProperty, &[]);
-                }
-            }
-            // b. If IsAccessorDescriptor(targetDesc) is true and targetDesc.[[Get]] is undefined, then
-            if target_descriptor.is_accessor_descriptor() && fully_populated(target_descriptor.get).is_none() {
-                // i. If trapResult is not undefined, throw a TypeError exception.
-                if !trap_result.is_undefined() {
-                    return vm.throw_completion(ErrorKind::TypeError, ErrorType::ProxyGetNonConfigurableAccessor, &[]);
-                }
-            }
-        }
-
-        // 10. Return trapResult.
-        Ok(trap_result)
+        verify_proxy_get_invariant(vm, target, property_key, trap_result)
     }
 
     // 10.5.9 [[Set]] ( P, V, Receiver ), https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-set-p-v-receiver

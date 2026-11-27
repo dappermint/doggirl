@@ -208,6 +208,19 @@ impl RegisterSet {
         RegisterMask(self.caller_saved_gprs.0 | (self.caller_saved_fprs.0 << FPR_BASE))
     }
 
+    /// The floating point registers a call or float-clobbering slow path clobbers.
+    pub fn caller_saved_fprs(&self) -> RegisterMask {
+        RegisterMask(self.caller_saved_fprs.0 << FPR_BASE)
+    }
+
+    /// The registers of `class` a call clobbers.
+    pub fn caller_saved_for(&self, class: RegisterClass) -> RegisterMask {
+        match class {
+            RegisterClass::General => self.caller_saved_gprs,
+            RegisterClass::Float => self.caller_saved_fprs(),
+        }
+    }
+
     /// The fewest allocatable registers allocation works with: the ones
     /// calls take their arguments and return their results in, the one
     /// shifts take their amount in, and `extra` more.
@@ -565,14 +578,36 @@ impl<'w> Allocator<'_, 'w> {
                 .predecessors
                 .iter()
                 .any(|predecessor| predecessor.index() >= index);
-            let mut general = self.registers.allocatable(RegisterClass::General).iter();
-            let mut float = self.registers.allocatable(RegisterClass::Float).iter();
+            let mut general_free = self.registers.allocatable(RegisterClass::General).0;
+            let mut float_free = self.registers.allocatable(RegisterClass::Float).0;
+            let general_caller = self.registers.caller_saved_for(RegisterClass::General).0;
+            let float_caller = self.registers.caller_saved_for(RegisterClass::Float).0;
             for phi in &block.phis {
-                let registers = match RegisterClass::of(self.graph.node(*phi).repr) {
-                    RegisterClass::General => &mut general,
-                    RegisterClass::Float => &mut float,
+                let register = if is_loop_header {
+                    let prefer_callee_saved = self.prefers_callee_saved(*phi);
+                    let (free, caller) = match RegisterClass::of(self.graph.node(*phi).repr) {
+                        RegisterClass::General => (&mut general_free, general_caller),
+                        RegisterClass::Float => (&mut float_free, float_caller),
+                    };
+                    if *free == 0 {
+                        None
+                    } else {
+                        let preferred = if prefer_callee_saved {
+                            *free & !caller
+                        } else {
+                            *free & caller
+                        };
+                        let picked = if preferred != 0 {
+                            preferred.trailing_zeros() as u8
+                        } else {
+                            free.trailing_zeros() as u8
+                        };
+                        *free &= !(1u64 << picked);
+                        Some(picked)
+                    }
+                } else {
+                    None
                 };
-                let register = if is_loop_header { registers.next() } else { None };
                 self.place_phi(*phi, register);
             }
         }
@@ -617,12 +652,33 @@ impl<'w> Allocator<'_, 'w> {
         Ok(self.allocation)
     }
 
+    /// Whether holding `value` in `register` will be clobbered by a call or float-clobbering slow path it crosses.
+    fn clobbered_in(&self, value: NodeId, register: u8) -> bool {
+        (self.liveness.crosses_call(value) && self.registers.caller_saved().contains(register))
+            || (self.liveness.crosses_float_clobber(value) && self.registers.caller_saved_fprs().contains(register))
+    }
+
+    /// Whether `value` needs a spill/frame home from its definition when allocated in `register`.
+    fn needs_home_in(&self, value: NodeId, register: u8) -> bool {
+        self.liveness.needs_spill(value) || self.clobbered_in(value, register)
+    }
+
+    /// Whether `value` benefits from a callee-saved register because it lives across a call or float clobber
+    /// in a non-cold block.
+    fn prefers_callee_saved(&self, value: NodeId) -> bool {
+        self.liveness.crosses_hot_call(value)
+            || (RegisterClass::of(self.graph.node(value).repr) == RegisterClass::Float
+                && self.liveness.crosses_hot_float_clobber(value))
+    }
+
     /// Gives `phi` its location: `register` if it has one, and its spill
     /// slot (which it may have already, if it is live into a block
     /// allocated before its own) if it has no register or needs a slot.
     fn place_phi(&mut self, phi: NodeId, register: Option<u8>) {
         let slot = match register {
-            Some(_) if !self.liveness.needs_spill(phi) && self.allocation.nodes[phi.index()].spill_slot.is_none() => {
+            Some(register)
+                if !self.needs_home_in(phi, register) && self.allocation.nodes[phi.index()].spill_slot.is_none() =>
+            {
                 None
             }
             _ => Some(self.ensure_spill_slot(phi)),
@@ -681,7 +737,7 @@ impl<'w> Allocator<'_, 'w> {
         self.loops
             .headed_by(block)
             .is_some_and(|loop_| self.loops.carries_through(loop_, value))
-            && self.liveness.needs_spill(value)
+            && (self.allocation.nodes[value.index()].spill_slot.is_some() || frame_home(self.graph, value).is_some())
     }
 
     fn start_block(&mut self, block: BlockId) {
@@ -788,10 +844,19 @@ impl<'w> Allocator<'_, 'w> {
 
     /// A register of `class` that is not `blocked`, freeing one if necessary
     /// by evicting the value used furthest in the future.
-    fn pick_register(&mut self, blocked: RegisterMask, class: RegisterClass) -> u8 {
+    fn pick_register(&mut self, blocked: RegisterMask, class: RegisterClass, prefer_callee_saved: bool) -> u8 {
         let candidates = self.registers.allocatable(class).0 & !blocked.0;
         let free = candidates & !self.occupied.0;
         if free != 0 {
+            let caller = self.registers.caller_saved_for(class).0;
+            let preferred = if prefer_callee_saved {
+                free & !caller
+            } else {
+                free & caller
+            };
+            if preferred != 0 {
+                return preferred.trailing_zeros() as u8;
+            }
             return free.trailing_zeros() as u8;
         }
         let victim = RegisterMask(candidates)
@@ -858,6 +923,12 @@ impl<'w> Allocator<'_, 'w> {
         };
         let mut blocked = RegisterMask::default();
 
+        let clobbered = match constraints.clobbers {
+            Clobbers::CallerSaved => self.registers.caller_saved(),
+            Clobbers::Floats => self.registers.caller_saved_fprs(),
+            Clobbers::Nothing => RegisterMask::default(),
+        };
+
         // Fixed register inputs first, so that inputs in any register do not
         // take their registers.
         for index in 0..constrained_inputs {
@@ -874,8 +945,15 @@ impl<'w> Allocator<'_, 'w> {
                 self.add_move(from, Location::Register(register));
                 match from {
                     // The value moves, unless an earlier input of this node
-                    // needs it where it is; then this is a copy for the node.
-                    Location::Register(previous) if !blocked.contains(previous) => {
+                    // needs it where it is, or moving it from a preserved
+                    // callee-saved register into a clobbered register would
+                    // lose it across this node while it stays live.
+                    Location::Register(previous)
+                        if !blocked.contains(previous)
+                            && !(clobbered.contains(register)
+                                && !clobbered.contains(previous)
+                                && self.is_live_after(input, node_id)) =>
+                    {
                         self.free_register(previous);
                         self.assign_register(register, input);
                     }
@@ -905,7 +983,14 @@ impl<'w> Allocator<'_, 'w> {
             let register = match self.value_registers[input.index()] {
                 Some(register) if is_allocated_value(self.graph, input) => register,
                 _ => {
-                    let register = self.pick_register(blocked, RegisterClass::of(self.graph.node(input).repr));
+                    let prefer_callee_saved = is_allocated_value(self.graph, input)
+                        && self.is_live_after(input, node_id)
+                        && self.prefers_callee_saved(input);
+                    let register = self.pick_register(
+                        blocked,
+                        RegisterClass::of(self.graph.node(input).repr),
+                        prefer_callee_saved,
+                    );
                     let from = self.current_location(input);
                     self.add_move(from, Location::Register(register));
                     if is_allocated_value(self.graph, input) {
@@ -925,7 +1010,7 @@ impl<'w> Allocator<'_, 'w> {
         );
         let mut temps = [0; MAX_TEMPS];
         for temp in &mut temps[..temp_count] {
-            let register = self.pick_register(blocked, RegisterClass::General);
+            let register = self.pick_register(blocked, RegisterClass::General, false);
             blocked = blocked.with(register);
             *temp = register;
         }
@@ -933,6 +1018,8 @@ impl<'w> Allocator<'_, 'w> {
         // NB: Two-address instructions (like those of x86) write their output
         //     over their first input, which then needs no copy where it dies
         //     here. Nodes that may exit keep their inputs for the exit.
+        let output_class = RegisterClass::of(node.repr);
+        let output_prefers_callee_saved = self.prefers_callee_saved(node_id);
         let first_input = self.allocation.locations[inputs_start..].first().copied();
         let first_input_register = match first_input {
             Some(Location::Register(register))
@@ -940,8 +1027,10 @@ impl<'w> Allocator<'_, 'w> {
                     && constraints.reuses_first_input
                     && is_allocated_value(self.graph, node.inputs[0])
                     && self.liveness.dies_at(node_id).contains(&node.inputs[0])
-                    && RegisterClass::of_register(register) == RegisterClass::of(node.repr)
-                    && !temps[..temp_count].contains(&register) =>
+                    && RegisterClass::of_register(register) == output_class
+                    && !temps[..temp_count].contains(&register)
+                    && (!output_prefers_callee_saved
+                        || !self.registers.caller_saved_for(output_class).contains(register)) =>
             {
                 Some(register)
             }
@@ -953,9 +1042,9 @@ impl<'w> Allocator<'_, 'w> {
         // it loaded), so no exit value may stay in that register.
         let pick_output = |allocator: &mut Self| match constraints.output {
             OutputConstraint::None => None,
-            OutputConstraint::Register => Some(
-                first_input_register.unwrap_or_else(|| allocator.pick_register(blocked, RegisterClass::of(node.repr))),
-            ),
+            OutputConstraint::Register => Some(first_input_register.unwrap_or_else(|| {
+                allocator.pick_register(blocked, output_class, output_prefers_callee_saved)
+            })),
             OutputConstraint::Return => {
                 let register = allocator.registers.return_gpr;
                 debug_assert!(constraints.clobbers == Clobbers::CallerSaved || !blocked.contains(register));
@@ -963,21 +1052,12 @@ impl<'w> Allocator<'_, 'w> {
                 Some(register)
             }
         };
-        let clobbered = match constraints.clobbers {
-            Clobbers::CallerSaved => self.registers.caller_saved(),
-            Clobbers::Floats => self.registers.allocatable(RegisterClass::Float),
-            Clobbers::Nothing => RegisterMask::default(),
-        };
         {
             for register in RegisterMask(clobbered.0 & self.occupied.0).iter() {
                 let value = self.contents[register as usize];
-                debug_assert!(
-                    self.allocation.nodes[value.index()].spill_slot.is_some()
-                        || frame_home(self.graph, value).is_some()
-                        || !self.is_live_after(value, node_id),
-                    "v{} is live across a call that clobbers its register without a spill slot",
-                    value.0
-                );
+                if self.is_live_after(value, node_id) {
+                    self.ensure_home(value);
+                }
                 self.free_register(register);
             }
         }
@@ -1002,7 +1082,7 @@ impl<'w> Allocator<'_, 'w> {
 
         if let Some(register) = output {
             self.assign_register(register, node_id);
-            if self.liveness.needs_spill(node_id) {
+            if self.needs_home_in(node_id, register) {
                 self.ensure_home(node_id);
             }
             if self.liveness.is_dead_output(node_id) {
@@ -1034,22 +1114,30 @@ impl<'w> Allocator<'_, 'w> {
             }
         }
         for (phi, input) in liveness::phi_inputs_from(self.graph, predecessor, join) {
-            let own = self.value_registers[input.index()]
-                .filter(|register| is_allocated_value(self.graph, input) && !taken.contains(*register));
+            let class = RegisterClass::of(self.graph.node(phi).repr);
+            let candidates = self.registers.allocatable(class).0 & !taken.0;
+            let free = candidates & !self.occupied.0;
+            let prefer_callee_saved = self.prefers_callee_saved(phi);
+            let caller = self.registers.caller_saved_for(class).0;
+            let own = self.value_registers[input.index()].filter(|register| {
+                is_allocated_value(self.graph, input)
+                    && !taken.contains(*register)
+                    && !(prefer_callee_saved && ((caller & (1u64 << register)) != 0) && ((free & !caller) != 0))
+            });
             let register = own.or_else(|| {
-                let candidates = self
-                    .registers
-                    .allocatable(RegisterClass::of(self.graph.node(phi).repr))
-                    .0
-                    & !taken.0;
                 if candidates == 0 {
                     return None;
                 }
-                let free = candidates & !self.occupied.0;
-                Some(if free != 0 {
-                    free.trailing_zeros() as u8
+                let pool = if free != 0 { free } else { candidates };
+                let preferred = if prefer_callee_saved {
+                    pool & !caller
                 } else {
-                    candidates.trailing_zeros() as u8
+                    pool & caller
+                };
+                Some(if preferred != 0 {
+                    preferred.trailing_zeros() as u8
+                } else {
+                    pool.trailing_zeros() as u8
                 })
             });
             self.place_phi(phi, register);

@@ -74,6 +74,7 @@ public:
     ErrorOr<void> try_reserve(PrimitiveStorageHandle, size_t new_capacity);
     ErrorOr<void> try_resize_and_reserve(PrimitiveStorageHandle, size_t new_size, size_t new_capacity, ZeroFillNewBytes = ZeroFillNewBytes::No);
     void free(PrimitiveStorageHandle);
+    void release_pooled_large_ranges();
 
     u8* cage_base() { return m_allocator.cage_base(); }
     u8 const* cage_base() const { return m_allocator.cage_base(); }
@@ -95,6 +96,7 @@ private:
             size_t capacity { 0 };
             size_t reservation_size { 0 };
             size_t committed_size { 0 };
+            bool reused_from_pool { false };
             Optional<SmallAllocation> small_allocation;
         };
 
@@ -102,6 +104,7 @@ private:
         ErrorOr<void> resize(Allocation&, size_t old_size, size_t new_size, ZeroFillNewBytes);
         ErrorOr<Allocation> reallocate(Allocation const&, size_t old_size, size_t new_size, size_t new_capacity, ZeroFillNewBytes, bool force_large);
         void deallocate(Allocation&);
+        void release_pooled_large_ranges();
         ErrorOr<void> ensure_cage();
 
         bool contains(void const* address, size_t size = 1) const;
@@ -118,6 +121,12 @@ private:
             size_t size { 0 };
         };
 
+        struct PooledLargeRange {
+            size_t offset { 0 };
+            size_t reservation_size { 0 };
+            size_t committed_size { 0 };
+        };
+
         struct Slab {
             size_t offset { 0 };
             size_t slot_size { 0 };
@@ -127,7 +136,7 @@ private:
         };
 
         ErrorOr<Allocation> allocate_small_storage(size_t size, ZeroFillNewBytes);
-        ErrorOr<Allocation> allocate_large_storage(size_t size, size_t capacity, size_t guard_size);
+        ErrorOr<Allocation> allocate_large_storage(size_t size, size_t capacity, ZeroFillNewBytes, size_t guard_size);
         ErrorOr<Allocation> allocate_from_new_slab(u16 size_class_index, size_t slot_size);
         ErrorOr<size_t> allocate_cage_range(size_t reservation_size);
         ErrorOr<void> commit_large_storage(Allocation&, size_t new_size);
@@ -142,6 +151,8 @@ private:
         size_t m_cage_size { 0 };
         size_t m_next_offset { 0 };
         Vector<FreeRange> m_free_ranges;
+        Vector<PooledLargeRange> m_pooled_large_ranges;
+        size_t m_pooled_large_committed_bytes { 0 };
         Vector<Slab> m_small_slabs[13];
         // The indices of the slabs of each size class that have a free slot, so that allocation never visits a full one.
         Vector<u16> m_small_slabs_with_free_slots[13];

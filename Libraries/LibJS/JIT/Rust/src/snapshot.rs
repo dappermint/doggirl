@@ -985,6 +985,8 @@ pub enum Intrinsic {
     ObjectKeys,
     /// `Object.assign`.
     ObjectAssign,
+    /// `Reflect.get`.
+    ReflectGet,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -1168,6 +1170,13 @@ impl Intrinsic {
                 result: HelperResult::Value,
                 reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
                 writes: Locations::NAMED,
+            }),
+            Intrinsic::ReflectGet => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value, HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
+                writes: Locations::NONE,
             }),
             _ => None,
         }
@@ -1503,10 +1512,19 @@ pub struct DynamicCallLayout {
     pub function_environment_outer: u32,
     pub function_environment_function_object: u32,
     pub function_environment_this_value: u32,
+    /// `FunctionPrototype::apply` raw native function pointer, or 0 if call stubs do not unwrap `apply`.
+    pub apply_function_address: u64,
     /// The address of the call stub (see `codegen::generate_call_stub()`),
     /// or 0 if JIT code makes every call it does not make directly through
     /// `RuntimeInfo::jit_call`.
     pub call_stub: u64,
+    /// The address of the call forwarding stub for `Op::CallForwardingArguments`
+    /// (`f.apply(thisArg, arguments)`), or 0 to use `RuntimeInfo::call_forwarding_arguments`.
+    pub call_forwarding_stub: u64,
+    /// The address of the accessor get stub for `CallSlowPath(GetById)`, or 0.
+    pub get_by_id_accessor_stub: u64,
+    /// The address of the prototype setter stub for `CallSlowPath(PutByValue)`, or 0.
+    pub put_by_value_setter_stub: u64,
 }
 
 /// The allocation contract for plain objects (`JS::Object` created with a
@@ -2510,6 +2528,8 @@ pub struct RuntimeLayout {
     pub property_lookup_cache_entry_type_change_own_property: u32,
     /// `PropertyLookupCache::Entry::Type::GetPropertyInPrototypeChain`.
     pub property_lookup_cache_entry_type_get_property_in_prototype_chain: u32,
+    /// `PropertyLookupCache::Entry::Type::ChangePropertyInPrototypeChain`.
+    pub property_lookup_cache_entry_type_change_property_in_prototype_chain: u32,
     /// The mask that rounds the address of a cell down to its block, and
     /// where the block holds the class of its cells. A block of an allocator
     /// that classes share holds that class with `block_class_tail_tag` set,

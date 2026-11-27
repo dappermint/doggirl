@@ -562,7 +562,7 @@ impl Verifier<'_, '_> {
         }
         let clobbered = match lowering.clobbers {
             Clobbers::CallerSaved => self.registers.caller_saved(),
-            Clobbers::Floats => self.registers.allocatable(super::RegisterClass::Float),
+            Clobbers::Floats => self.registers.caller_saved_fprs(),
             Clobbers::Nothing => super::RegisterMask::default(),
         };
         for register in clobbered.iter() {

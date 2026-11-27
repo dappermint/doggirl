@@ -8,17 +8,23 @@
 
 #include <AK/Debug.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibHTTP/Cache/Utilities.h>
+#include <LibJS/ScriptCompilation.h>
+#include <LibJS/SourceCode.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/HTMLIntegration.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLOrSVGScriptElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
+#include <LibWeb/HTML/Scripting/CompiledScriptCache.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTML/Scripting/ImportMapParseResult.h>
@@ -512,11 +518,45 @@ void HTMLOrSVGScriptElement::prepare_script()
         // -> "classic"
         if (m_script_type == ScriptType::Classic) {
             // 1. Let script be the result of creating a classic script using source text, settings object, base URL, and options.
-            auto script = ClassicScript::create(element.document().url().to_byte_string(), source_text, settings_object, base_url, m_source_line_number, ClassicScript::MutedErrors::No, ScriptRegistry::IsInlineSource::Yes);
+            auto filename = element.document().url().to_byte_string();
+            GC::Ptr<ClassicScript> script;
+            if (Fetch::Fetching::http_memory_cache_enabled()) {
+                if (auto partition_key = Fetch::Infrastructure::determine_the_network_partition_key(settings_object); partition_key.has_value()) {
+                    if (auto partition = partition_key->disk_cache_partition(); partition.has_value()) {
+                        CompiledScriptCacheKey cache_key {
+                            .partition = partition.release_value(),
+                            .url_without_fragment = HTTP::serialize_url_for_cache_storage(element.document().url()),
+                            .program_type = JS::ProgramType::Script,
+                            .line_number_offset = m_source_line_number,
+                            .inline_source_hash = static_cast<u64>(source_text.hash()) | 1ULL,
+                        };
+                        auto fingerprint = CompiledScriptFingerprint::of(source_text);
+                        if (auto hit = CompiledScriptCache::the().find(cache_key, fingerprint); hit.has_value()) {
+                            auto source_code = hit->source_code_to_share
+                                ? JS::SourceCode::create_sharing_code(Utf16String::from_utf8(filename), *hit->source_code_to_share)
+                                : JS::SourceCode::create(Utf16String::from_utf8(filename), source_text);
+                            CompiledScriptCache::the().note_linked(cache_key, *source_code);
+                            script = ClassicScript::create_from_pre_compiled(filename, move(source_code), settings_object, base_url, move(hit->program), ClassicScript::MutedErrors::No, m_source_line_number, ScriptRegistry::IsInlineSource::Yes);
+                        } else {
+                            auto parsed = JS::ParsedProgram::parse(source_text, JS::ProgramType::Script, m_source_line_number);
+                            if (parsed && !parsed.has_errors()) {
+                                if (auto compiled = JS::CompiledProgram::compile(move(parsed))) {
+                                    CompiledScriptCache::the().store(cache_key, fingerprint, compiled);
+                                    auto source_code = JS::SourceCode::create(Utf16String::from_utf8(filename), source_text);
+                                    CompiledScriptCache::the().note_linked(cache_key, *source_code);
+                                    script = ClassicScript::create_from_pre_compiled(filename, move(source_code), settings_object, base_url, move(compiled), ClassicScript::MutedErrors::No, m_source_line_number, ScriptRegistry::IsInlineSource::Yes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!script)
+                script = ClassicScript::create(move(filename), source_text, settings_object, base_url, m_source_line_number, ClassicScript::MutedErrors::No, ScriptRegistry::IsInlineSource::Yes);
             script->set_fetch_options(options);
 
             // 2. Mark as ready el given script.
-            mark_as_ready(Result(move(script)));
+            mark_as_ready(Result(GC::Ref { *script }));
         }
         // -> "module"
         else if (m_script_type == ScriptType::Module) {

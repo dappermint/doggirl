@@ -119,7 +119,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// executable `executable` (an index into `Snapshot::executables`) in
     /// `dst`. The compiled function's is the running frame's; inlined
     /// callees' are constants.
-    pub(super) fn property_cache_address(
+    pub(in crate::codegen) fn property_cache_address(
         &mut self,
         dst: Gpr,
         executable: u32,
@@ -157,6 +157,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         executable: u32,
         cache_index: u32,
         miss: Label,
+        megamorphic_miss: Label,
     ) -> Result<(), CompileFailure> {
         let layout = self.runtime.layout;
         let scratch = self.pinned.scratch;
@@ -182,7 +183,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             );
             self.masm
                 .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-            self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, miss);
+            self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, megamorphic_miss);
             self.masm.bind(not_megamorphic);
         }
         self.masm.branch_test64(Condition::Zero, entry, u64::MAX, miss);
@@ -214,7 +215,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             layout.property_lookup_cache_megamorphic_tag as i64,
             miss,
         );
-        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, miss);
+        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, megamorphic_miss);
         self.masm.bind(found);
         self.branch_unless_dictionary_generation_matches(shape, entry, miss);
         Ok(())
@@ -398,9 +399,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.bind(have_object);
         // NB: The runtime also fills the VM's keyed lookup cache for the names of megamorphic caches (see
         //     `get_with_property_lookup_cache()`).
-        let vm_cache_name = self.megamorphic_cache_name(executable, cache_index, property);
+        let vm_cache_name = self.megamorphic_cache_name(executable, property);
         let vm_cache = vm_cache_name.map(|_| self.masm.new_label());
-        self.probe_cache_entry(&registers, executable, cache_index, vm_cache.unwrap_or(probe))?;
+        self.probe_cache_entry(&registers, executable, cache_index, probe, vm_cache.unwrap_or(probe))?;
         let present = self.masm.new_label();
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
@@ -461,20 +462,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     }
 
     /// The identity of the name at index `property` of the property key
-    /// table of `executable` (see `Op::ProbePropertyCache`), if property
-    /// lookup cache `cache_index` was megamorphic: such caches see more
-    /// shapes than their hash tables hold, so their accesses also look in
-    /// the VM's keyed caches.
-    fn megamorphic_cache_name(&self, executable: u32, cache_index: u32, property: u32) -> Option<u64> {
+    /// table of `executable` (see `Op::ProbePropertyCache`), used by the
+    /// out-of-line VM keyed cache probe when the site cache is megamorphic
+    /// at runtime (even if it became megamorphic after compilation).
+    fn megamorphic_cache_name(&self, executable: u32, property: u32) -> Option<u64> {
         let snapshot = &self.snapshot.executables[executable as usize];
-        self.snapshot[snapshot.property_caches]
-            .get(cache_index as usize)
-            .filter(|cache| cache.kind == PropertyCacheKind::Megamorphic)
-            .and_then(|_| {
-                self.snapshot[snapshot.property_key_names]
-                    .get(property as usize)
-                    .copied()
-            })
+        self.snapshot[snapshot.property_key_names]
+            .get(property as usize)
+            .copied()
             .filter(|name| *name != 0)
     }
 
@@ -672,9 +667,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
 
         // The entry for the object's shape among the others.
         self.masm.bind(others);
-        let vm_cache_name = self.megamorphic_cache_name(executable, cache_index, name_index);
+        let vm_cache_name = self.megamorphic_cache_name(executable, name_index);
         let vm_cache = vm_cache_name.map(|_| self.masm.new_label());
-        self.probe_cache_entry(&registers, executable, cache_index, vm_cache.unwrap_or(probe))?;
+        self.probe_cache_entry(&registers, executable, cache_index, probe, vm_cache.unwrap_or(probe))?;
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
             &Address::new(entry, layout.property_lookup_cache_entry_type as i32),

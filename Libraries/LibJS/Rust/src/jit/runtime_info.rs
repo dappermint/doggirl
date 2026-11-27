@@ -364,6 +364,8 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_change_own_property: PropertyLookupCacheEntryType::ChangeOwnProperty as u32,
         property_lookup_cache_entry_type_get_property_in_prototype_chain:
             PropertyLookupCacheEntryType::GetPropertyInPrototypeChain as u32,
+        property_lookup_cache_entry_type_change_property_in_prototype_chain:
+            PropertyLookupCacheEntryType::ChangePropertyInPrototypeChain as u32,
         cell_block_mask: !(BLOCK_SIZE as u64 - 1),
         block_class_offset: offset(BLOCK_CLASS_OFFSET),
         block_class_tail_tag: BLOCK_CLASS_TAIL_TAG as u64,
@@ -567,6 +569,9 @@ pub(crate) fn build_cached_runtime_info(vm: &Vm) -> RuntimeInfo {
         dynamic_calls: dynamic_call_layout(vm),
     };
     info.dynamic_calls.call_stub = vm.jit.call_stub(&info);
+    info.dynamic_calls.call_forwarding_stub = vm.jit.call_forwarding_stub(&info);
+    info.dynamic_calls.get_by_id_accessor_stub = vm.jit.get_by_id_accessor_stub(&info);
+    info.dynamic_calls.put_by_value_setter_stub = vm.jit.put_by_value_setter_stub(&info);
     info.construct_stub = vm.jit.construct_stub(&info);
     info
 }
@@ -668,6 +673,10 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         function_environment_outer: offset(offset_of!(Environment, outer)),
         function_environment_function_object: offset(FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET),
         function_environment_this_value: offset(FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET),
+        apply_function_address: crate::runtime::function_prototype::APPLY_FUNCTION.map_or(0, |f| f as usize as u64),
         call_stub: 0,
+        call_forwarding_stub: 0,
+        get_by_id_accessor_stub: 0,
+        put_by_value_setter_stub: 0,
     }
 }

@@ -137,6 +137,9 @@ pub struct ScriptData {
     /// Whether the code that gets compiled for the functions of this source is worth keeping, because the program may
     /// get linked again.
     retains_compiled_functions: AtomicBool,
+    /// Whether this source is an engine builtin file whose retained functions are compiled with builtin abstract
+    /// operations enabled.
+    is_builtin_script: AtomicBool,
     /// The bytes of the code kept so far, for [`ScriptData::memory_size()`].
     retained_code_size: AtomicUsize,
 }
@@ -165,6 +168,14 @@ impl ScriptData {
 
     pub(crate) fn retains_compiled_functions(&self) -> bool {
         self.retains_compiled_functions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_builtin_script(&self) -> bool {
+        self.is_builtin_script.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_is_builtin_script(&self, is_builtin_script: bool) {
+        self.is_builtin_script.store(is_builtin_script, Ordering::Relaxed);
     }
 
     pub(crate) fn add_retained_code_size(&self, size: usize) {
@@ -652,6 +663,7 @@ fn parse_code_units<'z, U: Unit + Default, R>(
         reparse_context: Mutex::new(None),
         reparse_context_idle_collections: AtomicU8::new(0),
         retains_compiled_functions: AtomicBool::new(false),
+        is_builtin_script: AtomicBool::new(false),
         retained_code_size: AtomicUsize::new(0),
     });
     let view = TreeView {

@@ -92,7 +92,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
     VERIFY(size <= capacity);
     if (!force_large && guard_size == 0 && size == capacity && small_size_class_index(size).has_value())
         return allocate_small_storage(size, zero_fill_new_bytes);
-    return allocate_large_storage(size, capacity, guard_size);
+    return allocate_large_storage(size, capacity, zero_fill_new_bytes, guard_size);
 }
 
 ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::allocate_small_storage(size_t size, ZeroFillNewBytes zero_fill_new_bytes)
@@ -170,7 +170,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
     };
 }
 
-ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::allocate_large_storage(size_t size, size_t capacity, size_t guard_size)
+ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::allocate_large_storage(size_t size, size_t capacity, ZeroFillNewBytes zero_fill_new_bytes, size_t guard_size)
 {
     TRY(ensure_cage());
 
@@ -181,8 +181,50 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
     if (reservation_size.has_overflow())
         return Error::from_errno(ENOMEM);
 
-    auto offset = TRY(allocate_cage_range(reservation_size.value()));
     auto committed_size = round_up_to_page(size);
+    if (guard_size == 0 && !m_pooled_large_ranges.is_empty()) {
+        auto max_reservation = max(reservation_size.value() * 2, reservation_size.value() + 64 * KiB);
+        Optional<size_t> best_index;
+        for (size_t i = 0; i < m_pooled_large_ranges.size(); ++i) {
+            auto const& pooled = m_pooled_large_ranges[i];
+            if (pooled.reservation_size >= reservation_size.value() && pooled.reservation_size <= max_reservation) {
+                if (!best_index.has_value() || pooled.reservation_size < m_pooled_large_ranges[*best_index].reservation_size)
+                    best_index = i;
+            }
+        }
+        if (best_index.has_value()) {
+            auto pooled = m_pooled_large_ranges.take(*best_index);
+            VERIFY(m_pooled_large_committed_bytes >= pooled.committed_size);
+            m_pooled_large_committed_bytes -= pooled.committed_size;
+            auto old_committed_size = pooled.committed_size;
+            auto final_committed_size = old_committed_size;
+            if (committed_size > old_committed_size) {
+                auto commit_result = Core::System::commit_memory(m_cage_base + pooled.offset + old_committed_size, committed_size - old_committed_size, Core::System::MemoryTag::GarbageCollector);
+                if (commit_result.is_error()) {
+                    if (old_committed_size > 0)
+                        MUST(Core::System::decommit_memory(m_cage_base + pooled.offset, old_committed_size, Core::System::MemoryTag::GarbageCollector));
+                    release_cage_range(pooled.offset, pooled.reservation_size);
+                    return commit_result.release_error();
+                }
+                final_committed_size = committed_size;
+            }
+            if (zero_fill_new_bytes == ZeroFillNewBytes::Yes) {
+                auto zero_bytes = min(size, old_committed_size);
+                if (zero_bytes > 0)
+                    __builtin_memset(m_cage_base + pooled.offset, 0, zero_bytes);
+            }
+            return Allocation {
+                .offset = pooled.offset,
+                .capacity = capacity,
+                .reservation_size = pooled.reservation_size,
+                .committed_size = final_committed_size,
+                .reused_from_pool = true,
+                .small_allocation = {},
+            };
+        }
+    }
+
+    auto offset = TRY(allocate_cage_range(reservation_size.value()));
     if (committed_size > 0) {
         auto commit_result = Core::System::commit_memory(m_cage_base + offset, committed_size, Core::System::MemoryTag::GarbageCollector);
         if (commit_result.is_error()) {
@@ -196,6 +238,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::al
         .capacity = capacity,
         .reservation_size = reservation_size.value(),
         .committed_size = committed_size,
+        .reused_from_pool = false,
         .small_allocation = {},
     };
 }
@@ -275,7 +318,7 @@ ErrorOr<PrimitiveStorage::Allocator::Allocation> PrimitiveStorage::Allocator::re
     auto bytes_to_copy = min(old_size, new_size);
     if (bytes_to_copy > 0)
         __builtin_memcpy(m_cage_base + allocation.offset, m_cage_base + old_allocation.offset, bytes_to_copy);
-    if (zero_fill_new_bytes == ZeroFillNewBytes::Yes && new_size > old_size && allocation.small_allocation.has_value())
+    if (zero_fill_new_bytes == ZeroFillNewBytes::Yes && new_size > old_size && (allocation.small_allocation.has_value() || allocation.reused_from_pool))
         __builtin_memset(m_cage_base + allocation.offset + old_size, 0, new_size - old_size);
 
     return allocation;
@@ -297,11 +340,38 @@ void PrimitiveStorage::Allocator::deallocate(Allocation& allocation)
         return;
     }
 
+    static constexpr size_t max_pooled_large_ranges = 16;
+    static constexpr size_t max_pooled_large_entry_bytes = 1 * MiB;
+    static constexpr size_t max_pooled_large_committed_bytes = 4 * MiB;
     if (allocation.reservation_size > 0) {
-        decommit_large_storage(allocation);
-        release_cage_range(allocation.offset, allocation.reservation_size);
+        if (allocation.committed_size > 0
+            && allocation.committed_size <= max_pooled_large_entry_bytes
+            && allocation.reservation_size <= max_pooled_large_entry_bytes
+            && m_pooled_large_ranges.size() < max_pooled_large_ranges
+            && m_pooled_large_committed_bytes + allocation.committed_size <= max_pooled_large_committed_bytes) {
+            m_pooled_large_ranges.append(PooledLargeRange {
+                .offset = allocation.offset,
+                .reservation_size = allocation.reservation_size,
+                .committed_size = allocation.committed_size,
+            });
+            m_pooled_large_committed_bytes += allocation.committed_size;
+        } else {
+            decommit_large_storage(allocation);
+            release_cage_range(allocation.offset, allocation.reservation_size);
+        }
     }
     allocation = {};
+}
+
+void PrimitiveStorage::Allocator::release_pooled_large_ranges()
+{
+    for (auto const& pooled : m_pooled_large_ranges) {
+        if (pooled.committed_size > 0)
+            MUST(Core::System::decommit_memory(m_cage_base + pooled.offset, pooled.committed_size, Core::System::MemoryTag::GarbageCollector));
+        release_cage_range(pooled.offset, pooled.reservation_size);
+    }
+    m_pooled_large_ranges.clear();
+    m_pooled_large_committed_bytes = 0;
 }
 
 void PrimitiveStorage::Allocator::release_cage_range(size_t offset, size_t size)
@@ -576,6 +646,12 @@ void PrimitiveStorage::free(PrimitiveStorageHandle handle)
     m_allocator.deallocate(entry->allocation);
     entry->size = 0;
     free_entry(handle, primitive_storage_tag);
+}
+
+void PrimitiveStorage::release_pooled_large_ranges()
+{
+    MutexLocker locker { m_mutex };
+    m_allocator.release_pooled_large_ranges();
 }
 
 PrimitiveStorage::Entry* PrimitiveStorage::entry_for(PrimitiveStorageHandle handle)

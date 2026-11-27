@@ -30,6 +30,37 @@ use crate::tables::Run;
 const DEAD_OUTPUT: u8 = 1 << 0;
 /// A value that must have a stack slot that holds it from its definition on.
 const NEEDS_SPILL: u8 = 1 << 1;
+/// A node that is an allocated SSA value (`is_allocated_value`).
+const ALLOCATED_VALUE: u8 = 1 << 2;
+/// A node whose representation is `Repr::Float64`.
+const IS_FLOAT64: u8 = 1 << 3;
+/// A value live across at least one `Clobbers::CallerSaved` node (or in its non-`SiteKind::Call` frame state).
+const CROSSES_CALL: u8 = 1 << 4;
+/// A Float64 value live across at least one `Clobbers::Floats` (or call) node.
+const CROSSES_FLOAT_CLOBBER: u8 = 1 << 5;
+/// A value live across at least one `Clobbers::CallerSaved` node in a non-cold block.
+const CROSSES_HOT_CALL: u8 = 1 << 6;
+/// A Float64 value live across at least one `Clobbers::Floats` (or call) node in a non-cold block.
+const CROSSES_HOT_FLOAT_CLOBBER: u8 = 1 << 7;
+
+/// Whether `op` emits a `SiteKind::Call` site whose inlined caller frame values are read from stack slots while the
+/// callee runs (`codegen/sites.rs`).
+#[inline(always)]
+fn is_inlined_call_site(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::CallDirect {
+            inlined_frame_bytes,
+            ..
+        } | Op::CallNative {
+            inlined_frame_bytes,
+            ..
+        } | Op::CallNativeAccessor {
+            inlined_frame_bytes,
+            ..
+        } if *inlined_frame_bytes != 0
+    )
+}
 
 /// In place of the frame state uses of a frame state: they are not listed yet.
 const NOT_LISTED: Run = Run::NOT_WRITTEN;
@@ -63,30 +94,23 @@ pub(super) struct ValueLiveness<'w> {
     blocks: ZoneVec<'w, u32>,
     /// The uses of values as inputs, as the value in the high half and the position in the low half.
     use_pairs: ZoneVec<'w, u64>,
-    /// Where the walks up start: the value in the high half, then the block, then whether the value is only known to
-    /// flow out of the block (to a phi) in the lowest bit.
+    /// Where cross-block liveness starts: the value in the high half, then the block, then whether the value is only
+    /// known to flow out of the block (to a phi) in the lowest bit.
     seeds: ZoneVec<'w, u64>,
-    /// For each block, the value (plus one) that was last found live into it and out of it.
-    in_marks: ZoneVec<'w, u32>,
-    out_marks: ZoneVec<'w, u32>,
-    /// The blocks a walk up has still to pass.
-    pending: ZoneVec<'w, u32>,
-    /// What the walks found: the block in the high half and the value in the low half, in the order of the values.
+    /// What the dataflow found: the block in the high half and the value in the low half, in ascending value order.
     in_pairs: ZoneVec<'w, u64>,
     out_pairs: ZoneVec<'w, u64>,
     /// For each frame state, the allocated values that a node uses through it, as a part of `frame_uses`.
     frame_runs: ZoneVec<'w, Run>,
     frame_uses: ZoneVec<'w, NodeId>,
-    /// For each frame state, the block (plus one) whose seed scan last expanded it.
+    /// For each frame state, the block (plus one) whose scan last expanded it.
     frame_seen_block: ZoneVec<'w, u32>,
-    /// For each value, the block (plus one) that last queued a non-flowing-out seed for it.
-    last_seed_block: ZoneVec<'w, u32>,
+    /// Per-value mark reused across disjoint phases: `last_seed_block` in the forward pass, `live` in the backward walk.
+    node_mark: ZoneVec<'w, u32>,
     /// Per-value use counts / write cursors for linear-time use-list scattering.
     use_counts: ZoneVec<'w, u32>,
     /// Seeds bucketed by value index, avoiding comparison sort on `seeds`.
     seed_lists: Lists<'w, u32>,
-    /// For each value, the block (plus one) whose backwards walk has it live at the place it is at.
-    live: ZoneVec<'w, u32>,
     /// The values that were live at some place of the block that is walked.
     touched: ZoneVec<'w, NodeId>,
     live_since: ZoneVec<'w, Clobbers>,
@@ -167,6 +191,7 @@ impl<'w> ValueLiveness<'w> {
     /// The liveness of the values of `graph`, which has `size`. A compile fails if the lists of the liveness grow
     /// past their limit (see `check_items()`).
     pub fn compute(graph: &Graph, size: &Size, work: &'w Zone) -> Result<Self, CompileFailure> {
+        let single_block = graph.blocks.len() <= 1;
         let mut liveness = Self {
             live_in: Lists::new_in(work),
             live_out: Lists::new_in(work),
@@ -180,20 +205,27 @@ impl<'w> ValueLiveness<'w> {
             successors: Lists::with_capacity_in(size.blocks, size.edges, work),
             blocks: ZoneVec::from_elem_in(0, size.nodes, work),
             use_pairs: ZoneVec::with_capacity_in(size.inputs, work),
-            seeds: ZoneVec::with_capacity_in(size.inputs, work),
-            in_marks: ZoneVec::from_elem_in(0, size.blocks, work),
-            out_marks: ZoneVec::from_elem_in(0, size.blocks, work),
-            // NB: A walk up passes each block one time.
-            pending: ZoneVec::with_capacity_in(size.blocks, work),
-            in_pairs: ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work),
-            out_pairs: ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work),
+            seeds: if single_block {
+                ZoneVec::new_in(work)
+            } else {
+                ZoneVec::with_capacity_in(size.inputs, work)
+            },
+            in_pairs: if single_block {
+                ZoneVec::new_in(work)
+            } else {
+                ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work)
+            },
+            out_pairs: if single_block {
+                ZoneVec::new_in(work)
+            } else {
+                ZoneVec::with_capacity_in(size.inputs.max(size.blocks), work)
+            },
             frame_runs: ZoneVec::from_elem_in(NOT_LISTED, size.frame_states, work),
             frame_uses: ZoneVec::with_capacity_in(size.frame_states.saturating_mul(4), work),
             frame_seen_block: ZoneVec::from_elem_in(0, size.frame_states, work),
-            last_seed_block: ZoneVec::from_elem_in(0, size.nodes, work),
+            node_mark: ZoneVec::from_elem_in(0, size.nodes, work),
             use_counts: ZoneVec::from_elem_in(0, size.nodes, work),
             seed_lists: Lists::new_in(work),
-            live: ZoneVec::from_elem_in(0, size.nodes, work),
             touched: ZoneVec::with_capacity_in(size.nodes.min(256), work),
             live_since: ZoneVec::from_elem_in(Clobbers::default(), size.nodes, work),
         };
@@ -219,10 +251,30 @@ impl<'w> ValueLiveness<'w> {
         self.flags[value.index()] & DEAD_OUTPUT != 0
     }
 
-    /// Whether `value` must have a stack slot that holds it from its definition on: a value that is live across a
-    /// call, or live into a loop header (or a merge without a state predecessor).
+    /// Whether `value` must have a stack slot that holds it from its definition on regardless of register class:
+    /// a value live into a merge without a state predecessor, or referenced by a `SiteKind::Call` frame state.
     pub fn needs_spill(&self, value: NodeId) -> bool {
         self.flags[value.index()] & NEEDS_SPILL != 0
+    }
+
+    /// Whether `value` is live across a `Clobbers::CallerSaved` node.
+    pub fn crosses_call(&self, value: NodeId) -> bool {
+        self.flags[value.index()] & CROSSES_CALL != 0
+    }
+
+    /// Whether `value` is live across a `Clobbers::CallerSaved` node in a non-cold block.
+    pub fn crosses_hot_call(&self, value: NodeId) -> bool {
+        self.flags[value.index()] & CROSSES_HOT_CALL != 0
+    }
+
+    /// Whether `value` (a Float64) is live across a `Clobbers::Floats` (or call) node.
+    pub fn crosses_float_clobber(&self, value: NodeId) -> bool {
+        self.flags[value.index()] & CROSSES_FLOAT_CLOBBER != 0
+    }
+
+    /// Whether `value` (a Float64) is live across a `Clobbers::Floats` (or call) node in a non-cold block.
+    pub fn crosses_hot_float_clobber(&self, value: NodeId) -> bool {
+        self.flags[value.index()] & CROSSES_HOT_FLOAT_CLOBBER != 0
     }
 
     /// The positions of the nodes that use `value` as an input, in order.
@@ -248,7 +300,7 @@ impl<'w> ValueLiveness<'w> {
             let start = self.frame_uses.len();
             self.frame_uses.reserve(own_values.len());
             for &(_, value) in own_values {
-                if is_allocated_value(graph, value) {
+                if self.flags[value.index()] & ALLOCATED_VALUE != 0 {
                     self.frame_uses.push(value);
                 }
             }
@@ -257,7 +309,7 @@ impl<'w> ValueLiveness<'w> {
         }
         let start = self.frame_uses.len();
         for (_, value) in graph.frame_state_values(frame, work) {
-            if is_allocated_value(graph, value) {
+            if self.flags[value.index()] & ALLOCATED_VALUE != 0 {
                 self.frame_uses.push(value);
             }
         }
@@ -277,10 +329,10 @@ impl<'w> ValueLiveness<'w> {
                 return Ok(());
             }
             let block_mark = block as u32 + 1;
-            if self.last_seed_block[value_index] == block_mark {
+            if self.node_mark[value_index] == block_mark {
                 return Ok(());
             }
-            self.last_seed_block[value_index] = block_mark;
+            self.node_mark[value_index] = block_mark;
         }
         // NB: The frame states of the nodes give a block seeds that its inputs do not tell, so the seeds of one
         //     block alone can be past the limit.
@@ -294,10 +346,24 @@ impl<'w> ValueLiveness<'w> {
     fn fill(&mut self, graph: &Graph, work: &Zone) -> Result<(), CompileFailure> {
         let block_count = graph.blocks.len();
         let node_count = graph.nodes.len();
-        let has_virtual_objects = graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, Op::VirtualObject { .. }));
+        let mut has_virtual_objects = false;
+        for (node_index, node) in graph.nodes.iter().enumerate() {
+            match &node.op {
+                Op::VirtualObject { .. } => {
+                    has_virtual_objects = true;
+                }
+                Op::Constant(_) => {}
+                _ => {
+                    if let Some(repr) = node.repr {
+                        let mut flag = ALLOCATED_VALUE;
+                        if repr == crate::code::Repr::Float64 {
+                            flag |= IS_FLOAT64;
+                        }
+                        self.flags[node_index] = flag;
+                    }
+                }
+            }
+        }
 
         self.successors.begin();
         let mut position = 0;
@@ -315,22 +381,25 @@ impl<'w> ValueLiveness<'w> {
         }
 
         // The uses of each value: where it is an input, and the blocks it is used in that are not its own.
+        let single_block = block_count <= 1;
         for (index, block) in graph.blocks.iter().enumerate() {
             let block_mark = index as u32 + 1;
             for node_id in block.body.iter().chain(&block.control) {
                 let node = graph.node(*node_id);
                 let position = self.positions[node_id.index()];
                 for input in &node.inputs {
-                    if is_allocated_value(graph, *input) {
+                    if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
                         self.use_pairs.push(pair(input.0, position));
                         self.use_counts[input.index()] += 1;
-                        self.add_seed(*input, index, false)?;
+                        if !single_block {
+                            self.add_seed(*input, index, false)?;
+                        }
                     }
                 }
                 if let Some(frame) = node.frame_state {
                     if has_virtual_objects {
                         self.list_frame_uses(graph, frame, true, work)?;
-                        if self.frame_seen_block[frame.index()] != block_mark {
+                        if !single_block && self.frame_seen_block[frame.index()] != block_mark {
                             self.frame_seen_block[frame.index()] = block_mark;
                             for use_index in self.frame_runs[frame.index()].range() {
                                 self.add_seed(self.frame_uses[use_index], index, false)?;
@@ -344,30 +413,37 @@ impl<'w> ValueLiveness<'w> {
                             }
                             self.frame_seen_block[id.index()] = block_mark;
                             self.list_frame_uses(graph, id, false, work)?;
-                            for use_index in self.frame_runs[id.index()].range() {
-                                self.add_seed(self.frame_uses[use_index], index, false)?;
+                            if !single_block {
+                                for use_index in self.frame_runs[id.index()].range() {
+                                    self.add_seed(self.frame_uses[use_index], index, false)?;
+                                }
                             }
                             current = graph.frame_state(id).parent;
                         }
                     }
                 }
             }
-            let block_id = BlockId::from_index(index);
-            let end = self.positions[graph.control_id(block_id).index()];
-            for successor_index in 0..self.successors.get(index).len() {
-                let successor = self.successors.get(index)[successor_index];
-                for (_, input) in phi_inputs_from(graph, block_id, successor) {
-                    if is_allocated_value(graph, input) {
-                        self.use_pairs.push(pair(input.0, end));
-                        self.use_counts[input.index()] += 1;
-                        self.add_seed(input, index, true)?;
+            if !single_block && !block.phis.is_empty() {
+                // Invert the phi edge scan: iterate each predecessor once in O(1) instead of searching
+                // `predecessors.iter().position(...)` per `(block, successor)` pair.
+                for (pred_index, &predecessor) in block.predecessors.iter().enumerate() {
+                    let pred_idx = predecessor.index();
+                    let end = self.positions[graph.control_id(predecessor).index()];
+                    for &phi in &block.phis {
+                        let input = graph.node(phi).inputs[pred_index];
+                        if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
+                            self.use_pairs.push(pair(input.0, end));
+                            self.use_counts[input.index()] += 1;
+                            self.add_seed(input, pred_idx, true)?;
+                        }
                     }
                 }
             }
         }
 
-        // Linear-time counting scatter: `use_pairs` was appended in non-decreasing position order, so scattering
-        // per value preserves ascending position order without sorting.
+        // Linear-time counting scatter: `use_pairs` is appended in ascending position order for regular inputs;
+        // phi uses come from predecessors whose `end` may differ from the successor's block order, so sort each
+        // value's small slice only if out of order (almost never).
         let mut offset = 0usize;
         for value in 0..node_count {
             let count = self.use_counts[value] as usize;
@@ -384,77 +460,147 @@ impl<'w> ValueLiveness<'w> {
             self.use_counts[value] = slot as u32 + 1;
             self.uses[slot] = low(use_pair);
         }
+        if !single_block {
+            for value in 0..node_count {
+                let range = self.use_runs[value].range();
+                if range.len() > 1 {
+                    let slice = &mut self.uses[range];
+                    if slice.windows(2).any(|w| w[0] > w[1]) {
+                        slice.sort_unstable();
+                    }
+                }
+            }
+        }
 
-        // Bucket seeds by value index in linear time, preserving ascending value order for `live_in`/`live_out`.
-        self.seed_lists.begin_counts(node_count);
-        for &seed_pair in &self.seeds {
-            self.seed_lists.count(high(seed_pair) as usize);
-        }
-        self.seed_lists.end_counts(0);
-        for &seed_pair in &self.seeds {
-            self.seed_lists.fill(high(seed_pair) as usize, low(seed_pair));
-        }
-        self.seed_lists.end_fill();
+        if single_block {
+            self.live_in.begin_counts(block_count);
+            self.live_in.end_counts(NodeId(0));
+            self.live_in.end_fill();
+            self.live_out.begin_counts(block_count);
+            self.live_out.end_counts(NodeId(0));
+            self.live_out.end_fill();
+        } else {
+            // Bucket seeds by value index in linear time, then solve cross-block liveness in 64-value bitwise RPO chunks.
+            self.seed_lists.begin_counts(node_count);
+            for &seed_pair in &self.seeds {
+                self.seed_lists.count(high(seed_pair) as usize);
+            }
+            self.seed_lists.end_counts(0);
+            for &seed_pair in &self.seeds {
+                self.seed_lists.fill(high(seed_pair) as usize, low(seed_pair));
+            }
+            self.seed_lists.end_fill();
 
-        // Walk up from the uses of each value, as far as the block of its definition.
-        for value_index in 0..node_count {
-            let seeds = self.seed_lists.get(value_index);
-            if seeds.is_empty() {
-                continue;
-            }
-            let value = value_index as u32;
-            let mark = value + 1;
-            let definition = self.blocks[value_index];
-            self.pending.clear();
-            for &seed in seeds {
-                let (block, flows_out) = (seed >> 1, seed & 1 != 0);
-                if flows_out {
-                    if self.out_marks[block as usize] != mark {
-                        self.out_marks[block as usize] = mark;
-                        self.out_pairs.push(pair(block, value));
-                    }
-                    if block == definition {
-                        continue;
-                    }
-                }
-                if self.in_marks[block as usize] != mark {
-                    self.in_marks[block as usize] = mark;
-                    self.in_pairs.push(pair(block, value));
-                    self.pending.push(block);
+            let mut cross_values = ZoneVec::with_capacity_in(node_count.min(self.seeds.len()), work);
+            for value_index in 0..node_count {
+                if !self.seed_lists.get(value_index).is_empty() {
+                    cross_values.push(value_index as u32);
                 }
             }
-            while let Some(block) = self.pending.pop() {
-                for predecessor in &graph.blocks[block as usize].predecessors {
-                    let predecessor = predecessor.0;
-                    if self.out_marks[predecessor as usize] != mark {
-                        self.out_marks[predecessor as usize] = mark;
-                        self.out_pairs.push(pair(predecessor, value));
-                    }
-                    if predecessor != definition && self.in_marks[predecessor as usize] != mark {
-                        self.in_marks[predecessor as usize] = mark;
-                        self.in_pairs.push(pair(predecessor, value));
-                        self.pending.push(predecessor);
+            if !cross_values.is_empty() {
+                let mut has_loops = false;
+                let mut last_loop_block = 0usize;
+                for (b, block) in graph.blocks.iter().enumerate() {
+                    for pred in &block.predecessors {
+                        if pred.index() >= b {
+                            has_loops = true;
+                            last_loop_block = last_loop_block.max(pred.index());
+                        }
                     }
                 }
+                let mut use_mask = ZoneVec::from_elem_in(0u64, block_count, work);
+                let mut phi_out_mask = ZoneVec::from_elem_in(0u64, block_count, work);
+                let mut def_mask = ZoneVec::from_elem_in(0u64, block_count, work);
+                let mut live_in_mask = ZoneVec::from_elem_in(0u64, block_count, work);
+                let mut live_out_mask = ZoneVec::from_elem_in(0u64, block_count, work);
+
+                let mut chunk_start = 0usize;
+                while chunk_start < cross_values.len() {
+                    let chunk_end = (chunk_start + 64).min(cross_values.len());
+                    let chunk = &cross_values[chunk_start..chunk_end];
+                    if chunk_start != 0 {
+                        use_mask.fill(0);
+                        phi_out_mask.fill(0);
+                        def_mask.fill(0);
+                        live_in_mask.fill(0);
+                        live_out_mask.fill(0);
+                    }
+                    for (bit, &value) in chunk.iter().enumerate() {
+                        let mask = 1u64 << bit;
+                        def_mask[self.blocks[value as usize] as usize] |= mask;
+                        for &seed in self.seed_lists.get(value as usize) {
+                            let block = (seed >> 1) as usize;
+                            if seed & 1 != 0 {
+                                phi_out_mask[block] |= mask;
+                            } else {
+                                use_mask[block] |= mask;
+                            }
+                        }
+                    }
+                    for b in (0..block_count).rev() {
+                        let mut out = phi_out_mask[b];
+                        for &succ in self.successors.get(b) {
+                            out |= live_in_mask[succ.index()];
+                        }
+                        live_out_mask[b] = out;
+                        live_in_mask[b] = (use_mask[b] | out) & !def_mask[b];
+                    }
+                    if has_loops {
+                        loop {
+                            let mut changed = false;
+                            for b in (0..=last_loop_block).rev() {
+                                let mut out = phi_out_mask[b];
+                                for &succ in self.successors.get(b) {
+                                    out |= live_in_mask[succ.index()];
+                                }
+                                let new_in = (use_mask[b] | out) & !def_mask[b];
+                                if out != live_out_mask[b] || new_in != live_in_mask[b] {
+                                    live_out_mask[b] = out;
+                                    live_in_mask[b] = new_in;
+                                    changed = true;
+                                }
+                            }
+                            if !changed {
+                                break;
+                            }
+                        }
+                    }
+                    for b in 0..block_count {
+                        let mut m = live_in_mask[b];
+                        while m != 0 {
+                            let bit = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            self.in_pairs.push(pair(b as u32, chunk[bit]));
+                        }
+                        let mut m = live_out_mask[b];
+                        while m != 0 {
+                            let bit = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            self.out_pairs.push(pair(b as u32, chunk[bit]));
+                        }
+                    }
+                    check_items(self.in_pairs.len())?;
+                    check_items(self.out_pairs.len())?;
+                    chunk_start = chunk_end;
+                }
             }
-            // NB: How many blocks a value is live into is known only when its walk is done.
-            check_items(self.in_pairs.len())?;
-            check_items(self.out_pairs.len())?;
+            // NB: The pairs are emitted in ascending value order across chunks, so each block's list comes out sorted.
+            fn lists_of_blocks(lists: &mut Lists<NodeId>, pairs: &[u64], block_count: usize) {
+                lists.begin_counts(block_count);
+                for pair in pairs {
+                    lists.count(high(*pair) as usize);
+                }
+                lists.end_counts(NodeId(0));
+                for pair in pairs {
+                    lists.fill(high(*pair) as usize, NodeId(low(*pair)));
+                }
+                lists.end_fill();
+            }
+            lists_of_blocks(&mut self.live_in, &self.in_pairs, block_count);
+            lists_of_blocks(&mut self.live_out, &self.out_pairs, block_count);
+            // Reset `node_mark` before reusing it as `live` in the backwards walk.
+            self.node_mark.fill(0);
         }
-        // NB: The pairs are in the order of the values, so the list of each block comes out sorted.
-        fn lists_of_blocks(lists: &mut Lists<NodeId>, pairs: &[u64], block_count: usize) {
-            lists.begin_counts(block_count);
-            for pair in pairs {
-                lists.count(high(*pair) as usize);
-            }
-            lists.end_counts(NodeId(0));
-            for pair in pairs {
-                lists.fill(high(*pair) as usize, NodeId(low(*pair)));
-            }
-            lists.end_fill();
-        }
-        lists_of_blocks(&mut self.live_in, &self.in_pairs, block_count);
-        lists_of_blocks(&mut self.live_out, &self.out_pairs, block_count);
 
         // OPTIMIZATION: Rather than marking every value live across each call or float clobbering slow path there,
         //               which takes time quadratic in the size of code that keeps many values live past many of them
@@ -463,21 +609,25 @@ impl<'w> ValueLiveness<'w> {
         let mut clobbers = Clobbers::default();
         let back_mark_base = block_count as u32;
         for (index, block) in graph.blocks.iter().enumerate() {
+            let hot_block = !block.is_cold;
             let block_id = BlockId::from_index(index);
             let block_start = clobbers;
             let check_spill = |flags: &mut [u8], since: Clobbers, clobbers: Clobbers, value: usize| {
-                let is_float = graph.nodes[value].repr == Some(crate::code::Repr::Float64);
-                if clobbers.calls != since.calls || (is_float && clobbers.float_clobbers != since.float_clobbers) {
-                    flags[value] |= NEEDS_SPILL;
+                let is_float = flags[value] & IS_FLOAT64 != 0;
+                if clobbers.calls != since.calls {
+                    flags[value] |= CROSSES_CALL | if hot_block { CROSSES_HOT_CALL } else { 0 };
+                }
+                if is_float && clobbers.float_clobbers != since.float_clobbers {
+                    flags[value] |= CROSSES_FLOAT_CLOBBER | if hot_block { CROSSES_HOT_FLOAT_CLOBBER } else { 0 };
                 }
             };
-            // Walk the block backwards from the values live at its end. A value is live where the walk is if `live`
+            // Walk the block backwards from the values live at its end. A value is live where the walk is if `node_mark`
             // has the mark of the block for it.
             let mark = index as u32 + 1;
             let parent_back_mark = back_mark_base + mark;
             self.touched.clear();
             for value in self.live_out.get(index) {
-                self.live[value.index()] = mark;
+                self.node_mark[value.index()] = mark;
                 self.live_since[value.index()] = block_start;
                 self.touched.push(*value);
             }
@@ -489,7 +639,7 @@ impl<'w> ValueLiveness<'w> {
                     None => 0..0,
                 };
 
-                let node_was_live = self.live[node_id.index()] == mark;
+                let node_was_live = self.node_mark[node_id.index()] == mark;
                 if node_was_live {
                     check_spill(
                         &mut self.flags,
@@ -497,7 +647,7 @@ impl<'w> ValueLiveness<'w> {
                         clobbers,
                         node_id.index(),
                     );
-                } else if is_allocated_value(graph, *node_id) {
+                } else if self.flags[node_id.index()] & ALLOCATED_VALUE != 0 {
                     self.flags[node_id.index()] |= DEAD_OUTPUT;
                 }
                 let (is_call, clobbers_floats) = match lowering_clobbers(node) {
@@ -509,30 +659,43 @@ impl<'w> ValueLiveness<'w> {
                 if is_call || clobbers_floats {
                     clobbers.float_clobbers += 1;
                     clobbers.calls += u32::from(is_call);
-                    for value in &self.frame_uses[frame_uses.clone()] {
-                        let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
-                        if value != node_id && (is_call || is_float) {
-                            self.flags[value.index()] |= NEEDS_SPILL;
+                    // Values in `SiteKind::Call` frame states are read from stack slots while the callee runs,
+                    // so they must always have a stack home (`NEEDS_SPILL`). Other call/float-clobber frame states
+                    // read from `RegisterDump` on exit, so callee-saved registers remain valid there.
+                    let requires_stack_home = is_inlined_call_site(&node.op);
+                    let mark_frame_clobber = |flags: &mut [u8], value: NodeId| {
+                        if value == *node_id {
+                            return;
                         }
+                        let flag = &mut flags[value.index()];
+                        if requires_stack_home {
+                            *flag |= NEEDS_SPILL;
+                        }
+                        if is_call {
+                            *flag |= CROSSES_CALL | if hot_block { CROSSES_HOT_CALL } else { 0 };
+                        }
+                        if *flag & IS_FLOAT64 != 0 {
+                            *flag |= CROSSES_FLOAT_CLOBBER | if hot_block { CROSSES_HOT_FLOAT_CLOBBER } else { 0 };
+                        }
+                    };
+                    for &value in &self.frame_uses[frame_uses.clone()] {
+                        mark_frame_clobber(&mut self.flags, value);
                     }
                     if !has_virtual_objects && let Some(frame) = node.frame_state {
                         let mut parent = graph.frame_state(frame).parent;
                         while let Some(id) = parent {
-                            if self.frame_seen_block[id.index()] == parent_back_mark {
+                            if !requires_stack_home && self.frame_seen_block[id.index()] == parent_back_mark {
                                 break;
                             }
-                            for value in &self.frame_uses[self.frame_runs[id.index()].range()] {
-                                let is_float = graph.nodes[value.index()].repr == Some(crate::code::Repr::Float64);
-                                if value != node_id && (is_call || is_float) {
-                                    self.flags[value.index()] |= NEEDS_SPILL;
-                                }
+                            for &value in &self.frame_uses[self.frame_runs[id.index()].range()] {
+                                mark_frame_clobber(&mut self.flags, value);
                             }
                             parent = graph.frame_state(id).parent;
                         }
                     }
                 }
                 let deaths = self.dying.len();
-                self.live[node_id.index()] = 0;
+                self.node_mark[node_id.index()] = 0;
                 let mut self_used = false;
                 let mut mark_use = |value: NodeId| {
                     if value == *node_id {
@@ -545,15 +708,15 @@ impl<'w> ValueLiveness<'w> {
                         }
                         return;
                     }
-                    if self.live[value.index()] != mark {
-                        self.live[value.index()] = mark;
+                    if self.node_mark[value.index()] != mark {
+                        self.node_mark[value.index()] = mark;
                         self.dying.push(value);
                         self.live_since[value.index()] = clobbers;
                         self.touched.push(value);
                     }
                 };
                 for &input in &node.inputs {
-                    if is_allocated_value(graph, input) {
+                    if self.flags[input.index()] & ALLOCATED_VALUE != 0 {
                         mark_use(input);
                     }
                 }
@@ -589,32 +752,34 @@ impl<'w> ValueLiveness<'w> {
                 }
                 prev_frame = node.frame_state;
                 if self_used {
-                    self.live[node_id.index()] = mark;
+                    self.node_mark[node_id.index()] = mark;
                     self.touched.push(*node_id);
                 }
                 self.deaths[node_id.index()] = Run::new(deaths, self.dying.len());
             }
             // NB: The phis of the block are live from its start if anything uses them.
             for phi in &block.phis {
-                if self.live[phi.index()] == mark {
+                if self.node_mark[phi.index()] == mark {
                     check_spill(&mut self.flags, self.live_since[phi.index()], clobbers, phi.index());
-                    self.live[phi.index()] = 0;
+                    self.node_mark[phi.index()] = 0;
                 }
             }
             // NB: `touched` may have a value more than one time, which does no harm here.
             for value in &self.touched {
-                if self.live[value.index()] == mark {
+                if self.node_mark[value.index()] == mark {
                     check_spill(&mut self.flags, self.live_since[value.index()], clobbers, value.index());
                 }
             }
             // NB: Most merges start with the register state of one of their
             //     predecessors (see `state_predecessor()`).
-            let predecessors = &block.predecessors;
-            if (predecessors.len() > 1 || predecessors.first().is_some_and(|predecessor| *predecessor >= block_id))
-                && state_predecessor(graph, block_id).is_none()
-            {
-                for value in self.live_in.get(index) {
-                    self.flags[value.index()] |= NEEDS_SPILL;
+            if !single_block {
+                let predecessors = &block.predecessors;
+                if (predecessors.len() > 1 || predecessors.first().is_some_and(|predecessor| *predecessor >= block_id))
+                    && state_predecessor(graph, block_id).is_none()
+                {
+                    for value in self.live_in.get(index) {
+                        self.flags[value.index()] |= NEEDS_SPILL;
+                    }
                 }
             }
             // NB: The frame states of the nodes give a block deaths that its inputs do not tell.
