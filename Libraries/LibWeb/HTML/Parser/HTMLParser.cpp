@@ -2153,7 +2153,10 @@ private:
             fly_name = Utf16FlyString::from_utf8_without_validation({ name.data(), length });
         else
             fly_name = Utf16FlyString::from_utf16({ name.data(), length });
-        DOM::QualifiedName qualified_name { fly_name, {}, {} };
+        static thread_local size_t s_immortal_custom_attribute_count = 0;
+        DOM::QualifiedName qualified_name = s_immortal_custom_attribute_count < 256
+            ? (++s_immortal_custom_attribute_count, DOM::QualifiedName::make_immortal(fly_name, {}, {}))
+            : DOM::QualifiedName { fly_name, {}, {} };
         entry = { hash, move(qualified_name), DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
         return &entry;
     }

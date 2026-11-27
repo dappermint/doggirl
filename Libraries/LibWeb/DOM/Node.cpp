@@ -70,6 +70,7 @@
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
+#include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
@@ -990,7 +991,8 @@ void Node::adjust_live_ranges_for_insertion(Node& child, size_t count)
 void Node::insert_node_into_children(GC::Ref<Node> node, GC::Ptr<Node> child, bool defer_subtree_root)
 {
     // 1. Adopt node into parent’s node document.
-    document().adopt_node_steps(node);
+    if (node->parent() || &node->document() != &document())
+        document().adopt_node_steps(node);
 
     // 2. If child is null, then append node to parent’s children.
     // 3. Otherwise, insert node into parent’s children before child’s index.
@@ -1067,6 +1069,20 @@ static void run_post_connection_steps(Nodes const& nodes)
 
 static CSS::StyleNodeID mirror_identity_of(Node const&);
 
+static bool has_form_or_fieldset_inclusive_ancestor(Node const& node)
+{
+    for (auto const* ancestor = &node; ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->is_element())
+            continue;
+        auto const& element = static_cast<Element const&>(*ancestor);
+        if (element.tree_mutation_fast_path() != Element::TreeMutationFastPath::None)
+            continue;
+        if (is<HTML::HTMLFormElement>(element) || is<HTML::HTMLFieldSetElement>(element))
+            return true;
+    }
+    return false;
+}
+
 void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements affects_elements)
 {
     // 5. If child is non-null:
@@ -1099,10 +1115,12 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
         && !(is_element() && static_cast<Element const&>(*this).is_shadow_host())
         && !is_html_slot_element();
     bool const parent_in_editable_subtree = m_in_editable_subtree;
-    bool const doc_has_no_form_or_fieldset = !document().has_form_or_fieldset_element() && !document().has_form_element();
+    bool const parent_has_no_form_or_fieldset_ancestor = (!document().has_form_or_fieldset_element() && !document().has_form_element())
+        || !has_form_or_fieldset_inclusive_ancestor(*this);
     u32 const nonce_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::nonce);
     u32 const autofocus_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::autofocus);
     u32 const dir_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::dir);
+    u32 const form_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::form);
     auto* focused_area = document().focused_area().ptr();
     bool const focused_area_may_be_in_detached_node = focused_area && !focused_area->is_connected();
     bool parent_style_arrival_ancestors_marked = false;
@@ -1131,7 +1149,9 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
         bool const fast_plain_text_base = parent_is_connected
             && subtree_insertion_scope.descendants_covered_by_subtree_arrival()
             && !subtree_insertion_scope.keyboard_scroll_tracks_document()
-            && !subtree_insertion_scope.document_may_have_blocking_wheel_event_listener();
+            && !subtree_insertion_scope.document_may_have_blocking_wheel_event_listener()
+            && !subtree_insertion_scope.may_be_in_shadow_tree()
+            && !subtree_insertion_scope.document_has_auto_directionality();
         bool const fast_plain_element_base = fast_plain_text_base
             && !parent_in_editable_subtree
             && !subtree_insertion_scope.document_has_inert_element()
@@ -1142,14 +1162,14 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                 auto const filter = static_cast<Element const&>(*node_to_insert).subtree_attribute_filter();
                 return (filter & nonce_attr_bits) != nonce_attr_bits
                     && (filter & autofocus_attr_bits) != autofocus_attr_bits
-                    && (filter & dir_attr_bits) != dir_attr_bits;
+                    && (filter & dir_attr_bits) != dir_attr_bits
+                    && (filter & form_attr_bits) != form_attr_bits;
             }();
+        bool subtree_hit_slow_path = false;
 
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
-            if (fast_plain_text_base
-                && !subtree_insertion_scope.may_be_in_shadow_tree()
-                && !subtree_insertion_scope.document_has_auto_directionality()) {
+            if (fast_plain_text_base) {
                 if (inclusive_descendant.is_exclusive_text()) {
                     auto& text = static_cast<Text&>(inclusive_descendant);
                     if (text.style_node_id() == 0) {
@@ -1179,21 +1199,21 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                             || element.has_no_raw_attributes()
                             || ((element.subtree_attribute_filter() & nonce_attr_bits) != nonce_attr_bits
                                 && (element.subtree_attribute_filter() & autofocus_attr_bits) != autofocus_attr_bits
-                                && (element.subtree_attribute_filter() & dir_attr_bits) != dir_attr_bits))
+                                && (element.subtree_attribute_filter() & dir_attr_bits) != dir_attr_bits
+                                && (element.subtree_attribute_filter() & form_attr_bits) != form_attr_bits))
                         && static_cast<HTML::HTMLElement const&>(element).content_editable_state() == HTML::ContentEditableState::Inherit
                         && (!element.parent() || !element.parent()->m_in_editable_subtree)
                         && &element.document() == &document()) {
                         bool can_fast_insert = fast_kind == Element::TreeMutationFastPath::PlainHTML;
-                        if (!can_fast_insert && doc_has_no_form_or_fieldset) {
+                        if (!can_fast_insert && parent_has_no_form_or_fieldset_ancestor && !subtree_hit_slow_path) {
                             if (fast_kind == Element::TreeMutationFastPath::Button) {
-                                // NB: `element.rare_data()` is already verified null above, and `HTMLElement::form_associated_rare_data()` returns `rare_data()`.
-                                ASSERT(!static_cast<HTML::HTMLButtonElement const&>(element).form()
-                                    && !static_cast<HTML::HTMLButtonElement const&>(element).has_form_associated_rare_data());
-                                can_fast_insert = true;
+                                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
+                                can_fast_insert = !button.form() && !button.has_form_associated_rare_data();
                             } else if (fast_kind == Element::TreeMutationFastPath::Input) {
                                 auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
-                                ASSERT(!input.form() && !input.has_form_associated_rare_data());
-                                can_fast_insert = input.type_state() != HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                                can_fast_insert = !input.form()
+                                    && !input.has_form_associated_rare_data()
+                                    && input.type_state() != HTML::HTMLInputElement::TypeAttributeState::RadioButton
                                     && !input.has_rare_input_data();
                             }
                         }
@@ -1207,6 +1227,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                     }
                 }
             }
+
+            subtree_hit_slow_path = true;
 
             if (subtree_root_deferred) {
                 node_to_insert->set_root_for_subtree(parent_root);
@@ -1665,7 +1687,8 @@ Node::RemovingStepsContext Node::make_removing_steps_context(Node& parent, Node&
             && !doc.page().accessibility_interested()
             && doc.timeline_declarations_generation() == 0
             && !parent_root.is_shadow_root(),
-        .doc_has_no_form_or_fieldset = !doc.has_form_or_fieldset_element() && !doc.has_form_element(),
+        .doc_has_no_form_or_fieldset = (!doc.has_form_or_fieldset_element() && !doc.has_form_element())
+            || !has_form_or_fieldset_inclusive_ancestor(parent),
         .is_parent_connected = parent.is_connected(),
     };
 }
@@ -1709,13 +1732,14 @@ void Node::run_removing_steps_with_context(Node& parent, Node& parent_root, bool
             if (!doc_has_no_form_or_fieldset)
                 return false;
             if (fast_kind == Element::TreeMutationFastPath::Button) {
-                // NB: `element.rare_data()` is already verified null above, and `HTMLElement::form_associated_rare_data()` returns `rare_data()`.
-                ASSERT(!static_cast<HTML::HTMLButtonElement const&>(element).form()
-                    && !static_cast<HTML::HTMLButtonElement const&>(element).has_form_associated_rare_data());
+                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
+                if (button.form() || button.has_form_associated_rare_data())
+                    return false;
             } else if (fast_kind == Element::TreeMutationFastPath::Input) {
                 auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
-                ASSERT(!input.form() && !input.has_form_associated_rare_data());
-                if (input.type_state() == HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                if (input.form()
+                    || input.has_form_associated_rare_data()
+                    || input.type_state() == HTML::HTMLInputElement::TypeAttributeState::RadioButton
                     || input.has_rare_input_data()) {
                     return false;
                 }

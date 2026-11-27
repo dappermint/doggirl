@@ -1630,8 +1630,42 @@ pub struct TransitionStart {
 
 /// The easing of the computed timing function `value`, with its serialization, as `EffectTiming.easing` reads it.
 fn timing_function_and_serialization(value: &StyleValueData) -> (CompactEasing, RetainedUtf16FlyString) {
+    use crate::css::css_enums::keyword;
     use crate::css::serialize::{SerializationMode, TextSink, serialize_style_value};
     use libcompositing_rust::easing::FfiEasingKind;
+
+    // Fast path for the five standard keyword timing functions without formatting UTF-16 or re-interning.
+    if let StyleValueData::Keyword { keyword: kw } = *value {
+        thread_local! {
+            static KEYWORD_SERIALIZATIONS: [std::cell::OnceCell<RetainedUtf16FlyString>; 5] = [
+                const { std::cell::OnceCell::new() },
+                const { std::cell::OnceCell::new() },
+                const { std::cell::OnceCell::new() },
+                const { std::cell::OnceCell::new() },
+                const { std::cell::OnceCell::new() },
+            ];
+        }
+        let fast: Option<(CompactEasing, usize, &[u8])> = match kw {
+            keyword::LINEAR => Some((CompactEasing::Linear, 0usize, b"linear")),
+            keyword::EASE => Some((CompactEasing::Keyword(0), 1usize, b"ease")),
+            keyword::EASE_IN => Some((CompactEasing::Keyword(1), 2usize, b"ease-in")),
+            keyword::EASE_OUT => Some((CompactEasing::Keyword(2), 3usize, b"ease-out")),
+            keyword::EASE_IN_OUT => Some((CompactEasing::Keyword(3), 4usize, b"ease-in-out")),
+            _ => None,
+        };
+        if let Some((compact, slot, ascii)) = fast {
+            let serialization = KEYWORD_SERIALIZATIONS.with(|cells| {
+                cells[slot]
+                    .get_or_init(|| {
+                        let units: Vec<u16> = ascii.iter().map(|&b| u16::from(b)).collect();
+                        RetainedUtf16FlyString::from_utf16(&units)
+                    })
+                    .clone()
+            });
+            return (compact, serialization);
+        }
+    }
+
     let easing = crate::css::style::effect_descriptions::easing_from_computed_timing_function(value)
         .expect("a computed transition-timing-function describes an easing");
     let mode = if matches!(value, StyleValueData::Easing(_)) && easing.kind() == FfiEasingKind::CubicBezier {

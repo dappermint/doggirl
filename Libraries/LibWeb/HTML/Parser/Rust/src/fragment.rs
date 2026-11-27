@@ -14,11 +14,13 @@
 
 use crate::code_units::RustFfiHtmlUtf16View;
 use crate::known_names::known_attribute_name;
+#[cfg(test)]
 use crate::known_names::tag_id;
 #[cfg(test)]
 use crate::known_names::tag_id_for_name;
 use crate::scan;
 use crate::scan::CodeUnit;
+#[cfg(test)]
 use crate::token::TagId;
 #[cfg(test)]
 use crate::token::TagSet;
@@ -303,8 +305,6 @@ fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
     Scanner {
         input,
         offset: 0,
-        #[cfg(not(test))]
-        hot_attributes: hot_attribute_identities(),
         tape,
     }
     .scan()
@@ -313,8 +313,6 @@ fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
 struct Scanner<'a, T> {
     input: &'a [T],
     offset: usize,
-    #[cfg(not(test))]
-    hot_attributes: &'static [usize; HOT_ATTRIBUTE_NAMES.len()],
     tape: &'a mut RustHtmlFragmentTape,
 }
 
@@ -554,7 +552,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     fn scan_supported_tag(&mut self) -> Option<RustFfiHtmlFragmentTag> {
         let mut buffer = [core::mem::MaybeUninit::<u8>::uninit(); 16];
         let (_, bytes) = self.scan_name_into(&mut buffer);
-        supported_tag_for_name(bytes?).map(|(_, tag_kind)| tag_kind)
+        supported_tag_for_name(bytes?)
     }
 
     /// Scans a tag or attribute name of lowercase ASCII letters, digits and hyphens, returning its
@@ -602,11 +600,12 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
 
     #[inline(always)]
     fn consume(&mut self, byte: u8) -> bool {
-        if self.offset == self.input.len() || self.peek() != u16::from(byte) {
-            return false;
+        if self.offset < self.input.len() && self.input[self.offset].into() == u16::from(byte) {
+            self.offset += 1;
+            true
+        } else {
+            false
         }
-        self.offset += 1;
-        true
     }
 
     #[inline(always)]
@@ -642,8 +641,10 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         }
         if let Some(index) = hot_attribute_index(bytes) {
             let kind = HOT_ATTRIBUTE_KINDS[index];
+            // NB: C++ resolves hot attributes directly from `hot_kind` via its immortal table and never reads
+            //     `known_name` when `hot_kind != None`.
             #[cfg(not(test))]
-            let identity = self.hot_attributes[index];
+            let identity = 0;
             #[cfg(test)]
             let identity = 1;
             return (kind, identity);
@@ -705,63 +706,64 @@ fn hot_attribute_index(bytes: &[u8]) -> Option<usize> {
     }
 }
 
-#[inline]
-fn supported_tag_for_name(name: &[u8]) -> Option<(TagId, RustFfiHtmlFragmentTag)> {
+#[inline(always)]
+fn supported_tag_for_name(name: &[u8]) -> Option<RustFfiHtmlFragmentTag> {
     use RustFfiHtmlFragmentTag as Kind;
     match name.len() {
         1 => match name[0] {
-            b'a' => Some((tag_id!("a"), Kind::A)),
-            b'b' => Some((tag_id!("b"), Kind::B)),
-            b'i' => Some((tag_id!("i"), Kind::I)),
-            b's' => Some((tag_id!("s"), Kind::S)),
-            b'u' => Some((tag_id!("u"), Kind::U)),
+            b'a' => Some(Kind::A),
+            b'b' => Some(Kind::B),
+            b'i' => Some(Kind::I),
+            b's' => Some(Kind::S),
+            b'u' => Some(Kind::U),
             _ => None,
         },
         2 => match name {
-            b"li" => Some((tag_id!("li"), Kind::Li)),
-            b"ul" => Some((tag_id!("ul"), Kind::Ul)),
-            b"br" => Some((tag_id!("br"), Kind::Br)),
-            b"em" => Some((tag_id!("em"), Kind::Em)),
-            b"ol" => Some((tag_id!("ol"), Kind::Ol)),
-            b"tt" => Some((tag_id!("tt"), Kind::Tt)),
+            b"li" => Some(Kind::Li),
+            b"ul" => Some(Kind::Ul),
+            b"br" => Some(Kind::Br),
+            b"em" => Some(Kind::Em),
+            b"ol" => Some(Kind::Ol),
+            b"tt" => Some(Kind::Tt),
             _ => None,
         },
         3 => match name {
-            b"div" => Some((tag_id!("div"), Kind::Div)),
-            b"nav" => Some((tag_id!("nav"), Kind::Nav)),
-            b"big" => Some((tag_id!("big"), Kind::Big)),
+            b"div" => Some(Kind::Div),
+            b"nav" => Some(Kind::Nav),
+            b"big" => Some(Kind::Big),
             _ => None,
         },
         4 => match name {
-            b"span" => Some((tag_id!("span"), Kind::Span)),
-            b"main" => Some((tag_id!("main"), Kind::Main)),
-            b"code" => Some((tag_id!("code"), Kind::Code)),
+            b"span" => Some(Kind::Span),
+            b"main" => Some(Kind::Main),
+            b"code" => Some(Kind::Code),
             _ => None,
         },
         5 => match name {
-            b"input" => Some((tag_id!("input"), Kind::Input)),
-            b"label" => Some((tag_id!("label"), Kind::Label)),
-            b"aside" => Some((tag_id!("aside"), Kind::Aside)),
-            b"small" => Some((tag_id!("small"), Kind::Small)),
+            b"input" => Some(Kind::Input),
+            b"label" => Some(Kind::Label),
+            b"aside" => Some(Kind::Aside),
+            b"small" => Some(Kind::Small),
             _ => None,
         },
         6 => match name {
-            b"button" => Some((tag_id!("button"), Kind::Button)),
-            b"footer" => Some((tag_id!("footer"), Kind::Footer)),
-            b"header" => Some((tag_id!("header"), Kind::Header)),
-            b"strong" => Some((tag_id!("strong"), Kind::Strong)),
-            b"strike" => Some((tag_id!("strike"), Kind::Strike)),
+            b"button" => Some(Kind::Button),
+            b"footer" => Some(Kind::Footer),
+            b"header" => Some(Kind::Header),
+            b"strong" => Some(Kind::Strong),
+            b"strike" => Some(Kind::Strike),
             _ => None,
         },
         7 => match name {
-            b"section" => Some((tag_id!("section"), Kind::Section)),
-            b"article" => Some((tag_id!("article"), Kind::Article)),
+            b"section" => Some(Kind::Section),
+            b"article" => Some(Kind::Article),
             _ => None,
         },
         _ => None,
     }
 }
 
+#[cfg(test)]
 const HOT_ATTRIBUTE_NAMES: [&[u8]; 17] = [
     b"class",
     b"id",
@@ -782,7 +784,7 @@ const HOT_ATTRIBUTE_NAMES: [&[u8]; 17] = [
     b"autocomplete",
 ];
 
-const HOT_ATTRIBUTE_KINDS: [RustFfiHtmlFragmentAttributeKind; HOT_ATTRIBUTE_NAMES.len()] = [
+const HOT_ATTRIBUTE_KINDS: [RustFfiHtmlFragmentAttributeKind; 17] = [
     RustFfiHtmlFragmentAttributeKind::Class,
     RustFfiHtmlFragmentAttributeKind::Id,
     RustFfiHtmlFragmentAttributeKind::Type,
@@ -801,16 +803,6 @@ const HOT_ATTRIBUTE_KINDS: [RustFfiHtmlFragmentAttributeKind; HOT_ATTRIBUTE_NAME
     RustFfiHtmlFragmentAttributeKind::Tabindex,
     RustFfiHtmlFragmentAttributeKind::Autocomplete,
 ];
-
-#[cfg(not(test))]
-fn hot_attribute_identities() -> &'static [usize; HOT_ATTRIBUTE_NAMES.len()] {
-    static IDENTITIES: std::sync::OnceLock<[usize; HOT_ATTRIBUTE_NAMES.len()]> = std::sync::OnceLock::new();
-    IDENTITIES.get_or_init(|| {
-        std::array::from_fn(|index| {
-            known_attribute_name(HOT_ATTRIBUTE_NAMES[index]).map_or(0, |name| name.raw_identity())
-        })
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -990,7 +982,7 @@ mod tests {
                 (tag != TagId::UNKNOWN && SUPPORTED_TAGS.contains(tag)).then_some(tag)
             };
             assert_eq!(
-                supported_tag_for_name(name.as_bytes()).map(|(tag, _)| tag),
+                supported_tag_for_name(name.as_bytes()).map(|kind| tag_id_for_name(TAG_BYTES[kind as usize])),
                 expected,
                 "{name}"
             );

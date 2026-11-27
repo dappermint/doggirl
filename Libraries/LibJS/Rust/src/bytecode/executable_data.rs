@@ -242,24 +242,31 @@ impl SharedJitLearning {
             if self.arith.len() < arith.len() {
                 self.arith.resize(arith.len(), 0);
             }
-            for (dst, src) in self.arith.iter_mut().zip(arith) {
-                *dst |= src.get();
+            // SAFETY: `Cell<u8>` is `#[repr(transparent)]` over `u8` and no concurrent mutation occurs on this VM thread.
+            let arith_vals = unsafe { ak::slice_from_raw_parts(arith.as_ptr().cast::<u8>(), arith.len()) };
+            for (dst, &src) in self.arith.iter_mut().zip(arith_vals) {
+                *dst |= src;
             }
 
             let value = feedback.value();
             if self.value.len() < value.len() {
                 self.value.resize(value.len(), 0);
             }
-            for (dst, src) in self.value.iter_mut().zip(value) {
-                *dst |= src.get();
+            // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
+            let value_vals = unsafe { ak::slice_from_raw_parts(value.as_ptr().cast::<u16>(), value.len()) };
+            for (dst, &src) in self.value.iter_mut().zip(value_vals) {
+                *dst |= src;
             }
 
             let cache_value = feedback.cache_value();
             if self.cache_value.len() < cache_value.len() {
                 self.cache_value.resize(cache_value.len(), 0);
             }
-            for (dst, src) in self.cache_value.iter_mut().zip(cache_value) {
-                *dst |= src.get();
+            // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
+            let cache_value_vals =
+                unsafe { ak::slice_from_raw_parts(cache_value.as_ptr().cast::<u16>(), cache_value.len()) };
+            for (dst, &src) in self.cache_value.iter_mut().zip(cache_value_vals) {
+                *dst |= src;
             }
 
             let keyed = feedback.keyed();
