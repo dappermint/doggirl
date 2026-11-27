@@ -347,6 +347,88 @@ impl PathGeometry {
         self.contour_cubic_to(control1, control2, point);
     }
 
+    /// Appends a complete ellipse directly as four quarter-ellipse conics with weight `FRAC_1_SQRT_2`,
+    /// avoiding endpoint-to-center recovery and trigonometric calls for axis-aligned circles and ellipses.
+    pub fn append_full_ellipse(
+        &mut self,
+        center: FloatPoint,
+        radii: (f32, f32),
+        x_axis_rotation: f32,
+        start_angle: f32,
+        counterclockwise: bool,
+    ) {
+        let (p0, c0, p1, c1, p2, c2, p3, c3) = if x_axis_rotation == 0.0 && start_angle == 0.0 {
+            let (cx, cy) = (center.x, center.y);
+            let (rx, ry) = radii;
+            let dy = if counterclockwise { -ry } else { ry };
+            (
+                FloatPoint { x: cx + rx, y: cy },
+                FloatPoint { x: cx + rx, y: cy + dy },
+                FloatPoint { x: cx, y: cy + dy },
+                FloatPoint { x: cx - rx, y: cy + dy },
+                FloatPoint { x: cx - rx, y: cy },
+                FloatPoint { x: cx - rx, y: cy - dy },
+                FloatPoint { x: cx, y: cy - dy },
+                FloatPoint { x: cx + rx, y: cy - dy },
+            )
+        } else {
+            let (cx, cy) = (f64::from(center.x), f64::from(center.y));
+            let (rx, ry) = (f64::from(radii.0), f64::from(radii.1));
+            let (sin_r, cos_r) = if x_axis_rotation == 0.0 {
+                (0.0, 1.0)
+            } else {
+                ak::math::sincos(f64::from(x_axis_rotation))
+            };
+            let (ux, uy) = if start_angle == 0.0 {
+                (1.0, 0.0)
+            } else {
+                let (sin_a, cos_a) = ak::math::sincos(f64::from(start_angle));
+                if rx == ry {
+                    (arcs::snap_to_axis(cos_a), arcs::snap_to_axis(sin_a))
+                } else {
+                    let tx = ry * cos_a;
+                    let ty = rx * sin_a;
+                    let inv_len = (tx * tx + ty * ty).sqrt().recip();
+                    (arcs::snap_to_axis(tx * inv_len), arcs::snap_to_axis(ty * inv_len))
+                }
+            };
+            let (vx, vy) = if counterclockwise { (uy, -ux) } else { (-uy, ux) };
+            let (ax, ay) = (rx * ux, ry * uy);
+            let (bx, by) = (rx * vx, ry * vy);
+            let (ex_u, ey_u) = (cos_r * ax - sin_r * ay, sin_r * ax + cos_r * ay);
+            let (ex_v, ey_v) = (cos_r * bx - sin_r * by, sin_r * bx + cos_r * by);
+            let pt = |dx: f64, dy: f64| FloatPoint {
+                x: (cx + dx) as f32,
+                y: (cy + dy) as f32,
+            };
+            (
+                pt(ex_u, ey_u),
+                pt(ex_u + ex_v, ey_u + ey_v),
+                pt(ex_v, ey_v),
+                pt(-ex_u + ex_v, -ey_u + ey_v),
+                pt(-ex_u, -ey_u),
+                pt(-ex_u - ex_v, -ey_u - ey_v),
+                pt(-ex_v, -ey_v),
+                pt(ex_u - ex_v, ey_u - ey_v),
+            )
+        };
+
+        if !self.has_current_point {
+            self.move_to(p0);
+        } else {
+            self.contour_line_to(p0);
+        }
+
+        let conic_points = [c0, p1, c1, p2, c2, p3, c3, p0];
+        if self.has_only_finite_points {
+            self.has_only_finite_points = conic_points.iter().all(|&point| is_finite_point(point));
+        }
+        self.verbs.extend_from_slice(&[PathVerb::Conic; 4]);
+        self.points.extend_from_slice(&conic_points);
+        self.conic_weights
+            .extend_from_slice(&[core::f32::consts::FRAC_1_SQRT_2; 4]);
+    }
+
     /// An arc of an ellipse, with the parameters of the SVG path command. The rotation is in radians.
     pub fn elliptical_arc_to(
         &mut self,

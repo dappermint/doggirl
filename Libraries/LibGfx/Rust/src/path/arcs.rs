@@ -164,7 +164,7 @@ pub(super) fn append_elliptical_arc(
 
 /// A coordinate on the unit circle that is 0, 1 or -1 but for rounding, as at the ends of quarter
 /// circles, is made exact, so that arcs along the axes have exact points.
-fn snap_to_axis(value: f64) -> f64 {
+pub(super) fn snap_to_axis(value: f64) -> f64 {
     const ROUNDING_TOLERANCE: f64 = 1e-12;
     for exact in [0.0, 1.0, -1.0] {
         if (value - exact).abs() < ROUNDING_TOLERANCE {
