@@ -17,7 +17,8 @@ use crate::layout::value::Value;
 use crate::runtime::array::Array;
 use crate::runtime::keyed_collections::canonicalize_keyed_collection_key;
 use crate::runtime::map::Map;
-use crate::runtime::regexp_prototype::regexp_builtin_exec_running_no_code;
+use crate::runtime::object_constructor::object_assign_running_no_code;
+use crate::runtime::regexp_prototype::{regexp_builtin_exec_running_no_code, regexp_builtin_test_running_no_code};
 use crate::runtime::set::Set;
 use crate::runtime::string_prototype::{StringPrototype, trim_primitive_string};
 use crate::runtime::value::same_value;
@@ -40,6 +41,7 @@ pub fn address(intrinsic: Intrinsic) -> u64 {
         Intrinsic::StringPrototypeTrimStart => jit_function_address!(string_trim_start),
         Intrinsic::StringPrototypeTrimEnd => jit_function_address!(string_trim_end),
         Intrinsic::RegExpPrototypeExec => jit_function_address!(regexp_exec),
+        Intrinsic::RegExpPrototypeTest => jit_function_address!(regexp_test),
         Intrinsic::MapPrototypeGet => jit_function_address!(map_get),
         Intrinsic::MapPrototypeHas => jit_function_address!(map_has),
         Intrinsic::MapPrototypeSet => jit_function_address!(map_set),
@@ -47,6 +49,7 @@ pub fn address(intrinsic: Intrinsic) -> u64 {
         Intrinsic::SetPrototypeAdd => jit_function_address!(set_add),
         Intrinsic::ObjectIs => jit_function_address!(object_is),
         Intrinsic::ObjectKeys => jit_function_address!(object_keys),
+        Intrinsic::ObjectAssign => jit_function_address!(object_assign),
         Intrinsic::FunctionPrototypeApply
         | Intrinsic::FunctionPrototypeCall
         | Intrinsic::ArrayPrototypePush
@@ -183,6 +186,14 @@ extern "C" fn regexp_exec(vm: &Vm, regexp: u64, string_value: u64) -> u64 {
         .map_or(Value::EMPTY.0, |result| result.0)
 }
 
+/// `regexp.test(string)`, for an unmodified RegExp object whose test runs no code (see
+/// `regexp_builtin_test_running_no_code()`).
+#[jit_abi]
+extern "C" fn regexp_test(vm: &Vm, regexp: u64, string_value: u64) -> u64 {
+    regexp_builtin_test_running_no_code(vm, Value::from_bits(regexp), string(string_value).as_string())
+        .map_or(Value::EMPTY.0, |result| result.0)
+}
+
 /// The Map a `this` value is, if it is one.
 fn map(value: u64) -> Option<crate::layout::cell::Gc<Map>> {
     let value = Value::from_bits(value);
@@ -279,4 +290,18 @@ extern "C" fn object_keys(vm: &Vm, _receiver: u64, value: u64) -> u64 {
         .shape()
         .with_own_enumerable_string_keys(vm, |keys, _| array.set_indexed_property_elements(keys));
     Value::from_object(array).0
+}
+
+/// `Object.assign(target, src1, src2, src3)` for ordinary cached shapes without running any JS code; declines with
+/// empty otherwise.
+#[jit_abi]
+extern "C" fn object_assign(vm: &Vm, _receiver: u64, target: u64, src1: u64, src2: u64, src3: u64) -> u64 {
+    object_assign_running_no_code(
+        vm,
+        Value::from_bits(target),
+        Value::from_bits(src1),
+        Value::from_bits(src2),
+        Value::from_bits(src3),
+    )
+    .map_or(Value::EMPTY.0, |result| result.0)
 }

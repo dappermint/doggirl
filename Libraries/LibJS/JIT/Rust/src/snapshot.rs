@@ -957,6 +957,8 @@ pub enum Intrinsic {
     StringPrototypeTrimEnd,
     /// `RegExp.prototype.exec`.
     RegExpPrototypeExec,
+    /// `RegExp.prototype.test`.
+    RegExpPrototypeTest,
     /// `Map.prototype.get`.
     MapPrototypeGet,
     /// `Map.prototype.has`.
@@ -971,6 +973,8 @@ pub enum Intrinsic {
     ObjectIs,
     /// `Object.keys`.
     ObjectKeys,
+    /// `Object.assign`.
+    ObjectAssign,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -979,6 +983,8 @@ pub enum Intrinsic {
 pub enum HelperOperand {
     /// Any value, which the helper checks itself.
     Value,
+    /// Any value; calls that omit this argument pass `undefined` instead.
+    OptionalValue,
     /// A string, as a tagged value.
     String,
     /// An int32, as a `Repr::Int32`. Calls that pass no such argument pass
@@ -1019,7 +1025,7 @@ pub struct HelperCall {
 impl HelperOperand {
     pub fn repr(self) -> crate::code::Repr {
         match self {
-            HelperOperand::Value | HelperOperand::String => crate::code::Repr::Tagged,
+            HelperOperand::Value | HelperOperand::OptionalValue | HelperOperand::String => crate::code::Repr::Tagged,
             HelperOperand::Int32 { .. } => crate::code::Repr::Int32,
         }
     }
@@ -1058,6 +1064,11 @@ impl Default for Float64FunctionAddresses {
 }
 
 impl Intrinsic {
+    /// Whether calls passing more arguments than `helper_call().arguments` ignore the extras.
+    pub fn ignores_extra_arguments(self) -> bool {
+        self != Intrinsic::ObjectAssign
+    }
+
     /// How JIT code calls the builtin through its runtime helper, if it
     /// does.
     pub fn helper_call(self) -> Option<HelperCall> {
@@ -1091,8 +1102,8 @@ impl Intrinsic {
             | Intrinsic::StringPrototypeTrim
             | Intrinsic::StringPrototypeTrimStart
             | Intrinsic::StringPrototypeTrimEnd => call(&[], HelperResult::String),
-            // NB: RegExpBuiltinExec reads and writes lastIndex.
-            Intrinsic::RegExpPrototypeExec => Some(HelperCall {
+            // NB: RegExpBuiltinExec and RegExp.prototype.test read and write lastIndex.
+            Intrinsic::RegExpPrototypeExec | Intrinsic::RegExpPrototypeTest => Some(HelperCall {
                 receiver: HelperOperand::Value,
                 arguments: &[String],
                 result: HelperResult::Value,
@@ -1135,6 +1146,18 @@ impl Intrinsic {
                 result: HelperResult::Value,
                 reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
                 writes: Locations::NONE,
+            }),
+            Intrinsic::ObjectAssign => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[
+                    HelperOperand::Value,
+                    HelperOperand::OptionalValue,
+                    HelperOperand::OptionalValue,
+                    HelperOperand::OptionalValue,
+                ],
+                result: HelperResult::Value,
+                reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
+                writes: Locations::NAMED,
             }),
             _ => None,
         }
