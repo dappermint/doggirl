@@ -17,7 +17,7 @@ use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{call_function_object, checked_js_string_length_sum, species_constructor};
 use crate::runtime::array::{Holes, sort_indexed_properties};
 use crate::runtime::array_buffer::{ElementType, Order, clone_array_buffer};
-use crate::runtime::array_prototype::array_merge_sort;
+use crate::runtime::array_prototype::value_slice_merge_sort;
 use crate::runtime::array_iterator::ArrayIterator;
 use crate::runtime::canonical_index::{CanonicalIndex, CanonicalIndexType};
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -315,11 +315,7 @@ fn try_fast_sort_typed_array_in_place(typed_array: &TypedArrayBase, length: usiz
 }
 
 /// Bulk-reads `length` elements of a non-shared numeric typed array directly into a `MarkedVec<Value>`.
-fn try_read_numeric_typed_array_values<'vm>(
-    vm: &'vm Vm,
-    typed_array: &TypedArrayBase,
-    length: usize,
-) -> Option<MarkedVec<'vm, Value>> {
+fn try_read_numeric_typed_array_values(typed_array: &TypedArrayBase, length: usize) -> Option<Vec<Value>> {
     if !cfg!(target_endian = "little") {
         return None;
     }
@@ -339,7 +335,7 @@ fn try_read_numeric_typed_array_values<'vm>(
             return None;
         }
         let ptr = block.data_at(byte_offset);
-        let items = MarkedVec::with_capacity(vm, length);
+        let mut items = Vec::with_capacity(length);
         macro_rules! read_typed {
             ($ty:ty, $to_value:expr) => {{
                 if !(ptr as usize).is_multiple_of(align_of::<$ty>()) {
@@ -375,11 +371,7 @@ fn try_read_numeric_typed_array_values<'vm>(
 
 /// Bulk-writes `length` sorted numeric `Value`s back into a non-shared, non-detached typed array.
 /// Returns `false` if the buffer was detached/shrunk or the kind is unsupported (caller falls back to spec `Set`).
-fn try_write_numeric_typed_array_values(
-    typed_array: &TypedArrayBase,
-    length: usize,
-    sorted_list: &MarkedVec<'_, Value>,
-) -> bool {
+fn try_write_numeric_typed_array_values(typed_array: &TypedArrayBase, length: usize, sorted_list: &[Value]) -> bool {
     if !cfg!(target_endian = "little") || sorted_list.len() < length {
         return false;
     }
@@ -408,8 +400,7 @@ fn try_write_numeric_typed_array_values(
                 }
                 // SAFETY: The buffer is non-shared, non-detached, aligned for `$ty`, and covers `length` elements.
                 let slice = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<$ty>(), length) };
-                for (dst, j) in slice.iter_mut().zip(0..length) {
-                    let v = sorted_list.get(j).expect("the index is in bounds");
+                for (dst, &v) in slice.iter_mut().zip(&sorted_list[..length]) {
                     *dst = ($from_value)(v);
                 }
                 true
@@ -2406,18 +2397,32 @@ impl TypedArrayPrototype {
         };
 
         // 7. Let sortedList be ? SortIndexedProperties(obj, len, SortCompare, read-through-holes).
-        // OPTIMIZATION: Bulk-read raw numeric elements directly into MarkedVec instead of calling Get(obj, ToString(k))
-        //               per element, and bulk-write back after re-checking buffer bounds.
-        let sorted_list = if let Some(items) = try_read_numeric_typed_array_values(vm, &typed_array, length) {
-            array_merge_sort(vm, &sort_compare, &items)?;
-            items
-        } else {
-            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?
-        };
+        // OPTIMIZATION: Bulk-read raw numeric elements directly into a plain Vec<Value> (all numeric Values hold no
+        //               GC cells, so no MarkedVec root registration or RefCell borrow checks are needed), sort in
+        //               place, and bulk-write back after re-checking buffer bounds.
+        if let Some(mut items) = try_read_numeric_typed_array_values(&typed_array, length) {
+            crate::runtime::array_prototype::value_slice_merge_sort(&mut items, &sort_compare)?;
+            if !try_write_numeric_typed_array_values(&typed_array, length, &items) {
+                for (j, &value) in items.iter().enumerate().take(length) {
+                    typed_array
+                        .set(
+                            vm,
+                            &PropertyKey::from_number(j as u64),
+                            value,
+                            ShouldThrowExceptions::Yes,
+                        )
+                        .must();
+                }
+            }
+            return Ok(Value::from_object(typed_array));
+        }
+
+        let sorted_list =
+            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?;
 
         // 8. Let j be 0.
         // 9. Repeat, while j < len,
-        if !try_write_numeric_typed_array_values(&typed_array, length, &sorted_list) {
+        if !try_write_numeric_typed_array_values(&typed_array, length, &sorted_list.values()) {
             for j in 0..length {
                 // a. Perform ! Set(obj, ! ToString(𝔽(j)), sortedList[j], true).
                 typed_array
@@ -2715,16 +2720,24 @@ impl TypedArrayPrototype {
         };
 
         // 8. Let sortedList be ? SortIndexedProperties(O, len, SortCompare, read-through-holes).
-        let sorted_list = if let Some(items) = try_read_numeric_typed_array_values(vm, &typed_array, length) {
-            array_merge_sort(vm, &sort_compare, &items)?;
-            items
-        } else {
-            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?
-        };
+        if let Some(mut items) = try_read_numeric_typed_array_values(&typed_array, length) {
+            value_slice_merge_sort(&mut items, &sort_compare)?;
+            if !try_write_numeric_typed_array_values(&array, length, &items) {
+                for (j, &value) in items.iter().enumerate() {
+                    array
+                        .set(vm, &PropertyKey::from_number(j as u64), value, ShouldThrowExceptions::Yes)
+                        .must();
+                }
+            }
+            return Ok(Value::from_object(array));
+        }
+
+        let sorted_list =
+            sort_indexed_properties(vm, &typed_array, length as u64, &sort_compare, Holes::ReadThroughHoles)?;
 
         // 9. Let j be 0.
         // 10. Repeat, while j < len,
-        if !try_write_numeric_typed_array_values(&array, length, &sorted_list) {
+        if !try_write_numeric_typed_array_values(&array, length, &sorted_list.values()) {
             for j in 0..length {
                 // a. Perform ! Set(A, ! ToString(𝔽(j)), sortedList[j], true).
                 array

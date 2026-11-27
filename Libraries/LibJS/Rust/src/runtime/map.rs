@@ -5,7 +5,6 @@
  */
 
 use core::cell::Cell;
-use core::hash::BuildHasher;
 use core::ops::Deref;
 
 use hashbrown::HashTable;
@@ -21,12 +20,7 @@ use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::realm::Realm;
-use crate::runtime::value_traits::ValueTraitsKey;
-
-thread_local! {
-    /// Shared per-thread randomized hasher for Map and Set index tables.
-    static KEYED_COLLECTION_HASHER: foldhash::fast::RandomState = foldhash::fast::RandomState::default();
-}
+use crate::runtime::value_traits::{ValueTraitsKey, fast_hash_value_key};
 
 #[inline(always)]
 fn fold_hash32(hash64: u64) -> u32 {
@@ -100,7 +94,7 @@ struct Indices {
 impl Indices {
     #[inline]
     fn hash_pair(key: Value) -> (u32, u64) {
-        let hash64 = KEYED_COLLECTION_HASHER.with(|hasher| hasher.hash_one(ValueTraitsKey(key)));
+        let hash64 = fast_hash_value_key(key);
         let hash32 = fold_hash32(hash64);
         (hash32, expand_hash32(hash32))
     }

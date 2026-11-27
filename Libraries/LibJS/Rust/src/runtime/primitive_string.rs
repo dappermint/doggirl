@@ -240,7 +240,16 @@ impl PrimitiveString {
         {
             return cached_string;
         }
+        Self::create_from_non_trivial_fly_string_slow(vm, string, cache_slot)
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn create_from_non_trivial_fly_string_slow(
+        vm: &Vm,
+        string: &Utf16FlyString,
+        cache_slot: &Cell<Option<Gc<PrimitiveString>>>,
+    ) -> Gc<PrimitiveString> {
         // Prefer the interned string, so that comparisons with constants are pointer comparisons.
         let interned_string = vm.interned_strings().borrow().get(&string.raw_identity()).copied();
         if let Some(interned_string) = interned_string {
@@ -403,16 +412,18 @@ impl PrimitiveString {
         }
 
         // OPTIMIZATION: A few ASCII characters are copied rather than kept in their source, which a substring would keep
-        //               alive and copy out of when resolved.
+        //               alive and copy out of when resolved. Dynamic 2..=7 ASCII substrings allocate a short
+        //               Utf16String directly without polling `fly_string_cache` / `interned_strings`.
         if code_unit_length <= INLINE_STRING_CAPACITY
             && string.deferred_kind() != DeferredKind::Rope
             && let Utf16View::Ascii(characters) = string.utf16_string_view()
         {
+            let slice = &characters[code_unit_offset..code_unit_offset + code_unit_length];
+            if code_unit_length < size_of::<usize>() {
+                return Self::allocate_resolved(vm.heap(), Utf16String::from_ascii(slice));
+            }
             let mut copied_characters = [0; INLINE_STRING_CAPACITY];
-            copy_few_bytes(
-                &mut copied_characters,
-                &characters[code_unit_offset..code_unit_offset + code_unit_length],
-            );
+            copy_few_bytes(&mut copied_characters, slice);
             return Self::create_from_inline_characters(vm, copied_characters, code_unit_length);
         }
 
@@ -626,6 +637,24 @@ impl PrimitiveString {
         }
     }
 
+    /// Returns AK's deterministic 32-bit string hash, matching `AK::Utf16View::hash()` across every
+    /// `PrimitiveString` representation (resolved, inline, substring, and unresolved rope).
+    #[inline]
+    pub fn cached_hash32(&self) -> u32 {
+        if let Some(resolved) = self.resolved_utf16_string() {
+            return resolved.cached_hash32();
+        }
+        match self.deferred_kind() {
+            DeferredKind::Inline => ak::ak_string_hash_bytes(self.as_inline_string().characters()),
+            DeferredKind::Substring => match self.utf16_string_view() {
+                Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => ak::ak_string_hash_bytes(bytes),
+                Utf16View::Utf16(units) => ak::ak_string_hash_u16(units),
+            },
+            DeferredKind::Rope => self.utf16_string_in_place().cached_hash32(),
+            DeferredKind::None => unreachable!("a non-deferred string has its resolved Utf16String"),
+        }
+    }
+
     #[inline(never)]
     fn resolve(&self) {
         match self.deferred_kind() {
@@ -734,11 +763,6 @@ impl PrimitiveString {
             },
             DeferredKind::Rope | DeferredKind::Substring => None,
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn inline_characters(&self) -> &[u8] {
-        self.as_inline_string().characters()
     }
 
     #[inline]
@@ -852,12 +876,7 @@ impl RopeString {
     }
 
     fn concatenation(&self) -> Utf16String {
-        let string =
-            if self.lhs().deferred_kind() != DeferredKind::Rope && self.rhs().deferred_kind() != DeferredKind::Rope {
-                concatenate(&[self.lhs().utf16_string_view(), self.rhs().utf16_string_view()])
-            } else {
-                self.concatenate_pieces()
-            };
+        let string = self.concatenate_pieces();
         debug_assert_eq!(
             Utf16View::of_string(&string).length_in_code_units(),
             self.base.length_in_utf16_code_units()
@@ -920,10 +939,6 @@ impl RopeString {
         }
 
         let total_len = self.base.length_in_utf16_code_units();
-        if total_len < size_of::<usize>() {
-            return self.concatenate_many_pieces();
-        }
-
         let lhs_ptr = self.lhs().as_ptr();
         let rhs_ptr = self.rhs().as_ptr();
 
@@ -931,20 +946,29 @@ impl RopeString {
         // SAFETY: Flattening allocates no GC cells and triggers no GC, so both children stay live.
         let (lhs_ref, rhs_ref) = unsafe { (&*lhs_ptr, &*rhs_ptr) };
         if lhs_ref.deferred_kind() != DeferredKind::Rope && rhs_ref.deferred_kind() != DeferredKind::Rope {
+            if total_len < size_of::<usize>() {
+                return concatenate(&[lhs_ref.utf16_string_view(), rhs_ref.utf16_string_view()]);
+            }
+            // Check for UTF-16 leaves before allocating a Latin-1 buffer so we never waste a Latin-1 allocation.
+            let lhs_view = if lhs_ref.deferred_kind() == DeferredKind::Inline {
+                Utf16View::Ascii(lhs_ref.as_inline_string().characters())
+            } else {
+                lhs_ref.utf16_string_view()
+            };
+            let rhs_view = if rhs_ref.deferred_kind() == DeferredKind::Inline {
+                Utf16View::Ascii(rhs_ref.as_inline_string().characters())
+            } else {
+                rhs_ref.utf16_string_view()
+            };
+            if matches!(lhs_view, Utf16View::Utf16(_)) || matches!(rhs_view, Utf16View::Utf16(_)) {
+                return concatenate(&[lhs_view, rhs_view]);
+            }
             return Utf16String::try_from_latin1_with_uninit(total_len, |storage| {
                 let dst = storage.as_mut_ptr().cast::<u8>();
                 let mut offset = 0usize;
                 let mut all_ascii = true;
-                for leaf in [lhs_ref, rhs_ref] {
-                    if leaf.deferred_kind() == DeferredKind::Inline {
-                        let bytes = leaf.as_inline_string().characters();
-                        debug_assert!(bytes.len() <= total_len - offset);
-                        // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
-                        unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
-                        offset += bytes.len();
-                        continue;
-                    }
-                    match leaf.utf16_string_view() {
+                for view in [lhs_view, rhs_view] {
+                    match view {
                         Utf16View::Ascii(bytes) => {
                             debug_assert!(bytes.len() <= total_len - offset);
                             // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
@@ -960,22 +984,16 @@ impl RopeString {
                             unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
                             offset += bytes.len();
                         }
-                        Utf16View::Utf16(units) => {
-                            let mut utf16 = Vec::with_capacity(total_len);
-                            // SAFETY: `dst..dst + offset` has already been initialized above.
-                            let written = unsafe { ak::slice_from_raw_parts(dst.cast_const(), offset) };
-                            utf16.extend(written.iter().map(|&b| u16::from(b)));
-                            utf16.extend_from_slice(units);
-                            if core::ptr::eq(leaf, lhs_ref) {
-                                rhs_ref.utf16_string_view().append_to(&mut utf16);
-                            }
-                            return Err(Utf16String::from_utf16(&utf16));
-                        }
+                        Utf16View::Utf16(_) => unreachable!("UTF-16 leaves handled above"),
                     }
                 }
                 debug_assert_eq!(offset, total_len);
                 Ok(all_ascii)
             });
+        }
+
+        if total_len < size_of::<usize>() {
+            return self.concatenate_many_pieces();
         }
 
         const INLINE_STACK_CAP: usize = 128;

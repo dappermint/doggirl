@@ -939,11 +939,24 @@ impl Input for &[u8] {
 
     #[inline(always)]
     fn matches_ascii_ignore_case_latin1_at(self, pos: usize, lower_needle: &[u8]) -> bool {
+        const ASCII_LOWER_LUT: [u8; 256] = {
+            let mut lut = [0u8; 256];
+            let mut i = 0;
+            while i < 256 {
+                lut[i] = if i >= b'A' as usize && i <= b'Z' as usize {
+                    (i + 32) as u8
+                } else {
+                    i as u8
+                };
+                i += 1;
+            }
+            lut
+        };
         let Some(slice) = self.get(pos..pos + lower_needle.len()) else {
             return false;
         };
         for (&actual, &expected) in slice.iter().zip(lower_needle.iter()) {
-            if actual.to_ascii_lowercase() != expected {
+            if ASCII_LOWER_LUT[actual as usize] != expected {
                 return false;
             }
         }
@@ -2562,46 +2575,77 @@ impl<'a, I: Input> Vm<'a, I> {
     /// Eliminates surrogate pair checks and backward mode branches.
     fn run_fast(&mut self) -> VmResult {
         let program = self.program;
-        let instructions = &program.instructions;
-        let num_instructions = instructions.len();
+        let instructions = program.instructions.as_slice();
         let input = self.input;
         let input_len = input.len();
-        'vm_loop: loop {
-            self.steps += 1;
-            if self.steps >= self.next_checkpoint
-                && let Some(result) = self.reach_checkpoint()
-            {
-                return result;
-            }
+        let mut pc = self.pc;
+        let mut pos = self.pos;
+        let mut steps = self.steps;
+        let mut next_checkpoint = self.next_checkpoint;
 
-            let pc = self.pc as usize;
-            if pc >= num_instructions {
+        macro_rules! sync_to_self {
+            () => {
+                self.pc = pc;
+                self.pos = pos;
+                self.steps = steps;
+            };
+        }
+        macro_rules! sync_from_self {
+            () => {
+                pc = self.pc;
+                pos = self.pos;
+                steps = self.steps;
+                next_checkpoint = self.next_checkpoint;
+            };
+        }
+        macro_rules! check_limit {
+            () => {
+                if steps >= next_checkpoint {
+                    sync_to_self!();
+                    if let Some(result) = self.reach_checkpoint() {
+                        return result;
+                    }
+                    next_checkpoint = self.next_checkpoint;
+                }
+            };
+        }
+        macro_rules! do_backtrack {
+            () => {{
+                sync_to_self!();
                 if !self.backtrack() {
                     return VmResult::NoMatch;
                 }
-                continue;
-            }
+                pc = self.pc;
+                pos = self.pos;
+                check_limit!();
+            }};
+        }
 
-            let inst = &instructions[pc];
+        check_limit!();
+        'vm_loop: loop {
+            steps += 1;
+            let Some(inst) = instructions.get(pc as usize) else {
+                do_backtrack!();
+                continue;
+            };
+
             match inst {
                 Instruction::Char(c) => {
                     let c = *c;
-                    if self.pos < input_len {
-                        let input_cp = input.code_unit(self.pos) as u32;
+                    if pos < input_len {
+                        let input_cp = input.code_unit(pos) as u32;
                         let matches = if self.modifiers.ignore_case {
                             case_fold_eq(input_cp, c, false)
                         } else {
                             input_cp == c
                         };
                         if matches {
-                            self.pos += 1;
-                            self.pc += 1;
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::Literal {
@@ -2611,99 +2655,85 @@ impl<'a, I: Input> Vm<'a, I> {
                     rest_len,
                 } => {
                     // NB: Each code unit after the first that is compared costs a step, as the Char instructions of
-                    //     the literal did. A match needs no checkpoint here, as the next instruction looks first.
-                    match literal_matches_at(input, self.pos, *first, *ignore_case, false, || {
+                    //     the literal did.
+                    match literal_matches_at(input, pos, *first, *ignore_case, false, || {
                         program.literal_rest(*rest_start, *rest_len)
                     }) {
                         Ok(()) => {
-                            self.steps += u64::from(*rest_len);
-                            self.pos += 1 + *rest_len as usize;
-                            self.pc += 1;
+                            steps += u64::from(*rest_len);
+                            pos += 1 + *rest_len as usize;
+                            pc += 1;
                             continue;
                         }
                         Err(rest_compared) => {
                             if rest_compared != 0 {
-                                self.steps += rest_compared as u64;
-                                if self.steps >= self.next_checkpoint
-                                    && let Some(result) = self.reach_checkpoint()
-                                {
-                                    return result;
-                                }
+                                steps += rest_compared as u64;
+                                check_limit!();
                             }
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::CharNoCase(lo, _hi) => {
-                    if self.pos < input_len {
-                        let input_cp = input.code_unit(self.pos) as u32;
+                    if pos < input_len {
+                        let input_cp = input.code_unit(pos) as u32;
                         if case_fold_eq(input_cp, *lo, false) {
-                            self.pos += 1;
-                            self.pc += 1;
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::AnyChar { dot_all } => {
-                    if self.pos < input_len {
+                    if pos < input_len {
                         let dot_all = *dot_all || self.modifiers.dot_all;
-                        if dot_all || !is_line_terminator(input.code_unit(self.pos) as u32) {
-                            self.pos += 1;
-                            self.pc += 1;
+                        if dot_all || !is_line_terminator(input.code_unit(pos) as u32) {
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::CharClass { class, negated } => {
                     let ranges = program.class(*class);
-                    if self.pos < input_len {
-                        let cp = input.code_unit(self.pos) as u32;
+                    if pos < input_len {
+                        let cp = input.code_unit(pos) as u32;
                         let in_class = if self.modifiers.ignore_case {
-                            match_char_class(cp, ranges, true, false, false)
+                            ranges.contains_ignore_case_non_unicode(cp)
                         } else {
                             ranges.contains(cp)
                         };
                         if in_class != *negated {
-                            self.pos += 1;
-                            self.pc += 1;
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::BuiltinClass(class) => {
                     let class = *class;
-                    if self.pos < input_len {
-                        let cp = input.code_unit(self.pos) as u32;
+                    if pos < input_len {
+                        let cp = input.code_unit(pos) as u32;
                         if match_builtin_class(cp, class, false) {
-                            self.pos += 1;
-                            self.pc += 1;
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::UnicodeProperty(index) => {
                     let data = program.unicode_property(*index);
-                    if self.pos < input_len {
-                        let cp = input.code_unit(self.pos) as u32;
+                    if pos < input_len {
+                        let cp = input.code_unit(pos) as u32;
                         // NB: run_fast is only entered when !unicode, so the
                         // case-insensitive Unicode path never applies here.
                         let result = {
@@ -2716,58 +2746,60 @@ impl<'a, I: Input> Vm<'a, I> {
                             if data.negated { !matched } else { matched }
                         };
                         if result {
-                            self.pos += 1;
-                            self.pc += 1;
+                            pos += 1;
+                            pc += 1;
                             continue;
                         }
                     }
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::Jump(target) => {
-                    self.pc = *target;
+                    let target = *target;
+                    if target <= pc {
+                        check_limit!();
+                    }
+                    pc = target;
                 }
 
                 Instruction::Split { prefer, other } => {
+                    check_limit!();
                     let prefer = *prefer;
                     let other = *other;
                     // OPTIMIZATION: A preferred path that starts by matching a character the input does not have here
                     //               fails right away, which would backtrack to the other path with nothing changed. So
                     //               take the other path without saving a backtrack state.
-                    if !self.modifiers.ignore_case && Self::fails_at_first_code_unit(program, prefer, input, self.pos) {
-                        self.pc = other;
+                    if !self.modifiers.ignore_case && Self::fails_at_first_code_unit(program, prefer, input, pos) {
+                        pc = other;
                         continue;
                     }
-                    let pos = self.pos;
                     self.push_backtrack(other, pos);
-                    self.pc = prefer;
+                    pc = prefer;
                 }
 
                 Instruction::Save(reg) => {
                     let reg = *reg as usize;
-                    let pos_i32 = self.pos as i32;
+                    let pos_i32 = pos as i32;
                     if reg < self.registers.len() {
                         self.set_register(reg, pos_i32);
                     }
-                    self.pc += 1;
+                    pc += 1;
                     // Fuse consecutive Save/ClearRegister instructions.
                     loop {
-                        match instructions.get(self.pc as usize) {
+                        match instructions.get(pc as usize) {
                             Some(Instruction::Save(r2)) => {
                                 let r2 = *r2 as usize;
                                 if r2 < self.registers.len() {
                                     self.set_register(r2, pos_i32);
                                 }
-                                self.pc += 1;
+                                pc += 1;
                             }
                             Some(Instruction::ClearRegister(r2)) => {
                                 let r2 = *r2 as usize;
                                 if r2 < self.registers.len() {
                                     self.set_register(r2, -1);
                                 }
-                                self.pc += 1;
+                                pc += 1;
                             }
                             _ => break,
                         }
@@ -2779,23 +2811,23 @@ impl<'a, I: Input> Vm<'a, I> {
                     if reg < self.registers.len() {
                         self.set_register(reg, -1);
                     }
-                    self.pc += 1;
+                    pc += 1;
                     // Fuse consecutive ClearRegister/Save instructions.
                     loop {
-                        match instructions.get(self.pc as usize) {
+                        match instructions.get(pc as usize) {
                             Some(Instruction::ClearRegister(r2)) => {
                                 let r2 = *r2 as usize;
                                 if r2 < self.registers.len() {
                                     self.set_register(r2, -1);
                                 }
-                                self.pc += 1;
+                                pc += 1;
                             }
                             Some(Instruction::Save(r2)) => {
                                 let r2 = *r2 as usize;
                                 if r2 < self.registers.len() {
-                                    self.set_register(r2, self.pos as i32);
+                                    self.set_register(r2, pos as i32);
                                 }
-                                self.pc += 1;
+                                pc += 1;
                             }
                             _ => break,
                         }
@@ -2803,66 +2835,89 @@ impl<'a, I: Input> Vm<'a, I> {
                 }
 
                 Instruction::AssertStart { multiline } => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_assert_start(*multiline) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::AssertEnd { multiline } => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_assert_end(*multiline, input_len) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::AssertWordBoundary => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_word_boundary_assert(true) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::AssertNonWordBoundary => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_word_boundary_assert(false) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::Match => {
+                    sync_to_self!();
                     return VmResult::Match;
                 }
 
                 Instruction::Fail => {
-                    if !self.backtrack() {
-                        return VmResult::NoMatch;
-                    }
+                    do_backtrack!();
                 }
 
                 Instruction::Backref(index) => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_backref(*index) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::BackrefNamed(index) => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_backref_named(program.backref_name(*index)) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::RepeatStart { counter_reg } => {
+                    sync_to_self!();
                     self.handle_repeat_start(*counter_reg);
+                    sync_from_self!();
                 }
 
                 Instruction::RepeatCheck { check, body } => {
+                    sync_to_self!();
+                    if steps >= next_checkpoint
+                        && let Some(result) = self.reach_checkpoint()
+                    {
+                        return result;
+                    }
                     self.handle_repeat_check(program.repeat_check(*check), *body);
+                    sync_from_self!();
                 }
 
                 Instruction::LookStart { positive, forward, end } => {
+                    sync_to_self!();
                     if let Some(result) = self.handle_look_start(*positive, *forward, *end) {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::LookEnd => {
+                    sync_to_self!();
                     return VmResult::Match;
                 }
 
@@ -2871,30 +2926,36 @@ impl<'a, I: Input> Vm<'a, I> {
                     multiline,
                     dot_all,
                 } => {
+                    sync_to_self!();
                     self.handle_push_modifiers(*ignore_case, *multiline, *dot_all);
+                    sync_from_self!();
                 }
 
                 Instruction::PopModifiers => {
+                    sync_to_self!();
                     self.handle_pop_modifiers();
+                    sync_from_self!();
                 }
 
                 Instruction::Nop => {
-                    self.pc += 1;
+                    pc += 1;
                 }
 
                 Instruction::StringPropertyMatch(index) => {
                     let string_property = program.string_property(*index);
+                    sync_to_self!();
                     if let Some(result) =
                         self.handle_string_property_match(&string_property.strings, &string_property.property)
                     {
                         return result;
                     }
+                    sync_from_self!();
                 }
 
                 Instruction::ProgressCheck { reg, clear_captures } => {
                     let reg = *reg as usize;
                     let last_pos = self.registers[reg];
-                    if last_pos == self.pos as i32 {
+                    if last_pos == pos as i32 {
                         // Zero-width match detected. Per ECMA-262, captures from the
                         // body should be cleared to undefined before exiting.
                         for &cap_reg in program.register_list(*clear_captures) {
@@ -2903,66 +2964,60 @@ impl<'a, I: Input> Vm<'a, I> {
                                 self.set_register(r, -1);
                             }
                         }
-                        if !self.backtrack() {
-                            return VmResult::NoMatch;
-                        }
+                        do_backtrack!();
                     } else {
-                        self.set_register(reg, self.pos as i32);
-                        self.pc += 1;
+                        self.set_register(reg, pos as i32);
+                        pc += 1;
                     }
                 }
 
                 Instruction::GreedyLoop { index, .. } => {
+                    check_limit!();
                     let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
-                    let start_pos = self.pos;
+                    let start_pos = pos;
 
-                    let count = Self::greedy_consume_fast(input, &mut self.pos, matcher, &self.modifiers, max);
+                    let count = Self::greedy_consume_fast(input, &mut pos, matcher, &self.modifiers, max);
 
                     if count < min {
-                        self.pos = start_pos;
-                        if !self.backtrack() {
-                            return VmResult::NoMatch;
-                        }
+                        pos = start_pos;
+                        do_backtrack!();
                     } else {
                         if count > min {
-                            let greedy_pos = self.pos;
-                            self.push_greedy_backtrack(self.pc, start_pos, greedy_pos, min);
+                            let greedy_pos = pos;
+                            self.push_greedy_backtrack(pc, start_pos, greedy_pos, min);
                         }
-                        self.pc += 1;
+                        pc += 1;
                     }
                 }
 
                 Instruction::LazyLoop(index) => {
+                    check_limit!();
                     let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
-                    let start_pos = self.pos;
+                    let start_pos = pos;
 
                     for _ in 0..min {
-                        if self.pos < input_len {
-                            let cp = input.code_unit(self.pos) as u32;
+                        if pos < input_len {
+                            let cp = input.code_unit(pos) as u32;
                             if self.match_simple(cp, matcher) {
-                                self.pos += 1;
+                                pos += 1;
                             } else {
-                                self.pos = start_pos;
-                                if !self.backtrack() {
-                                    return VmResult::NoMatch;
-                                }
+                                pos = start_pos;
+                                do_backtrack!();
                                 continue 'vm_loop;
                             }
                         } else {
-                            self.pos = start_pos;
-                            if !self.backtrack() {
-                                return VmResult::NoMatch;
-                            }
+                            pos = start_pos;
+                            do_backtrack!();
                             continue 'vm_loop;
                         }
                     }
 
-                    self.push_lazy_backtrack(self.pc, self.pos, max, min);
-                    self.pc += 1;
+                    self.push_lazy_backtrack(pc, pos, max, min);
+                    pc += 1;
                 }
             }
         }

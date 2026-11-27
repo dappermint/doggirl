@@ -1044,18 +1044,14 @@ impl StringPrototype {
         let mut replace_string = None;
         if !replace_value.is_function() {
             // a. Set replaceValue to ? ToString(replaceValue).
-            replace_string = Some(replace_value.to_utf16_string(vm)?);
+            replace_string = Some(replace_value.to_primitive_string(vm)?);
         }
 
         // 7. Let searchLength be the length of searchString.
         let search_length = search_string.length_in_utf16_code_units();
 
         // 8. Let position be StringIndexOf(string, searchString, 0).
-        let string_data = string.utf16_string();
-        let string_view = Utf16View::of_string(&string_data);
-        let search_string_data = search_string.utf16_string();
-        let search_string_view = Utf16View::of_string(&search_string_data);
-        let position = string_index_of(string_view, search_string_view, 0);
+        let position = string_index_of(string.utf16_string_view(), search_string.utf16_string_view(), 0);
 
         // 9. If position = -1, return string.
         let Some(position) = position else {
@@ -1063,12 +1059,8 @@ impl StringPrototype {
         };
 
         // 10. Let preceding be the substring of string from 0 to position.
-        let preceding = string_view.substring_view(0, position);
-
         // 11. Let following be the substring of string from position + searchLength.
         let following_start = position + search_length;
-        let following =
-            string_view.substring_view(following_start, string_view.length_in_code_units() - following_start);
 
         // 12. If functionalReplace is true, then
         if replace_value.is_function() {
@@ -1085,6 +1077,11 @@ impl StringPrototype {
             )?
             .to_utf16_string(vm)?;
 
+            let string_view = string.utf16_string_view();
+            let preceding = string_view.substring_view(0, position);
+            let following =
+                string_view.substring_view(following_start, string_view.length_in_code_units() - following_start);
+
             // 14. Return the string-concatenation of preceding, replacement, and following.
             return Ok(string_value(
                 vm,
@@ -1095,11 +1092,15 @@ impl StringPrototype {
         // 13. Else,
         // a. Assert: replaceValue is a String.
         let replace_string = replace_string.expect("a replacement that is not a function was converted to a string");
-        let replace_view = Utf16View::of_string(&replace_string);
+        let replace_view = replace_string.utf16_string_view();
         let has_dollar = match replace_view {
             Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => memchr::memchr(b'$', bytes).is_some(),
             Utf16View::Utf16(units) => units.contains(&u16::from(b'$')),
         };
+        let string_view = string.utf16_string_view();
+        let preceding = string_view.substring_view(0, position);
+        let following =
+            string_view.substring_view(following_start, string_view.length_in_code_units() - following_start);
         if !has_dollar {
             // OPTIMIZATION: Without '$' in the replacement string, GetSubstitution returns it unchanged.
             return Ok(string_value(vm, concatenate(&[preceding, replace_view, following])));
@@ -1109,7 +1110,7 @@ impl StringPrototype {
         // c. Let replacement be ! GetSubstitution(searchString, string, position, captures, undefined, replaceValue).
         let replacement = get_substitution(
             vm,
-            search_string_view,
+            search_string.utf16_string_view(),
             string_view,
             position,
             &[],

@@ -5112,6 +5112,23 @@ impl Object {
         elements
     }
 
+    /// Copies `self[start..end]` from packed indexed storage directly into `destination` via one bulk allocation.
+    pub fn copy_packed_elements_range_to(&self, start: u32, end: u32, destination: &Object) {
+        assert!(!core::ptr::eq(self, destination));
+        if start >= end {
+            destination.set_indexed_property_elements(&[]);
+            return;
+        }
+        assert!(self.indexed_storage_kind() == IndexedStorageKind::Packed);
+        assert!(end <= self.indexed_packed_elements_span_size());
+        // SAFETY: `start..end` lies within initialized packed storage, `self` and `destination` are distinct,
+        // and `set_indexed_property_elements` does not collect garbage.
+        let slice = unsafe {
+            ak::slice_from_raw_parts(self.indexed_elements.get().add(start as usize), (end - start) as usize)
+        };
+        destination.set_indexed_property_elements(slice);
+    }
+
     /// Overwrites the first `values.len()` elements of packed indexed storage in bulk.
     /// Every element of `values` must be a non-empty `Value`.
     pub fn overwrite_packed_elements_prefix(&self, values: &[Value]) {

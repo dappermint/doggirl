@@ -27,7 +27,6 @@ use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
-use crate::runtime::value::{TriState, is_less_than};
 use crate::utf16::Utf16View;
 
 /// The Array exotic object. Its "length" is not a stored property: it is the size of the indexed storage, which the
@@ -599,16 +598,24 @@ pub fn sort_indexed_properties<'vm>(
 }
 
 /// AK::Utf16View::operator<=>: the code units in order, then the lengths.
+#[inline]
 fn compare_code_units(lhs: Utf16View<'_>, rhs: Utf16View<'_>) -> f64 {
-    let common_length = lhs.length_in_code_units().min(rhs.length_in_code_units());
-    for index in 0..common_length {
-        let lhs_code_unit = lhs.code_unit_at(index);
-        let rhs_code_unit = rhs.code_unit_at(index);
-        if lhs_code_unit != rhs_code_unit {
-            return if lhs_code_unit < rhs_code_unit { -1.0 } else { 1.0 };
+    let ordering = match (lhs, rhs) {
+        (Utf16View::Ascii(a) | Utf16View::Latin1(a), Utf16View::Ascii(b) | Utf16View::Latin1(b)) => a.cmp(b),
+        (Utf16View::Utf16(a), Utf16View::Utf16(b)) => a.cmp(b),
+        _ => {
+            let common_length = lhs.length_in_code_units().min(rhs.length_in_code_units());
+            for index in 0..common_length {
+                let lhs_code_unit = lhs.code_unit_at(index);
+                let rhs_code_unit = rhs.code_unit_at(index);
+                if lhs_code_unit != rhs_code_unit {
+                    return if lhs_code_unit < rhs_code_unit { -1.0 } else { 1.0 };
+                }
+            }
+            lhs.length_in_code_units().cmp(&rhs.length_in_code_units())
         }
-    }
-    match lhs.length_in_code_units().cmp(&rhs.length_in_code_units()) {
+    };
+    match ordering {
         core::cmp::Ordering::Less => -1.0,
         core::cmp::Ordering::Equal => 0.0,
         core::cmp::Ordering::Greater => 1.0,
@@ -641,6 +648,13 @@ pub fn compare_array_elements(
     if let Some(comparefn) = comparefn {
         // a. Let v be ? ToNumber(? Call(comparefn, undefined, « x, y »)).
         let value = call_function_object(vm, comparefn, Value::UNDEFINED, &[x, y])?;
+        if value.is_int32() {
+            return Ok(f64::from(value.as_i32()));
+        }
+        if value.is_double() {
+            let number = value.as_f64();
+            return Ok(if number.is_nan() { 0.0 } else { number });
+        }
         let value_number = value.to_number(vm)?;
 
         // b. If v is NaN, return +0𝔽.
@@ -652,9 +666,8 @@ pub fn compare_array_elements(
         return Ok(value_number.as_f64());
     }
 
-    // OPTIMIZATION: When both operands are already Strings, ToString is the identity, so we can compare their
-    //               UTF-16 views directly. This preserves any cached UTF-16 on the original PrimitiveStrings
-    //               across sort comparisons and skips the ToPrimitive + IsLessThan detour.
+    // OPTIMIZATION: Convert both operands via ToString in spec order without allocating PrimitiveString GC cells
+    //               and compare UTF-16 code units directly (IsLessThan on two strings is lexicographical code-unit order).
     if x.is_string() && y.is_string() {
         let x_primitive_string = x.as_string();
         let y_primitive_string = y.as_string();
@@ -663,31 +676,52 @@ pub fn compare_array_elements(
             y_primitive_string.utf16_string_view(),
         ));
     }
+    if x.is_int32() && y.is_int32() {
+        let x_digits = crate::runtime::value::DecimalDigits::new_signed(i64::from(x.as_i32()));
+        let y_digits = crate::runtime::value::DecimalDigits::new_signed(i64::from(y.as_i32()));
+        return Ok(match x_digits.as_bytes().cmp(y_digits.as_bytes()) {
+            core::cmp::Ordering::Less => -1.0,
+            core::cmp::Ordering::Equal => 0.0,
+            core::cmp::Ordering::Greater => 1.0,
+        });
+    }
+
+    enum SortString {
+        Digits(crate::runtime::value::DecimalDigits),
+        Owned(ak::Utf16String),
+        GcString(Gc<PrimitiveString>),
+    }
+
+    impl SortString {
+        #[inline]
+        fn from_value(vm: &Vm, value: Value) -> ThrowCompletionOr<Self> {
+            if value.is_string() {
+                Ok(Self::GcString(value.as_string()))
+            } else if value.is_int32() {
+                Ok(Self::Digits(crate::runtime::value::DecimalDigits::new_signed(i64::from(
+                    value.as_i32(),
+                ))))
+            } else {
+                Ok(Self::Owned(value.to_utf16_string(vm)?))
+            }
+        }
+
+        #[inline]
+        fn view(&self) -> Utf16View<'_> {
+            match self {
+                Self::Digits(digits) => Utf16View::Ascii(digits.as_bytes()),
+                Self::Owned(string) => Utf16View::of_string(string),
+                Self::GcString(string) => string.utf16_string_view(),
+            }
+        }
+    }
 
     // 5. Let xString be ? ToString(x).
-    let x_string = PrimitiveString::create(vm, x.to_utf16_string(vm)?);
-
+    let x_string = SortString::from_value(vm, x)?;
     // 6. Let yString be ? ToString(y).
-    let y_string = PrimitiveString::create(vm, y.to_utf16_string(vm)?);
-
-    // 7. Let xSmaller be ! IsLessThan(xString, yString, true).
-    let x_smaller = is_less_than(vm, Value::from_string(x_string), Value::from_string(y_string), true).must();
-
-    // 8. If xSmaller is true, return -1𝔽.
-    if x_smaller == TriState::True {
-        return Ok(-1.0);
-    }
-
-    // 9. Let ySmaller be ! IsLessThan(yString, xString, true).
-    let y_smaller = is_less_than(vm, Value::from_string(y_string), Value::from_string(x_string), true).must();
-
-    // 10. If ySmaller is true, return 1𝔽.
-    if y_smaller == TriState::True {
-        return Ok(1.0);
-    }
-
-    // 11. Return +0𝔽.
-    Ok(0.0)
+    let y_string = SortString::from_value(vm, y)?;
+    // 7-11. Lexicographical UTF-16 code unit comparison.
+    Ok(compare_code_units(x_string.view(), y_string.view()))
 }
 
 // The class tables point at code that uses the heap, so this links only against LibGC.
