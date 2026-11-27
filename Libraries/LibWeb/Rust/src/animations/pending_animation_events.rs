@@ -106,7 +106,26 @@ impl PendingAnimationEvents {
 
     /// Takes the events of the pending animation event queue in the order to dispatch them in.
     /// https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
-    pub(crate) fn take_events_to_dispatch(&mut self, tree_order: &mut impl TreeOrder) -> Vec<PendingAnimationEvent> {
+    pub(crate) fn take_events_to_dispatch(
+        &mut self,
+        dispatch_css_events: bool,
+        tree_order: &mut impl TreeOrder,
+    ) -> Vec<PendingAnimationEvent> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        // OPTIMIZATION: CSS animation/transition events have no default action and cannot be observed when no
+        //               listener for any of those event types exists. Only drop when the entire batch is CSS events
+        //               so a Playback/Time listener cannot register a CSS event listener mid-dispatch.
+        if !dispatch_css_events
+            && self
+                .pending
+                .iter()
+                .all(|event| event.event.kind == PendingAnimationEventKind::Css)
+        {
+            self.pending.clear();
+            return Vec::new();
+        }
         // 4. Let events to dispatch be a copy of doc’s pending animation event queue.
         // 5. Clear doc’s pending animation event queue.
         let mut events_to_dispatch = std::mem::take(&mut self.pending);

@@ -60,6 +60,7 @@
 #include <LibWeb/SVG/SVGTextPathElement.h>
 #include <LibWeb/SVG/SVGTextPositioningElement.h>
 #include <LibWeb/SVG/SVGUseElement.h>
+#include <LibWeb/SVG/TagNames.h>
 
 namespace Web::Layout {
 
@@ -157,7 +158,7 @@ static Array<Optional<CSS::URL>, 4> svg_style_reference_urls(CSS::ComputedValues
 
 static Array<CSS::StyleAtomID, 4> svg_style_reference_atoms(DOM::Element& element)
 {
-    if (!is<SVG::SVGGraphicsElement>(element))
+    if (!element.has_style() || !is<SVG::SVGGraphicsElement>(element))
         return {};
     auto urls = svg_style_reference_urls(element.style_record_groups());
     return {
@@ -234,6 +235,55 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
     auto const* svg_element = as_if<SVG::SVGElement>(dom_node);
     if (!svg_element)
         return {};
+
+    auto const& tag = dom_node.local_name();
+    auto const has_style = dom_node.has_style();
+    if (tag == SVG::TagNames::g) {
+        RustFFI::FfiSvgAttributeFacts facts {};
+        facts.is_graphics_element = true;
+        if (has_style) {
+            auto style_references = svg_style_reference_atoms(dom_node);
+            facts.mask_reference_atom = style_references[0].value();
+            facts.clip_path_reference_atom = style_references[1].value();
+            facts.fill_reference_atom = style_references[2].value();
+            facts.stroke_reference_atom = style_references[3].value();
+        }
+        return facts;
+    }
+    if (tag == SVG::TagNames::path || tag == SVG::TagNames::rect || tag == SVG::TagNames::circle || tag == SVG::TagNames::ellipse || tag == SVG::TagNames::line) {
+        RustFFI::FfiSvgAttributeFacts facts {};
+        facts.is_graphics_element = true;
+        if (tag == SVG::TagNames::path)
+            facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_PATH;
+        else if (tag == SVG::TagNames::rect)
+            facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_RECT;
+        else if (tag == SVG::TagNames::circle)
+            facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_CIRCLE;
+        else if (tag == SVG::TagNames::ellipse)
+            facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_ELLIPSE;
+        else if (auto const* line_element = as_if<SVG::SVGLineElement>(dom_node)) {
+            facts.geometry_kind = RustFFI::SVG_GEOMETRY_KIND_LINE;
+            facts.line_x1 = to_ffi_number_percentage(line_element->x1_value());
+            facts.line_y1 = to_ffi_number_percentage(line_element->y1_value());
+            facts.line_x2 = to_ffi_number_percentage(line_element->x2_value());
+            facts.line_y2 = to_ffi_number_percentage(line_element->y2_value());
+        }
+        if (auto const* geometry_element = as_if<SVG::SVGGeometryElement>(dom_node)) {
+            if (auto path_length = geometry_element->author_path_length(); path_length.has_value()) {
+                facts.has_path_length = true;
+                facts.path_length = *path_length;
+            }
+        }
+        if (has_style) {
+            auto style_references = svg_style_reference_atoms(dom_node);
+            facts.mask_reference_atom = style_references[0].value();
+            facts.clip_path_reference_atom = style_references[1].value();
+            facts.fill_reference_atom = style_references[2].value();
+            facts.stroke_reference_atom = style_references[3].value();
+        }
+        return facts;
+    }
+
     auto const* fit_to_view_box = svg_element->fit_to_view_box();
 
     Optional<SVG::ViewBox> active_view_box;
@@ -433,22 +483,27 @@ void publish_table_spans(DOM::Element const& element)
 void publish_svg_attribute_facts(DOM::Element& element)
 {
     VERIFY(element.style_node_id() != 0);
-    auto points = svg_shape_points(element);
+    auto const& tag = element.local_name();
+    ReadonlySpan<Gfx::FloatPoint> points;
+    if (tag == SVG::TagNames::polygon || tag == SVG::TagNames::polyline)
+        points = svg_shape_points(element);
     Vector<RustFFI::FfiSvgTextPosition> text_positions;
-    if (auto const* text_element = as_if<SVG::SVGTextPositioningElement>(element)) {
-        auto positioning = text_element->parsed_text_positioning();
-        auto length = max(max(positioning.x.size(), positioning.y.size()), max(positioning.dx.size(), positioning.dy.size()));
-        text_positions.ensure_capacity(length);
-        auto value_at = [](auto const& values, size_t index) {
-            return index < values.size() ? to_ffi_svg_length_value(values[index]) : RustFFI::FfiSvgLengthValue {};
-        };
-        for (size_t index = 0; index < length; ++index) {
-            text_positions.unchecked_append({
-                .x = value_at(positioning.x, index),
-                .y = value_at(positioning.y, index),
-                .dx = value_at(positioning.dx, index),
-                .dy = value_at(positioning.dy, index),
-            });
+    if (tag == SVG::TagNames::text || tag == SVG::TagNames::tspan) {
+        if (auto const* text_element = as_if<SVG::SVGTextPositioningElement>(element)) {
+            auto positioning = text_element->parsed_text_positioning();
+            auto length = max(max(positioning.x.size(), positioning.y.size()), max(positioning.dx.size(), positioning.dy.size()));
+            text_positions.ensure_capacity(length);
+            auto value_at = [](auto const& values, size_t index) {
+                return index < values.size() ? to_ffi_svg_length_value(values[index]) : RustFFI::FfiSvgLengthValue {};
+            };
+            for (size_t index = 0; index < length; ++index) {
+                text_positions.unchecked_append({
+                    .x = value_at(positioning.x, index),
+                    .y = value_at(positioning.y, index),
+                    .dx = value_at(positioning.dx, index),
+                    .dy = value_at(positioning.dy, index),
+                });
+            }
         }
     }
     static_assert(sizeof(Gfx::FloatPoint) == sizeof(RustFFI::FfiFloatPoint));

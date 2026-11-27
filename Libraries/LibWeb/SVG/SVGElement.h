@@ -67,7 +67,7 @@ public:
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const final override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const final override;
-    virtual bool publishes_presentational_hints_on_arrival() const final override { return true; }
+    virtual bool updates_presentational_hints_incrementally() const final override { return true; }
 
     virtual SVGFitToViewBox const* fit_to_view_box() const { return nullptr; }
 

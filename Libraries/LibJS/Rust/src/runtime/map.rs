@@ -89,11 +89,13 @@ impl Indices {
     #[inline]
     fn find<V: StoredValue>(&self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
         let key_bits = key.0;
-        let key = ValueTraitsKey(key);
+        let is_identity_key = !(key.is_string() || key.is_bigint());
+        let traits_key = ValueTraitsKey(key);
         self.positions
-            .find(self.hash(key.0), |&index| {
-                let entry_key = entries[index].key;
-                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == key
+            .find(self.hash(key), |&index| {
+                // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
+                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             })
             .copied()
     }
@@ -107,13 +109,15 @@ impl Indices {
     ) -> Option<usize> {
         let hash = self.hash(key);
         let key_bits = key.0;
+        let is_identity_key = !(key.is_string() || key.is_bigint());
         let traits_key = ValueTraitsKey(key);
         let hasher = &self.hasher;
         match self.positions.entry(
             hash,
             |&index| {
-                let entry_key = entries[index].key;
-                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == traits_key
+                // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
+                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             },
             |&index| hasher.hash_one(ValueTraitsKey(entries[index].key)),
         ) {
@@ -135,12 +139,14 @@ impl Indices {
 
     fn remove<V: StoredValue>(&mut self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
         let key_bits = key.0;
-        let key = ValueTraitsKey(key);
+        let is_identity_key = !(key.is_string() || key.is_bigint());
+        let traits_key = ValueTraitsKey(key);
         let entry = self
             .positions
-            .find_entry(self.hash(key.0), |&index| {
-                let entry_key = entries[index].key;
-                entry_key.0 == key_bits || ValueTraitsKey(entry_key) == key
+            .find_entry(self.hash(key), |&index| {
+                // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
+                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             })
             .ok()?;
         Some(entry.remove().0)

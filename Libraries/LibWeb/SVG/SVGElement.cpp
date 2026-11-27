@@ -274,14 +274,15 @@ Vector<CSS::StyleProperty> const& SVGElement::presentation_attribute_style() con
         return *m_presentation_attribute_style;
 
     Vector<CSS::StyleProperty> presentation_attribute_style;
-    for_each_attribute([&](DOM::QualifiedName const& name, Utf16View const& value) {
+    auto const& tag_name = local_name();
+    for (auto const& [name, value] : attribute_list()) {
         if (name.namespace_().has_value())
-            return;
-        if (auto property_id = property_id_for_presentational_attribute(name.as_string(), local_name()); property_id.has_value()) {
+            continue;
+        if (auto property_id = property_id_for_presentational_attribute(name.as_string(), tag_name); property_id.has_value()) {
             if (auto style_value = parse_presentation_attribute(*property_id, value))
                 presentation_attribute_style.append({ .property_id = *property_id, .value = style_value.release_nonnull() });
         }
-    });
+    }
     m_presentation_attribute_style = move(presentation_attribute_style);
     return *m_presentation_attribute_style;
 }
@@ -442,10 +443,15 @@ static RefPtr<CSS::StyleValue const> try_parse_simple_svg_presentation_attribute
     case CSS::PropertyID::R:
     case CSS::PropertyID::Rx:
     case CSS::PropertyID::Ry:
+    case CSS::PropertyID::StrokeWidth:
         if (auto number = parse_simple_svg_presentation_number(value); number.has_value() && *number >= 0.0 && *number < 1e7) {
             double const px = (*number == 0.0) ? 0.0 : CSSPixels::nearest_value_for(*number).to_double();
             return CSS::LengthStyleValue::create(CSS::Length::make_px(px));
         }
+        return {};
+    case CSS::PropertyID::StrokeMiterlimit:
+        if (auto number = parse_simple_svg_presentation_number(value); number.has_value() && *number >= 1.0)
+            return CSS::NumberStyleValue::create(*number);
         return {};
     case CSS::PropertyID::Transform:
         return try_parse_simple_svg_translate(value);
@@ -484,8 +490,14 @@ RefPtr<CSS::StyleValue const> SVGElement::parse_presentation_attribute(CSS::Prop
 
 void SVGElement::update_presentation_attribute_style(Utf16FlyString const& name, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
-    if (!m_presentation_attribute_style.has_value() || namespace_.has_value())
+    if (namespace_.has_value())
         return;
+
+    if (!m_presentation_attribute_style.has_value()) {
+        if (style_node_id() == 0 || initial_style_features_pending())
+            return;
+        m_presentation_attribute_style.emplace();
+    }
 
     auto property_id = property_id_for_presentational_attribute(name, local_name());
     if (!property_id.has_value())
