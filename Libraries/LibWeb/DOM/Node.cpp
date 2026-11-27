@@ -65,6 +65,7 @@
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
+#include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLDocument.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
@@ -971,14 +972,14 @@ void Node::adjust_live_ranges_for_insertion(Node& child, size_t count)
 }
 
 // https://dom.spec.whatwg.org/#concept-node-insert
-void Node::insert_node_into_children(GC::Ref<Node> node, GC::Ptr<Node> child)
+void Node::insert_node_into_children(GC::Ref<Node> node, GC::Ptr<Node> child, bool defer_subtree_root)
 {
     // 1. Adopt node into parent’s node document.
     document().adopt_node_steps(node);
 
     // 2. If child is null, then append node to parent’s children.
     // 3. Otherwise, insert node into parent’s children before child’s index.
-    insert_before_impl(node, child);
+    insert_before_impl(node, child, defer_subtree_root);
 
     // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
     //    assign a slot for node.
@@ -1049,6 +1050,8 @@ static void run_post_connection_steps(Nodes const& nodes)
     }
 }
 
+static CSS::StyleNodeID mirror_identity_of(Node const&);
+
 void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements affects_elements)
 {
     // 5. If child is non-null:
@@ -1075,13 +1078,29 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
     auto* document_global_custom_element_registry = document().effective_global_custom_element_registry().ptr();
     bool const document_global_registry_has_definitions = document_global_custom_element_registry && document_global_custom_element_registry->has_definitions();
     bool const parent_is_connected = is_connected();
+    auto& parent_root = root();
+    bool const parent_allows_deferred_subtree_root = parent_is_connected
+        && !parent_root.is_shadow_root()
+        && !(is_element() && static_cast<Element const&>(*this).is_shadow_host())
+        && !is_html_slot_element();
+    bool const parent_in_editable_subtree = m_in_editable_subtree;
+    bool const doc_has_no_form_or_fieldset = !document().has_form_or_fieldset_element() && !document().has_form_element();
+    u32 const nonce_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::nonce);
+    u32 const autofocus_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::autofocus);
+    u32 const dir_attr_bits = Element::attribute_filter_bits(HTML::AttributeNames::dir);
     auto* focused_area = document().focused_area().ptr();
     bool const focused_area_may_be_in_detached_node = focused_area && !focused_area->is_connected();
     bool parent_style_arrival_ancestors_marked = false;
 
     for (auto& node_to_insert : nodes) {
         bool const node_was_connected = node_to_insert->is_connected();
-        insert_node_into_children(*node_to_insert, child);
+        bool const can_defer_subtree_root = parent_allows_deferred_subtree_root
+            && !focused_area_may_be_in_detached_node
+            && !node_was_connected
+            && !node_to_insert->parent()
+            && &node_to_insert->document() == &document();
+        insert_node_into_children(*node_to_insert, child, can_defer_subtree_root);
+        bool subtree_root_deferred = can_defer_subtree_root && node_to_insert->parent() == this && node_to_insert->has_children();
 
         // And a subtree holding the focused or hovered node brings `:focus-within` and `:hover` to
         // the chain it lands under.
@@ -1098,22 +1117,76 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
             && subtree_insertion_scope.descendants_covered_by_subtree_arrival()
             && !subtree_insertion_scope.keyboard_scroll_tracks_document()
             && !subtree_insertion_scope.document_may_have_blocking_wheel_event_listener();
+        bool const fast_plain_element_base = fast_plain_text_base
+            && !parent_in_editable_subtree
+            && !subtree_insertion_scope.document_has_inert_element()
+            && !subtree_insertion_scope.content_blocker_has_cosmetic_rules()
+            && !document_global_registry_has_definitions;
 
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
             if (fast_plain_text_base
-                && inclusive_descendant.is_exclusive_text()
                 && !subtree_insertion_scope.may_be_in_shadow_tree()
                 && !subtree_insertion_scope.document_has_auto_directionality()) {
-                auto& text = static_cast<Text&>(inclusive_descendant);
-                if (text.style_node_id() == 0) {
-                    text.m_is_connected = true;
-                    auto* text_parent = text.parent();
-                    text.m_in_editable_subtree = text_parent && text_parent->m_in_editable_subtree;
-                    if (auto* parent_element = as_if<Element>(text_parent); parent_element && parent_element->style_node_id() != 0 && !text.data().is_empty())
-                        CSS::record_element_emptiness_changed(*parent_element, text, false, true);
-                    return TraversalDecision::Continue;
+                if (inclusive_descendant.is_exclusive_text()) {
+                    auto& text = static_cast<Text&>(inclusive_descendant);
+                    if (text.style_node_id() == 0) {
+                        if (subtree_root_deferred)
+                            text.m_root = parent_root;
+                        text.m_is_connected = true;
+                        auto* text_parent = text.parent();
+                        text.m_in_editable_subtree = text_parent && text_parent->m_in_editable_subtree;
+                        if (auto* parent_element = as_if<Element>(text_parent); parent_element && parent_element->style_node_id() != 0 && !text.data().is_empty())
+                            CSS::record_element_emptiness_changed(*parent_element, text, false, true);
+                        return TraversalDecision::Continue;
+                    }
+                } else if (fast_plain_element_base && inclusive_descendant.is_element()) {
+                    auto& element = static_cast<Element&>(inclusive_descendant);
+                    auto const fast_kind = element.tree_mutation_fast_path();
+                    if (fast_kind != Element::TreeMutationFastPath::None
+                        && element.style_node_id() == 0
+                        && element.uses_document_global_custom_element_registry()
+                        && !element.is_custom()
+                        && !element.id().has_value()
+                        && !element.has_name_attribute()
+                        && !element.has_style_attribute_pending_work()
+                        && !element.is_shadow_host()
+                        && !element.rare_data()
+                        && !element.element_animations_if_created()
+                        && (element.has_no_raw_attributes()
+                            || ((element.subtree_attribute_filter() & nonce_attr_bits) != nonce_attr_bits
+                                && (element.subtree_attribute_filter() & autofocus_attr_bits) != autofocus_attr_bits
+                                && (element.subtree_attribute_filter() & dir_attr_bits) != dir_attr_bits))
+                        && static_cast<HTML::HTMLElement const&>(element).content_editable_state() == HTML::ContentEditableState::Inherit
+                        && (!element.parent() || !element.parent()->m_in_editable_subtree)
+                        && &element.document() == &document()) {
+                        bool can_fast_insert = fast_kind == Element::TreeMutationFastPath::PlainHTML;
+                        if (!can_fast_insert && doc_has_no_form_or_fieldset) {
+                            if (fast_kind == Element::TreeMutationFastPath::Button) {
+                                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
+                                can_fast_insert = !button.form() && !button.has_form_associated_rare_data();
+                            } else if (fast_kind == Element::TreeMutationFastPath::Input) {
+                                auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
+                                can_fast_insert = !input.form()
+                                    && !input.has_form_associated_rare_data()
+                                    && input.type_state() != HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                                    && !input.has_rare_input_data();
+                            }
+                        }
+                        if (can_fast_insert) {
+                            if (subtree_root_deferred)
+                                element.m_root = parent_root;
+                            element.m_is_connected = true;
+                            element.m_in_editable_subtree = false;
+                            return TraversalDecision::Continue;
+                        }
+                    }
                 }
+            }
+
+            if (subtree_root_deferred) {
+                node_to_insert->set_root_for_subtree(parent_root);
+                subtree_root_deferred = false;
             }
 
             // 1. Run the insertion steps with inclusiveDescendant.
@@ -1193,7 +1266,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
             parent_element()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBeforeWithDisplayContents);
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
         for (auto& inserted_node : nodes) {
-            inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+            if (mirror_identity_of(*inserted_node) != 0)
+                inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
         }
     }
 
@@ -1554,32 +1628,104 @@ void Node::assign_slottables_after_removal(Node& parent, Node& parent_root, Read
     }
 }
 
-void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine)
+void Node::run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root)
 {
-    if (was_tracked_by_style_engine) {
-        if (auto* element = as_if<Element>(*this); element && element->element_animations_if_created())
-            element->cancel_css_animations_and_transitions();
-    }
-    removed_from(IsSubtreeRoot::Yes, &parent, parent_root);
-
-    bool is_parent_connected = parent.is_connected();
-
-    auto* root_element = as_if<DOM::Element>(*this);
-    if (root_element && root_element->is_custom() && is_parent_connected)
-        root_element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
-
-    if (!has_children() && (!root_element || !root_element->is_shadow_host()))
-        return;
-
     auto& doc = document();
     bool const doc_has_auto_dir = doc.has_element_with_auto_directionality();
     Node const* focused_area = doc.focused_area().ptr();
+    if (is_exclusive_text() && !doc_has_auto_dir && focused_area != this) {
+        m_is_connected = false;
+        m_in_editable_subtree = false;
+        return;
+    }
+
+    bool subtree_root_deferred = defer_subtree_root && has_children();
+    bool const fast_plain_remove_base = !doc.has_inert_element()
+        && !doc.has_render_blocking_elements()
+        && !doc.fullscreen_element()
+        && !doc.has_anchor_names()
+        && !doc.page().accessibility_interested()
+        && doc.timeline_declarations_generation() == 0
+        && !parent_root.is_shadow_root();
+    bool const doc_has_no_form_or_fieldset = !doc.has_form_or_fieldset_element() && !doc.has_form_element();
+
+    auto try_fast_remove_plain_html_element = [&](Element& element) -> bool {
+        if (!fast_plain_remove_base || focused_area == &element)
+            return false;
+        auto const fast_kind = element.tree_mutation_fast_path();
+        if (fast_kind == Element::TreeMutationFastPath::None
+            || element.style_node_id() != 0
+            || element.is_custom()
+            || element.id().has_value()
+            || element.has_name_attribute()
+            || element.rare_data()
+            || element.element_animations_if_created()
+            || element.is_shadow_host()
+            || static_cast<HTML::HTMLElement const&>(element).popover_visibility_state() != HTML::HTMLElement::PopoverVisibilityState::Hidden) {
+            return false;
+        }
+        if (fast_kind != Element::TreeMutationFastPath::PlainHTML) {
+            if (!doc_has_no_form_or_fieldset)
+                return false;
+            if (fast_kind == Element::TreeMutationFastPath::Button) {
+                auto const& button = static_cast<HTML::HTMLButtonElement const&>(element);
+                if (button.form() || button.has_form_associated_rare_data())
+                    return false;
+            } else if (fast_kind == Element::TreeMutationFastPath::Input) {
+                auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
+                if (input.form()
+                    || input.has_form_associated_rare_data()
+                    || input.type_state() == HTML::HTMLInputElement::TypeAttributeState::RadioButton
+                    || input.has_rare_input_data()) {
+                    return false;
+                }
+            }
+        }
+        if (subtree_root_deferred)
+            element.m_root = *this;
+        element.m_is_connected = false;
+        element.m_in_editable_subtree = false;
+        if (element.has_style())
+            element.clear_installed_style_for_disconnected_element();
+        return true;
+    };
+
+    auto* root_element = as_if<DOM::Element>(*this);
+    bool const is_parent_connected = parent.is_connected();
+    if (root_element && try_fast_remove_plain_html_element(*root_element)) {
+        // Fast-removed root element cannot be custom or have a shadow root.
+        if (!has_children())
+            return;
+    } else {
+        if (subtree_root_deferred) {
+            set_root_for_subtree(*this);
+            subtree_root_deferred = false;
+        }
+        if (was_tracked_by_style_engine && root_element && root_element->element_animations_if_created())
+            root_element->cancel_css_animations_and_transitions();
+        removed_from(IsSubtreeRoot::Yes, &parent, parent_root);
+
+        if (root_element && root_element->is_custom() && is_parent_connected)
+            root_element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
+
+        if (!has_children() && (!root_element || !root_element->is_shadow_host()))
+            return;
+    }
 
     for_each_shadow_including_descendant([&](Node& descendant) {
         if (descendant.is_exclusive_text() && !doc_has_auto_dir && focused_area != &descendant) {
+            if (subtree_root_deferred)
+                descendant.m_root = *this;
             descendant.m_is_connected = false;
             descendant.m_in_editable_subtree = false;
             return TraversalDecision::Continue;
+        }
+        if (descendant.is_element() && try_fast_remove_plain_html_element(static_cast<Element&>(descendant)))
+            return TraversalDecision::Continue;
+
+        if (subtree_root_deferred) {
+            set_root_for_subtree(*this);
+            subtree_root_deferred = false;
         }
 
         if (was_tracked_by_style_engine) {
@@ -3183,7 +3329,11 @@ void Node::remove_all_children(bool suppress_observers)
         }
 
         // 7. Remove node from its parent’s children.
-        remove_child_for_remove_all_impl(*child);
+        bool const defer_subtree_root = was_connected
+            && !parent_root_is_shadow_root
+            && !this_is_shadow_host
+            && !child_holds_a_propagating_state_source;
+        remove_child_for_remove_all_impl(*child, defer_subtree_root);
 
         // 8. If node is assigned, then run assign slottables for node’s assigned slot.
         // 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
@@ -3204,7 +3354,7 @@ void Node::remove_all_children(bool suppress_observers)
         // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with
         //     node, callback name "disconnectedCallback", and an empty argument list.
         // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-        child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine);
+        child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine, defer_subtree_root);
 
         // 15. Add transient registered observers given node and parent.
         if (has_subtree_mutation_observer)
@@ -4302,7 +4452,7 @@ static void add_to_attribute_name_filter_of_parent(Node& parent, Node const& chi
         parent_element->add_to_subtree_filters(child_element->subtree_name_filter(), child_element->subtree_attribute_filter());
 }
 
-void Node::append_child_impl(GC::Ref<Node> node)
+void Node::append_child_impl(GC::Ref<Node> node, bool defer_subtree_root)
 {
     VERIFY(!node->parent());
 
@@ -4310,20 +4460,26 @@ void Node::append_child_impl(GC::Ref<Node> node)
         return;
 
     TreeNode::append_child(node);
-    node->set_root_for_subtree(root());
+    if (defer_subtree_root)
+        node->m_root = root();
+    else
+        node->set_root_for_subtree(root());
     if (auto count = node->m_associated_animation_count_in_subtree)
         change_associated_animation_count_in_subtree(count);
     add_to_attribute_name_filter_of_parent(*this, node);
 }
 
-void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
+void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child, bool defer_subtree_root)
 {
     if (!child)
-        return append_child_impl(move(node));
+        return append_child_impl(move(node), defer_subtree_root);
     TreeNode::insert_before(node, child);
     if (node->is_element())
         begin_child_index_generation();
-    node->set_root_for_subtree(root());
+    if (defer_subtree_root)
+        node->m_root = root();
+    else
+        node->set_root_for_subtree(root());
     if (auto count = node->m_associated_animation_count_in_subtree)
         change_associated_animation_count_in_subtree(count);
     add_to_attribute_name_filter_of_parent(*this, node);
@@ -4342,14 +4498,17 @@ void Node::remove_child_impl(GC::Ref<Node> node)
     node->set_root_for_subtree(node);
 }
 
-void Node::remove_child_for_remove_all_impl(GC::Ref<Node> node)
+void Node::remove_child_for_remove_all_impl(GC::Ref<Node> node, bool defer_subtree_root)
 {
     if (auto count = node->m_associated_animation_count_in_subtree)
         change_associated_animation_count_in_subtree(-static_cast<i32>(count));
     if (auto* element = as_if<Element>(*node))
         element->forget_child_indices();
     TreeNode::remove_child(node);
-    node->set_root_for_subtree(node);
+    if (defer_subtree_root)
+        node->m_root = node;
+    else
+        node->set_root_for_subtree(node);
 }
 
 void Node::begin_child_index_generation()
