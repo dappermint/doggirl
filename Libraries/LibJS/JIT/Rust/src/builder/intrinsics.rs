@@ -994,12 +994,17 @@ impl<'a> GraphBuilder<'a, '_> {
             return Ok(None);
         }
         // NB: Calls without a required argument pass undefined, which the
-        //     slow path converts.
-        let passes_required_arguments = call
-            .arguments
-            .iter()
-            .skip(arguments.len())
-            .all(|operand| matches!(operand, HelperOperand::Int32 { absent: Some(_) }));
+        //     slow path converts. Variadic builtins like Object.assign cannot
+        //     drop arguments beyond those their helper takes.
+        if !intrinsic.ignores_extra_arguments() && arguments.len() > call.arguments.len() {
+            return Ok(None);
+        }
+        let passes_required_arguments = call.arguments.iter().skip(arguments.len()).all(|operand| {
+            matches!(
+                operand,
+                HelperOperand::Int32 { absent: Some(_) } | HelperOperand::OptionalValue
+            )
+        });
         if !passes_required_arguments
             || self.holds_virtual_arguments(*this_value)
             || arguments.iter().any(|operand| self.holds_virtual_arguments(*operand))
@@ -1040,7 +1045,7 @@ impl<'a> GraphBuilder<'a, '_> {
             .chain((0..call.arguments.len()).map(|index| arguments.get(index).copied()));
         for (operand, kind) in operands.zip(core::iter::once(call.receiver).chain(call.arguments.iter().copied())) {
             let input = match (operand, kind) {
-                (Some(operand), HelperOperand::Value) => self.read(operand)?,
+                (Some(operand), HelperOperand::Value | HelperOperand::OptionalValue) => self.read(operand)?,
                 (Some(operand), HelperOperand::String) => {
                     let value = self.read(operand)?;
                     self.branch_to_slow_path(&mut slow_paths, BranchCondition::String, &[value], true)
@@ -1049,6 +1054,7 @@ impl<'a> GraphBuilder<'a, '_> {
                     let value = self.read(operand)?;
                     self.int32_or_slow_path(&mut slow_paths, value)
                 }
+                (None, HelperOperand::OptionalValue) => self.constant(crate::ir::value::UNDEFINED),
                 (None, HelperOperand::Int32 { absent: Some(absent) }) => self.int32_constant(absent),
                 (None, _) => unreachable!("calls pass the required arguments"),
             };

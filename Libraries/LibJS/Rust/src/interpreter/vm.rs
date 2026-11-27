@@ -87,7 +87,7 @@ use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::reference::{BaseType, Reference};
 use crate::runtime::regexp_prototype::RegexCache;
-use crate::runtime::shape::{ConstructShapeCache, PrototypeTransitionCache};
+use crate::runtime::shape::{AssignPlanCache, ConstructShapeCache, PrototypeTransitionCache};
 use crate::runtime::shared_function_instance_data::SharedFunctionInstanceData;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::runtime::symbol::{self, GlobalSymbolRegistry, Symbol, enumerate_well_known_symbols};
@@ -628,6 +628,7 @@ pub struct Vm {
     keyed_property_lookup_cache: KeyedPropertyLookupCache,
     prototype_transition_cache: Box<PrototypeTransitionCache>,
     construct_shape_cache: Box<ConstructShapeCache>,
+    assign_plan_cache: Box<AssignPlanCache>,
     /// Like the keyed property lookup cache, how string-keyed PutByValue instructions whose own caches gave up put
     /// properties: the writable own data properties they change and the properties they add, by shape and name (see
     /// put_by_value_with_keyed_store_cache()).
@@ -821,6 +822,7 @@ impl Vm {
             keyed_property_lookup_cache: KeyedPropertyLookupCache::new(),
             prototype_transition_cache: Box::new(PrototypeTransitionCache::new()),
             construct_shape_cache: Box::new(ConstructShapeCache::new()),
+            assign_plan_cache: Box::new(AssignPlanCache::new()),
             keyed_property_store_cache: KeyedPropertyLookupCache::new(),
             keyed_property_store_scratch_cache: PropertyLookupCache::new(),
             host_ensure_can_add_private_element: Cell::new(default_host_ensure_can_add_private_element),
@@ -1783,6 +1785,7 @@ impl Vm {
         self.keyed_property_lookup_cache.remove_dead_entries(sweep);
         self.prototype_transition_cache.remove_dead_entries(sweep);
         self.construct_shape_cache.remove_dead_entries(sweep);
+        self.assign_plan_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
         self.jit.dependents.remove_dead_entries(self, sweep);
     }
@@ -1822,6 +1825,10 @@ impl Vm {
 
     pub fn construct_shape_cache(&self) -> &ConstructShapeCache {
         &self.construct_shape_cache
+    }
+
+    pub fn assign_plan_cache(&self) -> &AssignPlanCache {
+        &self.assign_plan_cache
     }
 
     pub fn keyed_property_store_cache(&self) -> &KeyedPropertyLookupCache {
