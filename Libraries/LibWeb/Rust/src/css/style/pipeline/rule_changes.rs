@@ -412,10 +412,19 @@ impl RuleIndexChanges {
         }
         let mut filter = AncestorFilter::new();
         filter.fill();
+        let mut joined_buckets: HashMap<ScopeGroupID, RuleIndex> = HashMap::default();
         for regrouped in &self.regrouped {
-            Self::for_each_regrouped(regrouped, state, index, records, &filter, &mut |node| {
-                visit(node, Restyled::Anew);
-            });
+            Self::for_each_regrouped(
+                regrouped,
+                state,
+                index,
+                records,
+                &filter,
+                &mut joined_buckets,
+                &mut |node| {
+                    visit(node, Restyled::Anew);
+                },
+            );
         }
     }
 
@@ -452,6 +461,7 @@ impl RuleIndexChanges {
         index: &RuleIndex,
         records: &RetainedRecords,
         filter: &AncestorFilter,
+        joined_buckets: &mut HashMap<ScopeGroupID, RuleIndex>,
         visit: &mut impl FnMut(StyleNodeID),
     ) {
         let tree = &state.projection;
@@ -463,19 +473,9 @@ impl RuleIndexChanges {
         else {
             return;
         };
-        let joined = regrouped
-            .joined
-            .map(|group| index.buckets_of(&index.live_entries_of(group)));
-        let mut matcher = joined.as_ref().map(|joined| Matcher::reaching(index, joined, state));
-        let mut matches = Vec::new();
-        for node in tree.style_preorder(host) {
-            let Some(facts) = tree.facts(node) else {
-                continue;
-            };
-            if records.get(node).is_none() {
-                continue;
-            }
-            let left_one = regrouped.left.is_some_and(|left| {
+        let left_group = regrouped.left;
+        let left_matches = |node: StyleNodeID| {
+            left_group.is_some_and(|left| {
                 records.matches_of(node).is_none_or(|matched| {
                     matched.iter().any(|&entry| {
                         index
@@ -484,8 +484,55 @@ impl RuleIndexChanges {
                             .is_none_or(|_| index.entries.placement(entry as usize).group == left)
                     })
                 })
-            });
-            if left_one {
+            })
+        };
+        let mut iter = tree.style_preorder(host);
+        let first_needing_joined = if let Some(group) = regrouped.joined
+            && !joined_buckets.contains_key(&group)
+        {
+            let mut pending = None;
+            for node in iter.by_ref() {
+                let Some(facts) = tree.facts(node) else {
+                    continue;
+                };
+                if records.get(node).is_none() {
+                    continue;
+                }
+                if left_matches(node) {
+                    visit(node);
+                    continue;
+                }
+                pending = Some((node, facts));
+                break;
+            }
+            if pending.is_some() {
+                joined_buckets.insert(group, index.buckets_of(&index.live_entries_of(group)));
+            }
+            pending
+        } else {
+            None
+        };
+        let mut matcher = regrouped
+            .joined
+            .and_then(|group| joined_buckets.get(&group))
+            .map(|joined| Matcher::reaching(index, joined, state));
+        let mut matches = Vec::new();
+        if let Some((node, facts)) = first_needing_joined
+            && let Some(matcher) = matcher.as_mut()
+            && matcher
+                .match_element(node, facts, filter, &mut matches)
+                .map_or(true, |()| !matches.is_empty())
+        {
+            visit(node);
+        }
+        for node in iter {
+            let Some(facts) = tree.facts(node) else {
+                continue;
+            };
+            if records.get(node).is_none() {
+                continue;
+            }
+            if left_matches(node) {
                 visit(node);
                 continue;
             }
