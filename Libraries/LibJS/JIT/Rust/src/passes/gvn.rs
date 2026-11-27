@@ -89,10 +89,76 @@ fn mix32(mut x: u32) -> u32 {
 }
 
 #[inline(always)]
+fn hash_u64(x: u64) -> u32 {
+    mix32(x as u32) ^ mix32((x >> 32) as u32)
+}
+
+#[inline(always)]
+fn hash_payload<T: Hash>(value: &T) -> u32 {
+    struct PayloadHasher(u32);
+    impl Hasher for PayloadHasher {
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            u64::from(self.0)
+        }
+        #[inline(always)]
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = mix32(self.0 ^ u32::from(b));
+            }
+        }
+        #[inline(always)]
+        fn write_u8(&mut self, i: u8) {
+            self.0 = mix32(self.0 ^ u32::from(i));
+        }
+        #[inline(always)]
+        fn write_u16(&mut self, i: u16) {
+            self.0 = mix32(self.0 ^ u32::from(i));
+        }
+        #[inline(always)]
+        fn write_u32(&mut self, i: u32) {
+            self.0 = mix32(self.0 ^ i);
+        }
+        #[inline(always)]
+        fn write_u64(&mut self, i: u64) {
+            self.0 = mix32(self.0 ^ hash_u64(i));
+        }
+        #[inline(always)]
+        fn write_usize(&mut self, i: usize) {
+            self.0 = mix32(self.0 ^ hash_u64(i as u64));
+        }
+    }
+    let mut hasher = PayloadHasher(0);
+    value.hash(&mut hasher);
+    hasher.0
+}
+
+#[inline(always)]
+fn op_payload_hash(op: &Op) -> u32 {
+    match op {
+        Op::Constant(bits) => hash_u64(*bits),
+        Op::LoadFunctionEnvironment { private } => u32::from(*private),
+        Op::TaggedEquals { equal } => u32::from(*equal),
+        Op::CheckElements { kind } => hash_payload(kind),
+        Op::Int32Binary { op } | Op::Int32WrappingBinary { op } | Op::Float64Binary { op } => hash_payload(op),
+        Op::Int32Compare { comparison } | Op::Float64Compare { comparison } => hash_payload(comparison),
+        Op::Float64Unary { op } => hash_payload(op),
+        Op::CheckValue { expected, kind } => hash_u64(*expected) ^ mix32(hash_payload(kind)),
+        Op::TypeofIs { kind, equal } => hash_payload(kind) ^ (u32::from(*equal) << 8),
+        Op::Refine { condition, holds } => hash_payload(condition) ^ (u32::from(*holds) << 8),
+        _ => 0,
+    }
+}
+
+#[inline(always)]
 fn node_hash(node: &Node, replacements: &Replacements) -> u32 {
     let mut hasher = DiscriminantHasher(0);
     discriminant(&node.op).hash(&mut hasher);
     let mut h = mix32(hasher.0 ^ ((node.inputs.len() as u32) << 16));
+    let payload = op_payload_hash(&node.op);
+    if payload != 0 {
+        h = mix32(h ^ payload);
+    }
     if replacements.is_empty() {
         for input in &node.inputs {
             h = mix32(h ^ input.0);
@@ -105,8 +171,8 @@ fn node_hash(node: &Node, replacements: &Replacements) -> u32 {
     h
 }
 
-pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) {
-    run_with_hash(graph, work, dominators, node_hash);
+pub fn run_with_dominators(graph: &mut Graph, work: &Zone, dominators: &mut CachedDominators) -> bool {
+    run_with_hash(graph, work, dominators, node_hash)
 }
 
 fn run_with_hash(
@@ -114,7 +180,7 @@ fn run_with_hash(
     work: &Zone,
     dominators: &mut CachedDominators,
     hash: impl Fn(&Node, &Replacements) -> u32,
-) {
+) -> bool {
     let mut numbered_count = 0usize;
     for block in &graph.blocks {
         for &node in &block.body {
@@ -124,7 +190,7 @@ fn run_with_hash(
         }
     }
     if numbered_count < 2 {
-        return;
+        return false;
     }
     let dominators = dominators.get_or_compute(graph);
     let mut replacements = Replacements::new(graph, work);
@@ -243,7 +309,9 @@ fn run_with_hash(
     if !removed.is_empty() {
         replacements.apply(graph);
         edit::remove_nodes(graph, &removed);
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -271,5 +339,24 @@ mod tests {
         run_with_hash(&mut graph, crate::test_zone(), &mut dominators, |_, _| 0);
         assert_eq!(graph.blocks[0].body, [first, different_input, different_operation]);
         assert_eq!(graph.node(returned).inputs, [first]);
+    }
+
+    #[test]
+    fn payload_fields_disambiguate_gvn_hashes() {
+        let mut graph = Graph::default();
+        graph.add_block(Block::default());
+        let a = graph.add(Op::Constant(1), &[], Some(Repr::Int32), 0);
+        let b = graph.add(Op::Constant(2), &[], Some(Repr::Int32), 0);
+        let env_pub = graph.add(Op::LoadFunctionEnvironment { private: false }, &[a], Some(Repr::Tagged), 0);
+        let env_priv = graph.add(Op::LoadFunctionEnvironment { private: true }, &[a], Some(Repr::Tagged), 0);
+        let eq = graph.add(Op::TaggedEquals { equal: true }, &[a, b], Some(Repr::Int32), 0);
+        let ne = graph.add(Op::TaggedEquals { equal: false }, &[a, b], Some(Repr::Int32), 0);
+        let empty = Replacements::new(&graph, crate::test_zone());
+        assert_ne!(node_hash(graph.node(a), &empty), node_hash(graph.node(b), &empty));
+        assert_ne!(
+            node_hash(graph.node(env_pub), &empty),
+            node_hash(graph.node(env_priv), &empty)
+        );
+        assert_ne!(node_hash(graph.node(eq), &empty), node_hash(graph.node(ne), &empty));
     }
 }

@@ -190,8 +190,9 @@ fn add_predecessor(graph: &mut Graph, target: BlockId, predecessor: BlockId, lik
     }
 }
 
-/// Returns whether control flow changed (boolean phis were threaded into new edge blocks).
-pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
+/// Returns `(changed_cfg, changed_any)`: whether boolean phis were threaded into new edge blocks,
+/// and whether any CFG or branch-comparison change occurred.
+pub fn run_checked(graph: &mut Graph, work: &Zone) -> (bool, bool) {
     let has_bool_branch = graph.blocks.iter().any(|block| {
         block.control.is_some_and(|control| {
             matches!(
@@ -204,7 +205,7 @@ pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
         })
     });
     if !has_bool_branch {
-        return false;
+        return (false, false);
     }
     // NB: Threading moves the uses of each phi's inputs to the branches.
     let uses = count_uses(graph, work);
@@ -256,6 +257,7 @@ pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
         data.inputs.assign(&inputs);
         removed.insert(comparison.index());
     }
+    let changed_any = changed_cfg || !removed.is_empty();
     edit::remove_nodes(graph, &removed);
-    changed_cfg
+    (changed_cfg, changed_any)
 }

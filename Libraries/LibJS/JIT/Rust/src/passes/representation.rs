@@ -87,17 +87,19 @@ const UNBOXED: [Unboxed; 3] = [
     },
 ];
 
-pub fn run(graph: &mut Graph, work: &Zone) {
+pub fn run_checked(graph: &mut Graph, work: &Zone) -> bool {
     let has_tagged_phi = graph
         .blocks
         .iter()
         .any(|block| block.phis.iter().any(|phi| graph.node(*phi).repr == Some(Repr::Tagged)));
     if !has_tagged_phi {
-        return;
+        return false;
     }
+    let mut changed = false;
     for unboxed in &UNBOXED {
-        unbox_phis(graph, unboxed, work);
+        changed |= unbox_phis(graph, unboxed, work);
     }
+    changed
 }
 
 /// Whether `node` is among the phis being unboxed. Nodes added by the pass
@@ -231,7 +233,7 @@ fn checkable_inputs<'w>(
     checkable
 }
 
-fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
+fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) -> bool {
     let phis = ZoneVec::from_iter_in(
         graph
             .blocks
@@ -241,7 +243,7 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
         work,
     );
     if phis.is_empty() {
-        return;
+        return false;
     }
     let count = graph.nodes.len();
     let mut candidates = ZoneBitSet::new_in(count, work);
@@ -272,7 +274,7 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
         }
     }
     if benefiting.is_empty() {
-        return;
+        return false;
     }
     let checked = checked_phis(graph, unboxed, &candidates, work);
     let checkable = checkable_inputs(graph, unboxed, &checked, work);
@@ -301,7 +303,7 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
     spread_over_phis(graph, &candidates, &mut useful);
     let candidates = useful;
     if candidates.is_empty() {
-        return;
+        return false;
     }
 
     // Unbox the phis in place.
@@ -387,6 +389,7 @@ fn unbox_phis(graph: &mut Graph, unboxed: &Unboxed, work: &Zone) {
     }
     replacements.apply(graph);
     edit::remove_nodes(graph, &removed);
+    true
 }
 
 /// Adds a check that unboxes `value` at the end of `predecessor`, exiting

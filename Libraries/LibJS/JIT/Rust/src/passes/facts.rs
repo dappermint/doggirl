@@ -667,6 +667,10 @@ impl PartialEq for Facts<'_> {
     }
 }
 
+/// Precomputed union of a phi's input kinds.
+#[derive(Clone, Copy)]
+pub struct PhiKinds(Kinds);
+
 impl<'w> Facts<'w> {
     /// Knowing nothing, with the lists that change in `zone`.
     pub fn new_in(zone: &'w Zone) -> Self {
@@ -822,8 +826,29 @@ impl<'w> Facts<'w> {
         self.narrow_kinds(value, Kinds::of(kind));
     }
 
+    /// Computes the union of the kinds of a phi's inputs from their incoming facts, so callers
+    /// can compute phi kinds before consuming incoming `Facts` into `Facts::merge` without freezing them.
+    pub fn compute_phi_kinds<'a>(
+        graph: &Graph,
+        inputs: impl Iterator<Item = (&'a Facts<'w>, NodeId)>,
+    ) -> Option<PhiKinds>
+    where
+        'w: 'a,
+    {
+        let kinds = inputs.fold(Kinds(0), |kinds, (facts, input)| {
+            kinds.union(facts.kinds_in(graph, input))
+        });
+        (kinds != Kinds(0) && kinds != Kinds::ALL).then_some(PhiKinds(kinds))
+    }
+
+    /// Applies precomputed phi kinds (from `compute_phi_kinds`).
+    pub fn apply_phi_kinds(&mut self, phi: NodeId, kinds: PhiKinds) {
+        self.narrow_kinds(phi, kinds.0);
+    }
+
     /// Records that the phi `phi` is of a kind one of its inputs is, given
     /// as each input with the facts where it comes from.
+    #[allow(dead_code)]
     pub fn set_phi_kinds<'a>(
         &mut self,
         graph: &Graph,
@@ -1079,7 +1104,9 @@ impl<'w> Facts<'w> {
                     continue;
                 }
                 if is_stable(shapes) {
-                    self.unvalidated.insert(zone, *value);
+                    if !self.unvalidated.contains(value) {
+                        self.unvalidated.insert(zone, *value);
+                    }
                 } else {
                     killed_any = true;
                 }

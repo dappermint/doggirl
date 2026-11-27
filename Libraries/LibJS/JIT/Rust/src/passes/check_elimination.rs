@@ -285,6 +285,10 @@ struct Round<'a, 'g, 'w> {
     free: ZoneVec<'w, u32>,
     /// Whether the facts changed in this round.
     changed: bool,
+    /// Whether the graph contains any loop back edge (`predecessor >= block`).
+    has_loops: bool,
+    /// Highest block index that is the source of any back edge (`0` when `!has_loops`).
+    last_loop_block: usize,
     /// The block to visit next in this round.
     next: usize,
 }
@@ -297,12 +301,19 @@ impl<'a, 'g, 'w> Round<'a, 'g, 'w> {
         work: &'w Zone,
     ) -> Self {
         let block_count = graph.blocks.len();
+        let mut has_loops = false;
+        let mut last_loop_block = 0usize;
         let revisited = ZoneVec::from_iter_in(
             (0..block_count).map(|block| {
-                graph.blocks[block]
-                    .predecessors
-                    .iter()
-                    .any(|predecessor| predecessor.index() >= block)
+                let mut has_back_edge = false;
+                for predecessor in &graph.blocks[block].predecessors {
+                    if predecessor.index() >= block {
+                        has_back_edge = true;
+                        has_loops = true;
+                        last_loop_block = last_loop_block.max(predecessor.index());
+                    }
+                }
+                has_back_edge
             }),
             work,
         );
@@ -317,6 +328,8 @@ impl<'a, 'g, 'w> Round<'a, 'g, 'w> {
             entry_facts: ZoneVec::from_elem_in(None, block_count, work),
             free: ZoneVec::with_capacity_in(block_count, work),
             changed: false,
+            has_loops,
+            last_loop_block,
             next: 0,
         };
         round.start();
@@ -335,21 +348,44 @@ impl<'a, 'g, 'w> Round<'a, 'g, 'w> {
     /// Visits blocks until the facts stop changing, and returns true, or until `store` holds more than `limit` bytes
     /// before a visit, and returns false. It goes on where it stopped when it is called again.
     fn run(&mut self, store: &mut Store, limit: usize) -> bool {
+        let block_count = self.graph.blocks.len();
         loop {
-            if self.next == self.graph.blocks.len() {
+            if self.has_loops && self.next == self.last_loop_block + 1 && self.next < block_count {
+                // No block `> last_loop_block` can send a back edge into `0..=last_loop_block`.
+                // If anything in the loop region changed (or a skipped loop block received a back edge),
+                // restart immediately instead of visiting post-loop blocks whose decisions will be discarded.
+                if !self.changed && !self.skipped.is_empty() {
+                    let edges = &self.edges;
+                    let graph = &*self.graph;
+                    self.changed |= self.skipped.iter().any(|block| {
+                        graph
+                            .block(*block)
+                            .predecessors
+                            .iter()
+                            .any(|predecessor| edges[predecessor.index()].iter().any(|(target, _)| target == block))
+                    });
+                }
+                if self.changed {
+                    self.start();
+                    continue;
+                }
+            }
+            if self.next == block_count {
                 // NB: A block that only back edges lead to (code after an entry that comes later in the order,
                 //     such as an on-stack replacement entry) is skipped until they bring facts, which they did if
                 //     a predecessor visited later has facts along its edge. What can be reached from it then saw
                 //     other facts along the other paths in this round.
-                let edges = &self.edges;
-                let graph = &*self.graph;
-                self.changed |= self.skipped.iter().any(|block| {
-                    graph
-                        .block(*block)
-                        .predecessors
-                        .iter()
-                        .any(|predecessor| edges[predecessor.index()].iter().any(|(target, _)| target == block))
-                });
+                if !self.skipped.is_empty() {
+                    let edges = &self.edges;
+                    let graph = &*self.graph;
+                    self.changed |= self.skipped.iter().any(|block| {
+                        graph
+                            .block(*block)
+                            .predecessors
+                            .iter()
+                            .any(|predecessor| edges[predecessor.index()].iter().any(|(target, _)| target == block))
+                    });
+                }
                 if !self.changed {
                     return true;
                 }
@@ -469,12 +505,18 @@ fn facts_at_entry<'f>(
     }
     let phis = &graph.block(block).phis;
     // NB: Each predecessor brings the facts along its one edge here.
+    let in_order = incoming.len() == predecessors.len()
+        && incoming
+            .iter()
+            .zip(predecessors)
+            .all(|((source, _), predecessor)| source == predecessor);
     let knows_phi_inputs = !revisited[block.index()]
         && !phis.is_empty()
-        && incoming.len() == predecessors.len()
-        && predecessors
-            .iter()
-            .all(|predecessor| incoming.iter().filter(|(source, _)| source == predecessor).count() == 1);
+        && (in_order
+            || (incoming.len() == predecessors.len()
+                && predecessors
+                    .iter()
+                    .all(|predecessor| incoming.iter().filter(|(source, _)| source == predecessor).count() == 1)));
     if !knows_phi_inputs {
         return match incoming.len() {
             0 => None,
@@ -482,23 +524,45 @@ fn facts_at_entry<'f>(
             _ => Some(Facts::merge(zone, incoming.drain_all().map(|(_, facts)| facts))),
         };
     }
-    let mut facts = Facts::merge(zone, incoming.iter_mut().map(|(_, facts)| facts.share()));
+    // Precompute phi kinds before consuming `incoming` owned into `Facts::merge` so `incoming[0]` keeps
+    // `Part::Owned` storage without freezing and copying every list.
+    let mut phi_kinds = ZoneVec::with_capacity_in(phis.len(), zone);
     for phi in phis {
-        let inputs = graph
-            .node(*phi)
-            .inputs
-            .iter()
-            .zip(predecessors)
-            .map(|(input, predecessor)| {
-                let (_, facts) = incoming
+        let computed = if in_order {
+            Facts::compute_phi_kinds(
+                graph,
+                graph
+                    .node(*phi)
+                    .inputs
                     .iter()
-                    .find(|(source, _)| source == predecessor)
-                    .expect("each predecessor brings facts");
-                (facts, decisions.value(graph, *input))
-            });
-        facts.set_phi_kinds(graph, *phi, inputs);
+                    .zip(incoming.iter())
+                    .map(|(input, (_, facts))| (facts, decisions.value(graph, *input))),
+            )
+        } else {
+            Facts::compute_phi_kinds(
+                graph,
+                graph
+                    .node(*phi)
+                    .inputs
+                    .iter()
+                    .zip(predecessors)
+                    .map(|(input, predecessor)| {
+                        let (_, facts) = incoming
+                            .iter()
+                            .find(|(source, _)| source == predecessor)
+                            .expect("each predecessor brings facts");
+                        (facts, decisions.value(graph, *input))
+                    }),
+            )
+        };
+        if let Some(kinds) = computed {
+            phi_kinds.push((*phi, kinds));
+        }
     }
-    incoming.clear();
+    let mut facts = Facts::merge(zone, incoming.drain_all().map(|(_, facts)| facts));
+    for (phi, kinds) in phi_kinds {
+        facts.apply_phi_kinds(phi, kinds);
+    }
     Some(facts)
 }
 
@@ -514,9 +578,11 @@ fn visit_block<'f>(
 ) {
     // NB: A phi makes another value of the objects it merges, which anything
     //     may see.
-    for phi in &graph.block(block).phis {
-        for input in &graph.node(*phi).inputs {
-            facts.expose(decisions.value(graph, *input));
+    if facts.has_unexposed() {
+        for phi in &graph.block(block).phis {
+            for input in &graph.node(*phi).inputs {
+                facts.expose(decisions.value(graph, *input));
+            }
         }
     }
     for index in 0..graph.block(block).body.len() {
