@@ -251,10 +251,12 @@ private:
     bool has_non_main_world_preserved_wrappers() const { return (m_flags & HasNonMainWorldPreservedWrappers) != 0; }
     void set_has_non_main_world_preserved_wrappers(bool value)
     {
-        if (value)
+        if (value) {
             m_flags |= HasNonMainWorldPreservedWrappers;
-        else
+            mark_needs_destruction();
+        } else {
             m_flags &= ~HasNonMainWorldPreservedWrappers;
+        }
     }
     void clear_preserved_wrappers(WrapperWorld const&);
 };

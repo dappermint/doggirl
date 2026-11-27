@@ -347,15 +347,19 @@ OwnPtr<Node::RareData> Node::create_rare_data() const
 
 Node::RareData& Node::ensure_rare_data() const
 {
-    if (!m_rare_data)
+    if (!m_rare_data) {
         m_rare_data = create_rare_data();
+        mark_needs_destruction();
+    }
     return *m_rare_data;
 }
 
 UniqueNodeID Node::unique_id() const
 {
-    if (!m_node_directory_slot)
+    if (!m_node_directory_slot) {
         m_node_directory_slot = allocate_node_directory_slot(const_cast<Node&>(*this));
+        mark_needs_destruction();
+    }
     return unique_id_of_node_directory_slot(m_node_directory_slot);
 }
 
@@ -1122,6 +1126,13 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
             && !subtree_insertion_scope.document_has_inert_element()
             && !subtree_insertion_scope.content_blocker_has_cosmetic_rules()
             && !document_global_registry_has_definitions;
+        bool const subtree_has_no_special_insert_attrs = node_to_insert->is_element()
+            && [&] {
+                auto const filter = static_cast<Element const&>(*node_to_insert).subtree_attribute_filter();
+                return (filter & nonce_attr_bits) != nonce_attr_bits
+                    && (filter & autofocus_attr_bits) != autofocus_attr_bits
+                    && (filter & dir_attr_bits) != dir_attr_bits;
+            }();
 
         // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
         node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
@@ -1153,7 +1164,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                         && !element.is_shadow_host()
                         && !element.rare_data()
                         && !element.element_animations_if_created()
-                        && (element.has_no_raw_attributes()
+                        && (subtree_has_no_special_insert_attrs
+                            || element.has_no_raw_attributes()
                             || ((element.subtree_attribute_filter() & nonce_attr_bits) != nonce_attr_bits
                                 && (element.subtree_attribute_filter() & autofocus_attr_bits) != autofocus_attr_bits
                                 && (element.subtree_attribute_filter() & dir_attr_bits) != dir_attr_bits))

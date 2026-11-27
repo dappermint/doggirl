@@ -153,7 +153,7 @@ Optional<Utf16FlyString> HTMLElement::opened_in_popover_mode() const
     return rare_data ? rare_data->opened_in_popover_mode : Optional<Utf16FlyString> {};
 }
 
-GC_DEFINE_ALLOCATOR(HTMLElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLElement);
 
 static Optional<Utf16View> optional_utf16_view(Optional<Utf16String> const& string)
 {

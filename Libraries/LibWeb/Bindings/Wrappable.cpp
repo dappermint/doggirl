@@ -111,6 +111,7 @@ void Wrappable::set_cached_main_world_wrapper(JS::HostObject& wrapper)
     }
 
     m_main_world_wrapper = wrapper;
+    mark_needs_destruction();
 }
 
 void Wrappable::clear_cached_main_world_wrapper(JS::HostObject const& wrapper)
