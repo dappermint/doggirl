@@ -171,11 +171,18 @@ impl BoxFacts {
         default_scroll_shift_anchor: NodeSlotId,
         effects: impl FnOnce(&Arena) -> (Option<EffectsData>, bool),
     ) -> Self {
+        use crate::css::css_enums::{backface_visibility, content_visibility, overflow};
+        use crate::layout::node_data::{CompositorAnimationFrameKind, NodeFlag};
+        use crate::layout::node_facts::NodeShape;
+        use crate::painting::paint_read::PaintRow;
+        use crate::painting::{node_painting, style_queries};
+
+        let row = layout_arena.node(slot);
+        let compositor_animation_frame_kinds = row.map_or(0, |row| row.compositor_animation_frame_kinds());
         let mut facts = Self {
-            needs_compositor_background_color_effect: layout_arena.node_has_compositor_animation_frame(
-                slot,
-                crate::layout::node_data::CompositorAnimationFrameKind::BackgroundColor,
-            ),
+            needs_compositor_background_color_effect: compositor_animation_frame_kinds
+                & CompositorAnimationFrameKind::BackgroundColor as u8
+                != 0,
             transform: None,
             transform_is_invertible: false,
             perspective: None,
@@ -194,38 +201,83 @@ impl BoxFacts {
             default_scroll_shift_anchor,
             filter_references_svg_filter: false,
         };
-        if let Some((transform, transform_is_invertible)) =
-            super::node_values::compute_transform(layout_arena, slot, pixel_ratio)
-        {
-            facts.transform = Some(transform);
-            facts.transform_is_invertible = transform_is_invertible;
+        let style = row.and_then(|row| row.style());
+        let kind = row.map(|row| row.kind());
+        let flags = row.map_or(0, |row| row.flags());
+        let has_children = row.is_some_and(|row| !row.first_child().is_invalid());
+        if let Some(style) = style {
+            let transform_values = style.transform();
+            let may_have_transform = transform_values.resolved_transforms.length != 0
+                || transform_values.has_offset_path
+                || kind.is_some_and(style_queries::kind_is_svg_element_box)
+                || style_queries::will_change_promotes_transform_node(style);
+            if may_have_transform
+                && let Some((transform, transform_is_invertible)) =
+                    super::node_values::compute_transform(layout_arena, slot, pixel_ratio)
+            {
+                facts.transform = Some(transform);
+                facts.transform_is_invertible = transform_is_invertible;
+            }
+            if transform_values.has_perspective {
+                facts.perspective = super::node_values::compute_perspective_data(layout_arena, slot, pixel_ratio);
+            }
+            facts.backface_hidden = transform_values.backface_visibility == backface_visibility::HIDDEN
+                && style_queries::is_transformable(layout_arena, slot);
         }
-        facts.perspective = super::node_values::compute_perspective_data(layout_arena, slot, pixel_ratio);
         let (effects, filter_references_svg_filter) = effects(layout_arena);
         facts.effects = effects.map(std::rc::Rc::new);
         facts.filter_references_svg_filter = filter_references_svg_filter;
-        facts.backface_hidden = super::node_values::backface_hidden(layout_arena, slot);
         let node = slot;
-        facts.establishes_or_extends_3d_rendering_context =
-            crate::painting::style_queries::establishes_or_extends_a_3d_rendering_context(layout_arena, node);
+        if flags & NodeFlag::HasPreserve3dTransformStyle as u32 != 0 {
+            facts.establishes_or_extends_3d_rendering_context =
+                style_queries::establishes_or_extends_a_3d_rendering_context(layout_arena, node);
+        }
         let (establishes_absolute, establishes_fixed) =
-            crate::painting::style_queries::establishes_positioning_containing_blocks(layout_arena, node);
+            style_queries::establishes_positioning_containing_blocks(layout_arena, node);
         facts.establishes_absolute_containing_block = establishes_absolute;
         facts.establishes_fixed_containing_block = establishes_fixed;
-        facts.clip_path = super::basic_shapes::compute_basic_shape_clip_path_data(layout_arena, slot, pixel_ratio)
-            .map(|(path, bounding_rect, fill_rule)| (std::sync::Arc::new(path), bounding_rect, fill_rule));
         let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
-        let masks_backdrop = facts.effects_layer_is_inside_transform_and_clips();
-        facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot)
-            .into_iter()
-            .map(|layer| MaskData {
-                rect: converter.enclosing_device_rect(layer.area),
-                kind: layer.kind,
-                origin: layer.origin,
-                masks_backdrop,
-            })
-            .collect();
-        facts.css_clip = super::node_values::compute_css_clip_data(layout_arena, slot, pixel_ratio);
+        if let Some(style) = style {
+            let mask_values = style.mask();
+            if style_queries::clip_path_has_value(mask_values) {
+                facts.clip_path =
+                    super::basic_shapes::compute_basic_shape_clip_path_data(layout_arena, slot, pixel_ratio)
+                        .map(|(path, bounding_rect, fill_rule)| (std::sync::Arc::new(path), bounding_rect, fill_rule));
+            }
+            if style_queries::has_css_mask_image(mask_values)
+                || (has_children && kind.is_some_and(node_painting::supports_svg_masking))
+            {
+                let masks_backdrop = facts.effects_layer_is_inside_transform_and_clips();
+                facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot)
+                    .into_iter()
+                    .map(|layer| MaskData {
+                        rect: converter.enclosing_device_rect(layer.area),
+                        kind: layer.kind,
+                        origin: layer.origin,
+                        masks_backdrop,
+                    })
+                    .collect();
+            }
+            if style.effects().clip_is_rect && style.is_absolutely_positioned() {
+                facts.css_clip = super::node_values::compute_css_clip_data(layout_arena, slot, pixel_ratio);
+            }
+            let box_values = style.box_values();
+            facts.may_have_clip = style.overflow_x() != overflow::VISIBLE
+                || style.overflow_y() != overflow::VISIBLE
+                || box_values.paint_containment
+                || style.content_visibility() == content_visibility::AUTO;
+        } else if has_children && kind.is_some_and(node_painting::supports_svg_masking) {
+            let masks_backdrop = facts.effects_layer_is_inside_transform_and_clips();
+            facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot)
+                .into_iter()
+                .map(|layer| MaskData {
+                    rect: converter.enclosing_device_rect(layer.area),
+                    kind: layer.kind,
+                    origin: layer.origin,
+                    masks_backdrop,
+                })
+                .collect();
+        }
         facts.clip_decided_by_parent = layout_arena
             .with_committed_fragment_link(slot, |link| {
                 link.and_then(|link| link.placement.shown_as.facts.clip_decided_by_parent)
@@ -233,7 +285,6 @@ impl BoxFacts {
             .map(|clip_relative_to_border_box| {
                 let border_box =
                     crate::painting::paintable_geometry::first_fragment_border_box_rect(layout_arena, slot);
-                let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
                 ClipData {
                     rect: converter
                         .rounded_device_rect(clip_relative_to_border_box.translated_by(border_box.location()))
@@ -242,7 +293,6 @@ impl BoxFacts {
                     mode: ClipMode::Intersect,
                 }
             });
-        facts.may_have_clip = super::node_values::may_have_clip(layout_arena, slot);
         facts.overflow_clip = if facts.may_have_clip {
             super::node_values::compute_clip_data(layout_arena, slot, pixel_ratio)
         } else {

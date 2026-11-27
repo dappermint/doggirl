@@ -39,7 +39,7 @@
 
 namespace Web::SVG {
 
-GC_DEFINE_ALLOCATOR(SVGElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(SVGElement);
 
 struct SVGElement::RareData final : DOM::Element::RareData {
     AK_ALLOC_WITH_KMALLOC;

@@ -13,7 +13,7 @@
 
 namespace Web::SVG {
 
-GC_DEFINE_ALLOCATOR(SVGPathElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(SVGPathElement);
 
 SVGPathElement::SVGPathElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGeometryElement(document, move(qualified_name))

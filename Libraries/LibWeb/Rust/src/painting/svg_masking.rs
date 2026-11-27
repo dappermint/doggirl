@@ -47,19 +47,6 @@ pub(crate) fn object_bounding_box_content_units_transform(
     }
 }
 
-/// The masking area of the mask that `target` references, in the target's user space, as layout resolved it. A mask
-/// layer with an empty area clips the target away entirely.
-pub(crate) fn mask_area(arena: &impl PaintRead, target: NodeSlotId) -> Option<CssPixelRect> {
-    if !arena
-        .node_kind_if_live(target)
-        .is_some_and(node_painting::supports_svg_masking)
-    {
-        return None;
-    }
-    let mask_box = first_child_paintable_of_kind(arena, target, NodeKind::SVGMaskBox)?;
-    paintable_geometry::committed_svg_mask_area_in_target_user_space(arena, mask_box).map(css_pixel_rect_of)
-}
-
 fn committed_local_transform(arena: &impl PaintRead, slot: NodeSlotId) -> AffineTransform {
     paintable_geometry::committed_svg_geometry(arena, slot)
         .map_or_else(AffineTransform::identity, |geometry| geometry.local_transform.into())
@@ -152,15 +139,7 @@ fn svg_clip_path_geometry_bounds(
     ))
 }
 
-// An empty clipping path completely clips away the element that had the clip-path property applied.
-pub(crate) fn clip_area(arena: &impl PaintRead, target: NodeSlotId) -> Option<CssPixelRect> {
-    if !arena
-        .node_kind_if_live(target)
-        .is_some_and(node_painting::supports_svg_masking)
-    {
-        return None;
-    }
-    let clip_box = first_child_paintable_of_kind(arena, target, NodeKind::SVGClipBox)?;
+fn clip_area_for_box(arena: &impl PaintRead, clip_box: NodeSlotId) -> CssPixelRect {
     let mut clip_path_transform = committed_local_transform(arena, clip_box);
     if paintable_geometry::committed_svg_resource_content_units_are_object_bounding_box(arena, clip_box) {
         clip_path_transform = multiply_affine(
@@ -168,14 +147,11 @@ pub(crate) fn clip_area(arena: &impl PaintRead, target: NodeSlotId) -> Option<Cs
             clip_path_transform,
         );
     }
-    Some(svg_clip_path_geometry_bounds(arena, clip_box, clip_path_transform).unwrap_or_default())
+    svg_clip_path_geometry_bounds(arena, clip_box, clip_path_transform).unwrap_or_default()
 }
 
-pub(crate) fn mask_kind(arena: &impl PaintRead, target: NodeSlotId) -> MaskKind {
+fn mask_kind_for_box(arena: &impl PaintRead, mask_box: NodeSlotId) -> MaskKind {
     use crate::css::css_enums::keyword;
-    let Some(mask_box) = first_child_paintable_of_kind(arena, target, NodeKind::SVGMaskBox) else {
-        return MaskKind::Alpha;
-    };
     let Some(style) = arena.node_style_if_live(mask_box) else {
         return MaskKind::Alpha;
     };
@@ -185,4 +161,41 @@ pub(crate) fn mask_kind(arena: &impl PaintRead, target: NodeSlotId) -> MaskKind 
         }
         _ => MaskKind::Alpha,
     }
+}
+
+/// Resolves both SVG mask and SVG clip-path areas in a single scan of `target`'s children.
+pub(crate) fn mask_and_clip_areas(
+    arena: &impl PaintRead,
+    target: NodeSlotId,
+) -> (Option<(CssPixelRect, MaskKind)>, Option<CssPixelRect>) {
+    let mut first_mask_child: Option<NodeSlotId> = None;
+    let mut first_clip_child: Option<NodeSlotId> = None;
+    for child in arena.children(target) {
+        match arena.node_kind_if_live(child) {
+            Some(NodeKind::SVGMaskBox) if first_mask_child.is_none() => {
+                first_mask_child = Some(child);
+                if first_clip_child.is_some() {
+                    break;
+                }
+            }
+            Some(NodeKind::SVGClipBox) if first_clip_child.is_none() => {
+                first_clip_child = Some(child);
+                if first_mask_child.is_some() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mask = first_mask_child
+        .filter(|&mask_box| arena.paintable_row_is_populated(mask_box))
+        .and_then(|mask_box| {
+            let area = paintable_geometry::committed_svg_mask_area_in_target_user_space(arena, mask_box)
+                .map(css_pixel_rect_of)?;
+            Some((area, mask_kind_for_box(arena, mask_box)))
+        });
+    let clip = first_clip_child
+        .filter(|&clip_box| arena.paintable_row_is_populated(clip_box))
+        .map(|clip_box| clip_area_for_box(arena, clip_box));
+    (mask, clip)
 }

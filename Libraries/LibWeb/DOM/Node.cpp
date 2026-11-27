@@ -16,6 +16,7 @@
 #include <AK/Vector.h>
 #include <LibGC/DeferGC.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapBlock.h>
 #include <LibGC/RootVector.h>
 #include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/Animations/RecordHandles.h>
@@ -151,7 +152,11 @@ static Utf16String generated_content_accessible_text(Element const& element, CSS
 static constexpr u32 max_node_directory_generation = (1u << 21) - 1;
 
 struct NodeDirectorySlot {
-    GC::Weak<Node> node;
+    // Non-owning pointer cleared by Node::~Node() before the cell can be reused.
+    // Node cells never move, and from_unique_id() checks GC mark state whenever the
+    // cell's block awaits sweep or a collection is active, avoiding per-node WeakImpl
+    // allocations and WeakBlock teardown churn.
+    Node* node { nullptr };
     u32 generation { 0 };
     // The free slot freed after this one, while this one is free.
     u32 next_free { 0 };
@@ -210,7 +215,13 @@ Node* Node::from_unique_id(UniqueNodeID unique_id)
     auto const& directory = node_directory();
     if (index >= directory.size() || directory[index].generation != generation)
         return nullptr;
-    return directory[index].node.ptr().ptr();
+    auto* node = directory[index].node;
+    if (!node)
+        return nullptr;
+    auto const* block = GC::HeapBlock::from_cell(node);
+    if ((block->is_pending_sweep() || block->is_being_swept() || node->heap().is_collecting()) && !node->is_marked())
+        return nullptr;
+    return node;
 }
 
 Node::Node(Document& document, NodeType type)

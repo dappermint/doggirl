@@ -91,28 +91,31 @@ fn first_paintable_in_layout_siblings(
     layout_arena: &impl PaintRead,
     first_node: Option<NodeSlotId>,
 ) -> Option<NodeSlotId> {
+    use crate::layout::node_facts::{self, NodeShape};
     let mut pending_siblings = Vec::new();
     let mut current = first_node;
     while let Some(node) = current {
-        let next_sibling = layout_arena.node_next_sibling_if_live(node);
+        let Some(row) = layout_arena.node(node) else {
+            current = pending_siblings.pop();
+            continue;
+        };
+        let next_sibling = (!row.next_sibling().is_invalid()).then_some(row.next_sibling());
         if layout_arena.paintable_row_is_populated(node) {
+            let kind = row.kind();
             // A table cell whose columns all have 'visibility: collapse' is removed from the display along with them,
             // descendants included: "This value causes the entire row or column to be removed from the display".
             // https://www.w3.org/TR/CSS22/tables.html#dynamic-effects
-            if !layout_arena
-                .node_kind_if_live(node)
-                .is_some_and(crate::layout::node_facts::kind_is_svg_resource_box)
-                && !crate::painting::paintable_geometry::committed_hidden_by_collapsed_columns(layout_arena, node)
+            if !node_facts::kind_is_svg_resource_box(kind)
+                && (node_facts::kind_is_svg_box(kind)
+                    || !crate::painting::paintable_geometry::committed_hidden_by_collapsed_columns(layout_arena, node))
             {
                 return Some(node);
             }
-        } else if node_painting::is_fragmented_inline(layout_arena, node)
-            && let Some(first_child) = layout_arena.node_first_child_if_live(node)
-        {
+        } else if row.is_fragmented_inline() && !row.first_child().is_invalid() {
             if let Some(next_sibling) = next_sibling {
                 pending_siblings.push(next_sibling);
             }
-            current = Some(first_child);
+            current = Some(row.first_child());
             continue;
         }
         current = next_sibling.or_else(|| pending_siblings.pop());

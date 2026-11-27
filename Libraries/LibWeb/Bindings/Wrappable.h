@@ -118,6 +118,7 @@ public:
     // Whether an object of an interface implemented in Rust owns this object, so that its wrappers are the Rust
     // object's (Libraries/LibWeb/Bindings/Rust/src/bindings/event_target.rs).
     [[nodiscard]] virtual bool is_owned_by_rust_interface_object() const { return false; }
+    [[nodiscard]] virtual bool is_gc_allocated_wrappable() const { return false; }
 
     enum WrappableFlag : u8 {
         MainWorldWrapperIsPreserved = 1 << 0,
@@ -229,6 +230,7 @@ class WEB_API GCAllocatedWrappable : public Wrappable {
 
 public:
     virtual ~GCAllocatedWrappable() override;
+    [[nodiscard]] virtual bool is_gc_allocated_wrappable() const override { return true; }
 
 protected:
     GCAllocatedWrappable() = default;

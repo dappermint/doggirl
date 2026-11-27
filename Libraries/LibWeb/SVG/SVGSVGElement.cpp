@@ -27,7 +27,7 @@
 
 namespace Web::SVG {
 
-GC_DEFINE_ALLOCATOR(SVGSVGElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(SVGSVGElement);
 
 SVGSVGElement::SVGSVGElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, qualified_name)

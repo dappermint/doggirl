@@ -223,7 +223,8 @@ void preserve_wrapper(Wrappable& wrappable, JS::HostObject& wrapper)
     if (wrappable.is_owned_by_rust_interface_object())
         return;
 
-    auto& gc_allocated_wrappable = as<GCAllocatedWrappable>(wrappable);
+    VERIFY(wrappable.is_gc_allocated_wrappable());
+    auto& gc_allocated_wrappable = static_cast<GCAllocatedWrappable&>(wrappable);
     auto& world = host_defined_wrapper_world(wrapper.shape().realm());
 
     // Script can still run against a detached world's realm (e.g. a pending microtask after
@@ -264,7 +265,8 @@ bool wrapper_is_preserved(JS::HostObject const& wrapper)
     //     wrappable.
     if (wrappable->is_owned_by_rust_interface_object())
         return host_defined_wrapper_world(wrapper.shape().realm()).is_main_world();
-    auto const& gc_allocated_wrappable = as<GCAllocatedWrappable>(*wrappable);
+    VERIFY(wrappable->is_gc_allocated_wrappable());
+    auto const& gc_allocated_wrappable = static_cast<GCAllocatedWrappable const&>(*wrappable);
 
     auto& world = host_defined_wrapper_world(wrapper.shape().realm());
     if (world.is_main_world())

@@ -16,6 +16,7 @@ mod planned_style_fact {
     pub(crate) const HAS_PRESERVE_3D_TRANSFORM_STYLE: u32 = 1 << 2;
     pub(crate) const HAS_AUTO_CONTENT_VISIBILITY: u32 = 1 << 3;
     pub(crate) const HAS_SCROLL_SNAP_AREA: u32 = 1 << 4;
+    pub(crate) const HAS_NON_NORMAL_MIX_BLEND_MODE: u32 = 1 << 5;
     pub(crate) const MAKES_SCROLL_CONTAINER: u32 = 1 << 6;
     /// The style may make the box establish a containing block for positioned boxes.
     pub(crate) const MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS: u32 = 1 << 7;
@@ -61,6 +62,9 @@ pub(crate) fn planned_record_style_facts(style: ComputedValuesView<'_>) -> u32 {
         facts |= HAS_SIZE_CONTAINMENT_OR_IS_SIZE_CONTAINER;
     }
     let effects = style.effects();
+    if effects.mix_blend_mode != crate::css::css_enums::mix_blend_mode::NORMAL {
+        facts |= HAS_NON_NORMAL_MIX_BLEND_MODE;
+    }
     let mut kinds = 0u8;
     if crate::painting::css_filter::contains_url(&effects.filter) {
         kinds |= SvgPaintResourceKind::Filter.bit();
@@ -139,7 +143,7 @@ pub(crate) fn planned_style_flags(style_facts: u32) -> u32 {
 /// notes once for all rows of a plan (see [`LayoutNodeArena::note_planned_style_may_have_facts`]).
 pub(crate) fn planned_style_may_have_facts(style_facts: u32) -> u32 {
     use planned_style_fact::*;
-    style_facts & (HAS_AUTO_CONTENT_VISIBILITY | HAS_SCROLL_SNAP_AREA)
+    style_facts & (HAS_AUTO_CONTENT_VISIBILITY | HAS_SCROLL_SNAP_AREA | HAS_NON_NORMAL_MIX_BLEND_MODE)
 }
 
 /// Whether a row stamped completely by a plan, `row`, with a record whose facts are `style_facts` (see
@@ -222,6 +226,7 @@ impl LayoutNodeArena {
         use planned_style_fact::*;
         self.may_have_auto_content_visibility |= facts & HAS_AUTO_CONTENT_VISIBILITY != 0;
         self.may_have_scroll_snap_areas |= facts & HAS_SCROLL_SNAP_AREA != 0;
+        self.may_have_non_normal_mix_blend_mode |= facts & HAS_NON_NORMAL_MIX_BLEND_MODE != 0;
     }
 
     /// Binds the rows of `rows`, each a row a build stamped completely for the element or text node it is listed with,
