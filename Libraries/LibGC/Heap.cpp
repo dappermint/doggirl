@@ -1486,6 +1486,12 @@ void Heap::evacuate()
         for (auto& cell_move : moves) {
             cell_move.to = allocate_destination_for_moved_cell(allocator);
             set_marked(cell_move.to);
+            auto const& from_descriptor = block_descriptor_for(cell_move.from);
+            auto& to_descriptor = block_descriptor_for(cell_move.to);
+            if (from_descriptor.has_cells_needing_destruction)
+                to_descriptor.has_cells_needing_destruction = true;
+            if (from_descriptor.has_cells_needing_finalization)
+                to_descriptor.has_cells_needing_finalization = true;
             stats.moved.add(cell_size);
         }
         FFI::rust_gc_evacuation_forward_cells(m_evacuation, moves.data(), moves.size(), cell_size);

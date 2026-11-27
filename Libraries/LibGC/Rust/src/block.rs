@@ -73,11 +73,21 @@ pub struct BlockDescriptor {
     pub being_swept: bool,
     /// Whether the block is on its allocator's list of blocks with free cells.
     pub usable: bool,
+    /// Whether any cell in the block has acquired non-GC resources that its destructor must free (for allocators with
+    /// `conditional_destructor`).
+    pub has_cells_needing_destruction: bool,
+    /// Whether any cell in the block has acquired state that its finalizer must clean up (for allocators with
+    /// `conditional_finalize`).
+    pub has_cells_needing_finalization: bool,
     /// Rounds the descriptor up to 256 bytes, four whole cache lines in the table.
-    pub reserved2: [u8; 33],
+    pub reserved2: [u8; 31],
 }
 
-const _: () = assert!(size_of::<BlockDescriptor>() == 256);
+const _: () = {
+    assert!(size_of::<BlockDescriptor>() == 256);
+    assert!(core::mem::offset_of!(BlockDescriptor, has_cells_needing_destruction) == 223);
+    assert!(core::mem::offset_of!(BlockDescriptor, has_cells_needing_finalization) == 224);
+};
 
 impl BlockDescriptor {
     pub fn heap(&self) -> *mut c_void {

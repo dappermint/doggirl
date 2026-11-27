@@ -70,12 +70,12 @@ static HOST_FUNCTION_METHODS: ObjectMethods = ObjectMethods {
 };
 
 // The class that the class of every host class table of this kind extends. No function has it as its class.
+// Finalization is attached per derived host function class only when its hooks provide one.
 define_cell!(
     HostFunction,
     Object,
     extends: [NativeFunction, FunctionObject, Object],
-    methods: HOST_FUNCTION_METHODS,
-    finalize: finalize
+    methods: HOST_FUNCTION_METHODS
 );
 
 impl Finalize for HostFunction {
@@ -97,7 +97,12 @@ impl Deref for HostFunction {
 
 /// The class of the functions of `table`, which extends `parent`.
 pub fn derive_host_function_class(table: &'static JSHostClass, parent: &'static Class) -> &'static Class {
-    Class::derive_runtime(parent, table.class_name(), &HOST_FUNCTION_METHODS)
+    let finalize_fn = if table.host_function_hooks().finalize.is_some() {
+        Some(crate::gc::class::finalize::<HostFunction> as unsafe extern "C" fn(*mut c_void))
+    } else {
+        parent.type_info.finalize
+    };
+    Class::derive_runtime_with_finalize(parent, table.class_name(), &HOST_FUNCTION_METHODS, finalize_fn)
 }
 
 /// The host function an internal method of a host function class was called on.

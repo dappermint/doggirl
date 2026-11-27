@@ -60,6 +60,8 @@ pub struct AllocatorConfig {
     pub traced_on_owner_thread_only: bool,
     pub movable: bool,
     pub has_destructor: bool,
+    pub conditional_destructor: bool,
+    pub conditional_finalize: bool,
     pub has_address_sanitizer: bool,
     /// What the callbacks get, which is C++'s `CellAllocator`.
     pub context: *mut c_void,
@@ -69,6 +71,8 @@ pub struct AllocatorConfig {
     pub free_cell: FreeCell,
     /// Direct destructor thunk (`CellTypeInfo::destroy`), or null if none / using `free_cell`.
     pub destroy_cell: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Optional non-reentrant batch destructor for one 64-cell bitmap word.
+    pub destroy_dead_cells: Option<unsafe extern "C" fn(usize, usize, usize, u64)>,
 }
 
 /// What sweeping blocks did, which the sweeps add to what the caller passes in.
@@ -192,6 +196,8 @@ impl Allocator {
             (*descriptor).pending_sweep = false;
             (*descriptor).being_swept = false;
             (*descriptor).usable = false;
+            (*descriptor).has_cells_needing_destruction = false;
+            (*descriptor).has_cells_needing_finalization = false;
             AtomicPtr::from_ptr(&raw mut (*descriptor).evacuation).store(core::ptr::null_mut(), Ordering::Relaxed);
             (*descriptor).allocated = [0; CELL_BITMAP_WORDS];
         }
@@ -460,7 +466,10 @@ impl Allocator {
         };
         let mut kept_cell_died = false;
         let word_count = self.bitmap_word_count;
-        if !self.config.has_destructor && !self.config.has_address_sanitizer {
+        // SAFETY: Only the owner thread accesses `has_cells_needing_destruction`.
+        let needs_destruction = self.config.has_destructor
+            && (!self.config.conditional_destructor || unsafe { (*descriptor).has_cells_needing_destruction });
+        if !needs_destruction && !self.config.has_address_sanitizer {
             // Without a destructor, sweeping cannot re-enter the allocator or mutate bitmaps, so dead slots can be
             // cleared per word without an FFI call per cell.
             // SAFETY: `self.config.heap` is the live owning heap for the lifetime of this allocator.
@@ -589,6 +598,108 @@ impl Allocator {
                 self.make_usable(block);
             }
             return;
+        } else if !self.config.has_address_sanitizer
+            && let Some(destroy_dead_cells) = self.config.destroy_dead_cells
+        {
+            // Non-reentrant batch destruction: drop every dead cell in each 64-bit word with one FFI call and clear
+            // the allocated bitmap word in bulk.
+            // SAFETY: `self.config.heap` is the live owning heap for the lifetime of this allocator.
+            let check_identity_hash =
+                self.config.movable && unsafe { heap_has_moved_identity_hashes(self.config.heap) };
+            let cell_size = self.config.cell_size as usize;
+            let cell_base = block + self.config.cells_offset as usize - self.first_cell_index * cell_size;
+            let mut live = 0usize;
+            let mut dead_count = 0usize;
+            #[cfg(debug_assertions)]
+            let (state_offset, state_live, state_dead) = (
+                self.config.cell_state_offset as usize,
+                self.config.cell_state_live,
+                self.config.cell_state_dead,
+            );
+            for word in 0..word_count {
+                // SAFETY: Only the owner thread accesses allocated and mark words during sweep, and
+                //         `destroy_dead_cells` never allocates GC cells or re-enters the allocator.
+                let (allocated, marked) = unsafe {
+                    (
+                        (*descriptor).allocated[word],
+                        (*descriptor).mark_word(word).load(Ordering::Relaxed),
+                    )
+                };
+                // SAFETY: Only the owner thread writes mark words during sweep.
+                unsafe { (*descriptor).mark_word(word).store(0, Ordering::Relaxed) };
+                live += (allocated & marked).count_ones() as usize;
+                let dead = allocated & !marked;
+                if dead == 0 {
+                    continue;
+                }
+                dead_count += dead.count_ones() as usize;
+                if let Some(kept) = kept
+                    && kept[word] & dead != 0
+                {
+                    kept_cell_died = true;
+                }
+                #[cfg(debug_assertions)]
+                {
+                    let mut check_dead = dead;
+                    let word_base = cell_base + word * 64 * cell_size;
+                    while check_dead != 0 {
+                        let bit = check_dead.trailing_zeros() as usize;
+                        check_dead &= check_dead - 1;
+                        let cell = word_base + bit * cell_size;
+                        // SAFETY: `cell` is a live cell whose state byte sits at `state_offset`.
+                        unsafe {
+                            let state = core::ptr::with_exposed_provenance::<u8>(cell + state_offset);
+                            debug_assert_eq!(state.read(), state_live);
+                        }
+                    }
+                }
+                // SAFETY: Every bit in `dead` is a live, allocated, unmarked cell in this block.
+                unsafe { destroy_dead_cells(cell_base, cell_size, word, dead) };
+                if check_identity_hash || cfg!(debug_assertions) {
+                    let mut cleanup_dead = dead;
+                    let word_base = cell_base + word * 64 * cell_size;
+                    while cleanup_dead != 0 {
+                        let bit = cleanup_dead.trailing_zeros() as usize;
+                        cleanup_dead &= cleanup_dead - 1;
+                        let cell = word_base + bit * cell_size;
+                        // SAFETY: `cell` is a cell in this heap.
+                        if check_identity_hash && unsafe { has_moved_since_hashed(cell) } {
+                            // SAFETY: The cell is one of the heap's, and moved since it was hashed.
+                            unsafe { forget_identity_hash(self.config.heap, cell) };
+                        }
+                        #[cfg(debug_assertions)]
+                        // SAFETY: `cell` is a destroyed cell whose state byte sits at `state_offset`.
+                        unsafe {
+                            let state = core::ptr::with_exposed_provenance_mut::<u8>(cell + state_offset);
+                            state.write(state_dead);
+                        }
+                    }
+                }
+                // SAFETY: As above.
+                unsafe { (*descriptor).allocated[word] = allocated & marked };
+            }
+            // SAFETY: As above.
+            unsafe {
+                (*descriptor).next_free_word = (self.first_cell_index / 64) as u8;
+                (*descriptor).being_swept = false;
+            }
+            if kept_cell_died {
+                self.forget_cells_kept_by_pins(block);
+            }
+            stats.collected_cells += dead_count;
+            stats.swept_blocks += 1;
+            if live == 0 {
+                // SAFETY: As above.
+                unsafe { (*descriptor).kept_by_pins = false };
+                self.release_block(block, defer_decommit);
+                stats.freed_blocks += 1;
+                return;
+            }
+            stats.live_cells += live;
+            if live < self.cell_count && self.lists.borrow().local_block != block {
+                self.make_usable(block);
+            }
+            return;
         } else {
             // SAFETY: `self.config.heap` is the live owning heap for the lifetime of this allocator.
             let check_identity_hash =
@@ -615,9 +726,14 @@ impl Allocator {
                     }
                 }
 
-                let state_offset = self.config.cell_state_offset as usize;
-                let state_live = self.config.cell_state_live;
-                let state_dead = self.config.cell_state_dead;
+                #[cfg(debug_assertions)]
+                let (state_offset, state_live, state_dead) = (
+                    self.config.cell_state_offset as usize,
+                    self.config.cell_state_live,
+                    self.config.cell_state_dead,
+                );
+                let cell_size = self.config.cell_size as usize;
+                let cell_base = block + self.config.cells_offset as usize - self.first_cell_index * cell_size;
                 let mut sweep_depth_guard: Option<SweepDepthGuard> = None;
 
                 for word in 0..word_count {
@@ -636,15 +752,18 @@ impl Allocator {
                         }
                         let index = word * 64 + dead.trailing_zeros() as usize;
                         kept_cell_died |= kept.is_some_and(|kept| bitmap::get(&kept, index));
-                        let cell = self.cell_address(block, index);
+                        let cell = cell_base + index * cell_size;
                         // SAFETY: The cell is allocated.
                         let moved_since_hashed = check_identity_hash && unsafe { has_moved_since_hashed(cell) };
                         // NB: The cell stays allocated while its destructor runs, so nothing that it allocates takes its slot.
                         // SAFETY: The cell is live, allocated, and unmarked; `destroy_cell` is `CellTypeInfo::destroy`.
                         unsafe {
+                            #[cfg(debug_assertions)]
                             let state = core::ptr::with_exposed_provenance_mut::<u8>(cell + state_offset);
+                            #[cfg(debug_assertions)]
                             debug_assert_eq!(state.read(), state_live);
                             destroy_cell(cell as *mut c_void);
+                            #[cfg(debug_assertions)]
                             state.write(state_dead);
                         }
                         if moved_since_hashed {
@@ -720,11 +839,29 @@ impl Allocator {
             if lists.blocks.is_empty() {
                 return;
             }
-            lists.blocks.clone()
+            if self.config.conditional_finalize {
+                let mut flagged = Vec::new();
+                for &block in &lists.blocks {
+                    // SAFETY: Only the owner thread accesses `has_cells_needing_finalization`.
+                    if unsafe { (*self.descriptor(block)).has_cells_needing_finalization } {
+                        flagged.push(block);
+                    }
+                }
+                if flagged.is_empty() {
+                    return;
+                }
+                flagged
+            } else {
+                lists.blocks.clone()
+            }
         };
         let word_count = self.bitmap_word_count;
+        let cell_size = self.config.cell_size as usize;
+        let cells_offset = self.config.cells_offset as usize;
+        let first_cell_offset = self.first_cell_index * cell_size;
         for block in blocks {
             let descriptor = self.descriptor(block);
+            let cell_base = block + cells_offset - first_cell_offset;
             for word in 0..word_count {
                 // SAFETY: Only the owner thread accesses allocated and mark bits during post-mark finalization.
                 let (allocated, marked) = unsafe {
@@ -737,7 +874,7 @@ impl Allocator {
                 while dead != 0 {
                     let bit = dead.trailing_zeros() as usize;
                     dead &= dead - 1;
-                    let cell = self.cell_address(block, word * 64 + bit);
+                    let cell = cell_base + (word * 64 + bit) * cell_size;
                     // SAFETY: The cell is allocated and unmarked, and `finalize` is the block's finalizer.
                     unsafe { finalize(cell as *mut c_void) };
                 }
@@ -1128,12 +1265,15 @@ mod tests {
                 traced_on_owner_thread_only: false,
                 movable: true,
                 has_destructor: true,
+                conditional_destructor: false,
+                conditional_finalize: false,
                 has_address_sanitizer: false,
                 context: &raw mut *heap as *mut c_void,
                 block_sweeps_in_progress: core::ptr::null_mut(),
                 initialize_block,
                 free_cell,
                 destroy_cell: None,
+                destroy_dead_cells: None,
             };
             // SAFETY: The config describes this heap, which outlives the allocator.
             heap.allocator = unsafe { rust_gc_allocator_create(&config) };
@@ -1413,12 +1553,15 @@ mod tests {
             traced_on_owner_thread_only: false,
             movable: false,
             has_destructor: false,
+            conditional_destructor: false,
+            conditional_finalize: false,
             has_address_sanitizer: false,
             context: &raw mut *heap as *mut c_void,
             block_sweeps_in_progress: core::ptr::null_mut(),
             initialize_block,
             free_cell,
             destroy_cell: None,
+            destroy_dead_cells: None,
         };
         // SAFETY: The config describes this heap, which outlives the allocator.
         heap.allocator = unsafe { rust_gc_allocator_create(&config) };
@@ -1498,12 +1641,15 @@ mod tests {
             traced_on_owner_thread_only: false,
             movable: false,
             has_destructor: true,
+            conditional_destructor: false,
+            conditional_finalize: false,
             has_address_sanitizer: false,
             context: &raw mut *heap as *mut c_void,
             block_sweeps_in_progress: &raw mut sweep_depth,
             initialize_block,
             free_cell,
             destroy_cell: Some(direct_destroy),
+            destroy_dead_cells: None,
         };
         // SAFETY: The config describes this heap, which outlives the allocator.
         heap.allocator = unsafe { rust_gc_allocator_create(&config) };
@@ -1524,8 +1670,182 @@ mod tests {
         for &cell in &cells {
             // SAFETY: The block stays live because two survivors remain in it.
             let state = unsafe { ((cell + 9) as *const u8).read() };
-            let expected = if survivors.contains(&cell) { 0 } else { 1 };
-            assert_eq!(state, expected);
+            if survivors.contains(&cell) {
+                assert_eq!(state, 0);
+            } else if cfg!(debug_assertions) {
+                assert_eq!(state, 1);
+            }
         }
+    }
+
+    #[test]
+    fn conditional_destructor_and_finalize_skip_unflagged_blocks_and_run_flagged_ones() {
+        use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static FINALIZE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn count_destroy(_cell: *mut c_void) {
+            DESTROY_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        unsafe extern "C" fn count_finalize(_cell: *mut c_void) {
+            FINALIZE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        DESTROY_COUNT.store(0, AtomicOrdering::Relaxed);
+        FINALIZE_COUNT.store(0, AtomicOrdering::Relaxed);
+
+        let base = region_base();
+        let mut heap = Box::new(TestHeap {
+            allocator: core::ptr::null_mut(),
+            local: Box::new(UnsafeCell::new(LocalFreeCells {
+                free_list: core::ptr::null_mut(),
+                cursor: 0,
+                end: 0,
+                cell_size: 64,
+            })),
+            freed: RefCell::new(Vec::new()),
+            allocations_in_destructor: core::cell::Cell::new(0),
+            pool: block_pool::rust_gc_block_pool_create(),
+        });
+        let config = AllocatorConfig {
+            heap_region_base: base,
+            heap: &raw mut *heap as *mut c_void,
+            type_info: core::ptr::null(),
+            pool: heap.pool,
+            local: heap.local.get(),
+            cells_offset: 64,
+            cell_size: 64,
+            cell_state_offset: 9,
+            cell_state_live: 0,
+            cell_state_dead: 1,
+            traced_on_owner_thread_only: false,
+            movable: false,
+            has_destructor: true,
+            conditional_destructor: true,
+            conditional_finalize: true,
+            has_address_sanitizer: false,
+            context: &raw mut *heap as *mut c_void,
+            block_sweeps_in_progress: core::ptr::null_mut(),
+            initialize_block,
+            free_cell,
+            destroy_cell: Some(count_destroy),
+            destroy_dead_cells: None,
+        };
+        // SAFETY: The config describes this heap, which outlives the allocator.
+        heap.allocator = unsafe { rust_gc_allocator_create(&config) };
+
+        let cell_count = heap.allocator().cell_count;
+        let cells: Vec<usize> = (0..cell_count + 4).map(|_| heap.allocate()).collect();
+        for &cell in &cells {
+            // SAFETY: Each allocated cell has its state byte at offset 9.
+            unsafe { ((cell + 9) as *mut u8).write(0) };
+        }
+        // Only flag the second block; the first full block must skip both finalization and destruction.
+        let second_block = cells[cell_count] & !(BLOCK_SIZE - 1);
+        // SAFETY: Nothing else accesses the descriptor while this test runs.
+        unsafe {
+            (*heap.allocator().descriptor(second_block)).has_cells_needing_destruction = true;
+            (*heap.allocator().descriptor(second_block)).has_cells_needing_finalization = true;
+        }
+        heap.allocator().give_back_local_free_cells();
+        heap.mark(cells[0]);
+        heap.mark(cells[cell_count]);
+        heap.allocator().finalize_unmarked(count_finalize);
+        assert_eq!(FINALIZE_COUNT.load(AtomicOrdering::Relaxed), 3);
+
+        heap.allocator().start_sweep();
+        let mut stats = SweepStats::default();
+        while heap.allocator().sweep_next_block(true, &mut stats) {}
+        assert_eq!(DESTROY_COUNT.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(stats.collected_cells, cell_count + 2);
+        assert_eq!(stats.live_cells, 2);
+    }
+
+    #[test]
+    fn batch_destroy_dead_cells_drops_every_unmarked_cell_and_reclaims_block() {
+        use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        static BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED_CELLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn batch_destroy(cell_base: usize, cell_size: usize, word_index: usize, mut dead: u64) {
+            BATCH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            let word_base = cell_base + word_index * 64 * cell_size;
+            while dead != 0 {
+                let bit = dead.trailing_zeros() as usize;
+                dead &= dead - 1;
+                let cell = word_base + bit * cell_size;
+                // SAFETY: Each allocated cell in this test stores its marker tag at offset 16.
+                let tag = unsafe { ((cell + 16) as *const u64).read() };
+                assert_eq!(tag, 0xCAFE_BABEu64);
+                DROPPED_CELLS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        BATCH_CALLS.store(0, AtomicOrdering::Relaxed);
+        DROPPED_CELLS.store(0, AtomicOrdering::Relaxed);
+
+        let base = region_base();
+        let mut heap = Box::new(TestHeap {
+            allocator: core::ptr::null_mut(),
+            local: Box::new(UnsafeCell::new(LocalFreeCells {
+                free_list: core::ptr::null_mut(),
+                cursor: 0,
+                end: 0,
+                cell_size: 64,
+            })),
+            freed: RefCell::new(Vec::new()),
+            allocations_in_destructor: core::cell::Cell::new(0),
+            pool: block_pool::rust_gc_block_pool_create(),
+        });
+        let config = AllocatorConfig {
+            heap_region_base: base,
+            heap: &raw mut *heap as *mut c_void,
+            type_info: core::ptr::null(),
+            pool: heap.pool,
+            local: heap.local.get(),
+            cells_offset: 64,
+            cell_size: 64,
+            cell_state_offset: 9,
+            cell_state_live: 0,
+            cell_state_dead: 1,
+            traced_on_owner_thread_only: false,
+            movable: false,
+            has_destructor: true,
+            conditional_destructor: false,
+            conditional_finalize: false,
+            has_address_sanitizer: false,
+            context: &raw mut *heap as *mut c_void,
+            block_sweeps_in_progress: core::ptr::null_mut(),
+            initialize_block,
+            free_cell,
+            destroy_cell: None,
+            destroy_dead_cells: Some(batch_destroy),
+        };
+        // SAFETY: The config describes this heap, which outlives the allocator.
+        heap.allocator = unsafe { rust_gc_allocator_create(&config) };
+
+        let cells: Vec<usize> = (0..20).map(|_| heap.allocate()).collect();
+        for &cell in &cells {
+            // SAFETY: Each allocated cell has its state byte at offset 9 and marker at offset 16.
+            unsafe {
+                ((cell + 9) as *mut u8).write(0);
+                ((cell + 16) as *mut u64).write(0xCAFE_BABEu64);
+            }
+        }
+        let survivors = [cells[2], cells[15]];
+        let stats = heap.collect(&survivors);
+        assert_eq!(stats.collected_cells, 18);
+        assert_eq!(stats.live_cells, 2);
+        assert_eq!(DROPPED_CELLS.load(AtomicOrdering::Relaxed), 18);
+        assert_eq!(BATCH_CALLS.load(AtomicOrdering::Relaxed), 1);
+        assert!(heap.freed.borrow().is_empty());
+
+        let stats = heap.collect(&[]);
+        assert_eq!(stats.collected_cells, 2);
+        assert_eq!(stats.freed_blocks, 1);
+        assert_eq!(DROPPED_CELLS.load(AtomicOrdering::Relaxed), 20);
     }
 }

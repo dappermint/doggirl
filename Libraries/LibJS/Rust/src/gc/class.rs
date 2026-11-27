@@ -47,6 +47,8 @@ pub struct Class {
     /// Whether LibGC may only trace the cells of this class on the thread that owns their heap, see
     /// traced_on_owner_thread_only().
     owner_thread_only: bool,
+    /// Non-reentrant batch destructor for one 64-cell bitmap word, used when `has_non_reentrant_destructor()` is true.
+    pub destroy_dead_cells: Option<unsafe extern "C" fn(usize, usize, usize, u64)>,
 }
 
 // The layout module's mirror of the class, through which Layout.h tells an embedder where a class keeps its id and
@@ -103,6 +105,11 @@ impl Class {
             object_methods,
             kind,
             owner_thread_only: false,
+            destroy_dead_cells: if core::mem::needs_drop::<T>() {
+                Some(destroy_dead_cells::<T>)
+            } else {
+                None
+            },
         }
     }
 
@@ -159,6 +166,52 @@ impl Class {
                 | ClassId::Set
                 | ClassId::SetIterator
                 | ClassId::Promise
+        )
+    }
+
+    /// Whether cells of this class only require per-cell destruction when their block has been marked via
+    /// `mark_cell_needs_destruction()`. Only valid for classes whose `Drop` is a no-op unless explicitly flagged.
+    pub fn has_conditional_destructor(&self) -> bool {
+        matches!(
+            self.id,
+            ClassId::Object
+                | ClassId::Array
+                | ClassId::EcmascriptFunctionObject
+                | ClassId::HostObject
+                | ClassId::PrimitiveString
+                | ClassId::RopeString
+                | ClassId::Substring
+                | ClassId::InlineString
+        )
+    }
+
+    /// Whether cells of this class only require post-mark finalization when their block has been marked via
+    /// `mark_cell_needs_finalization()`.
+    pub fn has_conditional_finalize(&self) -> bool {
+        if self.is_derived_at_run_time() {
+            return false;
+        }
+        matches!(self.id, ClassId::DeclarativeEnvironment | ClassId::FunctionEnvironment)
+    }
+
+    /// Whether this class's `Drop` never allocates GC cells or re-enters the allocator, allowing LibGC to sweep dead
+    /// cells in a 64-cell bitmap word with a single batch call.
+    pub fn has_non_reentrant_destructor(&self) -> bool {
+        matches!(
+            self.id,
+            ClassId::Object
+                | ClassId::Array
+                | ClassId::EcmascriptFunctionObject
+                | ClassId::HostObject
+                | ClassId::PrimitiveString
+                | ClassId::RopeString
+                | ClassId::Substring
+                | ClassId::InlineString
+                | ClassId::Shape
+                | ClassId::RawNativeFunction
+                | ClassId::DirectGetterFunction
+                | ClassId::DictionaryPropertyTable
+                | ClassId::BoundFunction
         )
     }
 
@@ -276,6 +329,7 @@ impl Class {
             object_methods,
             kind: parent.kind,
             owner_thread_only: parent.owner_thread_only,
+            destroy_dead_cells: parent.destroy_dead_cells,
         }));
         #[cfg(feature = "address-sanitizer")]
         // SAFETY: The class is a live allocation, which the process keeps for as long as it runs.
@@ -312,6 +366,17 @@ impl Class {
 unsafe extern "C" fn destroy<T>(cell: *mut c_void) {
     // SAFETY: LibGC destroys each dead cell of this class exactly once.
     unsafe { core::ptr::drop_in_place(cell.cast::<T>()) };
+}
+
+unsafe extern "C" fn destroy_dead_cells<T>(cell_base: usize, cell_size: usize, word_index: usize, mut dead: u64) {
+    let word_base = cell_base + word_index * 64 * cell_size;
+    while dead != 0 {
+        let bit = dead.trailing_zeros() as usize;
+        dead &= dead - 1;
+        let cell = core::ptr::with_exposed_provenance_mut::<T>(word_base + bit * cell_size);
+        // SAFETY: LibGC destroys each dead cell of this class exactly once, and `T::drop` is non-reentrant.
+        unsafe { core::ptr::drop_in_place(cell) };
+    }
 }
 
 unsafe extern "C" fn class_name(cell: *const c_void, length: *mut usize) -> *const c_char {
