@@ -1363,6 +1363,8 @@ impl Projection {
             disabled,
             written,
             links_written,
+            leaf_link_max_depth,
+            reparented_link_depth_bound,
             relations_written,
             counts,
         } = publication;
@@ -1381,7 +1383,14 @@ impl Projection {
             self.pending_change_scan.writes.push(node);
         }
         for node in links_written {
-            self.note_links_written(node);
+            self.links_written.insert(node, node.element_slot());
+        }
+        if leaf_link_max_depth != 0 || reparented_link_depth_bound != 0 {
+            let current = self.link_rows_written.load(Ordering::Relaxed);
+            let updated = current
+                .saturating_add(reparented_link_depth_bound)
+                .max(leaf_link_max_depth);
+            self.link_rows_written.store(updated, Ordering::Relaxed);
         }
         for node in relations_written {
             self.relations_written.insert(node, node.element_slot());
@@ -1399,16 +1408,6 @@ impl Projection {
         let answer = write(&mut self.test_writer);
         let publication = self.test_writer.publish();
         (answer, self.adopt(publication))
-    }
-
-    /// Note that the links of `node` are written in the transaction to come.
-    fn note_links_written(&mut self, node: StyleNodeID) {
-        if self.links_written.insert(node, node.element_slot()) {
-            self.link_rows_written.store(
-                u32::try_from(self.links_written.nodes.len()).unwrap_or(u32::MAX),
-                Ordering::Relaxed,
-            );
-        }
     }
 
     // -- Reads ---------------------------------------------------------------------------------

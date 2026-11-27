@@ -139,8 +139,8 @@ impl RenderState {
         }))
     }
 
-    /// Drops the state, which must hold no layout node any more.
-    fn retire(self) {
+    /// Verifies teardown invariants and hands back the owned arena and engine to drop outside the slot hold.
+    fn prepare_retire(self) -> RetiredRenderState {
         let Self {
             arena, engine, owed, ..
         } = self;
@@ -150,9 +150,10 @@ impl RenderState {
             0,
             "layout node arena destroyed with live slots"
         );
-        drop(arena);
-        // SAFETY: The state made the handle, and the arena that linked it is gone.
-        drop(unsafe { engine.destroy() });
+        RetiredRenderState {
+            arena: Some(arena),
+            engine,
+        }
     }
 
     /// How far the arena's rows have been written, which the host keeps to know whether the rows it holds still read
@@ -386,7 +387,7 @@ pub(crate) enum ArenaChange {
     /// What is left of the boxes of the nodes the identities name is detached as the nodes leave the document (see
     /// [`crate::layout::tree_builder::detach_remaining_rows_for_removal`]), which owes the host what it pays once the
     /// job that applies it is done.
-    DetachForRemoval(Box<[u32]>),
+    DetachForRemoval(Vec<u32>),
     /// The anonymous rows below the row inherit its style again (see
     /// [`crate::layout::LayoutNodeArena::reinherit_anonymous_descendants`]), which owes their layout
     /// nodes the records they take, paid once the job that applies it is done.
@@ -513,7 +514,7 @@ impl ArenaChange {
             rows: self.row_write(),
             engine_facts,
             arena_facts,
-            selectors: matches!(self, Self::Rule(_)),
+            selectors: matches!(self, Self::Rule(write) if write.may_change_selectors()),
         }
     }
 
@@ -704,6 +705,13 @@ impl ChangeQueue {
             && last_target == target
         {
             last_marks.merge(*marks);
+            return;
+        }
+        // Consecutive detach-for-removal batches fold into one list to avoid per-node allocations and repeated setup.
+        if let ArenaChange::DetachForRemoval(nodes) = &change
+            && let Some(ArenaChange::DetachForRemoval(last_nodes)) = queued.last_mut()
+        {
+            last_nodes.extend_from_slice(nodes);
             return;
         }
         // Replaced content facts replace those of the same kind queued for the same box since the last write that may
@@ -903,9 +911,15 @@ pub(crate) fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
     /// The stack a job on a render state takes at most per level of the tree it recurses through, as it builds and
     /// lays out boxes, with room to spare for the boxes a level adds: release builds took about 1.5 KiB per element,
     /// and debug builds about 2 KiB.
+    #[cfg(debug_assertions)]
     const STACK_PER_TREE_LEVEL: usize = 16 * 1024;
+    #[cfg(not(debug_assertions))]
+    const STACK_PER_TREE_LEVEL: usize = 4 * 1024;
     /// The stack a job on a render state takes beside its recursion through the tree, with room to spare.
+    #[cfg(debug_assertions)]
     const STACK_BESIDE_RECURSION: usize = 1024 * 1024;
+    #[cfg(not(debug_assertions))]
+    const STACK_BESIDE_RECURSION: usize = 512 * 1024;
     unsafe extern "C" {
         safe fn web_current_thread_stack_base() -> usize;
     }
@@ -1180,7 +1194,7 @@ mod tests {
         queue.drain(|_| {});
         push(element, canvas(4));
         assert_eq!(queued_facts(), [canvas(4)], "facts applied before are not replaced");
-        queue.push(ArenaChange::DetachForRemoval(Box::new([1])), |_| {});
+        queue.push(ArenaChange::DetachForRemoval(vec![1]), |_| {});
         push(element, canvas(5));
         assert_eq!(
             queued_facts(),
@@ -1385,6 +1399,22 @@ mod tests {
                 .shell_facts(row)
                 .is_none()
         );
+    }
+}
+
+/// A retired document's arena and style engine, whose teardown invariants were already checked
+/// on the render owner so the heavy drops can run asynchronously off the `Render` thread.
+struct RetiredRenderState {
+    arena: Option<Box<ArenaHandle>>,
+    engine: StyleEngineHandle,
+}
+
+impl Drop for RetiredRenderState {
+    fn drop(&mut self) {
+        // Drop `arena` before destroying `engine` so no arena row outlives the style engine it links.
+        drop(self.arena.take());
+        // SAFETY: The state made the handle, and the arena that linked it is gone.
+        drop(unsafe { self.engine.destroy() });
     }
 }
 
