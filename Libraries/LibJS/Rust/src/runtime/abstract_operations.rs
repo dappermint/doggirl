@@ -163,12 +163,55 @@ fn with_callee_context<T>(
     // SAFETY: The frame was just allocated and stays allocated until the guard frees it.
     let callee_context = unsafe { callee_context.as_ref() };
     let argument_slots = callee_context.arguments();
-    for (slot, argument) in argument_slots.iter().zip(arguments_list) {
-        slot.set(*argument);
+    let arg_len = arguments_list.len().min(argument_slots.len());
+    let dst_ptr = argument_slots.as_ptr().cast::<Value>().cast_mut();
+    match arg_len {
+        0 => {}
+        1 => unsafe { dst_ptr.write(*arguments_list.get_unchecked(0)) },
+        2 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+        },
+        3 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+            dst_ptr.add(2).write(*arguments_list.get_unchecked(2));
+        },
+        4 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+            dst_ptr.add(2).write(*arguments_list.get_unchecked(2));
+            dst_ptr.add(3).write(*arguments_list.get_unchecked(3));
+        },
+        _ => unsafe {
+            core::ptr::copy_nonoverlapping(arguments_list.as_ptr(), dst_ptr, arg_len);
+        },
     }
-    if arguments_list.len() < argument_slots.len() {
-        for slot in &argument_slots[arguments_list.len()..] {
-            slot.set(Value::UNDEFINED);
+    let missing = argument_slots.len() - arg_len;
+    if missing != 0 {
+        let tail_ptr = unsafe { dst_ptr.add(arg_len) };
+        match missing {
+            1 => unsafe { tail_ptr.write(Value::UNDEFINED) },
+            2 => unsafe {
+                tail_ptr.write(Value::UNDEFINED);
+                tail_ptr.add(1).write(Value::UNDEFINED);
+            },
+            3 => unsafe {
+                tail_ptr.write(Value::UNDEFINED);
+                tail_ptr.add(1).write(Value::UNDEFINED);
+                tail_ptr.add(2).write(Value::UNDEFINED);
+            },
+            4 => unsafe {
+                tail_ptr.write(Value::UNDEFINED);
+                tail_ptr.add(1).write(Value::UNDEFINED);
+                tail_ptr.add(2).write(Value::UNDEFINED);
+                tail_ptr.add(3).write(Value::UNDEFINED);
+            },
+            _ => {
+                for slot in &argument_slots[arg_len..] {
+                    slot.set(Value::UNDEFINED);
+                }
+            }
         }
     }
     callee_context.passed_argument_count.set(arguments_list.len() as u32);
@@ -201,8 +244,29 @@ pub(crate) fn call_raw_native_function_fast(
 
     // SAFETY: The frame was just allocated and stays allocated until the guard frees it.
     let callee_context = unsafe { callee_context_ptr.as_ref() };
-    for (slot, argument) in callee_context.arguments().iter().zip(arguments_list) {
-        slot.set(*argument);
+    let arg_slots = callee_context.arguments();
+    let dst_ptr = arg_slots.as_ptr().cast::<Value>().cast_mut();
+    match arguments_list.len() {
+        0 => {}
+        1 => unsafe { dst_ptr.write(*arguments_list.get_unchecked(0)) },
+        2 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+        },
+        3 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+            dst_ptr.add(2).write(*arguments_list.get_unchecked(2));
+        },
+        4 => unsafe {
+            dst_ptr.write(*arguments_list.get_unchecked(0));
+            dst_ptr.add(1).write(*arguments_list.get_unchecked(1));
+            dst_ptr.add(2).write(*arguments_list.get_unchecked(2));
+            dst_ptr.add(3).write(*arguments_list.get_unchecked(3));
+        },
+        len => unsafe {
+            core::ptr::copy_nonoverlapping(arguments_list.as_ptr(), dst_ptr, len);
+        },
     }
     callee_context.passed_argument_count.set(argument_count);
     callee_context.function.set(Some(function.as_function_object_gc()));

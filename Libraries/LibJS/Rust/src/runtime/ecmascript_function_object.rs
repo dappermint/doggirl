@@ -901,6 +901,7 @@ impl EcmascriptFunctionObject {
 
     /// OrdinaryCallBindThis() for a call whose callee context has `local_env` as its LexicalEnvironment: binds and
     /// returns the this value, or returns nothing if the function's this is lexical.
+    #[inline]
     pub fn resolve_and_bind_this(
         &self,
         vm: &Vm,
@@ -909,22 +910,19 @@ impl EcmascriptFunctionObject {
     ) -> Option<Value> {
         // 1. Let thisMode be F.[[ThisMode]].
         // If thisMode is lexical, return unused.
-        if self.this_mode() == ThisMode::Lexical {
+        let this_mode = self.this_mode();
+        if this_mode == ThisMode::Lexical {
             return None;
         }
 
-        // 3. Let calleeRealm be F.[[Realm]].
-        let callee_realm = self.realm().expect("an ECMAScript function has a realm");
-
-        // 4. Let localEnv be the LexicalEnvironment of calleeContext.
-        // NB: The caller passes it.
-
         // 5. If thisMode is strict, let thisValue be thisArgument.
-        let this_value = if self.this_mode() == ThisMode::Strict {
+        let this_value = if this_mode == ThisMode::Strict {
             this_argument
         }
         // 6. Else,
         else {
+            // 3. Let calleeRealm be F.[[Realm]].
+            let callee_realm = self.shape().realm();
             // a. If thisArgument is undefined or null, then
             if this_argument.is_nullish() {
                 // i. Let globalEnv be calleeRealm.[[GlobalEnv]].
@@ -933,7 +931,9 @@ impl EcmascriptFunctionObject {
                 Value::from_object(callee_realm.global_environment().global_this_value())
             }
             // b. Else,
-            else {
+            else if this_argument.is_object() {
+                this_argument
+            } else {
                 // i. Let thisValue be ! ToObject(thisArgument).
                 let this_value = Value::from_object(this_argument.to_object(vm).must());
 
@@ -948,24 +948,37 @@ impl EcmascriptFunctionObject {
         // 8. Assert: The next step never returns an abrupt completion because localEnv.[[ThisBindingStatus]] is not initialized.
         // 9. Perform ! localEnv.BindThisValue(thisValue).
         if self.shared_data().function_environment_has_this_binding() {
-            local_env
-                .and_then(|environment| environment.downcast::<FunctionEnvironment>())
-                .expect("the lexical environment of the call is a function environment")
-                .bind_this_value(vm, this_value)
-                .must();
+            Self::bind_this_in_function_environment(vm, local_env, this_value);
         }
 
         // 10. Return unused.
         Some(this_value)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn bind_this_in_function_environment(vm: &Vm, local_env: Option<Gc<Environment>>, this_value: Value) {
+        local_env
+            .and_then(|environment| environment.downcast::<FunctionEnvironment>())
+            .expect("the lexical environment of the call is a function environment")
+            .bind_this_value(vm, this_value)
+            .must();
+    }
+
     /// The LexicalEnvironment and VariableEnvironment of a call of the function in an inline frame: a new function
     /// environment (steps 7 to 9 of PrepareForOrdinaryCall) if the function needs one, and its [[Environment]]
     /// otherwise.
+    #[inline(always)]
     pub fn inline_call_environment(&self, vm: &Vm, new_target: Option<Gc<Object>>) -> Option<Gc<Environment>> {
         if !self.function_environment_needed() {
             return self.environment();
         }
+        self.create_inline_call_environment(vm, new_target)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn create_inline_call_environment(&self, vm: &Vm, new_target: Option<Gc<Object>>) -> Option<Gc<Environment>> {
         let local_environment = new_call_environment(vm, self.as_ecmascript_function_gc(), new_target);
         let shared_data = self.shared_data();
         let function_environment_bindings_count = shared_data.function_environment_bindings_count();

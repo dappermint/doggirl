@@ -13,12 +13,12 @@ interface Node : EventTarget {
     const unsigned short DOCUMENT_TYPE_NODE = 10;
     const unsigned short DOCUMENT_FRAGMENT_NODE = 11;
     const unsigned short NOTATION_NODE = 12; // legacy
-    readonly attribute unsigned short nodeType;
+    [DirectGetter] readonly attribute unsigned short nodeType;
     readonly attribute DOMString nodeName;
 
     readonly attribute USVString baseURI;
 
-    readonly attribute boolean isConnected;
+    [DirectGetter] readonly attribute boolean isConnected;
     readonly attribute Document? ownerDocument;
     Node getRootNode(optional GetRootNodeOptions options = {});
     [DirectGetter] readonly attribute Node? parentNode;

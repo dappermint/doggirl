@@ -3279,7 +3279,11 @@ fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
         direct_getter: Some(DirectGetterFields {
             wrapper_implementation: 80,
             implementation_value: if compressed_field { 20 } else { 16 },
-            implementation_value_is_compressed: compressed_field,
+            value_kind: if compressed_field {
+                crate::snapshot::DirectGetterValueKind::CompressedPointer
+            } else {
+                crate::snapshot::DirectGetterValueKind::Pointer
+            },
             main_world_wrapper: 8,
             weak_impl_value: 8,
         }),

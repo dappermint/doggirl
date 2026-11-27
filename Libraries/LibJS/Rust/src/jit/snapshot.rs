@@ -18,7 +18,8 @@ use libjs_jit::bytecode::{
 use libjs_jit::code::ExitKind;
 use libjs_jit::snapshot::{
     AccessorFunctionSnapshot, BytecodeSlice, CallFeedbackSnapshot, CellId, ClosureTemplateSnapshot, CompileOptions,
-    ConstructTarget, DerivedInstanceFields, DirectCallTarget, DirectGetterFields, EnvironmentTemplateSnapshot,
+    ConstructTarget, DerivedInstanceFields, DirectCallTarget, DirectGetterFields, DirectGetterValueKind,
+    EnvironmentTemplateSnapshot,
     ExecutableSnapshot, FeedbackSnapshot, ForwardedCallSnapshot, Forwarding, FunctionFrameFields, GlobalCacheSnapshot,
     GlobalValueSnapshot, GlobalsSnapshot, InlinedFunctionSnapshot, InliningLimits, Intrinsic, KeyedFeedbackSnapshot,
     LexicalEnvironmentTemplateSnapshot, List, NativeCallTarget, ObjectShapeCacheSnapshot, OrdinaryHasInstanceSnapshot,
@@ -1487,10 +1488,17 @@ impl SnapshotBuilder<'_> {
             .filter(|_| direct_getter_validated)
             .map(|getter| {
                 let bytes = |word_offset: u32| word_offset * size_of::<u64>() as u32;
+                let value_kind = match getter.implementation_value_is_compressed.get() {
+                    0 => DirectGetterValueKind::Pointer,
+                    1 => DirectGetterValueKind::CompressedPointer,
+                    2 => DirectGetterValueKind::UnsignedShort,
+                    3 => DirectGetterValueKind::Boolean,
+                    kind => unreachable!("invalid DirectGetterFunction value kind {kind}"),
+                };
                 DirectGetterFields {
                     wrapper_implementation: bytes(getter.wrapper_implementation_word_offset.get()),
                     implementation_value: getter.implementation_value_offset.get(),
-                    implementation_value_is_compressed: getter.implementation_value_is_compressed.get() != 0,
+                    value_kind,
                     main_world_wrapper: bytes(getter.main_world_wrapper_word_offset.get()),
                     weak_impl_value: bytes(getter.weak_impl_value_word_offset.get()),
                 }

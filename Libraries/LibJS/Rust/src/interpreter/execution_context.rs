@@ -199,12 +199,30 @@ impl ExecutionContext {
                 new_target: Cell::new(Value::UNDEFINED),
             });
             // NB: Enter initializes the remaining registers, locals, and constants.
-            for slot in (*context)
-                .slots()
-                .iter()
-                .take(registers_and_locals_count.min(RESERVED_REGISTER_COUNT) as usize)
-            {
-                slot.set(Value::EMPTY);
+            // OPTIMIZATION: Write the 5 reserved registers directly without a dynamic loop so LLVM emits inline
+            //               stores instead of calling `_platform_memset_pattern16` on every frame push.
+            const _: () = assert!(RESERVED_REGISTER_COUNT == 5);
+            let reserved = registers_and_locals_count.min(RESERVED_REGISTER_COUNT);
+            let slots = context.add(1).cast::<Value>();
+            if reserved == RESERVED_REGISTER_COUNT {
+                slots.add(0).write(Value::EMPTY);
+                slots.add(1).write(Value::EMPTY);
+                slots.add(2).write(Value::EMPTY);
+                slots.add(3).write(Value::EMPTY);
+                slots.add(4).write(Value::EMPTY);
+            } else if reserved != 0 {
+                if reserved >= 1 {
+                    slots.add(0).write(Value::EMPTY);
+                }
+                if reserved >= 2 {
+                    slots.add(1).write(Value::EMPTY);
+                }
+                if reserved >= 3 {
+                    slots.add(2).write(Value::EMPTY);
+                }
+                if reserved >= 4 {
+                    slots.add(3).write(Value::EMPTY);
+                }
             }
         }
     }
