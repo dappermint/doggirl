@@ -355,16 +355,23 @@ static GC::Ref<Element> create_html_element_on_heap(Document& document, Qualifie
     return create_element_on_heap<ElementType>(document, move(qualified_name));
 }
 
+static GC::Ref<Element> create_plain_html_element_on_heap(Document& document, QualifiedName qualified_name)
+{
+    auto element = create_element_on_heap<HTML::HTMLElement>(document, move(qualified_name));
+    element->set_tree_mutation_fast_path(Element::TreeMutationFastPath::PlainHTML);
+    return element;
+}
+
 static HashMap<FlatPtr, HTMLElementFactoryEntry> const& html_element_factories()
 {
     static NeverDestroyed<HashMap<FlatPtr, HTMLElementFactoryEntry>> factories = [] {
         HashMap<FlatPtr, HTMLElementFactoryEntry> factories;
 
-#define __ENUMERATE_HTML_TAG(name, tag) factories.set(HTML::TagNames::name.raw_identity(), { &create_html_element_on_heap<HTML::HTMLUnknownElement>, QualifiedName { HTML::TagNames::name, {}, Namespace::HTML } });
+#define __ENUMERATE_HTML_TAG(name, tag) factories.set(HTML::TagNames::name.raw_identity(), { &create_html_element_on_heap<HTML::HTMLUnknownElement>, QualifiedName::make_immortal(HTML::TagNames::name, {}, Namespace::HTML) });
         ENUMERATE_HTML_TAGS
 #undef __ENUMERATE_HTML_TAG
 
-#define REGISTER_HTML_ELEMENT(tag_name, element_type) factories.set(HTML::TagNames::tag_name.raw_identity(), { &create_html_element_on_heap<HTML::element_type>, QualifiedName { HTML::TagNames::tag_name, {}, Namespace::HTML } })
+#define REGISTER_HTML_ELEMENT(tag_name, element_type) factories.set(HTML::TagNames::tag_name.raw_identity(), { &create_html_element_on_heap<HTML::element_type>, QualifiedName::make_immortal(HTML::TagNames::tag_name, {}, Namespace::HTML) })
         REGISTER_HTML_ELEMENT(a, HTMLAnchorElement);
         REGISTER_HTML_ELEMENT(area, HTMLAreaElement);
         REGISTER_HTML_ELEMENT(audio, HTMLAudioElement);
@@ -449,7 +456,7 @@ static HashMap<FlatPtr, HTMLElementFactoryEntry> const& html_element_factories()
         REGISTER_HTML_ELEMENT(ul, HTMLUListElement);
         REGISTER_HTML_ELEMENT(video, HTMLVideoElement);
 
-#define REGISTER_GENERIC_HTML_ELEMENT(tag_name) REGISTER_HTML_ELEMENT(tag_name, HTMLElement)
+#define REGISTER_GENERIC_HTML_ELEMENT(tag_name) factories.set(HTML::TagNames::tag_name.raw_identity(), { &create_plain_html_element_on_heap, QualifiedName::make_immortal(HTML::TagNames::tag_name, {}, Namespace::HTML) })
         REGISTER_GENERIC_HTML_ELEMENT(article);
         REGISTER_GENERIC_HTML_ELEMENT(search);
         REGISTER_GENERIC_HTML_ELEMENT(section);
@@ -524,17 +531,22 @@ static GC::Ref<Element> create_html_element(Document& document, QualifiedName qu
 
 using SVGElementFactory = GC::Ref<SVG::SVGElement> (*)(Document&, QualifiedName);
 
+struct SVGElementFactoryEntry {
+    SVGElementFactory factory;
+    QualifiedName qualified_name;
+};
+
 template<typename ElementType>
 static GC::Ref<SVG::SVGElement> create_svg_element_on_heap(Document& document, QualifiedName qualified_name)
 {
     return create_element_on_heap<ElementType>(document, move(qualified_name));
 }
 
-static HashMap<FlatPtr, SVGElementFactory> const& svg_element_factories()
+static HashMap<FlatPtr, SVGElementFactoryEntry> const& svg_element_factories()
 {
-    static NeverDestroyed<HashMap<FlatPtr, SVGElementFactory>> factories = [] {
-        HashMap<FlatPtr, SVGElementFactory> factories;
-#define REGISTER_SVG_ELEMENT(tag_name, element_type) factories.set(SVG::TagNames::tag_name.raw_identity(), &create_svg_element_on_heap<SVG::element_type>)
+    static NeverDestroyed<HashMap<FlatPtr, SVGElementFactoryEntry>> factories = [] {
+        HashMap<FlatPtr, SVGElementFactoryEntry> factories;
+#define REGISTER_SVG_ELEMENT(tag_name, element_type) factories.set(SVG::TagNames::tag_name.raw_identity(), { &create_svg_element_on_heap<SVG::element_type>, QualifiedName::make_immortal(SVG::TagNames::tag_name, {}, Namespace::SVG) })
         REGISTER_SVG_ELEMENT(svg, SVGSVGElement);
         REGISTER_SVG_ELEMENT(animate, SVGAnimateElement);
         REGISTER_SVG_ELEMENT(animateMotion, SVGAnimateMotionElement);
@@ -606,8 +618,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
 {
     auto const& local_name = qualified_name.local_name();
 
-    if (auto factory = svg_element_factories().get(local_name.raw_identity()); factory.has_value())
-        return factory.value()(document, move(qualified_name));
+    if (auto entry = svg_element_factories().get(local_name.raw_identity()); entry.has_value())
+        return entry->factory(document, move(qualified_name));
 
     // FIXME: Support SVG's mixedCase tag names properly.
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::clipPath))
@@ -812,18 +824,31 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16Fl
             return pointer;
         });
 
-    // OPTIMIZATION: Built-in HTML tag names never contain a hyphen, so without an `is` attribute they can neither
-    //               match a custom element definition nor be a valid custom element name.
-    if (namespace_ == Namespace::HTML && !is_value.has_value()) {
-        if (auto entry = html_element_factories().get(local_name.raw_identity()); entry.has_value()) {
-            if (!prefix.has_value()) {
-                auto element = entry->factory(document, entry->qualified_name);
-                element->set_custom_element_registry(registry);
-                element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
-                VERIFY(!element->has_attributes());
-                return element;
+    // OPTIMIZATION: Built-in HTML and SVG tag names never match custom element definitions (custom elements are
+    //               always in the HTML namespace and require a hyphenated name without `is`).
+    if (!is_value.has_value()) {
+        if (namespace_ == Namespace::HTML) {
+            if (auto entry = html_element_factories().get(local_name.raw_identity()); entry.has_value()) {
+                if (!prefix.has_value()) {
+                    auto element = entry->factory(document, entry->qualified_name);
+                    element->set_custom_element_registry(registry);
+                    element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
+                    VERIFY(!element->has_attributes());
+                    return element;
+                }
+                return create_element_internal(document, entry->factory, move(local_name), move(namespace_), move(prefix), CustomElementState::Uncustomized, {}, registry);
             }
-            return create_element_internal(document, entry->factory, move(local_name), move(namespace_), move(prefix), CustomElementState::Uncustomized, {}, registry);
+        } else if (namespace_ == Namespace::SVG) {
+            if (auto entry = svg_element_factories().get(local_name.raw_identity()); entry.has_value()) {
+                if (!prefix.has_value()) {
+                    auto element = entry->factory(document, entry->qualified_name);
+                    element->set_custom_element_registry(registry);
+                    element->set_custom_element_state_for_new_element(CustomElementState::Uncustomized);
+                    VERIFY(!element->has_attributes());
+                    return element;
+                }
+                return create_element_internal(document, entry->factory, move(local_name), move(namespace_), move(prefix), CustomElementState::Uncustomized, {}, registry);
+            }
         }
     }
 

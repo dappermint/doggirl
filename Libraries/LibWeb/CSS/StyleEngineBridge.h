@@ -456,6 +456,11 @@ public:
     // The host of the document's render state, which every entry into the document's style engine goes through.
     [[nodiscard]] Layout::RustFFI::DocumentHost* host() const { return m_render_document->host(); }
 
+    // Persistent cache for immortal element/attribute publication metadata owned by this StyleEngine.
+    struct ArrivalPublicationCache;
+    [[nodiscard]] ArrivalPublicationCache* arrival_publication_cache() const { return m_arrival_publication_cache; }
+    void set_arrival_publication_cache(ArrivalPublicationCache* cache) { m_arrival_publication_cache = cache; }
+
 private:
     struct LentComputationInputs;
     void gather_computation_inputs(LentComputationInputs&);
@@ -500,6 +505,9 @@ private:
     bool m_css_transitions_may_observe_style_changes { false };
     mutable bool m_geometry_read_deferred_transaction { false };
     StyleAtomID m_html_element_namespace;
+    ArrivalPublicationCache* m_arrival_publication_cache { nullptr };
 };
+
+void destroy_arrival_publication_cache(StyleEngine::ArrivalPublicationCache*);
 
 }

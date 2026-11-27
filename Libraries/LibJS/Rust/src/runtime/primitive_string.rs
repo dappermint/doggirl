@@ -736,6 +736,11 @@ impl PrimitiveString {
         }
     }
 
+    #[inline(always)]
+    pub(crate) fn inline_characters(&self) -> &[u8] {
+        self.as_inline_string().characters()
+    }
+
     #[inline]
     fn as_inline_string(&self) -> &InlineString {
         debug_assert!(self.header_class().is_subclass_of(InlineString::CLASS));
@@ -973,7 +978,7 @@ impl RopeString {
             });
         }
 
-        const INLINE_STACK_CAP: usize = 32;
+        const INLINE_STACK_CAP: usize = 128;
         let mut inline_stack = [core::mem::MaybeUninit::<*const PrimitiveString>::uninit(); INLINE_STACK_CAP];
         inline_stack[0].write(rhs_ptr);
         let mut inline_len = 1usize;

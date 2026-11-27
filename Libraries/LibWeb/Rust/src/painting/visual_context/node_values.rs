@@ -861,6 +861,9 @@ pub(crate) struct ResolvedEffects {
 // https://www.w3.org/TR/compositing-1/#csscompositingrules
 // Everything in CSS that creates a stacking context must be considered an ‘isolated’ group.
 fn stacking_context_needs_isolation(arena: &impl PaintRead, slot: NodeSlotId) -> bool {
+    if !arena.may_have_non_normal_mix_blend_mode() {
+        return false;
+    }
     // NB: The document root already paints inside the viewport's isolated group.
     if arena
         .node_parent_if_live(slot)
@@ -893,7 +896,8 @@ pub(crate) fn resolve_effects_data(
     device_pixels_per_css_pixel: f64,
 ) -> Option<ResolvedEffects> {
     use crate::css::css_enums::mix_blend_mode;
-    let style = layout_arena.node_style_if_live(slot)?;
+    let row = layout_arena.node(slot)?;
+    let style = row.style()?;
     let effects_values = style.effects();
     let isolation = stacking_context_needs_isolation(layout_arena, slot);
     let mut references_svg_filter = false;
@@ -922,8 +926,9 @@ pub(crate) fn resolve_effects_data(
             .map(std::sync::Arc::new)
     };
     let backdrop_filter = compute_backdrop_filter_data(layout_arena, slot, style, device_pixels_per_css_pixel);
-    let keeps_effects_node_for_later_values = layout_arena
-        .node_has_compositor_animation_frame(slot, crate::layout::node_data::CompositorAnimationFrameKind::Opacity)
+    let keeps_effects_node_for_later_values = row.compositor_animation_frame_kinds()
+        & crate::layout::node_data::CompositorAnimationFrameKind::Opacity as u8
+        != 0
         || style_queries::will_change_promotes_effects_node(style);
     if !isolation
         && filter.is_none()
@@ -1008,11 +1013,13 @@ pub(super) struct MaskLayerPresenceEntry {
 pub(super) fn mask_layer_presence(layout_arena: &impl PaintRead, slot: NodeSlotId) -> Vec<MaskLayerPresenceEntry> {
     use super::MaskLayerOrigin;
     let mut layers = Vec::new();
-    if let Some(style) = layout_arena.node_style_if_live(slot)
+    let Some(row) = layout_arena.node(slot) else {
+        return layers;
+    };
+    let kind = row.kind();
+    if let Some(style) = row.style()
         && style_queries::has_css_mask_image(style.mask())
-        && layout_arena
-            .node_kind_if_live(slot)
-            .is_some_and(node_facts::kind_is_box)
+        && node_facts::kind_is_box(kind)
         && style_queries::establishes_stacking_context(layout_arena, slot)
     {
         let mut area = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
@@ -1038,18 +1045,16 @@ pub(super) fn mask_layer_presence(layout_arena: &impl PaintRead, slot: NodeSlotI
             kind: libgfx_rust::MaskKind::Alpha,
         });
     }
-    if layout_arena
-        .node_kind_if_live(slot)
-        .is_some_and(node_painting::supports_svg_masking)
-    {
-        if let Some(mask_area) = crate::painting::svg_masking::mask_area(layout_arena, slot) {
+    if node_painting::supports_svg_masking(kind) && !row.first_child().is_invalid() {
+        let (mask, clip) = crate::painting::svg_masking::mask_and_clip_areas(layout_arena, slot);
+        if let Some((mask_area, mask_kind)) = mask {
             layers.push(MaskLayerPresenceEntry {
                 origin: MaskLayerOrigin::SvgMask,
                 area: mask_area,
-                kind: crate::painting::svg_masking::mask_kind(layout_arena, slot),
+                kind: mask_kind,
             });
         }
-        if let Some(clip_area) = crate::painting::svg_masking::clip_area(layout_arena, slot) {
+        if let Some(clip_area) = clip {
             layers.push(MaskLayerPresenceEntry {
                 origin: MaskLayerOrigin::SvgClip,
                 area: clip_area,
@@ -1058,27 +1063,6 @@ pub(super) fn mask_layer_presence(layout_arena: &impl PaintRead, slot: NodeSlotI
         }
     }
     layers
-}
-
-pub(crate) fn backface_hidden(layout_arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    use crate::css::css_enums::backface_visibility;
-    let Some(style) = layout_arena.node_style_if_live(node) else {
-        return false;
-    };
-    style.transform().backface_visibility == backface_visibility::HIDDEN
-        && style_queries::is_transformable(layout_arena, node)
-}
-
-pub(crate) fn may_have_clip(layout_arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    use crate::css::css_enums::{content_visibility, overflow};
-    let Some(style) = layout_arena.node_style_if_live(node) else {
-        return false;
-    };
-    let box_values = style.box_values();
-    style.overflow_x() != overflow::VISIBLE
-        || style.overflow_y() != overflow::VISIBLE
-        || box_values.paint_containment
-        || style.content_visibility() == content_visibility::AUTO
 }
 
 /// Whether a box's overflow clips in both axes, which is when its clipping region follows its corners.

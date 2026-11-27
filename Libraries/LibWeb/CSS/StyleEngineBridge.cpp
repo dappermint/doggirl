@@ -41,7 +41,11 @@ StyleEngine::StyleEngine(StyleComputer* style_computer)
 {
 }
 
-StyleEngine::~StyleEngine() = default;
+StyleEngine::~StyleEngine()
+{
+    if (m_arrival_publication_cache)
+        destroy_arrival_publication_cache(m_arrival_publication_cache);
+}
 
 void StyleEngine::visit_edges(GC::Cell::Visitor& visitor)
 {

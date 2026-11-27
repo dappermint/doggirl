@@ -1114,6 +1114,9 @@ Utf16String HTMLInputElement::placeholder() const
     auto placeholder = *maybe_placeholder;
 
     // The attribute, if specified, must have a value that contains no U+000A LINE FEED (LF) or U+000D CARRIAGE RETURN (CR) characters.
+    auto placeholder_view = placeholder.utf16_view();
+    if (!placeholder_view.contains(u'\r') && !placeholder_view.contains(u'\n'))
+        return placeholder;
     Utf16StringBuilder builder;
     for (auto c : placeholder) {
         if (c != '\r' && c != '\n')

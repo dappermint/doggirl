@@ -73,7 +73,13 @@ impl Hash for ValueTraitsKey {
             return;
         }
         if value.is_string() {
-            hash_utf16_view(value.as_string().utf16_string_view(), state);
+            let string = value.as_string();
+            if string.deferred_kind() == crate::layout::primitive_string::DeferredKind::Inline {
+                state.write_u8(0);
+                state.write(string.inline_characters());
+                return;
+            }
+            hash_utf16_view(string.utf16_string_view(), state);
             return;
         }
 

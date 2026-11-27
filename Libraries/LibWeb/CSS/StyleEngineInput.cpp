@@ -612,15 +612,6 @@ void record_element_connected(DOM::Element& element)
     record_node_connected(element, *style_engine);
 }
 
-// A text node's row records one of the facts an element's row does, whether it sits in a user agent shadow tree. A
-// text node has no element columns in the mirror, so the fact travels on its own row, published where its identity
-// arrives.
-static bool text_is_in_user_agent_shadow_tree(DOM::Text const& text)
-{
-    auto shadow_root = text.containing_shadow_root();
-    return shadow_root && shadow_root->is_user_agent_internal();
-}
-
 void record_text_connected(DOM::Text& text)
 {
     auto* style_engine = style_engine_for(text);
@@ -773,6 +764,7 @@ static ElementKind element_kind_of(StyleEngine& style_engine, DOM::Element const
 struct PublishedAttributeName {
     DOM::QualifiedName::Impl const* name { nullptr };
     StyleAtomID atom;
+    u64 unread_epoch { 0 };
     bool is_known_unread { false };
     bool is_lang { false };
     bool is_dir { false };
@@ -825,9 +817,47 @@ public:
         return m_slots[hash];
     }
 
+    void clear()
+    {
+        m_slots = {};
+    }
+
 private:
     Array<Entry, slot_count> m_slots {};
 };
+
+struct StyleEngine::ArrivalPublicationCache {
+    u64 atom_generation { 0 };
+    u64 unread_epoch { 0 };
+    StyleAtomID ltr_atom;
+    StyleAtomID rtl_atom;
+    TableByName<ElementKind, 64> kinds;
+    TableByName<PublishedAttributeName, 64> attribute_names;
+};
+
+void destroy_arrival_publication_cache(StyleEngine::ArrivalPublicationCache* cache)
+{
+    delete cache;
+}
+
+static StyleEngine::ArrivalPublicationCache& ensure_arrival_publication_cache(StyleEngine& style_engine)
+{
+    auto* cache = style_engine.arrival_publication_cache();
+    if (!cache) {
+        cache = new StyleEngine::ArrivalPublicationCache;
+        style_engine.set_arrival_publication_cache(cache);
+    }
+    auto const atom_generation = style_engine.atom_generation();
+    if (cache->ltr_atom.value() == 0 || cache->atom_generation != atom_generation) {
+        cache->atom_generation = atom_generation;
+        cache->ltr_atom = style_engine.intern_atom("ltr"_utf16_fly_string);
+        cache->rtl_atom = style_engine.intern_atom("rtl"_utf16_fly_string);
+        cache->kinds.clear();
+        cache->attribute_names.clear();
+    }
+    ++cache->unread_epoch;
+    return *cache;
+}
 
 // One batch of elements publishing their initial features. Nothing but the batch changes the DOM or what the engine
 // reads while it lives, so what one element answers holds for the next one asking. The elements cross to the engine in
@@ -846,10 +876,12 @@ public:
 
     ElementPublication(StyleEngine& style_engine, DOM::Document const& document)
         : m_style_engine(style_engine)
+        , m_cache(ensure_arrival_publication_cache(style_engine))
         , m_focus_within_chain(document)
         , m_hovered_element(hovered_element_of(document.hovered_node()))
-        , m_ltr_atom(style_engine.intern_atom("ltr"_utf16_fly_string))
-        , m_rtl_atom(style_engine.intern_atom("rtl"_utf16_fly_string))
+        , m_ltr_atom(m_cache.ltr_atom)
+        , m_rtl_atom(m_cache.rtl_atom)
+        , m_unread_epoch(m_cache.unread_epoch)
     {
     }
 
@@ -863,29 +895,58 @@ public:
 
     ElementKind const& kind_of(DOM::Element const& element)
     {
-        auto& kind = m_kinds.slot_of(element.qualified_name_identity());
-        if (kind.name != element.qualified_name_identity())
-            kind = element_kind_of(m_style_engine, element);
-        return kind;
+        auto const* identity = element.qualified_name_identity();
+        if (identity->is_immortal) {
+            auto& kind = m_cache.kinds.slot_of(identity);
+            if (kind.name != identity)
+                kind = element_kind_of(m_style_engine, element);
+            return kind;
+        }
+        if (m_non_immortal_kind.name != identity)
+            m_non_immortal_kind = element_kind_of(m_style_engine, element);
+        return m_non_immortal_kind;
     }
 
     PublishedAttributeName const& attribute_name(DOM::QualifiedName const& name)
     {
-        auto& slot = m_attribute_names.slot_of(name.identity());
-        if (slot.name == name.identity())
+        auto const* identity = name.identity();
+        if (identity->is_immortal) {
+            auto& slot = m_cache.attribute_names.slot_of(identity);
+            if (slot.name != identity) {
+                auto atom = m_style_engine.intern_attribute_name(name.local_name(), name.namespace_());
+                slot = {
+                    .name = identity,
+                    .atom = atom,
+                    .unread_epoch = 0,
+                    .is_known_unread = false,
+                    .is_lang = name.local_name() == HTML::AttributeNames::lang,
+                    .is_dir = name.local_name() == HTML::AttributeNames::dir,
+                    .never_presentational_hint = attribute_is_never_presentational_hint(name),
+                };
+            }
+            if (slot.unread_epoch != m_unread_epoch) {
+                slot.unread_epoch = m_unread_epoch;
+                slot.is_known_unread = m_style_engine.attribute_is_known_unread(slot.atom);
+                if (slot.is_known_unread)
+                    m_style_engine.note_attribute_withheld(name.local_name(), name.namespace_());
+            }
             return slot;
-        auto atom = m_style_engine.intern_attribute_name(name.local_name(), name.namespace_());
-        slot = {
-            .name = name.identity(),
-            .atom = atom,
-            .is_known_unread = m_style_engine.attribute_is_known_unread(atom),
-            .is_lang = name.local_name() == HTML::AttributeNames::lang,
-            .is_dir = name.local_name() == HTML::AttributeNames::dir,
-            .never_presentational_hint = attribute_is_never_presentational_hint(name),
-        };
-        if (slot.is_known_unread)
-            m_style_engine.note_attribute_withheld(name.local_name(), name.namespace_());
-        return slot;
+        }
+        if (m_non_immortal_attribute_name.name != identity) {
+            auto atom = m_style_engine.intern_attribute_name(name.local_name(), name.namespace_());
+            m_non_immortal_attribute_name = {
+                .name = identity,
+                .atom = atom,
+                .unread_epoch = m_unread_epoch,
+                .is_known_unread = m_style_engine.attribute_is_known_unread(atom),
+                .is_lang = name.local_name() == HTML::AttributeNames::lang,
+                .is_dir = name.local_name() == HTML::AttributeNames::dir,
+                .never_presentational_hint = attribute_is_never_presentational_hint(name),
+            };
+            if (m_non_immortal_attribute_name.is_known_unread)
+                m_style_engine.note_attribute_withheld(name.local_name(), name.namespace_());
+        }
+        return m_non_immortal_attribute_name;
     }
 
     // What the element's parent passes on, if it has one. Elements come mostly in tree order, so most parents were
@@ -980,12 +1041,14 @@ private:
     };
 
     StyleEngine& m_style_engine;
+    StyleEngine::ArrivalPublicationCache& m_cache;
     SelectorMatching::FocusWithinChain m_focus_within_chain;
     GC::Ptr<DOM::Element const> m_hovered_element;
     StyleAtomID m_ltr_atom;
     StyleAtomID m_rtl_atom;
-    TableByName<ElementKind, 64> m_kinds;
-    TableByName<PublishedAttributeName, 32> m_attribute_names;
+    u64 m_unread_epoch { 0 };
+    ElementKind m_non_immortal_kind;
+    PublishedAttributeName m_non_immortal_attribute_name;
     GC::RootVector<AncestorRow, 32> m_elements_to_parent;
     GC::RootVector<GC::Ref<DOM::Element>> m_elements_asked_their_language;
     Vector<StyleEngineFFI::FfiElementArrivalRow> m_rows;
@@ -1025,8 +1088,14 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
 
         void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
+    struct TextArrival {
+        GC::Ref<DOM::Text> text;
+        bool is_in_user_agent_shadow_tree { false };
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(text); }
+    };
     GC::RootVector<Arrival, 64> arrivals;
-    GC::RootVector<GC::Ref<DOM::Text>, 64> text_arrivals;
+    GC::RootVector<TextArrival, 64> text_arrivals;
     // Elements and text nodes in tree order, which is the order their places in the DOM child sequence can be taken
     // in: each node's previous sibling has taken its place first.
     GC::RootVector<GC::Ref<DOM::Node>, 64> dom_order_arrivals;
@@ -1059,7 +1128,12 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         } else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node); shadow_root && shadow_root->style_node_id() == no_style_node) {
             arrivals.append({ *shadow_root, tree_scope });
         } else if (auto* text = as_if<DOM::Text>(node); text && text->style_node_id() == no_style_node) {
-            text_arrivals.append(*text);
+            bool is_ua_shadow = false;
+            if (tree_scope != document_tree_scope) {
+                auto const* shadow_root = style_computer.shadow_root_for_tree_scope(tree_scope);
+                is_ua_shadow = shadow_root && shadow_root->is_user_agent_internal();
+            }
+            text_arrivals.append({ *text, is_ua_shadow });
             dom_order_arrivals.append(*text);
         }
     };
@@ -1081,14 +1155,14 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         Vector<StyleEngineFFI::FfiArrivingText, 64> texts;
         texts.ensure_capacity(text_arrivals.size());
         for (size_t i = 0; i < text_arrivals.size(); ++i) {
-            auto& text = *text_arrivals[i];
+            auto& text = *text_arrivals[i].text;
             text.set_style_node_id(identities[i]);
             style_computer.register_style_node(identities[i], text);
             texts.unchecked_append({
                 .data = text.data().to_raw_leaked(),
                 .node = identities[i].value(),
                 .is_ascii_whitespace = text.data().is_ascii_whitespace(),
-                .is_in_user_agent_shadow_tree = text_is_in_user_agent_shadow_tree(text),
+                .is_in_user_agent_shadow_tree = text_arrivals[i].is_in_user_agent_shadow_tree,
                 .is_password_input = text.is_password_input(),
             });
         }
