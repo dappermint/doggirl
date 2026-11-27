@@ -13,6 +13,7 @@ GC_DEFINE_ALLOCATOR(HTMLSpanElement);
 HTMLSpanElement::HTMLSpanElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
+    set_tree_mutation_fast_path(DOM::Element::TreeMutationFastPath::PlainHTML);
 }
 
 HTMLSpanElement::~HTMLSpanElement() = default;

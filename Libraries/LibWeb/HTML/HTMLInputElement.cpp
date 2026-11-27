@@ -111,6 +111,7 @@ static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16F
 HTMLInputElement::HTMLInputElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
+    set_tree_mutation_fast_path(DOM::Element::TreeMutationFastPath::Input);
 }
 
 HTMLInputElement::~HTMLInputElement() = default;

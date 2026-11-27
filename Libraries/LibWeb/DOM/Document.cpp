@@ -5866,6 +5866,21 @@ void Document::unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUse
     m_svg_use_elements.remove(use_element);
 }
 
+void Document::register_svg_use_element_fragment_id(Badge<SVG::SVGUseElement>, Utf16FlyString const& id, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements_by_fragment_id.ensure(id).append(&use_element);
+}
+
+void Document::unregister_svg_use_element_fragment_id(Badge<SVG::SVGUseElement>, Utf16FlyString const& id, SVG::SVGUseElement& use_element)
+{
+    auto it = m_svg_use_elements_by_fragment_id.find(id);
+    if (it == m_svg_use_elements_by_fragment_id.end())
+        return;
+    it->value.remove_first_matching([&](auto const* entry) { return entry == &use_element; });
+    if (it->value.is_empty())
+        m_svg_use_elements_by_fragment_id.remove(it);
+}
+
 void Document::increment_number_of_things_delaying_the_load_event(Badge<DocumentLoadEventDelayer>)
 {
     ++m_number_of_things_delaying_the_load_event;

@@ -703,7 +703,8 @@ void SVGElement::children_changed(ChildrenChangedMetadata const& metadata)
 
 void SVGElement::update_use_elements_that_reference_this()
 {
-    if (document().svg_use_elements().is_empty()
+    auto const& use_elements_by_id = document().svg_use_elements_by_fragment_id();
+    if (use_elements_by_id.is_empty()
         // An unconnected node cannot have valid references.
         // This also prevents searches for elements that are in the process of being constructed - as clones.
         || !this->is_connected()
@@ -716,11 +717,20 @@ void SVGElement::update_use_elements_that_reference_this()
         return;
     }
 
-    for (auto& use_element : document().svg_use_elements()) {
-        if (document().readiness() != HTML::DocumentReadyState::Loading)
-            use_element.svg_element_changed(*this);
-        else
-            use_element.svg_element_changed_before_parsing_complete(*this);
+    bool const is_loading = document().readiness() == HTML::DocumentReadyState::Loading;
+    for (DOM::Node* ancestor = this; ancestor; ancestor = ancestor->parent()) {
+        auto* ancestor_element = as_if<DOM::Element>(*ancestor);
+        if (!ancestor_element || !ancestor_element->id().has_value())
+            continue;
+        auto it = use_elements_by_id.find(*ancestor_element->id());
+        if (it == use_elements_by_id.end())
+            continue;
+        for (auto* use_element : it->value) {
+            if (!is_loading)
+                use_element->svg_element_changed(*this);
+            else
+                use_element->svg_element_changed_before_parsing_complete(*this);
+        }
     }
 }
 
@@ -816,19 +826,27 @@ void SVGElement::mark_resource_box_referencing_elements_for_layout_update()
 
 void SVGElement::remove_from_use_element_that_reference_this()
 {
-    if (is<SVGUseElement>(this) || !id().has_value()) {
+    auto const& use_elements_by_id = document().svg_use_elements_by_fragment_id();
+    if (use_elements_by_id.is_empty() || is<SVGUseElement>(this) || !id().has_value()) {
         return;
     }
 
-    for (auto& use_element : document().svg_use_elements()) {
+    auto it = use_elements_by_id.find(*id());
+    if (it == use_elements_by_id.end())
+        return;
+
+    GC::RootVector<GC::Ref<SVGUseElement>> matching_use_elements;
+    for (auto* use_element : it->value) {
         // Use elements that are part of the same subtree removal may still be registered, since removal hooks run
         // after the subtree has been detached. They are no longer reachable from the document and should not be
         // notified. NB: This must check the tree structure, not Node::is_connected(), because the connected flag of
         // nodes later in tree order has not been updated yet when we get here.
-        if (!use_element.root().is_document())
+        if (!use_element->root().is_document())
             continue;
-        use_element.svg_element_removed(*this);
+        matching_use_elements.append(*use_element);
     }
+    for (auto& use_element : matching_use_elements)
+        use_element->svg_element_removed(*this);
 }
 
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__classNames

@@ -727,6 +727,12 @@ GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, GC
         return element;
     };
 
+    auto make_plain_html_element = [&](QualifiedName const& qualified_name) -> GC::Ref<Element> {
+        auto element = make_element.template operator()<HTML::HTMLElement>(qualified_name);
+        element->set_tree_mutation_fast_path(Element::TreeMutationFastPath::PlainHTML);
+        return element;
+    };
+
     switch (static_cast<RustFfiHtmlFragmentTag>(tag_kind)) {
     case RustFfiHtmlFragmentTag::Div:
         return make_element.template operator()<HTML::HTMLDivElement>(names.div);
@@ -749,41 +755,41 @@ GC::Ref<Element> create_builtin_html_element_for_fragment(Document& document, GC
     case RustFfiHtmlFragmentTag::Br:
         return make_element.template operator()<HTML::HTMLBRElement>(names.br);
     case RustFfiHtmlFragmentTag::Article:
-        return make_element.template operator()<HTML::HTMLElement>(names.article);
+        return make_plain_html_element(names.article);
     case RustFfiHtmlFragmentTag::Aside:
-        return make_element.template operator()<HTML::HTMLElement>(names.aside);
+        return make_plain_html_element(names.aside);
     case RustFfiHtmlFragmentTag::B:
-        return make_element.template operator()<HTML::HTMLElement>(names.b);
+        return make_plain_html_element(names.b);
     case RustFfiHtmlFragmentTag::Big:
-        return make_element.template operator()<HTML::HTMLElement>(names.big);
+        return make_plain_html_element(names.big);
     case RustFfiHtmlFragmentTag::Code:
-        return make_element.template operator()<HTML::HTMLElement>(names.code);
+        return make_plain_html_element(names.code);
     case RustFfiHtmlFragmentTag::Em:
-        return make_element.template operator()<HTML::HTMLElement>(names.em);
+        return make_plain_html_element(names.em);
     case RustFfiHtmlFragmentTag::Footer:
-        return make_element.template operator()<HTML::HTMLElement>(names.footer);
+        return make_plain_html_element(names.footer);
     case RustFfiHtmlFragmentTag::Header:
-        return make_element.template operator()<HTML::HTMLElement>(names.header);
+        return make_plain_html_element(names.header);
     case RustFfiHtmlFragmentTag::I:
-        return make_element.template operator()<HTML::HTMLElement>(names.i);
+        return make_plain_html_element(names.i);
     case RustFfiHtmlFragmentTag::Main:
-        return make_element.template operator()<HTML::HTMLElement>(names.main);
+        return make_plain_html_element(names.main);
     case RustFfiHtmlFragmentTag::Nav:
-        return make_element.template operator()<HTML::HTMLElement>(names.nav);
+        return make_plain_html_element(names.nav);
     case RustFfiHtmlFragmentTag::S:
-        return make_element.template operator()<HTML::HTMLElement>(names.s);
+        return make_plain_html_element(names.s);
     case RustFfiHtmlFragmentTag::Section:
-        return make_element.template operator()<HTML::HTMLElement>(names.section);
+        return make_plain_html_element(names.section);
     case RustFfiHtmlFragmentTag::Small:
-        return make_element.template operator()<HTML::HTMLElement>(names.small);
+        return make_plain_html_element(names.small);
     case RustFfiHtmlFragmentTag::Strike:
-        return make_element.template operator()<HTML::HTMLElement>(names.strike);
+        return make_plain_html_element(names.strike);
     case RustFfiHtmlFragmentTag::Strong:
-        return make_element.template operator()<HTML::HTMLElement>(names.strong);
+        return make_plain_html_element(names.strong);
     case RustFfiHtmlFragmentTag::Tt:
-        return make_element.template operator()<HTML::HTMLElement>(names.tt);
+        return make_plain_html_element(names.tt);
     case RustFfiHtmlFragmentTag::U:
-        return make_element.template operator()<HTML::HTMLElement>(names.u);
+        return make_plain_html_element(names.u);
     case RustFfiHtmlFragmentTag::None:
         break;
     }

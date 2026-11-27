@@ -142,6 +142,7 @@ public:
     void reset_form_owner();
 
     void update_face_disabled_state();
+    bool has_form_associated_rare_data() const { return form_associated_rare_data() != nullptr; }
 
     ValidityStateFlags const& face_validity_flags() const;
     void set_face_validity_flags(Badge<ElementInternals>, ValidityStateFlags const& value);

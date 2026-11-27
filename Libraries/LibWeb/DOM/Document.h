@@ -1104,7 +1104,10 @@ public:
 
     void register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
     void unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
+    void register_svg_use_element_fragment_id(Badge<SVG::SVGUseElement>, Utf16FlyString const&, SVG::SVGUseElement&);
+    void unregister_svg_use_element_fragment_id(Badge<SVG::SVGUseElement>, Utf16FlyString const&, SVG::SVGUseElement&);
     SVG::SVGUseElement::DocumentUseElementList& svg_use_elements() { return m_svg_use_elements; }
+    HashMap<Utf16FlyString, Vector<SVG::SVGUseElement*>> const& svg_use_elements_by_fragment_id() const { return m_svg_use_elements_by_fragment_id; }
 
     bool has_node_iterators() const { return !m_node_iterators.is_empty(); }
 
@@ -2289,6 +2292,7 @@ private:
     // removal. This lets SVG elements notify interested use elements about mutations without traversing the entire
     // document. Not visited: registered elements are connected and thus kept alive by the tree.
     SVG::SVGUseElement::DocumentUseElementList m_svg_use_elements;
+    HashMap<Utf16FlyString, Vector<SVG::SVGUseElement*>> m_svg_use_elements_by_fragment_id;
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };

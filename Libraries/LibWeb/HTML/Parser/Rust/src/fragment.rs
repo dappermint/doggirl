@@ -84,8 +84,6 @@ pub struct RustFfiHtmlFragmentOperation {
     pub tag_kind: RustFfiHtmlFragmentTag,
     pub start: u32,
     pub length: u32,
-    /// The identity of the `Utf16FlyString` with the local name of the element to make.
-    pub tag_name: usize,
 }
 
 /// Compact classification of hot attribute names scanned by the fragment fast path.
@@ -153,7 +151,7 @@ pub struct RustFfiHtmlFragmentScan {
 pub struct RustHtmlFragmentTape {
     operations: Vec<RustFfiHtmlFragmentOperation>,
     attributes: Vec<RustFfiHtmlFragmentAttribute>,
-    open_elements: Vec<TagId>,
+    open_elements: Vec<RustFfiHtmlFragmentTag>,
 }
 
 thread_local! {
@@ -219,35 +217,22 @@ pub unsafe extern "C" fn rust_html_fragment_tape_release(tape: *mut RustHtmlFrag
     keep_as_spare_tape(unsafe { Box::from_raw(tape) });
 }
 
-/// Defines the tags the fast path takes, and the fly string of each.
-///
-/// Keep this subset deliberately small. Adding a tag requires checking its in-body tree-builder rules, its insertion
-/// steps, and interactions with every other supported tag. A supported tag must not have children changed steps,
-/// since the host links children below a new element without running them.
+/// Lowercase ASCII tag name bytes indexed by `RustFfiHtmlFragmentTag as usize`.
+const TAG_BYTES: [&[u8]; 29] = [
+    b"", b"a", b"article", b"aside", b"b", b"big", b"br", b"button", b"code", b"div", b"em", b"footer", b"header",
+    b"i", b"input", b"label", b"li", b"main", b"nav", b"ol", b"s", b"section", b"small", b"span", b"strike", b"strong",
+    b"tt", b"u", b"ul",
+];
+
+#[cfg(test)]
 macro_rules! supported_tags {
     ($($name:tt),+ $(,)?) => {
-        #[cfg(test)]
         const SUPPORTED_TAGS: &TagSet = tag_set![$($name),+];
-
-        #[cfg(test)]
         const SUPPORTED_TAG_NAMES: &[&str] = &[$($name),+];
-
-        /// The identity of the `Utf16FlyString` of every supported tag, by tag id.
-        #[cfg(not(test))]
-        fn tag_names() -> &'static [usize; TAG_ID_COUNT] {
-            static TAG_NAMES: std::sync::OnceLock<[usize; TAG_ID_COUNT]> = std::sync::OnceLock::new();
-            TAG_NAMES.get_or_init(|| {
-                let mut tag_names = [0; TAG_ID_COUNT];
-                $(tag_names[tag_id!($name).index()] = crate::known_names::tag_name!($name).raw_identity();)+
-                tag_names
-            })
-        }
     };
 }
 
-#[cfg(not(test))]
-const TAG_ID_COUNT: usize = crate::known_names::TAG_SET_WORD_COUNT * 64;
-
+#[cfg(test)]
 supported_tags![
     "a", "article", "aside", "b", "big", "br", "button", "code", "div", "em", "footer", "header", "i", "input",
     "label", "li", "main", "nav", "ol", "s", "section", "small", "span", "strike", "strong", "tt", "u", "ul",
@@ -309,8 +294,6 @@ fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
         input,
         offset: 0,
         #[cfg(not(test))]
-        tag_names: tag_names(),
-        #[cfg(not(test))]
         hot_attributes: hot_attribute_identities(),
         tape,
     }
@@ -320,8 +303,6 @@ fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
 struct Scanner<'a, T> {
     input: &'a [T],
     offset: usize,
-    #[cfg(not(test))]
-    tag_names: &'static [usize; TAG_ID_COUNT],
     #[cfg(not(test))]
     hot_attributes: &'static [usize; HOT_ATTRIBUTE_NAMES.len()],
     tape: &'a mut RustHtmlFragmentTape,
@@ -362,48 +343,62 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             tag_kind: RustFfiHtmlFragmentTag::None,
             start: self.offset as u32,
             length: run.length as u32,
-            tag_name: 0,
         });
         self.offset = end;
         true
     }
 
+    #[inline]
     fn scan_end_tag(&mut self) -> bool {
-        let Some((tag, _)) = self.scan_supported_tag() else {
+        let Some(&expected_tag) = self.tape.open_elements.last() else {
             return false;
         };
-        self.skip_whitespace();
-        if !self.consume(b'>') || self.tape.open_elements.pop() != Some(tag) {
+        let expected = TAG_BYTES[expected_tag as usize];
+        let end = self.offset + expected.len();
+        if end > self.input.len() || !equals_ascii(&self.input[self.offset..end], expected) {
             return false;
         }
+        self.offset = end;
+        if !self.consume(b'>') {
+            let next = self.peek();
+            if next <= 0x7A && NAME_CHAR_TABLE[next as usize] {
+                return false;
+            }
+            self.skip_whitespace();
+            if !self.consume(b'>') {
+                return false;
+            }
+        }
+        self.tape.open_elements.pop();
         self.tape.operations.push(RustFfiHtmlFragmentOperation {
             kind: RustFfiHtmlFragmentOperationKind::CloseElement,
             is_ascii: false,
             tag_kind: RustFfiHtmlFragmentTag::None,
             start: 0,
             length: 0,
-            tag_name: 0,
         });
         true
     }
 
     fn scan_start_tag(&mut self) -> bool {
-        let Some((tag, tag_kind)) = self.scan_supported_tag() else {
+        let Some(tag_kind) = self.scan_supported_tag() else {
             return false;
         };
         let open_elements = &self.tape.open_elements;
 
         // Leave implicit closing of anchors, buttons, and list items to the general parser.
-        if (tag == tag_id!("a") || tag == tag_id!("button")) && open_elements.contains(&tag) {
+        if (tag_kind == RustFfiHtmlFragmentTag::A || tag_kind == RustFfiHtmlFragmentTag::Button)
+            && open_elements.contains(&tag_kind)
+        {
             return false;
         }
-        if tag == tag_id!("li") {
+        if tag_kind == RustFfiHtmlFragmentTag::Li {
             for &ancestor in open_elements.iter().rev() {
-                if ancestor == tag_id!("li") {
+                if ancestor == RustFfiHtmlFragmentTag::Li {
                     return false;
                 }
                 // A nested list stops the in-body rule from closing an outer list item.
-                if ancestor == tag_id!("ul") || ancestor == tag_id!("ol") {
+                if ancestor == RustFfiHtmlFragmentTag::Ul || ancestor == RustFfiHtmlFragmentTag::Ol {
                     break;
                 }
             }
@@ -413,18 +408,19 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         }
 
         let first_attribute = self.tape.attributes.len();
+        let mut seen_hot_attrs: u32 = 0;
         loop {
             self.skip_whitespace();
             let next = self.peek();
             if next == u16::from(b'>') || next == u16::from(b'/') {
                 break;
             }
-            if !self.scan_attribute(tag, first_attribute) {
+            if !self.scan_attribute(tag_kind, first_attribute, &mut seen_hot_attrs) {
                 return false;
             }
         }
 
-        let is_void = tag == tag_id!("br") || tag == tag_id!("input");
+        let is_void = tag_kind == RustFfiHtmlFragmentTag::Br || tag_kind == RustFfiHtmlFragmentTag::Input;
         if self.consume(b'/') && !is_void {
             return false;
         }
@@ -442,31 +438,52 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             tag_kind,
             start: first_attribute as u32,
             length: (self.tape.attributes.len() - first_attribute) as u32,
-            tag_name: self.tag_name(tag),
         });
         if !is_void {
-            self.tape.open_elements.push(tag);
+            self.tape.open_elements.push(tag_kind);
         }
         true
     }
 
-    /// Scans one attribute of a start tag of `tag`, whose attributes so far start at `first_attribute`.
-    fn scan_attribute(&mut self, tag: TagId, first_attribute: usize) -> bool {
+    /// Scans one attribute of a start tag of `tag_kind`, whose attributes so far start at `first_attribute`.
+    fn scan_attribute(
+        &mut self,
+        tag_kind: RustFfiHtmlFragmentTag,
+        first_attribute: usize,
+        seen_hot_attrs: &mut u32,
+    ) -> bool {
         let input = self.input;
         let name_start = self.offset;
-        let name = self.scan_name();
+        let mut name_buf = [0u8; 32];
+        let (name_len, name_bytes) = self.scan_name_into(&mut name_buf);
         // NB: Customized built-in elements are made by the general parser.
-        if name.is_empty()
-            || (name.len() == 2 && equals_ascii(name, b"is"))
+        if name_len == 0
+            || name_bytes == Some(b"is".as_slice())
             || self.tape.attributes.len() - first_attribute >= MAX_ATTRIBUTES
         {
             return false;
         }
+
+        let (hot_kind, known_name) = match name_bytes {
+            Some(bytes) => self.classify_attribute_name_bytes(bytes),
+            None => (RustFfiHtmlFragmentAttributeKind::None, 0),
+        };
+
         // NB: The tokenizer drops an attribute whose name the tag already has, which the general parser sees to.
-        if self.tape.attributes.len() > first_attribute {
+        if hot_kind != RustFfiHtmlFragmentAttributeKind::None && hot_kind != RustFfiHtmlFragmentAttributeKind::OtherData
+        {
+            let bit = 1_u32 << (hot_kind as u8);
+            if *seen_hot_attrs & bit != 0 {
+                return false;
+            }
+            *seen_hot_attrs |= bit;
+        } else if self.tape.attributes.len() > first_attribute {
+            let name = &input[name_start..name_start + name_len];
             let is_duplicate = self.tape.attributes[first_attribute..].iter().any(|attribute| {
-                let start = attribute.name_start as usize;
-                input[start..start + attribute.name_length as usize] == *name
+                (attribute.hot_kind == RustFfiHtmlFragmentAttributeKind::None
+                    || attribute.hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData)
+                    && attribute.name_length as usize == name_len
+                    && input[attribute.name_start as usize..attribute.name_start as usize + name_len] == *name
             });
             if is_duplicate {
                 return false;
@@ -496,11 +513,9 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             }
         }
 
-        let (hot_kind, known_name) = self.classify_attribute_name(name);
-
         // NB: Other input types have insertion steps or children the fast path doesn't cover.
         let mut input_type = RustFfiHtmlFragmentInputType::None;
-        if tag == tag_id!("input") && hot_kind == RustFfiHtmlFragmentAttributeKind::Type {
+        if tag_kind == RustFfiHtmlFragmentTag::Input && hot_kind == RustFfiHtmlFragmentAttributeKind::Type {
             let value_code_units = &input[value_start..value_start + value.length];
             if equals_ascii(value_code_units, b"text") {
                 input_type = RustFfiHtmlFragmentInputType::Text;
@@ -514,7 +529,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         self.tape.attributes.push(RustFfiHtmlFragmentAttribute {
             known_name,
             name_start: name_start as u32,
-            name_length: name.len() as u32,
+            name_length: name_len as u32,
             value_start: value_start as u32,
             value_length: value.length as u32,
             hot_kind,
@@ -524,17 +539,20 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         true
     }
 
-    fn scan_supported_tag(&mut self) -> Option<(TagId, RustFfiHtmlFragmentTag)> {
-        let name = self.scan_name();
-        let mut buffer = [0; 16];
-        let bytes = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer))?;
-        supported_tag_for_name(bytes)
+    #[inline]
+    fn scan_supported_tag(&mut self) -> Option<RustFfiHtmlFragmentTag> {
+        let mut buffer = [0u8; 16];
+        let (_, bytes) = self.scan_name_into(&mut buffer);
+        supported_tag_for_name(bytes?).map(|(_, tag_kind)| tag_kind)
     }
 
-    /// Scans a tag name or an attribute name of lowercase ASCII letters, digits and hyphens. Other names are for the
-    /// general parser, which is what finding no name where one has to be leads to.
+    /// Scans a tag or attribute name of lowercase ASCII letters, digits and hyphens, returning its
+    /// length and, if it fits in `buffer`, its ASCII bytes in a single pass.
     #[inline]
-    fn scan_name(&mut self) -> &'a [T] {
+    fn scan_name_into<'b>(&mut self, buffer: &'b mut [u8]) -> (usize, Option<&'b [u8]>)
+    where
+        'a: 'b,
+    {
         let input = self.input;
         let start = self.offset;
         let mut advance = 0;
@@ -542,36 +560,33 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
             while advance < bytes.len() && NAME_CHAR_TABLE[bytes[advance] as usize] {
                 advance += 1;
             }
-        } else {
-            for &code_unit in &input[start..] {
-                let unit = code_unit.into();
-                if unit > 0x7A || !NAME_CHAR_TABLE[unit as usize] {
-                    break;
-                }
-                advance += 1;
+            self.offset = start + advance;
+            let slice = (advance <= buffer.len()).then_some(&bytes[..advance]);
+            return (advance, slice);
+        }
+        let buf_len = buffer.len();
+        for &code_unit in &input[start..] {
+            let unit = code_unit.into();
+            if unit > 0x7A || !NAME_CHAR_TABLE[unit as usize] {
+                break;
             }
+            if advance < buf_len {
+                buffer[advance] = unit as u8;
+            }
+            advance += 1;
         }
         self.offset = start + advance;
-        &input[start..self.offset]
-    }
-
-    fn tag_name(&self, tag: TagId) -> usize {
-        #[cfg(not(test))]
-        {
-            self.tag_names[tag.index()]
-        }
-        // NB: There are no fly strings in the standalone tests, which get the tag id in place of one.
-        #[cfg(test)]
-        {
-            tag.index()
-        }
+        let slice = (advance <= buf_len).then_some(&buffer[..advance]);
+        (advance, slice)
     }
 
     /// The code unit at the offset, or U+0000 NULL at the end of the input. Nothing the scanner takes has a NULL in it.
+    #[inline(always)]
     fn peek(&self) -> u16 {
         self.input.get(self.offset).map_or(0, |&code_unit| code_unit.into())
     }
 
+    #[inline(always)]
     fn consume(&mut self, byte: u8) -> bool {
         if self.offset == self.input.len() || self.peek() != u16::from(byte) {
             return false;
@@ -580,8 +595,11 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         true
     }
 
-    #[inline]
+    #[inline(always)]
     fn skip_whitespace(&mut self) {
+        if self.offset >= self.input.len() || self.input[self.offset].into() > 0x20 {
+            return;
+        }
         let mut advance = 0;
         if let Some(bytes) = T::as_byte_slice(&self.input[self.offset..]) {
             while advance < bytes.len() && TAG_WHITESPACE_TABLE[bytes[advance] as usize] {
@@ -598,11 +616,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         self.offset += advance;
     }
 
-    fn classify_attribute_name(&self, name: &[T]) -> (RustFfiHtmlFragmentAttributeKind, usize) {
-        let mut buffer = [0; 32];
-        let Some(bytes) = T::as_byte_slice(name).or_else(|| scan::ascii_name_bytes(name, &mut buffer)) else {
-            return (RustFfiHtmlFragmentAttributeKind::None, 0);
-        };
+    fn classify_attribute_name_bytes(&self, bytes: &[u8]) -> (RustFfiHtmlFragmentAttributeKind, usize) {
         // No HTML known attribute starts with "data-".
         if bytes.len() >= 5 && &bytes[..5] == b"data-" {
             let kind = if bytes == b"data-id" {
@@ -807,7 +821,8 @@ mod tests {
             match operation.kind {
                 OpenElement | AppendVoidElement => {
                     text.push_str(if operation.kind == OpenElement { "open" } else { "void" });
-                    text.push_str(&format!(" #{}", operation.tag_name));
+                    let tag = tag_id_for_name(TAG_BYTES[operation.tag_kind as usize]);
+                    text.push_str(&format!(" #{}", tag.index()));
                     let attributes = &tape.attributes[operation.start as usize..][..operation.length as usize];
                     for attribute in attributes {
                         text.push_str(&format!(
