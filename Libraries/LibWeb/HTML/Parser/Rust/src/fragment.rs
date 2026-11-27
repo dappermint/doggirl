@@ -274,12 +274,22 @@ fn is_tag_whitespace(code_unit: u16) -> bool {
     code_unit <= 0x20 && TAG_WHITESPACE_TABLE[code_unit as usize]
 }
 
+#[inline(always)]
 fn equals_ascii<T: CodeUnit>(code_units: &[T], ascii: &[u8]) -> bool {
-    code_units.len() == ascii.len()
-        && code_units
-            .iter()
-            .zip(ascii)
-            .all(|(&code_unit, &byte)| code_unit.into() == u16::from(byte))
+    if code_units.len() != ascii.len() {
+        return false;
+    }
+    if let Some(bytes) = T::as_byte_slice(code_units) {
+        return bytes == ascii;
+    }
+    let mut index = 0;
+    while index < ascii.len() {
+        if code_units[index].into() != u16::from(ascii[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn scan<T: CodeUnit>(input: &[T], tape: &mut RustHtmlFragmentTape) -> bool {
@@ -446,6 +456,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     }
 
     /// Scans one attribute of a start tag of `tag_kind`, whose attributes so far start at `first_attribute`.
+    #[inline]
     fn scan_attribute(
         &mut self,
         tag_kind: RustFfiHtmlFragmentTag,
@@ -454,7 +465,7 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
     ) -> bool {
         let input = self.input;
         let name_start = self.offset;
-        let mut name_buf = [0u8; 32];
+        let mut name_buf = [core::mem::MaybeUninit::<u8>::uninit(); 32];
         let (name_len, name_bytes) = self.scan_name_into(&mut name_buf);
         // NB: Customized built-in elements are made by the general parser.
         if name_len == 0
@@ -539,17 +550,17 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
         true
     }
 
-    #[inline]
+    #[inline(always)]
     fn scan_supported_tag(&mut self) -> Option<RustFfiHtmlFragmentTag> {
-        let mut buffer = [0u8; 16];
+        let mut buffer = [core::mem::MaybeUninit::<u8>::uninit(); 16];
         let (_, bytes) = self.scan_name_into(&mut buffer);
         supported_tag_for_name(bytes?).map(|(_, tag_kind)| tag_kind)
     }
 
     /// Scans a tag or attribute name of lowercase ASCII letters, digits and hyphens, returning its
     /// length and, if it fits in `buffer`, its ASCII bytes in a single pass.
-    #[inline]
-    fn scan_name_into<'b>(&mut self, buffer: &'b mut [u8]) -> (usize, Option<&'b [u8]>)
+    #[inline(always)]
+    fn scan_name_into<'b>(&mut self, buffer: &'b mut [core::mem::MaybeUninit<u8>]) -> (usize, Option<&'b [u8]>)
     where
         'a: 'b,
     {
@@ -571,12 +582,15 @@ impl<'a, T: CodeUnit> Scanner<'a, T> {
                 break;
             }
             if advance < buf_len {
-                buffer[advance] = unit as u8;
+                buffer[advance].write(unit as u8);
             }
             advance += 1;
         }
         self.offset = start + advance;
-        let slice = (advance <= buf_len).then_some(&buffer[..advance]);
+        let slice = (advance <= buf_len).then(|| {
+            // SAFETY: Every element in `buffer[..advance]` was initialized in the loop above.
+            unsafe { core::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), advance) }
+        });
         (advance, slice)
     }
 

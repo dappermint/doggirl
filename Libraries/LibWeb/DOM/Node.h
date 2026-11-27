@@ -746,7 +746,17 @@ private:
     void update_layout_tree_for_removal(Node& parent);
     GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
+    struct RemovingStepsContext {
+        Node const* focused_area { nullptr };
+        bool doc_has_auto_dir { false };
+        bool fast_plain_remove_base { false };
+        bool doc_has_no_form_or_fieldset { false };
+        bool is_parent_connected { false };
+    };
+
+    RemovingStepsContext make_removing_steps_context(Node& parent, Node& parent_root) const;
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root = false);
+    void run_removing_steps_with_context(Node& parent, Node& parent_root, bool was_tracked_by_style_engine, bool defer_subtree_root, RemovingStepsContext const& context);
     void add_transient_registered_observers(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 

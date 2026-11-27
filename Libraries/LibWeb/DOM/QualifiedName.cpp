@@ -44,30 +44,57 @@ static HashTable<QualifiedName::Impl*, ImplTraits>& impls()
     return *impls;
 }
 
-static NonnullRefPtr<QualifiedName::Impl> ensure_impl(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_)
+static constexpr uintptr_t qualified_name_immortal_bit = 1;
+
+static uintptr_t ensure_impl_raw(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_, bool make_immortal)
 {
     unsigned hash = hash_impl(local_name, prefix, namespace_);
     auto& slot = s_qualified_name_cache[hash & (qualified_name_cache_size - 1)];
-    if (slot && slot->local_name == local_name && slot->prefix == prefix && slot->namespace_ == namespace_)
-        return *slot;
-
-    auto it = impls().find(hash, [&](QualifiedName::Impl* entry) {
-        return entry->local_name == local_name
-            && entry->prefix == prefix
-            && entry->namespace_ == namespace_;
-    });
-    if (it != impls().end()) {
-        slot = *it;
-        return *(*it);
+    QualifiedName::Impl* found = nullptr;
+    if (slot && slot->local_name == local_name && slot->prefix == prefix && slot->namespace_ == namespace_) {
+        found = slot;
+    } else {
+        auto it = impls().find(hash, [&](QualifiedName::Impl* entry) {
+            return entry->local_name == local_name
+                && entry->prefix == prefix
+                && entry->namespace_ == namespace_;
+        });
+        if (it != impls().end()) {
+            found = *it;
+            slot = found;
+        }
     }
-    auto impl = adopt_ref(*new QualifiedName::Impl(local_name, prefix, namespace_));
-    slot = impl.ptr();
-    return impl;
+
+    if (found) {
+        if (found->is_immortal)
+            return reinterpret_cast<uintptr_t>(found) | qualified_name_immortal_bit;
+        if (make_immortal) {
+            // Keep a permanent reference so any existing non-immortal handles can unref safely without destroying `found`.
+            found->ref();
+            found->is_immortal = true;
+            return reinterpret_cast<uintptr_t>(found) | qualified_name_immortal_bit;
+        }
+        found->ref();
+        return reinterpret_cast<uintptr_t>(found);
+    }
+
+    auto* impl = new QualifiedName::Impl(local_name, prefix, namespace_);
+    slot = impl;
+    if (make_immortal) {
+        impl->is_immortal = true;
+        return reinterpret_cast<uintptr_t>(impl) | qualified_name_immortal_bit;
+    }
+    return reinterpret_cast<uintptr_t>(impl);
 }
 
 QualifiedName::QualifiedName(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_)
-    : m_impl(ensure_impl(local_name, prefix, namespace_))
+    : m_raw(ensure_impl_raw(local_name, prefix, namespace_, false))
 {
+}
+
+QualifiedName QualifiedName::make_immortal(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& prefix, Optional<Utf16FlyString> const& namespace_)
+{
+    return QualifiedName { ensure_impl_raw(local_name, prefix, namespace_, true) };
 }
 
 QualifiedName::Impl::Impl(Utf16FlyString const& a_local_name, Optional<Utf16FlyString> const& a_prefix, Optional<Utf16FlyString> const& a_namespace)
@@ -108,12 +135,18 @@ void QualifiedName::Impl::make_internal_string()
 
 Utf16FlyString const& QualifiedName::ascii_uppercased_as_string() const
 {
-    return m_impl->ascii_uppercased_as_string.ensure([&] { return m_impl->as_string.to_ascii_uppercase(); });
+    auto* current = impl();
+    return current->ascii_uppercased_as_string.ensure([&] { return current->as_string.to_ascii_uppercase(); });
 }
 
 void QualifiedName::set_prefix(Optional<Utf16FlyString> value)
 {
-    m_impl = ensure_impl(m_impl->local_name, move(value), m_impl->namespace_);
+    auto* current = impl();
+    auto new_raw = ensure_impl_raw(current->local_name, move(value), current->namespace_, false);
+    auto old_raw = m_raw;
+    m_raw = new_raw;
+    if ((old_raw & IMMORTAL_BIT) == 0 && old_raw != 0)
+        reinterpret_cast<Impl*>(old_raw)->unref();
 }
 
 }
