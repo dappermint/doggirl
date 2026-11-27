@@ -470,7 +470,7 @@ impl JsonParseCache {
 // SAFETY: The values being parsed are the only cells the cache keeps alive; its keys are strings and its shapes are
 // weak.
 unsafe impl Trace for JsonParseCache {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         // SAFETY: GC never runs inside `JsonValueStack::push` or `truncate`, so no mutable borrow is active.
         unsafe { self.values.as_slice() }.trace(visitor);
     }

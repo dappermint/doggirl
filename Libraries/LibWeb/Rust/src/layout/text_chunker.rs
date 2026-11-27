@@ -478,10 +478,13 @@ mod unicode_test_stubs {
     }
 }
 
+/// A run of the code units of a text that is shaped as one.
+// OPTIMIZATION: A memo keeps the chunks of every text node, so a chunk counts code units in 32 bits, which is as many
+//               as a text has.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TextChunk {
-    pub start: usize,
-    pub length: usize,
+    pub start: u32,
+    pub length: u32,
     /// Which of the fonts of its [`ChunkedText`] the chunk is set in.
     pub font_index: u16,
     pub has_breaking_newline: bool,
@@ -509,15 +512,35 @@ pub(crate) struct TextChunkInputs<'text> {
     pub splits_at_orientation_changes: bool,
 }
 
+const _: () = assert!(size_of::<TextChunk>() == 16);
+
 impl TextChunk {
     /// The font index of a chunk made outside any chunked text, whose font its maker keeps beside it.
     pub(crate) const FONT_INDEX_OUTSIDE_ANY_CHUNKED_TEXT: u16 = u16::MAX;
+
+    /// The code unit of the text the chunk starts at.
+    #[inline]
+    pub(crate) fn start(&self) -> usize {
+        self.start as usize
+    }
+
+    /// How many code units the chunk has.
+    #[inline]
+    pub(crate) fn length(&self) -> usize {
+        self.length as usize
+    }
+
+    /// What a chunk stores of an offset into its text, or of a count of its code units.
+    #[inline]
+    pub(crate) fn code_units(count: usize) -> u32 {
+        u32::try_from(count).expect("a text has fewer than 2^32 code units")
+    }
 }
 
 /// The chunks of a text, and the fonts they are set in, each once.
 #[derive(Default)]
 pub(crate) struct ChunkedText {
-    pub(crate) chunks: Vec<TextChunk>,
+    pub(crate) chunks: Box<[TextChunk]>,
     pub(crate) fonts: Box<[FontHandle]>,
     /// The frozen cascade the chunks were made against, which a memo of the chunks looks up by its address.
     #[expect(dead_code, reason = "held so that no other cascade takes the address")]
@@ -570,12 +593,15 @@ fn try_chunk_simple_ascii(
         return None;
     }
     let len = text.len();
+    if len > u32::MAX as usize {
+        return None;
+    }
     let mut chunks = Vec::with_capacity((len / 4).clamp(4, 64));
     let mut i = 0;
     while i < len {
         if text[i] == u16::from(b' ') {
             chunks.push(TextChunk {
-                start: i,
+                start: i as u32,
                 length: 1,
                 font_index: 0,
                 has_breaking_newline: false,
@@ -606,8 +632,8 @@ fn try_chunk_simple_ascii(
             i += 1;
         }
         chunks.push(TextChunk {
-            start,
-            length: i - start,
+            start: start as u32,
+            length: (i - start) as u32,
             font_index: 0,
             has_breaking_newline: false,
             has_breaking_tab: false,
@@ -617,7 +643,7 @@ fn try_chunk_simple_ascii(
         });
     }
     Some(ChunkedText {
-        chunks,
+        chunks: chunks.into_boxed_slice(),
         fonts: Box::from([font.clone()]),
         frozen_font_list_held_for_memo_key: None,
     })
@@ -637,7 +663,8 @@ pub(crate) fn chunk_text(inputs: TextChunkInputs<'_>) -> ChunkedText {
         chunks.push(chunk);
     }
     ChunkedText {
-        chunks,
+        // OPTIMIZATION: A memo keeps the chunks of every text node, so they keep no room to grow.
+        chunks: chunks.into_boxed_slice(),
         fonts: chunker.fonts.into_boxed_slice(),
         frozen_font_list_held_for_memo_key: None,
     }
@@ -1658,8 +1685,8 @@ impl<'text> TextChunker<'text> {
             .iter()
             .all(|unit| *unit <= 0x7f && code_point_is_ascii_space(u32::from(*unit)));
         Some(TextChunk {
-            start,
-            length: length_in_code_units,
+            start: TextChunk::code_units(start),
+            length: TextChunk::code_units(length_in_code_units),
             font_index,
             has_breaking_newline: break_flags.has_breaking_newline,
             has_breaking_tab: break_flags.has_breaking_tab,

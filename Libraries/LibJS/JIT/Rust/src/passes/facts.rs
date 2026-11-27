@@ -517,7 +517,10 @@ impl Location {
     fn sort_key(self) -> (u64, u64) {
         match self {
             Location::Named { object, offset } => (u64::from(object.0), u64::from(offset)),
-            Location::GlobalBinding { environment, index } => ((1u64 << 32) | u64::from(index), environment.0),
+            Location::GlobalBinding { environment, index } => {
+                // SAFETY: Used only as an internal ordering key during pass execution; never emitted into code or tables.
+                ((1u64 << 32) | u64::from(index), unsafe { environment.address() })
+            }
             Location::Binding { environment, index } => ((2u64 << 32) | u64::from(environment.0), u64::from(index)),
             Location::ElementCount { count, object } => ((3u64 << 32) | (count as u64), u64::from(object.0)),
             Location::TypedArrayDataOffset { object } => ((4u64 << 32) | u64::from(object.0), 0),
@@ -1535,7 +1538,7 @@ mod tests {
 
     fn shape(id: u64) -> ShapeCheck {
         ShapeCheck {
-            shape: CellId(id),
+            shape: CellId::from_address(id),
             dictionary_generation: None,
         }
     }
@@ -1689,7 +1692,7 @@ mod tests {
         let (first, second, value) = (NodeId(1), NodeId(2), NodeId(3));
         let binding = |environment, index| Location::Binding { environment, index };
         let global = Location::GlobalBinding {
-            environment: CellId(7),
+            environment: CellId::from_address(7),
             index: 0,
         };
         let mut facts = facts();

@@ -248,15 +248,12 @@ static bool paints_non_default_content(Layout::Node const& node)
     return border_is_painted(node_with_style->border_left()) || border_is_painted(node_with_style->border_top()) || border_is_painted(node_with_style->border_right()) || border_is_painted(node_with_style->border_bottom());
 }
 
-static CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
+// NB: The client rect of a text box is the union of the rects of its fragments.
+CSSPixelRect client_rect_of_text_row(Layout::RustFFI::DocumentHost* host, Compositing::RustFFI::NodeSlotId text_row, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
 {
-    if (!node.is_text_node())
-        return Painting::bounding_client_rect(node, viewport_mapping);
-
-    // NB: The client rect of a text box is the union of the rects of its fragments.
     CSSPixelRect united_rect;
     Layout::RustFFI::layout_script_text_range_rects(
-        node.document_host(), Layout::Node::slot_id(&node),
+        host, text_row,
         to_underlying(Painting::SelectionState::Full), 0, 0, 0, NumericLimits<size_t>::max(),
         viewport_mapping, &united_rect, [](void* context, CSSPixelRect rect) {
             auto& united_rect = *static_cast<CSSPixelRect*>(context);
@@ -265,6 +262,13 @@ static CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI
             united_rect = united_rect.is_empty() ? rect : united_rect.united(rect);
         });
     return united_rect;
+}
+
+CSSPixelRect client_rect_of_box(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
+{
+    if (!node.is_text_node())
+        return Painting::bounding_client_rect(node, viewport_mapping);
+    return client_rect_of_text_row(node.document_host(), Layout::Node::slot_id(&node), viewport_mapping);
 }
 
 // NB: This answers whether boxes of the document are paintable, from the state the document has after layout.
@@ -361,6 +365,34 @@ public:
     bool is_paintable(Layout::Node const& node, CheckAncestorOpacity check_ancestor_opacity) const
     {
         return paintable_client_rect(node, check_ancestor_opacity).has_value();
+    }
+
+    // OPTIMIZATION: A document has about as many text boxes as it has other boxes, and each is asked about once, so
+    //               this reads the rows of a text box and of its ancestors, and no layout node is made for them.
+    bool text_row_is_paintable(Layout::RustFFI::DocumentHost* host, Compositing::RustFFI::NodeSlotId text_row) const
+    {
+        if (!viewport())
+            return false;
+
+        // - el's used visibility is visible.
+        // NB: A text box has the visibility of the box it is in.
+        auto parent = Layout::RustFFI::layout_row_link(host, text_row, Layout::RustFFI::FfiNodeLink::Parent);
+        if (parent.index == Compositing::RustFFI::NodeSlotId_INVALID.index)
+            return false;
+        auto const* parent_style = Layout::RustFFI::layout_row_style(host, parent);
+        if (!parent_style || CSS::visibility_from_inherited_bits(CSS::style_record_inherited_values(parent_style).bits) != CSS::Visibility::Visible)
+            return false;
+
+        // - el and all of its ancestors' used opacity is greater than zero.
+        for (auto ancestor = parent; ancestor.index != Compositing::RustFFI::NodeSlotId_INVALID.index; ancestor = Layout::RustFFI::layout_row_link(host, ancestor, Layout::RustFFI::FfiNodeLink::Parent)) {
+            auto const* style = Layout::RustFFI::layout_row_style(host, ancestor);
+            if (style && CSS::style_record_group<CSS::ComputedValues::EffectsValues>(style).opacity <= 0)
+                return false;
+        }
+
+        // - el's paintable bounding rect intersects with the scrolling area of the document.
+        auto bounding_rect = client_rect_of_text_row(host, text_row, m_viewport_mapping).translated(m_scroll_offset);
+        return bounding_rect.intersects(*m_scrolling_area);
     }
 
 private:

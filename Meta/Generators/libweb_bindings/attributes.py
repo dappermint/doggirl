@@ -234,6 +234,7 @@ def define_the_attributes(
                     includes,
                     attribute.extended_attributes,
                     f"    {rust_member_definition_entry_point(interface, attribute)}(&vm, &realm, &object);\n",
+                    f"{interface.name}.{attribute.name}",
                 )
             )
             continue
