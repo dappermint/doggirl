@@ -1575,6 +1575,15 @@ fn try_read_direct_getter_inline(getter: &DirectGetterFunction, receiver: Gc<Obj
         if implementation.is_null() {
             return None;
         }
+        let value_ptr = implementation.add(getter.implementation_value_offset.get() as usize);
+        let value_kind = getter.implementation_value_is_compressed.get();
+        if value_kind >= 2 {
+            return if value_kind == 2 {
+                Some(Value::from_i32(i32::from(*value_ptr.cast::<u16>())))
+            } else {
+                Some(Value::from_bool(*value_ptr != 0))
+            };
+        }
         let weak_impl = *implementation.add(main_world_offset).cast::<*const u8>();
         if weak_impl.is_null() {
             return None;
@@ -1583,8 +1592,7 @@ fn try_read_direct_getter_inline(getter: &DirectGetterFunction, receiver: Gc<Obj
         if weak_wrapper != receiver_ptr {
             return None;
         }
-        let value_ptr = implementation.add(getter.implementation_value_offset.get() as usize);
-        let target_impl: *const u8 = if getter.implementation_value_is_compressed.get() != 0 {
+        let target_impl: *const u8 = if value_kind != 0 {
             let compressed = *value_ptr.cast::<u32>();
             if compressed == 0 {
                 return Some(Value::NULL);

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, RefCell, UnsafeCell};
+use core::cell::{Cell, UnsafeCell};
 use core::hash::BuildHasher;
 
 use ak::{Utf16FlyString, Utf16String, Utf16StringUnits};
@@ -876,13 +876,9 @@ impl RopeString {
 
     fn concatenate_pieces(&self) -> Utf16String {
         // OPTIMIZATION: Flatten the rope in a single DFS pass directly into an uninitialized Latin-1/ASCII buffer
-        //               of the already-known length, using a thread-local scratch stack so large ropes (e.g. template
-        //               concatenation) do zero Vec allocations/reallocations and skip extra length/view passes.
-        //               Widens to UTF-16 on the fly only if a UTF-16 leaf is encountered.
-        thread_local! {
-            static FLATTEN_STACK: RefCell<Vec<*const PrimitiveString>> = const { RefCell::new(Vec::new()) };
-        }
-
+        //               of the already-known length, keeping up to 64 right-hand branches on the native stack
+        //               (zero TLS/RefCell/Vec overhead for typical concatenations) and descending left branches
+        //               directly. Widens to UTF-16 on the fly only if a UTF-16 leaf is encountered.
         #[inline(always)]
         unsafe fn copy_bytes_fast(dst: *mut u8, src: *const u8, len: usize) {
             // SAFETY: Caller guarantees non-overlapping valid ranges of `len` bytes.
@@ -905,32 +901,34 @@ impl RopeString {
             }
         }
 
-        fn flatten_with_stack(rope: &RopeString, stack: &mut Vec<*const PrimitiveString>) -> Utf16String {
-            let total_len = rope.base.length_in_utf16_code_units();
-            if total_len < size_of::<usize>() {
-                return rope.concatenate_many_pieces();
-            }
-            stack.clear();
-            stack.push(rope.rhs().as_ptr());
-            stack.push(rope.lhs().as_ptr());
+        let total_len = self.base.length_in_utf16_code_units();
+        if total_len < size_of::<usize>() {
+            return self.concatenate_many_pieces();
+        }
 
-            Utf16String::try_from_latin1_with_uninit(total_len, |storage| {
+        let lhs_ptr = self.lhs().as_ptr();
+        let rhs_ptr = self.rhs().as_ptr();
+
+        // Fast path for a 2-piece rope (neither child is itself a Rope): avoid any stack buffer setup.
+        // SAFETY: Flattening allocates no GC cells and triggers no GC, so both children stay live.
+        let (lhs_ref, rhs_ref) = unsafe { (&*lhs_ptr, &*rhs_ptr) };
+        if lhs_ref.deferred_kind() != DeferredKind::Rope && rhs_ref.deferred_kind() != DeferredKind::Rope {
+            return Utf16String::try_from_latin1_with_uninit(total_len, |storage| {
                 let dst = storage.as_mut_ptr().cast::<u8>();
                 let mut offset = 0usize;
                 let mut all_ascii = true;
-
-                while let Some(ptr) = stack.pop() {
-                    // SAFETY: Flattening allocates no GC cells and triggers no GC, so every rope node pointer stays live.
-                    let current = unsafe { &*ptr };
-                    if current.deferred_kind() == DeferredKind::Rope {
-                        let current_rope = current.as_rope_string();
-                        stack.push(current_rope.rhs().as_ptr());
-                        stack.push(current_rope.lhs().as_ptr());
+                for leaf in [lhs_ref, rhs_ref] {
+                    if leaf.deferred_kind() == DeferredKind::Inline {
+                        let bytes = leaf.as_inline_string().characters();
+                        debug_assert!(bytes.len() <= total_len - offset);
+                        // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                        unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                        offset += bytes.len();
                         continue;
                     }
-                    match current.utf16_string_view() {
+                    match leaf.utf16_string_view() {
                         Utf16View::Ascii(bytes) => {
-                            assert!(bytes.len() <= total_len - offset);
+                            debug_assert!(bytes.len() <= total_len - offset);
                             // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
                             unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
                             offset += bytes.len();
@@ -939,7 +937,7 @@ impl RopeString {
                             if all_ascii && !bytes.is_ascii() {
                                 all_ascii = false;
                             }
-                            assert!(bytes.len() <= total_len - offset);
+                            debug_assert!(bytes.len() <= total_len - offset);
                             // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
                             unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
                             offset += bytes.len();
@@ -950,42 +948,121 @@ impl RopeString {
                             let written = unsafe { ak::slice_from_raw_parts(dst.cast_const(), offset) };
                             utf16.extend(written.iter().map(|&b| u16::from(b)));
                             utf16.extend_from_slice(units);
-                            while let Some(rem_ptr) = stack.pop() {
-                                // SAFETY: Same live-pointer invariant as above.
-                                let rem = unsafe { &*rem_ptr };
-                                if rem.deferred_kind() == DeferredKind::Rope {
-                                    let rem_rope = rem.as_rope_string();
-                                    stack.push(rem_rope.rhs().as_ptr());
-                                    stack.push(rem_rope.lhs().as_ptr());
-                                    continue;
-                                }
-                                rem.utf16_string_view().append_to(&mut utf16);
+                            if core::ptr::eq(leaf, lhs_ref) {
+                                rhs_ref.utf16_string_view().append_to(&mut utf16);
                             }
                             return Err(Utf16String::from_utf16(&utf16));
                         }
                     }
                 }
-                assert_eq!(offset, total_len);
+                debug_assert_eq!(offset, total_len);
                 Ok(all_ascii)
-            })
+            });
         }
 
-        struct ClearOnDrop<'a>(core::cell::RefMut<'a, Vec<*const PrimitiveString>>);
-        impl Drop for ClearOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.clear();
-            }
+        const INLINE_STACK_CAP: usize = 32;
+        let mut inline_stack = [core::mem::MaybeUninit::<*const PrimitiveString>::uninit(); INLINE_STACK_CAP];
+        inline_stack[0].write(rhs_ptr);
+        let mut inline_len = 1usize;
+        let mut heap_stack: Vec<*const PrimitiveString> = Vec::new();
+
+        macro_rules! push_node {
+            ($ptr:expr) => {{
+                let p: *const PrimitiveString = $ptr;
+                if heap_stack.is_empty() && inline_len < INLINE_STACK_CAP {
+                    inline_stack[inline_len].write(p);
+                    inline_len += 1;
+                } else {
+                    if heap_stack.is_empty() {
+                        heap_stack.reserve(INLINE_STACK_CAP * 2);
+                        for slot in &inline_stack[..inline_len] {
+                            // SAFETY: `inline_stack[..inline_len]` was initialized via `.write(...)`.
+                            heap_stack.push(unsafe { slot.assume_init() });
+                        }
+                        inline_len = 0;
+                    }
+                    heap_stack.push(p);
+                }
+            }};
         }
 
-        FLATTEN_STACK.with(|cell| {
-            if let Ok(borrow) = cell.try_borrow_mut() {
-                let mut guard = ClearOnDrop(borrow);
-                flatten_with_stack(self, &mut guard.0)
-            } else {
-                // Recursive resolution (e.g. a Substring leaf whose own source is an unresolved Rope).
-                let mut local_stack = Vec::with_capacity(32);
-                flatten_with_stack(self, &mut local_stack)
+        macro_rules! pop_node {
+            () => {{
+                if !heap_stack.is_empty() {
+                    heap_stack.pop()
+                } else if inline_len > 0 {
+                    inline_len -= 1;
+                    // SAFETY: `inline_stack[inline_len]` was initialized via `.write(...)`.
+                    Some(unsafe { inline_stack[inline_len].assume_init() })
+                } else {
+                    None
+                }
+            }};
+        }
+
+        let mut next_node: Option<*const PrimitiveString> = Some(lhs_ptr);
+
+        Utf16String::try_from_latin1_with_uninit(total_len, |storage| {
+            let dst = storage.as_mut_ptr().cast::<u8>();
+            let mut offset = 0usize;
+            let mut all_ascii = true;
+
+            while let Some(mut ptr) = next_node.take().or_else(|| pop_node!()) {
+                // SAFETY: Flattening allocates no GC cells and triggers no GC, so every rope node pointer stays live.
+                let mut current = unsafe { &*ptr };
+                while current.deferred_kind() == DeferredKind::Rope {
+                    let current_rope = current.as_rope_string();
+                    push_node!(current_rope.rhs().as_ptr());
+                    ptr = current_rope.lhs().as_ptr();
+                    current = unsafe { &*ptr };
+                }
+                if current.deferred_kind() == DeferredKind::Inline {
+                    let bytes = current.as_inline_string().characters();
+                    debug_assert!(bytes.len() <= total_len - offset);
+                    // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                    unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                    offset += bytes.len();
+                    continue;
+                }
+                match current.utf16_string_view() {
+                    Utf16View::Ascii(bytes) => {
+                        debug_assert!(bytes.len() <= total_len - offset);
+                        // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                        unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                        offset += bytes.len();
+                    }
+                    Utf16View::Latin1(bytes) => {
+                        if all_ascii && !bytes.is_ascii() {
+                            all_ascii = false;
+                        }
+                        debug_assert!(bytes.len() <= total_len - offset);
+                        // SAFETY: `dst + offset..dst + offset + bytes.len()` is inside `storage` and non-overlapping.
+                        unsafe { copy_bytes_fast(dst.add(offset), bytes.as_ptr(), bytes.len()) };
+                        offset += bytes.len();
+                    }
+                    Utf16View::Utf16(units) => {
+                        let mut utf16 = Vec::with_capacity(total_len);
+                        // SAFETY: `dst..dst + offset` has already been initialized above.
+                        let written = unsafe { ak::slice_from_raw_parts(dst.cast_const(), offset) };
+                        utf16.extend(written.iter().map(|&b| u16::from(b)));
+                        utf16.extend_from_slice(units);
+                        while let Some(mut rem_ptr) = pop_node!() {
+                            // SAFETY: Same live-pointer invariant as above.
+                            let mut rem = unsafe { &*rem_ptr };
+                            while rem.deferred_kind() == DeferredKind::Rope {
+                                let rem_rope = rem.as_rope_string();
+                                push_node!(rem_rope.rhs().as_ptr());
+                                rem_ptr = rem_rope.lhs().as_ptr();
+                                rem = unsafe { &*rem_ptr };
+                            }
+                            rem.utf16_string_view().append_to(&mut utf16);
+                        }
+                        return Err(Utf16String::from_utf16(&utf16));
+                    }
+                }
             }
+            debug_assert_eq!(offset, total_len);
+            Ok(all_ascii)
         })
     }
 
