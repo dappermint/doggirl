@@ -155,7 +155,10 @@ impl NumberPrototype {
         // 6-15. NB: number_prototype_algorithms::to_exponential() performs these steps.
         let fraction_digits = (!fraction_digits_value.is_undefined()).then_some(fraction_digits as u32);
         let result = number_prototype_algorithms::to_exponential(number_value.as_f64(), fraction_digits);
-        Ok(Value::from_string(PrimitiveString::create_from_utf8(vm, &result)))
+        Ok(Value::from_string(PrimitiveString::create_from_ascii(
+            vm,
+            result.as_bytes(),
+        )))
     }
 
     // 21.1.3.3 Number.prototype.toFixed ( fractionDigits ), https://tc39.es/ecma262/#sec-number.prototype.tofixed
@@ -188,7 +191,10 @@ impl NumberPrototype {
         // 7-12. NB: number_prototype_algorithms::to_fixed() performs these steps, except for step 10, where x ≥ 10^21
         //       and m is ! ToString(𝔽(x)).
         match number_prototype_algorithms::to_fixed(number_value.as_f64(), fraction_digits as u32) {
-            Some(result) => Ok(Value::from_string(PrimitiveString::create_from_utf8(vm, &result))),
+            Some(result) => Ok(Value::from_string(PrimitiveString::create_from_ascii(
+                vm,
+                result.as_bytes(),
+            ))),
             None => Ok(number_to_string_value(vm, number_value)),
         }
     }
@@ -245,7 +251,10 @@ impl NumberPrototype {
 
         // 6-14. NB: number_prototype_algorithms::to_precision() performs these steps.
         let result = number_prototype_algorithms::to_precision(number_value.as_f64(), precision as u32);
-        Ok(Value::from_string(PrimitiveString::create_from_utf8(vm, &result)))
+        Ok(Value::from_string(PrimitiveString::create_from_ascii(
+            vm,
+            result.as_bytes(),
+        )))
     }
 
     // 21.1.3.6 Number.prototype.toString ( [ radix ] ), https://tc39.es/ecma262/#sec-number.prototype.tostring

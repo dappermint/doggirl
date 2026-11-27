@@ -14,10 +14,13 @@ use libjs_runtime_macros::{jit_abi, jit_function_address};
 
 use crate::interpreter::vm::Vm;
 use crate::layout::value::Value;
+use crate::runtime::array::Array;
 use crate::runtime::keyed_collections::canonicalize_keyed_collection_key;
 use crate::runtime::map::Map;
 use crate::runtime::regexp_prototype::regexp_builtin_exec_running_no_code;
+use crate::runtime::set::Set;
 use crate::runtime::string_prototype::{StringPrototype, trim_primitive_string};
+use crate::runtime::value::same_value;
 use crate::utf16::TrimMode;
 
 /// The address of the runtime helper of `intrinsic`, or 0 if JIT code calls it in another way. Every intrinsic with a
@@ -39,6 +42,11 @@ pub fn address(intrinsic: Intrinsic) -> u64 {
         Intrinsic::RegExpPrototypeExec => jit_function_address!(regexp_exec),
         Intrinsic::MapPrototypeGet => jit_function_address!(map_get),
         Intrinsic::MapPrototypeHas => jit_function_address!(map_has),
+        Intrinsic::MapPrototypeSet => jit_function_address!(map_set),
+        Intrinsic::SetPrototypeHas => jit_function_address!(set_has),
+        Intrinsic::SetPrototypeAdd => jit_function_address!(set_add),
+        Intrinsic::ObjectIs => jit_function_address!(object_is),
+        Intrinsic::ObjectKeys => jit_function_address!(object_keys),
         Intrinsic::FunctionPrototypeApply
         | Intrinsic::FunctionPrototypeCall
         | Intrinsic::ArrayPrototypePush
@@ -202,4 +210,73 @@ extern "C" fn map_has(_vm: &Vm, map_value: u64, key: u64) -> u64 {
         return Value::EMPTY.0;
     };
     Value::from_bool(map.map_has(canonicalize_keyed_collection_key(Value::from_bits(key)))).0
+}
+
+/// `map.set(key, value)`, or the empty value if the `this` value is no Map.
+#[jit_abi]
+extern "C" fn map_set(vm: &Vm, map_value: u64, key: u64, value: u64) -> u64 {
+    let Some(map) = map(map_value) else {
+        return Value::EMPTY.0;
+    };
+    map.map_set(
+        vm,
+        canonicalize_keyed_collection_key(Value::from_bits(key)),
+        Value::from_bits(value),
+    );
+    map_value
+}
+
+/// The Set a `this` value is, if it is one.
+fn set(value: u64) -> Option<crate::layout::cell::Gc<Set>> {
+    let value = Value::from_bits(value);
+    if !value.is_object() {
+        return None;
+    }
+    value.as_object().downcast::<Set>()
+}
+
+/// `set.has(key)`, or the empty value if the `this` value is no Set.
+#[jit_abi]
+extern "C" fn set_has(_vm: &Vm, set_value: u64, key: u64) -> u64 {
+    let Some(set) = set(set_value) else {
+        return Value::EMPTY.0;
+    };
+    Value::from_bool(set.set_has(canonicalize_keyed_collection_key(Value::from_bits(key)))).0
+}
+
+/// `set.add(key)`, or the empty value if the `this` value is no Set.
+#[jit_abi]
+extern "C" fn set_add(vm: &Vm, set_value: u64, key: u64) -> u64 {
+    let Some(set) = set(set_value) else {
+        return Value::EMPTY.0;
+    };
+    set.set_add(vm, canonicalize_keyed_collection_key(Value::from_bits(key)));
+    set_value
+}
+
+/// `Object.is(lhs, rhs)` fallback when the two NaN-boxed bit patterns differ.
+#[jit_abi]
+extern "C" fn object_is(_vm: &Vm, _receiver: u64, lhs: u64, rhs: u64) -> u64 {
+    u64::from(same_value(Value::from_bits(lhs), Value::from_bits(rhs)))
+}
+
+/// `Object.keys(value)` for an ordinary object whose own keys are those of its shape; declines with empty otherwise.
+#[jit_abi]
+extern "C" fn object_keys(vm: &Vm, _receiver: u64, value: u64) -> u64 {
+    let value = Value::from_bits(value);
+    if !value.is_object() {
+        return Value::EMPTY.0;
+    }
+    let object = value.as_object();
+    if !object.own_property_keys_are_those_of_its_shape() {
+        return Value::EMPTY.0;
+    }
+    let Some(realm) = vm.current_realm() else {
+        return Value::EMPTY.0;
+    };
+    let array = Array::create_empty(vm, realm);
+    object
+        .shape()
+        .with_own_enumerable_string_keys(vm, |keys, _| array.set_indexed_property_elements(keys));
+    Value::from_object(array).0
 }

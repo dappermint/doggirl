@@ -1007,6 +1007,33 @@ impl<'a> GraphBuilder<'a, '_> {
         {
             return Ok(None);
         }
+        // OPTIMIZATION: `Object.is(a, b)` is true whenever both NaN-boxed values have identical bits (including
+        //               equal int32s, same object/string/symbol pointers, -0 vs -0, and canonical NaN vs NaN).
+        //               Only unequal bits call the helper to check SameValue on strings, bigints, or NaN payloads.
+        if intrinsic == Intrinsic::ObjectIs {
+            let receiver = self.read(*this_value)?;
+            let receiver = self.tagged(receiver);
+            let lhs = self.read(arguments[0])?;
+            let lhs = self.tagged(lhs);
+            let rhs = self.read(arguments[1])?;
+            let rhs = self.tagged(rhs);
+            let (same_bits, different_bits) =
+                self.branch_both_ways(BranchCondition::TaggedEquals { equal: true }, &[lhs, rhs]);
+            self.block = same_bits;
+            let same_result = self.typed_constant(1, Repr::Bool);
+            let same_block = self.block;
+
+            self.block = different_bits;
+            let diff_result = self.emit(Op::CallIntrinsic { intrinsic }, &[receiver, lhs, rhs], Some(Repr::Bool));
+            let diff_block = self.block;
+
+            self.join_blocks(&[same_block, diff_block]);
+            let result = self.add_phi(&[same_result, diff_result]);
+            self.graph.nodes[result.index()].repr = Some(Repr::Bool);
+            let boxed = self.emit(Op::BoxBool, &[result], Some(Repr::Tagged));
+            self.write(*dst, boxed)?;
+            return Ok(Some(Flow::Continue));
+        }
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
         let mut inputs = self.node_list();
         let operands = core::iter::once(Some(*this_value))

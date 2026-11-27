@@ -961,6 +961,16 @@ pub enum Intrinsic {
     MapPrototypeGet,
     /// `Map.prototype.has`.
     MapPrototypeHas,
+    /// `Map.prototype.set`.
+    MapPrototypeSet,
+    /// `Set.prototype.has`.
+    SetPrototypeHas,
+    /// `Set.prototype.add`.
+    SetPrototypeAdd,
+    /// `Object.is`.
+    ObjectIs,
+    /// `Object.keys`.
+    ObjectKeys,
 }
 
 /// A `this` value or argument of a builtin whose runtime helper JIT code
@@ -1089,13 +1099,41 @@ impl Intrinsic {
                 reads: Locations::NAMED,
                 writes: Locations::NAMED_SLOTS,
             }),
-            // NB: The helpers decline for receivers that are no Map, which
+            // NB: The helpers decline for receivers that are no Map/Set, which
             //     the slow path throws for.
-            Intrinsic::MapPrototypeGet | Intrinsic::MapPrototypeHas => Some(HelperCall {
+            Intrinsic::MapPrototypeGet | Intrinsic::MapPrototypeHas | Intrinsic::SetPrototypeHas => Some(HelperCall {
                 receiver: HelperOperand::Value,
                 arguments: &[HelperOperand::Value],
                 result: HelperResult::Value,
                 reads: Locations::COLLECTIONS,
+                writes: Locations::NONE,
+            }),
+            Intrinsic::MapPrototypeSet => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value, HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::COLLECTIONS,
+                writes: Locations::COLLECTIONS,
+            }),
+            Intrinsic::SetPrototypeAdd => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::COLLECTIONS,
+                writes: Locations::COLLECTIONS,
+            }),
+            Intrinsic::ObjectIs => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value, HelperOperand::Value],
+                result: HelperResult::Bool,
+                reads: Locations::NONE,
+                writes: Locations::NONE,
+            }),
+            Intrinsic::ObjectKeys => Some(HelperCall {
+                receiver: HelperOperand::Value,
+                arguments: &[HelperOperand::Value],
+                result: HelperResult::Value,
+                reads: Locations::NAMED | Locations::ELEMENTS_AND_COUNTS,
                 writes: Locations::NONE,
             }),
             _ => None,

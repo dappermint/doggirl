@@ -193,7 +193,8 @@ impl PrimitiveString {
     }
 
     /// Creates a string of the first `length` of `characters`, which are ASCII.
-    fn create_from_inline_characters(
+    #[inline]
+    pub(crate) fn create_from_inline_characters(
         vm: &Vm,
         characters: [u8; INLINE_STRING_CAPACITY],
         length: usize,
@@ -450,6 +451,7 @@ impl PrimitiveString {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.length_in_utf16_code_units.get() == 0
     }
@@ -500,10 +502,12 @@ impl PrimitiveString {
         PropertyKey::from(fly_string)
     }
 
+    #[inline]
     pub fn has_utf16_string(&self) -> bool {
         self.resolved_utf16_string().is_some()
     }
 
+    #[inline]
     pub fn length_in_utf16_code_units(&self) -> usize {
         self.length_in_utf16_code_units.get() as usize
     }
@@ -545,23 +549,31 @@ impl PrimitiveString {
 
     /// A view of the string's code units. A substring that is not resolved yet is viewed in the string it was taken
     /// from, so the view must not be held across anything that can collect garbage.
+    #[inline]
     pub fn utf16_string_view(&self) -> Utf16View<'_> {
-        if !self.has_utf16_string() {
-            if self.deferred_kind() == DeferredKind::Inline {
-                return Utf16View::Ascii(self.as_inline_string().characters());
-            }
-            if self.deferred_kind() == DeferredKind::Substring {
-                let substring = self.as_substring();
-                let source_string = substring.source_string();
-                // SAFETY: This substring keeps its source alive until it resolves, and resolving cannot collect
-                // garbage, so the source outlives every view a caller may hold without collecting.
-                let source_string = unsafe { source_string.as_non_null().as_ref() };
-                return source_string
-                    .utf16_string_view()
-                    .substring_view(substring.code_unit_offset(), self.length_in_utf16_code_units());
-            }
-            self.resolve_if_needed();
+        if let Some(string) = self.resolved_utf16_string() {
+            return Utf16View::of_string(string);
         }
+        if self.deferred_kind() == DeferredKind::Inline {
+            return Utf16View::Ascii(self.as_inline_string().characters());
+        }
+        self.utf16_string_view_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn utf16_string_view_slow(&self) -> Utf16View<'_> {
+        if self.deferred_kind() == DeferredKind::Substring {
+            let substring = self.as_substring();
+            let source_string = substring.source_string();
+            // SAFETY: This substring keeps its source alive until it resolves, and resolving cannot collect
+            // garbage, so the source outlives every view a caller may hold without collecting.
+            let source_string = unsafe { source_string.as_non_null().as_ref() };
+            return source_string
+                .utf16_string_view()
+                .substring_view(substring.code_unit_offset(), self.length_in_utf16_code_units());
+        }
+        self.resolve_if_needed();
         Utf16View::of_string(
             self.resolved_utf16_string()
                 .expect("a resolved string has its UTF-16 string"),
@@ -570,6 +582,7 @@ impl PrimitiveString {
 
     /// A view of the string's own code units, resolving a rope or a substring first. Unlike utf16_string_view(), the
     /// view stays valid for as long as the string lives, since a resolved string never changes.
+    #[inline]
     pub fn resolved_utf16_string_view(&self) -> Utf16View<'_> {
         if self.deferred_kind() == DeferredKind::Inline {
             return Utf16View::Ascii(self.as_inline_string().characters());
@@ -581,6 +594,7 @@ impl PrimitiveString {
         )
     }
 
+    #[inline]
     fn resolved_utf16_string(&self) -> Option<&Utf16String> {
         // SAFETY: The slot is only written while it is empty, so a string read out of it is never replaced.
         unsafe { (*self.utf16_string.0.get()).as_ref() }
@@ -709,6 +723,7 @@ impl PrimitiveString {
         }
     }
 
+    #[inline]
     fn as_inline_string(&self) -> &InlineString {
         debug_assert!(self.header_class().is_subclass_of(InlineString::CLASS));
         // SAFETY: Only InlineString creates strings that are deferred as inline strings, and it starts with its
@@ -716,12 +731,14 @@ impl PrimitiveString {
         unsafe { &*core::ptr::from_ref(self).cast::<InlineString>() }
     }
 
+    #[inline]
     fn as_rope_string(&self) -> &RopeString {
         debug_assert!(self.header_class().is_subclass_of(RopeString::CLASS));
         // SAFETY: Only RopeString creates strings that are deferred as ropes, and it starts with its PrimitiveString.
         unsafe { &*core::ptr::from_ref(self).cast::<RopeString>() }
     }
 
+    #[inline]
     fn as_substring(&self) -> &Substring {
         debug_assert!(self.header_class().is_subclass_of(Substring::CLASS));
         // SAFETY: Only Substring creates strings that are deferred as substrings, and it starts with its
@@ -729,10 +746,12 @@ impl PrimitiveString {
         unsafe { &*core::ptr::from_ref(self).cast::<Substring>() }
     }
 
+    #[inline]
     fn header_class(&self) -> &'static Class {
         self.header.class()
     }
 
+    #[inline]
     pub fn deferred_kind(&self) -> DeferredKind {
         match self.deferred_kind_and_flags.get() & DEFERRED_KIND_MASK {
             0 => DeferredKind::None,
@@ -751,6 +770,7 @@ impl PrimitiveString {
     /// An interned string is the only interned PrimitiveString with its contents, so two interned strings are equal if
     /// and only if they are the same string. The string constants of executables and the strings typeof produces are
     /// interned; create_from_fly_string() returns the interned string if there is one.
+    #[inline]
     pub fn is_interned(&self) -> bool {
         self.deferred_kind_and_flags.get() & INTERNED_FLAG != 0
     }
@@ -1038,6 +1058,7 @@ impl InlineString {
         }
     }
 
+    #[inline]
     fn characters(&self) -> &[u8] {
         &self.characters[..self.base.length_in_utf16_code_units()]
     }

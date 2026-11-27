@@ -505,6 +505,30 @@ pub trait Input: Copy {
         self.find_byte_in_bitset(start, end, bits)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn find_ascii_lut_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        lut: &AsciiNibbleLut,
+        bits: &[u64; 4],
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        let mut pos = start;
+        while pos < end {
+            let candidate = self.find_ascii_lut_bitset(pos, end, lut, bits)?;
+            if let Some(match_len) = check(candidate) {
+                return Some((candidate, match_len));
+            }
+            pos = candidate + 1;
+        }
+        None
+    }
+
     #[inline(always)]
     fn matches_latin1_at(self, pos: usize, needle: &[u8]) -> bool {
         if pos + needle.len() > self.len() {
@@ -648,6 +672,66 @@ impl Input for &[u16] {
         self.find_byte_in_bitset(start, end, bits)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn find_ascii_lut_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        lut: &AsciiNibbleLut,
+        _bits: &[u64; 4],
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        let slice = self.get(start..end)?;
+        let len = slice.len();
+        let ptr = slice.as_ptr();
+        let lo = lut.lo();
+        let mut offset = 0usize;
+        if len >= 8 {
+            use core::arch::aarch64::*;
+            const HI_LUT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            // SAFETY: NEON is always available on aarch64 and every 8-lane load stays within `slice`.
+            unsafe {
+                let lo_v = vld1q_u8(lo.as_ptr());
+                let hi_v = vld1q_u8(HI_LUT.as_ptr());
+                let mask_0f = vdup_n_u8(0x0F);
+                let max_ascii = vdupq_n_u16(0x7F);
+                while offset + 8 <= len {
+                    let v = vld1q_u16(ptr.add(offset));
+                    let non_ascii = vmovn_u16(vcgtq_u16(v, max_ascii));
+                    let narrow = vmovn_u16(v);
+                    let lo_bits = vqtbl1_u8(lo_v, vand_u8(narrow, mask_0f));
+                    let hi_bits = vqtbl1_u8(hi_v, vshr_n_u8::<4>(narrow));
+                    let hit = vbic_u8(vtst_u8(lo_bits, hi_bits), non_ascii);
+                    let mut mask = vget_lane_u64(vreinterpret_u64_u8(hit), 0);
+                    while mask != 0 {
+                        let lane = (mask.trailing_zeros() >> 3) as usize;
+                        let pos = start + offset + lane;
+                        if let Some(match_len) = check(pos) {
+                            return Some((pos, match_len));
+                        }
+                        mask &= !(0xFFu64 << (lane << 3));
+                    }
+                    offset += 8;
+                }
+            }
+        }
+        while offset < len {
+            let cu = slice[offset];
+            if cu < 0x80 && (lo[(cu & 0x0F) as usize] & (1u8 << (cu >> 4))) != 0 {
+                let pos = start + offset;
+                if let Some(match_len) = check(pos) {
+                    return Some((pos, match_len));
+                }
+            }
+            offset += 1;
+        }
+        None
+    }
+
     #[inline(always)]
     fn find_builtin_class_non_unicode(self, start: usize, class: BuiltinCharacterClass) -> Option<usize> {
         let slice = self.get(start..)?;
@@ -789,6 +873,63 @@ impl Input for &[u8] {
             return find_ascii_nibble_lut_bytes_neon::<false>(slice, lut.lo()).map(|offset| start + offset);
         }
         self.find_byte_in_bitset(start, end, bits)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn find_ascii_lut_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        lut: &AsciiNibbleLut,
+        _bits: &[u64; 4],
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        let slice = self.get(start..end)?;
+        let len = slice.len();
+        let ptr = slice.as_ptr();
+        let lo = lut.lo();
+        let mut offset = 0usize;
+        if len >= 16 {
+            use core::arch::aarch64::*;
+            const HI_LUT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            // SAFETY: NEON is always available on aarch64 and every 16-byte load stays within `slice`.
+            unsafe {
+                let lo_v = vld1q_u8(lo.as_ptr());
+                let hi_v = vld1q_u8(HI_LUT.as_ptr());
+                let mask_0f = vdupq_n_u8(0x0F);
+                while offset + 16 <= len {
+                    let v = vld1q_u8(ptr.add(offset));
+                    let lo_bits = vqtbl1q_u8(lo_v, vandq_u8(v, mask_0f));
+                    let hi_bits = vqtbl1q_u8(hi_v, vshrq_n_u8::<4>(v));
+                    let hit = vtstq_u8(lo_bits, hi_bits);
+                    let mut mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
+                    while mask != 0 {
+                        let lane = (mask.trailing_zeros() >> 2) as usize;
+                        let pos = start + offset + lane;
+                        if let Some(match_len) = check(pos) {
+                            return Some((pos, match_len));
+                        }
+                        mask &= !(0xFu64 << (lane << 2));
+                    }
+                    offset += 16;
+                }
+            }
+        }
+        while offset < len {
+            let byte = slice[offset];
+            if byte < 0x80 && (lo[(byte & 0x0F) as usize] & (1u8 << (byte >> 4))) != 0 {
+                let pos = start + offset;
+                if let Some(match_len) = check(pos) {
+                    return Some((pos, match_len));
+                }
+            }
+            offset += 1;
+        }
+        None
     }
 
     #[inline(always)]

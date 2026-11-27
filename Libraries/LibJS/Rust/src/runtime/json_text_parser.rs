@@ -8,7 +8,7 @@
 //! of the parse nodes as it goes, since nothing but the result needs the parse nodes when there is no reviver to give
 //! their source text to.
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, UnsafeCell};
 use core::hash::{Hash, Hasher};
 
 use ak::{Utf16FlyString, Utf16String};
@@ -21,7 +21,7 @@ use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::array::Array;
-use crate::runtime::completion::{Must, ThrowCompletionOr};
+use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::object::MAX_TRANSITIONS_BEFORE_CONVERTING_TO_DICTIONARY;
@@ -209,9 +209,9 @@ impl CodeUnit for u16 {
     fn make_primitive_string(vm: &Vm, units: &[u16], width: StringWidth) -> Gc<PrimitiveString> {
         match width {
             StringWidth::Ascii => {
-                // OPTIMIZATION: Short ASCII strings narrow into an uninitialized stack buffer so `create_from_ascii`
-                //               can store them inline inside `InlineString`; longer ones narrow directly into heap
-                //               storage in a single pass.
+                // OPTIMIZATION: Short ASCII strings narrow directly into an inline stack buffer so
+                //               `create_from_inline_characters` stores them in `InlineString` with a single copy;
+                //               longer ones narrow directly into heap storage in a single pass.
                 const MAX_INLINE_ASCII: usize = crate::layout::primitive_string::INLINE_STRING_CAPACITY;
                 if units.len() <= MAX_INLINE_ASCII {
                     let mut ascii = [0u8; MAX_INLINE_ASCII];
@@ -232,7 +232,7 @@ impl CodeUnit for u16 {
                         ascii[index] = units[index] as u8;
                         index += 1;
                     }
-                    return PrimitiveString::create_from_ascii(vm, &ascii[..units.len()]);
+                    return PrimitiveString::create_from_inline_characters(vm, ascii, units.len());
                 }
                 // SAFETY: `skip_ordinary_string_units` verified every code unit in `units` is `<= 0x7f`.
                 PrimitiveString::create(vm, unsafe { Utf16String::from_utf16_known_ascii(units) })
@@ -393,13 +393,63 @@ const STRING_VALUE_CACHE_SETS: usize = 256;
 const STRING_VALUE_CACHE_SLOTS: usize = STRING_VALUE_CACHE_SETS * 2;
 const STRING_VALUE_CACHE_MAX_LEN: usize = 128;
 
+/// Scratch stack of GC-traced `Value`s used while parsing a reviver-less JSON text.
+///
+/// `parse_json_text` executes no JavaScript callbacks; the only concurrent reader is GC tracing during cell
+/// allocations, when no `push` or `truncate` is active. Using `UnsafeCell` avoids per-element `RefCell` borrow flag
+/// churn on every parsed array element and object property.
+pub struct JsonValueStack(UnsafeCell<Vec<Value>>);
+
+impl Default for JsonValueStack {
+    fn default() -> Self {
+        Self(UnsafeCell::new(Vec::new()))
+    }
+}
+
+impl JsonValueStack {
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        // SAFETY: No mutable borrow is active across calls.
+        unsafe { (&*self.0.get()).len() }
+    }
+
+    #[inline(always)]
+    fn push(&self, value: Value) {
+        // SAFETY: `Vec::push` cannot trigger JS GC or re-enter `JsonValueStack`, so the exclusive borrow is unaliased.
+        unsafe { (&mut *self.0.get()).push(value) };
+    }
+
+    #[inline(always)]
+    fn truncate(&self, len: usize) {
+        // SAFETY: `Vec::truncate` cannot trigger JS GC or re-enter `JsonValueStack`, so the exclusive borrow is
+        //         unaliased.
+        unsafe { (&mut *self.0.get()).truncate(len) };
+    }
+
+    #[inline(always)]
+    fn get(&self, index: usize) -> Value {
+        // SAFETY: No mutable borrow is active across calls.
+        unsafe { (&*self.0.get())[index] }
+    }
+
+    /// Returns a shared view of the stacked values.
+    ///
+    /// # Safety
+    /// No `push` or `truncate` may be called on `self` while the returned slice is alive.
+    #[inline(always)]
+    pub(crate) unsafe fn as_slice(&self) -> &[Value] {
+        // SAFETY: Caller upholds that no exclusive borrow (`push`/`truncate`) overlaps the returned slice.
+        unsafe { (&*self.0.get()).as_slice() }
+    }
+}
+
 /// What JSON.parse keeps between the texts it parses: the property keys and the shapes of the objects of the texts it
 /// parsed last, which later texts usually share, a weak cache of recently parsed string values, and the values of the
 /// arrays and objects it has not finished making.
 pub struct JsonParseCache {
     /// The elements of the arrays and the values of the properties of the objects that are being parsed, which the
     /// VM keeps alive until their array or object is made.
-    values: RefCell<Vec<Value>>,
+    values: JsonValueStack,
     /// 2-way set-associative weak cache of recently parsed unescaped string values, swept on GC.
     string_values: Box<[Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS]>,
     tables: Cell<Option<Box<JsonParseTables>>>,
@@ -408,7 +458,7 @@ pub struct JsonParseCache {
 impl Default for JsonParseCache {
     fn default() -> Self {
         Self {
-            values: RefCell::new(Vec::new()),
+            values: JsonValueStack::default(),
             string_values: Box::new([const { Cell::new(None) }; STRING_VALUE_CACHE_SLOTS]),
             tables: Cell::new(None),
         }
@@ -429,7 +479,8 @@ impl JsonParseCache {
 // weak.
 unsafe impl Trace for JsonParseCache {
     fn trace(&self, visitor: &mut Visitor) {
-        self.values.borrow().trace(visitor);
+        // SAFETY: GC never runs inside `JsonValueStack::push` or `truncate`, so no mutable borrow is active.
+        unsafe { self.values.as_slice() }.trace(visitor);
     }
 }
 
@@ -446,7 +497,7 @@ struct JsonParseTables {
 pub fn parse_json_text(vm: &Vm, realm: Gc<Realm>, text: Utf16View<'_>) -> ThrowCompletionOr<Value> {
     let cache = vm.json_parse_cache();
     let mut tables = cache.tables.take().unwrap_or_default();
-    let first_value = cache.values.borrow().len();
+    let first_value = cache.values.len();
     let first_key = tables.property_keys.len();
     let result = match text {
         Utf16View::Ascii(bytes) => Parser::new(vm, realm, &mut tables, bytes).parse_text(),
@@ -456,7 +507,7 @@ pub fn parse_json_text(vm: &Vm, realm: Gc<Realm>, text: Utf16View<'_>) -> ThrowC
         Utf16View::Utf16(code_units) => Parser::new(vm, realm, &mut tables, code_units).parse_text(),
     };
     // NB: A text that is not valid leaves the values and keys of what it did not finish.
-    cache.values.borrow_mut().truncate(first_value);
+    cache.values.truncate(first_value);
     tables.property_keys.truncate(first_key);
     cache.tables.set(Some(tables));
     result
@@ -717,7 +768,7 @@ struct Parser<'a, 'vm, C: CodeUnit> {
     vm: &'vm Vm,
     realm: Gc<Realm>,
     tables: &'a mut JsonParseTables,
-    values: &'vm RefCell<Vec<Value>>,
+    values: &'vm JsonValueStack,
     string_values: &'vm [Cell<Option<Gc<PrimitiveString>>>; STRING_VALUE_CACHE_SLOTS],
     units: &'a [C],
     position: usize,
@@ -874,7 +925,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
         }
         self.position += 1;
         let first_key = self.tables.property_keys.len();
-        let first_value = self.values.borrow().len();
+        let first_value = self.values.len();
         self.skip_whitespace();
         if self.peek() == Some(0x7D) {
             self.position += 1;
@@ -978,7 +1029,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                         let result = self.parse_value();
                         self.tables.shapes.pin_counts[slot] = pin;
                         let value = result?;
-                        self.values.borrow_mut().push(value);
+                        self.values.push(value);
                         predicted_matched += 1;
                     } else {
                         predicted = None;
@@ -990,11 +1041,11 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                             .property_keys
                             .extend(entry.keys[..=predicted_matched].iter().cloned());
                         let value = self.parse_value()?;
-                        self.values.borrow_mut().push(value);
+                        self.values.push(value);
                     }
                 } else {
                     let value = self.parse_value()?;
-                    self.values.borrow_mut().push(value);
+                    self.values.push(value);
                     predicted_matched += 1;
                 }
             } else {
@@ -1009,7 +1060,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 self.skip_whitespace();
                 let value = self.parse_value()?;
                 self.tables.property_keys.push(key);
-                self.values.borrow_mut().push(value);
+                self.values.push(value);
             }
 
             self.skip_whitespace();
@@ -1035,7 +1086,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
             {
                 self.tables.shapes.last_slot = Some(slot);
                 let object = Object::create_with_premade_shape_from_values(self.vm, shape, self.values, first_value);
-                self.values.borrow_mut().truncate(first_value);
+                self.values.truncate(first_value);
                 return Ok(Value::from_object(object));
             }
             if predicted_matched > 0 {
@@ -1050,7 +1101,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
 
         let object = self.create_object(first_key, first_value);
         self.tables.property_keys.truncate(first_key);
-        self.values.borrow_mut().truncate(first_value);
+        self.values.truncate(first_value);
         Ok(Value::from_object(object))
     }
 
@@ -1066,7 +1117,7 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
         // NB: Keys that repeat or are array indices, and too many keys, take the generic path.
         let object = Object::create(self.vm, self.realm, Some(self.realm.object_prototype()));
         for (index, key) in keys.iter().enumerate() {
-            let value = self.values.borrow()[first_value + index];
+            let value = self.values.get(first_value + index);
             object.define_direct_property(self.vm, key, value, DEFAULT_ATTRIBUTES);
         }
         object
@@ -1080,15 +1131,15 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
                 .throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
         }
         self.position += 1;
-        let first_value = self.values.borrow().len();
+        let first_value = self.values.len();
         self.skip_whitespace();
         if self.peek() == Some(0x5D) {
             self.position += 1;
-            return Ok(Value::from_object(Array::create(self.vm, self.realm, 0, None).must()));
+            return Ok(Value::from_object(Array::create_empty(self.vm, self.realm)));
         }
         loop {
             let value = self.parse_value()?;
-            self.values.borrow_mut().push(value);
+            self.values.push(value);
             self.skip_whitespace();
             match self.peek() {
                 Some(0x2C) => {
@@ -1104,9 +1155,10 @@ impl<'a, 'vm, C: CodeUnit> Parser<'a, 'vm, C> {
         }
 
         // NB: The elements become the packed indexed storage of the array in one step.
-        let array = Array::create(self.vm, self.realm, 0, None).must();
-        array.set_indexed_property_elements(&self.values.borrow()[first_value..]);
-        self.values.borrow_mut().truncate(first_value);
+        let array = Array::create_empty(self.vm, self.realm);
+        // SAFETY: `set_indexed_property_elements` does not mutate `self.values` or trigger JS callbacks.
+        array.set_indexed_property_elements(unsafe { &self.values.as_slice()[first_value..] });
+        self.values.truncate(first_value);
         Ok(Value::from_object(array))
     }
 
