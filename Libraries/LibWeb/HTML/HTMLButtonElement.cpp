@@ -21,7 +21,7 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLButtonElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLButtonElement);
 
 HTMLButtonElement::HTMLButtonElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))

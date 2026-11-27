@@ -2069,9 +2069,9 @@ pub(in crate::css::style) struct GroupCache {
     /// How often each group was found and missed since the counts last started over. A group
     /// whose payloads are rarely the same, such as one holding each element's own inline style,
     /// is assembled without looking for it until the counts start over.
-    hits: [u32; crate::css::table_group_builder::group_index::COUNT],
-    misses: [u32; crate::css::table_group_builder::group_index::COUNT],
-    lookups: u32,
+    hits: [u16; crate::css::table_group_builder::group_index::COUNT],
+    misses: [u16; crate::css::table_group_builder::group_index::COUNT],
+    lookups: u16,
     /// The values of the keys of the entries, one run per entry, which the keys name by where it
     /// starts: what was written over the values the group read, by where each comes in place order,
     /// then the longhands and recorded specified values it read in place of computed values,
@@ -2184,10 +2184,10 @@ impl GroupCache {
 
     /// This cache, as a thread keeps it for its next pass: as it is where it holds few payloads,
     /// else empty.
-    pub(in crate::css::style) fn kept(mut self) -> Self {
+    pub(in crate::css::style) fn keep_for_next_pass(&mut self) {
         if self.count > Self::KEPT_ACROSS_PASSES {
             self.clear();
-            return self;
+            return;
         }
         // NB: A large pass leaves its room behind for the next one. Where the passes since have all been small, as an
         //     animation's are, the room goes back, and a large pass grows it again.
@@ -2195,7 +2195,6 @@ impl GroupCache {
         if self.small_passes == Self::SMALL_PASSES_BEFORE_SHRINKING {
             self.trim();
         }
-        self
     }
 
     /// How many small passes in a row give back the room a large pass left.
@@ -2210,7 +2209,7 @@ impl GroupCache {
     }
 
     /// How many lookups the hit counts cover before they start over.
-    const COUNT_PERIOD: u32 = 4096;
+    const COUNT_PERIOD: u16 = 4096;
 
     /// Whether looking for a payload of `group` is worth its cost.
     fn worth_looking_for(&mut self, group: usize) -> bool {
@@ -2220,7 +2219,7 @@ impl GroupCache {
             self.hits = Default::default();
             self.misses = Default::default();
         }
-        self.misses[group] < 32 || self.hits[group] * 4 >= self.misses[group]
+        self.misses[group] < 32 || u32::from(self.hits[group]) * 4 >= u32::from(self.misses[group])
     }
 
     /// What the groups of an element with `values`, in the color scheme `scheme`, are built from

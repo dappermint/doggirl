@@ -27,6 +27,16 @@
 #define GC_DEFINE_ALLOCATOR(ClassName) \
     GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv }
 
+// For Cell types whose destructors never allocate GC cells or re-enter the allocator, runs dead-cell
+// destructors in a single non-virtual C++ loop per 64-cell sweep bitmap word.
+#define GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(ClassName) \
+    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv, &GC::CellTypeThunks::destroy_dead_cells<ClassName> }
+
+// Like GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR, and also skips per-cell destruction for any block
+// where no cell called mark_needs_destruction().
+#define GC_DEFINE_ALLOCATOR_WITH_CONDITIONAL_BATCH_DESTRUCTOR(ClassName) \
+    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv, &GC::CellTypeThunks::destroy_dead_cells<ClassName>, GC::ConditionalDestructor::Yes }
+
 namespace GC::FFI {
 
 struct Allocator;
@@ -196,14 +206,26 @@ private:
     FFI::Allocator* m_allocator { nullptr };
 };
 
+enum class ConditionalDestructor : u8 {
+    No,
+    Yes,
+};
+
 template<typename T>
 class GC_API TypeIsolatingCellAllocator final : public CellAllocatorDescriptorBase {
 public:
     using CellType = T;
 
-    explicit TypeIsolatingCellAllocator(StringView class_name)
+    explicit TypeIsolatingCellAllocator(
+        StringView class_name,
+        DestroyDeadCellsFn destroy_dead_cells = nullptr,
+        ConditionalDestructor conditional_destructor = ConditionalDestructor::No)
         : CellAllocatorDescriptorBase(cell_type_info_for<T>, class_name)
     {
+        if (destroy_dead_cells)
+            set_destroy_dead_cells(destroy_dead_cells);
+        if (conditional_destructor == ConditionalDestructor::Yes)
+            set_conditional_destructor();
     }
 };
 

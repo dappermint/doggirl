@@ -179,6 +179,23 @@ impl ShapeWriter<'_> {
         self.write(|data| &mut data.parent, parent);
     }
 
+    /// Clears all five tree-link fields of a detached node in one mark check.
+    pub(crate) fn clear_tree_links(&mut self) {
+        if !self.data.parent.get().is_invalid()
+            || !self.data.first_child.get().is_invalid()
+            || !self.data.last_child.get().is_invalid()
+            || !self.data.previous_sibling.get().is_invalid()
+            || !self.data.next_sibling.get().is_invalid()
+        {
+            self.mark();
+            self.data.parent.set(NodeSlotId::INVALID);
+            self.data.first_child.set(NodeSlotId::INVALID);
+            self.data.last_child.set(NodeSlotId::INVALID);
+            self.data.previous_sibling.set(NodeSlotId::INVALID);
+            self.data.next_sibling.set(NodeSlotId::INVALID);
+        }
+    }
+
     pub(crate) fn set_first_child(&mut self, child: NodeSlotId) {
         self.write(|data| &mut data.first_child, child);
     }

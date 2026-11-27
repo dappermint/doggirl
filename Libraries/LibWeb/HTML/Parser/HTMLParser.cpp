@@ -1945,8 +1945,13 @@ private:
                             continue;
                         }
                         if (hot_kind == RustFfiHtmlFragmentAttributeKind::OtherData) {
-                            auto const& name_entry = cached_custom_attribute_name_entry(input_span.slice(attribute.name_start, attribute.name_length));
-                            element->append_attribute_without_callbacks_from_detached_parser(*name_entry.qualified_name, move(value), name_entry.name_filter_bit, name_entry.attribute_filter_bits);
+                            auto name_span = input_span.slice(attribute.name_start, attribute.name_length);
+                            if (auto const* cached = cached_custom_attribute_name_entry(name_span)) {
+                                element->append_attribute_without_callbacks_from_detached_parser(*cached->qualified_name, move(value), cached->name_filter_bit, cached->attribute_filter_bits);
+                            } else {
+                                auto entry = make_uncached_custom_attribute_name_entry(name_span);
+                                element->append_attribute_without_callbacks_from_detached_parser(*entry.qualified_name, move(value), entry.name_filter_bit, entry.attribute_filter_bits);
+                            }
                             continue;
                         }
                         if (hot_kind == RustFfiHtmlFragmentAttributeKind::Id) {
@@ -2078,7 +2083,10 @@ private:
             cache.set(raw, qualified_name);
             return qualified_name;
         }
-        return *cached_custom_attribute_name_entry(input_span.slice(attribute.name_start, attribute.name_length)).qualified_name;
+        auto name_span = input_span.slice(attribute.name_start, attribute.name_length);
+        if (auto const* cached = cached_custom_attribute_name_entry(name_span))
+            return *cached->qualified_name;
+        return *make_uncached_custom_attribute_name_entry(name_span).qualified_name;
     }
 
     struct CachedCustomName {
@@ -2095,17 +2103,22 @@ private:
     }
 
     template<typename CodeUnit>
-    static CachedCustomName cached_custom_attribute_name_entry(ReadonlySpan<CodeUnit> name)
+    static CachedCustomName make_uncached_custom_attribute_name_entry(ReadonlySpan<CodeUnit> name)
+    {
+        Utf16FlyString fly_name;
+        if constexpr (sizeof(CodeUnit) == 1)
+            fly_name = Utf16FlyString::from_utf8_without_validation({ name.data(), name.size() });
+        else
+            fly_name = Utf16FlyString::from_utf16({ name.data(), name.size() });
+        return { 0, DOM::QualifiedName { fly_name, {}, {} }, DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
+    }
+
+    template<typename CodeUnit>
+    static CachedCustomName const* cached_custom_attribute_name_entry(ReadonlySpan<CodeUnit> name)
     {
         auto const length = name.size();
-        if (length == 0 || length > 32) {
-            Utf16FlyString fly_name;
-            if constexpr (sizeof(CodeUnit) == 1)
-                fly_name = Utf16FlyString::from_utf8_without_validation({ name.data(), length });
-            else
-                fly_name = Utf16FlyString::from_utf16({ name.data(), length });
-            return { 0, DOM::QualifiedName { fly_name, {}, {} }, DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
-        }
+        if (length == 0 || length > 32)
+            return nullptr;
 
         u32 hash = static_cast<u32>(length) * 2654435761u;
         hash = (hash ^ static_cast<u32>(name[0])) * 2246822519u;
@@ -2131,7 +2144,7 @@ private:
                     }
                 }
                 if (matches)
-                    return entry;
+                    return &entry;
             }
         }
 
@@ -2141,8 +2154,8 @@ private:
         else
             fly_name = Utf16FlyString::from_utf16({ name.data(), length });
         DOM::QualifiedName qualified_name { fly_name, {}, {} };
-        entry = { hash, qualified_name, DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
-        return entry;
+        entry = { hash, move(qualified_name), DOM::Element::name_filter_bit(fly_name), DOM::Element::attribute_filter_bits(fly_name) };
+        return &entry;
     }
 
     Utf16View m_input;

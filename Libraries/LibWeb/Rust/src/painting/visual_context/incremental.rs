@@ -116,33 +116,36 @@ fn expand_dirty_entries(
     // Only style and tree changes can change a stacking context's blending descendants.
     // A dirty box is already rebuilt. Start at its parent since the box's own blend, or a change in whether it
     // establishes a stacking context, can change its enclosing group's isolation too.
-    let changed: Vec<_> = work
-        .iter()
-        .filter_map(|(slot, bits)| {
-            (bits.contains(VisualContextBoxDirtyKind::NewRow)
-                || bits.contains(VisualContextBoxDirtyKind::RecommittedInPlace)
-                || bits.contains(VisualContextBoxDirtyKind::ReattachedInLayoutTree)
-                || bits.contains(VisualContextBoxDirtyKind::StyleValueChange)
-                || bits.contains(VisualContextBoxDirtyKind::StyleStructuralChange))
-            .then(|| layout_arena.node_parent_if_live(*slot))
-            .flatten()
-        })
-        .chain(revalidate_children_of.iter().copied())
-        .collect();
-    let mut visited = HashSet::default();
-    for slot in changed {
-        let mut ancestor = Some(slot);
-        while let Some(parent) = ancestor {
-            if !visited.insert(parent) {
-                break;
+    let mut changed: Vec<NodeSlotId> = Vec::new();
+    for (slot, bits) in &work {
+        if bits.contains(VisualContextBoxDirtyKind::NewRow)
+            || bits.contains(VisualContextBoxDirtyKind::RecommittedInPlace)
+            || bits.contains(VisualContextBoxDirtyKind::ReattachedInLayoutTree)
+            || bits.contains(VisualContextBoxDirtyKind::StyleValueChange)
+            || bits.contains(VisualContextBoxDirtyKind::StyleStructuralChange)
+        {
+            if let Some(parent) = layout_arena.node_parent_if_live(*slot) {
+                changed.push(parent);
             }
-            if crate::painting::style_queries::establishes_stacking_context(layout_arena, parent) {
-                work.entry(parent)
-                    .or_default()
-                    .insert(VisualContextBoxDirtyKind::StyleValueChange);
-                break;
+        }
+    }
+    changed.extend(revalidate_children_of.iter().copied());
+    if !changed.is_empty() {
+        let mut visited = HashSet::default();
+        for slot in changed {
+            let mut ancestor = Some(slot);
+            while let Some(parent) = ancestor {
+                if !visited.insert(parent) {
+                    break;
+                }
+                if crate::painting::style_queries::establishes_stacking_context(layout_arena, parent) {
+                    work.entry(parent)
+                        .or_default()
+                        .insert(VisualContextBoxDirtyKind::StyleValueChange);
+                    break;
+                }
+                ancestor = layout_arena.node_parent_if_live(parent);
             }
-            ancestor = layout_arena.node_parent_if_live(parent);
         }
     }
     // The offset transform of a box with an offset path depends on the geometry and style of its containing block,
@@ -165,20 +168,27 @@ fn expand_dirty_entries(
                 .insert(VisualContextBoxDirtyKind::OffsetPathContainingBlockChanged);
         }
     }
+    let mut ancestors_of_work = HashSet::default();
+    let insert_ancestors = |ancestors_of_work: &mut HashSet<NodeSlotId>, slot: NodeSlotId| {
+        let mut ancestor = paint_order::paint_parent(layout_arena, slot);
+        while let Some(current) = ancestor {
+            if !ancestors_of_work.insert(current) {
+                break;
+            }
+            ancestor = paint_order::paint_parent(layout_arena, current);
+        }
+    };
+    for &slot in work.keys() {
+        insert_ancestors(&mut ancestors_of_work, slot);
+    }
+    for &slot in &revalidate_children_of {
+        insert_ancestors(&mut ancestors_of_work, slot);
+    }
     let mut plan = WorkPlan {
         work,
         revalidate_children_of,
-        ancestors_of_work: HashSet::default(),
+        ancestors_of_work,
     };
-    let dirty_slots: Vec<NodeSlotId> = plan
-        .work
-        .keys()
-        .copied()
-        .chain(plan.revalidate_children_of.iter().copied())
-        .collect();
-    for slot in dirty_slots {
-        plan.insert_ancestors_of_work(layout_arena, slot);
-    }
     plan.add_anchored_boxes_below_dirty_scroll_chains(layout_arena);
     Ok(plan)
 }
@@ -607,14 +617,14 @@ pub(crate) fn update_visual_context_tree<Arena: PaintableRowsWrite>(
         std::sync::Arc::make_mut(tree)
             .set_visual_viewport_transform(super::node_values::visual_viewport_transform_data(&tree_inputs));
     }
-    let every_box_capacity = if scope.rebuilds_every_box() {
+    let initial_capacity = if scope.rebuilds_every_box() {
         layout_arena.paintable_row_count()
     } else {
-        0
+        plan.work.len()
     };
-    let mut assignments: Vec<PaintableVisualContextAssignment> = Vec::with_capacity(every_box_capacity);
+    let mut assignments: Vec<PaintableVisualContextAssignment> = Vec::with_capacity(initial_capacity);
     let mut assignment_index_by_slot: HashMap<NodeSlotId, usize> =
-        HashMap::with_capacity_and_hasher(every_box_capacity, Default::default());
+        HashMap::with_capacity_and_hasher(initial_capacity, Default::default());
     let mut stack: Vec<PendingBox> = Vec::new();
     let push_children = |layout_arena: &Arena,
                          stack: &mut Vec<PendingBox>,

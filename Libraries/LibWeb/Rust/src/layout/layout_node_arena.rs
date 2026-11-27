@@ -1808,14 +1808,7 @@ impl LayoutNodeArena {
             // Every node in `rows` is in `root`'s unlinked subtree and is freed in this loop, so clearing `slot`'s
             // own tree links directly gives `free_unlinked_slot` an unlinked slot without per-child `unlink_child`
             // writes to sibling and parent rows.
-            {
-                let mut shape = self.write_shape(slot);
-                shape.set_parent(NodeSlotId::INVALID);
-                shape.set_first_child(NodeSlotId::INVALID);
-                shape.set_last_child(NodeSlotId::INVALID);
-                shape.set_previous_sibling(NodeSlotId::INVALID);
-                shape.set_next_sibling(NodeSlotId::INVALID);
-            }
+            self.write_shape(slot).clear_tree_links();
             if let Some(reset) = self.free_unlinked_slot(
                 slot,
                 has_any_highlight_pseudo_styles,
