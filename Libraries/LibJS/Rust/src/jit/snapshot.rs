@@ -10,7 +10,7 @@
 use ak::Zone;
 use core::num::NonZeroU64;
 use libjs_abi::Builtin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError};
 
 use libjs_jit::bytecode::{
     EnvironmentCoordinate, ExceptionHandler, FrameLayout, Instruction, OpCode, decode_instruction, opcode_and_length,
@@ -33,7 +33,7 @@ use super::allocation::{
 use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, SnapshotExecutables};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
-use crate::bytecode::executable_data::ExecutableData;
+use crate::bytecode::executable_data::{ExecutableData, SHARED_CALL_FLAGS_MASK};
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
 use crate::bytecode::instruction::instruction_length_from_bytes;
 use crate::gc::class::Extends;
@@ -104,6 +104,9 @@ pub(crate) struct SnapshotScratch {
     literal_instance_fields: Vec<(u32, LiteralFieldValues)>,
     derived_instance_fields: Vec<(u32, DerivedInstanceFields)>,
     property_cache_ranges: Vec<(u32, u32)>,
+    shared_call_flags: Vec<u8>,
+    shared_call_value: Vec<u16>,
+    shared_megamorphic_caches: Vec<u64>,
 }
 
 impl SnapshotScratch {
@@ -114,6 +117,16 @@ impl SnapshotScratch {
         self.literal_instance_fields.clear();
         self.derived_instance_fields.clear();
         self.property_cache_ranges.clear();
+        self.shared_call_flags.clear();
+        self.shared_call_value.clear();
+        self.shared_megamorphic_caches.clear();
+    }
+
+    #[inline]
+    fn is_shared_megamorphic(&self, cache_index: usize) -> bool {
+        self.shared_megamorphic_caches
+            .get(cache_index / 64)
+            .is_some_and(|word| word & (1u64 << (cache_index % 64)) != 0)
     }
 }
 
@@ -163,6 +176,8 @@ struct SnapshotBuilder<'vm> {
     /// For the constructors among the inlining candidates, by index: the shape of the `this` value their inlined
     /// constructs create, whose entries their megamorphic caches describe.
     construct_this_shapes: Vec<(u32, Gc<Shape>)>,
+    /// Whether this snapshot merges non-GC feedback, megamorphic hints, and exit sites from `ExecutableData`.
+    use_shared_learning: bool,
 }
 
 #[inline]
@@ -672,7 +687,17 @@ impl SnapshotBuilder<'_> {
         caller: &Entry,
         known_shape: Option<Gc<Shape>>,
         primitive_prototype_shapes: &[Gc<Shape>; 3],
+        force_megamorphic: bool,
     ) -> (PropertyCacheSnapshot, u8) {
+        if force_megamorphic && cache.tier() != PropertyLookupCacheTier::Megamorphic {
+            return (
+                PropertyCacheSnapshot {
+                    kind: PropertyCacheKind::Megamorphic,
+                    entries: List::empty(),
+                },
+                u8::MAX,
+            );
+        }
         let kind = match cache.tier() {
             PropertyLookupCacheTier::Empty => {
                 return (
@@ -1338,13 +1363,20 @@ impl SnapshotBuilder<'_> {
         Some(self.direct_call_target_snapshot(function, None, false))
     }
 
-    fn call_feedback(&mut self, call: &CallFeedback, entry: &Entry) -> CallFeedbackSnapshot {
+    fn call_feedback(
+        &mut self,
+        call: &CallFeedback,
+        entry: &Entry,
+        shared_flags: u8,
+        shared_value: u16,
+    ) -> CallFeedbackSnapshot {
         let target = call.target();
-        let flags = call.flags.get();
+        let flags = call.flags.get() | (shared_flags & SHARED_CALL_FLAGS_MASK);
+        let value = call.value.get() | shared_value;
         let Some(target) = target else {
             return CallFeedbackSnapshot {
                 flags,
-                value: call.value.get(),
+                value,
                 ..CallFeedbackSnapshot::default()
             };
         };
@@ -1353,7 +1385,7 @@ impl SnapshotBuilder<'_> {
         let mut snapshot = CallFeedbackSnapshot {
             target: Some(target_cell),
             flags,
-            value: call.value.get(),
+            value,
             ..CallFeedbackSnapshot::default()
         };
         if let Some(function) = ecmascript_function(Some(target)) {
@@ -1508,14 +1540,78 @@ impl SnapshotBuilder<'_> {
         //         until the snapshot is cleared or dropped.
         let bytecode_slice = unsafe { BytecodeSlice::borrowed(bytecode) };
 
+        self.scratch.shared_call_flags.clear();
+        self.scratch.shared_call_value.clear();
+        self.scratch.shared_megamorphic_caches.clear();
+        let caches_slice = executable.property_lookup_caches();
+
         // NB: Value feedback is only up to date once the values the interpreter recorded since the last update are
         //     folded in. Unprofiled inlined callees set `unprofiled = true` instead of allocating a zero-filled
         //     `ExecutableFeedback`, so `builder::has_run()` still reports unexecuted instructions as not having run.
-        let (unprofiled, feedback) = if let Some(feedback) = executable.feedback() {
+        let (unprofiled, feedback) = if self.use_shared_learning {
+            let local_feedback = executable.feedback();
+            let (has_feedback, arith, value, cache_value, keyed) = {
+                let mut learning = code
+                    .ensure_shared_jit_learning()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                learning.merge_feedback(local_feedback, caches_slice);
+                self.scratch
+                    .shared_megamorphic_caches
+                    .extend_from_slice(&learning.megamorphic_property_caches);
+                if learning.has_feedback {
+                    self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
+                    self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
+                    let arith = self.snapshot.add(&learning.arith);
+                    let value = self.snapshot.add(&learning.value);
+                    let cache_value = self.snapshot.add(&learning.cache_value);
+                    let keyed = self
+                        .snapshot
+                        .add_exact_iter(learning.keyed_bits.iter().map(|&bits| KeyedFeedbackSnapshot { bits }));
+                    (true, arith, value, cache_value, keyed)
+                } else {
+                    (false, List::empty(), List::empty(), List::empty(), List::empty())
+                }
+            };
+            if has_feedback {
+                let call = self.snapshot.begin();
+                if let Some(local_feedback) = local_feedback {
+                    for (slot, call) in local_feedback.call().iter().enumerate() {
+                        let shared_flags = self.scratch.shared_call_flags.get(slot).copied().unwrap_or(0);
+                        let shared_value = self.scratch.shared_call_value.get(slot).copied().unwrap_or(0);
+                        let row = self.call_feedback(call, entry, shared_flags, shared_value);
+                        self.snapshot.push(row);
+                    }
+                } else {
+                    for index in 0..self.scratch.shared_call_flags.len() {
+                        let flags = self.scratch.shared_call_flags[index] & SHARED_CALL_FLAGS_MASK;
+                        let value = self.scratch.shared_call_value[index];
+                        self.snapshot.push(CallFeedbackSnapshot {
+                            flags,
+                            value,
+                            ..CallFeedbackSnapshot::default()
+                        });
+                    }
+                }
+                let call = self.snapshot.end(call);
+                let snapshot = FeedbackSnapshot {
+                    arith,
+                    value,
+                    cache_value,
+                    call,
+                    keyed,
+                    bound_arguments: self.snapshot.add(&self.scratch.bound_arguments),
+                };
+                self.scratch.bound_arguments.clear();
+                (false, snapshot)
+            } else {
+                (true, FeedbackSnapshot::default())
+            }
+        } else if let Some(feedback) = executable.feedback() {
             feedback.update_value_feedback();
             let call = self.snapshot.begin();
             for call in feedback.call() {
-                let row = self.call_feedback(call, entry);
+                let row = self.call_feedback(call, entry, 0, 0);
                 self.snapshot.push(row);
             }
             let call = self.snapshot.end(call);
@@ -1559,15 +1655,20 @@ impl SnapshotBuilder<'_> {
                 realm.boolean_prototype(vm).shape(),
             ]
         };
-        let caches_slice = executable.property_lookup_caches();
         let cache_sizes_start =
             u32::try_from(self.property_cache_sizes.len()).expect("property cache sizes count fits in u32");
         self.property_cache_sizes.reserve(caches_slice.len());
         let mut has_megamorphic_cache = false;
         let property_caches = self.snapshot.begin();
-        for cache in caches_slice {
-            let (row, cache_size) =
-                self.property_cache(cache, entry, construct_this_shape, &primitive_prototype_shapes);
+        for (cache_index, cache) in caches_slice.iter().enumerate() {
+            let force_megamorphic = self.use_shared_learning && self.scratch.is_shared_megamorphic(cache_index);
+            let (row, cache_size) = self.property_cache(
+                cache,
+                entry,
+                construct_this_shape,
+                &primitive_prototype_shapes,
+                force_megamorphic,
+            );
             has_megamorphic_cache |= row.kind == PropertyCacheKind::Megamorphic;
             self.property_cache_sizes.push(cache_size);
             self.snapshot.push(row);
@@ -1652,7 +1753,9 @@ impl SnapshotBuilder<'_> {
                     end_offset: handler.end_offset,
                     handler_offset: handler.handler_offset,
                 })),
-            exit_sites: self.snapshot.add(&executable.jit_exit_sites_for_recompile()),
+            exit_sites: self
+                .snapshot
+                .add(&executable.jit_exit_sites_for_recompile_with_shared(self.use_shared_learning)),
             builtin_exit_sites: if entry.function.is_none() {
                 self.snapshot.add_exact_iter(
                     executable
@@ -1759,24 +1862,22 @@ impl SnapshotBuilder<'_> {
         {
             return List::empty();
         }
-        let accesses = executable.jit_state().captured_binding_accesses.get_or_init(|| {
-            let accesses = captured_binding_accesses(&executable, self.snapshot.scratch());
-            if accesses.loads.is_empty() && accesses.stores.is_empty() {
-                executable.code().mark_captured_bindings_empty();
-            }
-            accesses
-        });
+        let accesses = get_or_compute_captured_binding_accesses(&executable, self.snapshot.scratch());
         let loads = &accesses.loads;
         if loads.is_empty() {
             return List::empty();
         }
         let exit_sites = executable.jit_exit_sites();
-        let changed: Vec<EnvironmentCoordinate> = if exit_sites.is_empty() {
+        let has_shared_exits = self.use_shared_learning && executable.code().shared_jit_learning().is_some();
+        let changed: Vec<EnvironmentCoordinate> = if exit_sites.is_empty() && !has_shared_exits {
             Vec::new()
         } else {
             loads
                 .iter()
-                .filter(|&&(_, pc)| exit_sites.contains(&(pc, ExitKind::UnexpectedValue)))
+                .filter(|&&(_, pc)| {
+                    exit_sites.contains(&(pc, ExitKind::UnexpectedValue))
+                        || (has_shared_exits && executable.code().shared_has_unexpected_value_exit(pc))
+                })
                 .map(|&(coordinate, _)| coordinate)
                 .collect()
         };
@@ -1830,13 +1931,7 @@ fn mutable_bindings(
     {
         return List::empty();
     }
-    let accesses = executable.jit_state().captured_binding_accesses.get_or_init(|| {
-        let accesses = captured_binding_accesses(&executable, snapshot.scratch());
-        if accesses.loads.is_empty() && accesses.stores.is_empty() {
-            executable.code().mark_captured_bindings_empty();
-        }
-        accesses
-    });
+    let accesses = get_or_compute_captured_binding_accesses(&executable, snapshot.scratch());
     let stores = &accesses.stores;
     if stores.is_empty() {
         return List::empty();
@@ -1861,6 +1956,24 @@ fn mutable_bindings(
         }
     }
     snapshot.end(bindings)
+}
+
+/// Returns the cached bytecode scan of captured binding loads and stores for `executable`, sharing the immutable
+/// result across realms linking the same `ExecutableData`.
+fn get_or_compute_captured_binding_accesses(executable: &Executable, zone: &mut Zone) -> Arc<CapturedBindingAccesses> {
+    Arc::clone(executable.jit_state().captured_binding_accesses.get_or_init(|| {
+        if let Some(cached) = executable.code().cached_captured_binding_accesses() {
+            return cached;
+        }
+        let accesses = captured_binding_accesses(executable, zone);
+        if accesses.loads.is_empty() && accesses.stores.is_empty() {
+            executable.code().mark_captured_bindings_empty();
+            return Arc::new(accesses);
+        }
+        executable
+            .code()
+            .set_cached_captured_binding_accesses(Arc::new(accesses))
+    }))
 }
 
 /// The loads and stores of bindings of environments in `executable`, or none if its code may change its lexical
@@ -1929,6 +2042,7 @@ pub fn capture_snapshot<'d>(
     function: Option<Gc<EcmascriptFunctionObject>>,
     realm: Gc<Realm>,
     osr_pc: Option<u32>,
+    use_shared_learning: bool,
     defer_gc: &'d DeferGc<'_>,
 ) -> CapturedSnapshot<'d> {
     let compiled_function_fields = match function {
@@ -2004,6 +2118,7 @@ pub fn capture_snapshot<'d>(
                 sample_slots: Vec::new(),
                 lexical_environment_templates: List::empty(),
                 construct_this_shapes: Vec::new(),
+                use_shared_learning,
             };
             if let Some(function) = function {
                 note_frame_field_cells(&mut builder.cells, function);
