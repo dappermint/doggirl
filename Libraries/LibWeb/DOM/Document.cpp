@@ -310,7 +310,7 @@ struct PendingAnimationEventHost {
 extern "C" {
 
 // Defined in Bindings/Rust/src/animations/animation.rs.
-void web_animation_dispatch_pending_animation_events(JSVM*, Document*, Animations::RustFFI::DocumentAnimations*, Animations::RustFFI::FfiTreeOrder, PendingAnimationEventHost const*);
+void web_animation_dispatch_pending_animation_events(JSVM*, Document*, Animations::RustFFI::DocumentAnimations*, Animations::RustFFI::FfiTreeOrder, PendingAnimationEventHost const*, bool dispatch_css_events);
 }
 
 void PendingFullscreenEvent::visit_edges(GC::Cell::Visitor& visitor) const
@@ -8650,7 +8650,7 @@ int Document::compare_elements_in_tree_order_for_composite_order(Element& first,
 
     if (m_element_tree_positions_dom_tree_version != dom_tree_version()) {
         m_element_tree_positions_dom_tree_version = dom_tree_version();
-        m_element_tree_positions.clear();
+        m_element_tree_positions.clear_with_capacity();
         m_tree_order_compares_at_dom_tree_version = 0;
     }
     if (m_element_tree_positions.is_empty()) {
@@ -9499,7 +9499,7 @@ void Document::update_animations_and_send_events(double timestamp)
         .dispatch_at_element = [](void*, void* element, void* event) { static_cast<Element*>(element)->dispatch_event(*static_cast<Event*>(event)); },
         .dispatch_time_event = [](void*, Animations::RustFFI::AnimationCell const* animation, Animations::RustFFI::FfiPendingAnimationEvent const* event) { static_cast<SVG::SVGAnimationElement*>(Animations::RustFFI::animations_smil_animation_element(animation))->dispatch_pending_time_event(*event); },
     };
-    web_animation_dispatch_pending_animation_events(JS::HostABI::vm_to_abi(JS::VM::the()), this, m_animations, Animations::compare_elements_in_tree_order_for_composite_order, &host);
+    web_animation_dispatch_pending_animation_events(JS::HostABI::vm_to_abi(JS::VM::the()), this, m_animations, Animations::compare_elements_in_tree_order_for_composite_order, &host, EventTarget::has_any_css_animation_or_transition_event_listeners());
 
     // AD-HOC: Nothing else re-requests a rendering update while time-driven animations are running, since
     //         Document::set_needs_animated_style_update() only requests a frame when its flag flips from

@@ -35,8 +35,8 @@ public:
 
     virtual Node& slottable_as_node() override { return *this; }
 
-    Optional<size_t> max_length() const { return m_max_length; }
-    void set_max_length(Optional<size_t> max_length) { m_max_length = move(max_length); }
+    Optional<size_t> max_length() const;
+    void set_max_length(Optional<size_t> max_length);
 
     WebIDL::ExceptionOr<GC::Ref<Text>> split_text(size_t offset);
     Utf16String whole_text();
@@ -64,7 +64,6 @@ private:
     virtual SlottableMixin::RareData const* slottable_rare_data() const override;
     virtual SlottableMixin::RareData& ensure_slottable_rare_data() override;
 
-    Optional<size_t> m_max_length {};
     bool m_is_password_input { false };
     CSS::StyleNodeID m_style_node_id;
 };

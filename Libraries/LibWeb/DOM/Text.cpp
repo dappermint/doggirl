@@ -18,7 +18,7 @@
 namespace Web::DOM {
 
 #if ARCH(X86_64) && !defined(AK_OS_WINDOWS)
-static_assert(sizeof(Text) == 136);
+static_assert(sizeof(Text) == 120);
 #endif
 
 struct Text::RareData final
@@ -31,7 +31,22 @@ struct Text::RareData final
         CharacterData::RareData::visit_edges(visitor);
         SlottableMixin::RareData::visit_edges(visitor);
     }
+
+    Optional<size_t> max_length {};
 };
+
+Optional<size_t> Text::max_length() const
+{
+    auto const* data = static_cast<RareData const*>(rare_data());
+    return data ? data->max_length : OptionalNone {};
+}
+
+void Text::set_max_length(Optional<size_t> max_length)
+{
+    if (!max_length.has_value() && !rare_data())
+        return;
+    static_cast<RareData&>(ensure_rare_data()).max_length = move(max_length);
+}
 
 OwnPtr<Node::RareData> Text::create_rare_data() const
 {

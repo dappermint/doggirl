@@ -1283,6 +1283,7 @@ pub use super::pending_animation_events::{
 pub unsafe fn take_pending_animation_events_to_dispatch(
     animations: NonNull<c_void>,
     tree_order: FfiTreeOrder,
+    dispatch_css_events: bool,
 ) -> Vec<(AnimationRecordRef, PendingAnimationEvent)> {
     // SAFETY: Guaranteed by the caller.
     let animations = unsafe {
@@ -1293,7 +1294,7 @@ pub unsafe fn take_pending_animation_events_to_dispatch(
     // NB: Steps 4 to 6 take and sort the events.
     animations
         .pending_events
-        .take_events_to_dispatch(&mut host_tree_order(tree_order))
+        .take_events_to_dispatch(dispatch_css_events, &mut host_tree_order(tree_order))
         .into_iter()
         .map(|event| (AnimationRecordRef::from_handle(event.animation), event.event))
         .collect()

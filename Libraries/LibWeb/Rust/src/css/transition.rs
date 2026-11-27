@@ -555,21 +555,29 @@ impl TransitionDecision {
                 return None;
             }
         }
-        let to_compare = no_overlays
-            .then(|| {
-                before_longhands.shared_with(after_longhands).map(|shared| {
-                    let before_bits = before_longhands.value_groups().inherited_bits();
-                    let after_bits = after_longhands.value_groups().inherited_bits();
-                    if before_bits.writing_mode() == after_bits.writing_mode()
-                        && before_bits.direction() == after_bits.direction()
-                    {
-                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
-                    } else {
-                        shared.longhands_to_compare()
+        let mut to_compare = before_longhands.shared_with(after_longhands).map(|shared| {
+            let before_bits = before_longhands.value_groups().inherited_bits();
+            let after_bits = after_longhands.value_groups().inherited_bits();
+            if before_bits.writing_mode() == after_bits.writing_mode()
+                && before_bits.direction() == after_bits.direction()
+            {
+                shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+            } else {
+                shared.longhands_to_compare()
+            }
+        });
+        if let Some(words) = to_compare.as_mut() {
+            for overlay in [before_overlay, after_overlay].into_iter().flatten() {
+                for entry in overlay.entries() {
+                    if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID) {
+                        let word = usize::from(index) / 64;
+                        if word < words.len() {
+                            words[word] |= 1u64 << (index % 64);
+                        }
                     }
-                })
-            })
-            .flatten();
+                }
+            }
+        }
         if existing.is_empty()
             && let Some(words) = to_compare
             && words.iter().all(|&word| word == 0)
@@ -622,22 +630,38 @@ impl TransitionDecision {
             }
         };
 
-        // OPTIMIZATION: For `transition-property: all` with no existing transitions and a changed-longhand bitmask,
-        //               visit only the changed physical longhands instead of iterating all ~400 CSS properties.
+        // OPTIMIZATION: For `transition-property: all` with a changed-longhand bitmask, visit only the changed,
+        //               overlaid, or existing-transition physical longhands instead of iterating all ~400 CSS
+        //               properties.
         let mut handled_all_via_bitset = false;
-        if existing.is_empty()
-            && let crate::css::style_compute::TransitionEntries::All {
-                template,
-                writing_mode,
-                direction,
-            } = &entries
+        if let crate::css::style_compute::TransitionEntries::All {
+            template,
+            writing_mode,
+            direction,
+        } = &entries
         {
-            if template.duration.max(0.0) + template.delay <= 0.0 {
+            let positive_duration = template.duration.max(0.0) + template.delay > 0.0;
+            if !positive_duration && existing.is_empty() {
                 handled_all_via_bitset = true;
-            } else if let Some(words) = to_compare {
+            } else if let Some(base_words) = to_compare {
+                let mut words = if positive_duration {
+                    base_words
+                } else {
+                    [0u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]
+                };
+                for existing_item in existing {
+                    if existing_item.custom_name == 0
+                        && let Some(index) = existing_item.property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    {
+                        let word = usize::from(index) / 64;
+                        if word < words.len() {
+                            words[word] |= 1u64 << (index % 64);
+                        }
+                    }
+                }
                 let (mask, ranks) =
                     crate::css::computed_values::all_unique_transition_longhands_mask_and_ranks(*writing_mode, *direction);
-                let mut changed = [(0u16, 0u16); 16];
+                let mut changed = [(0u16, 0u16); 128];
                 let mut changed_count = 0usize;
                 let mut overflowed = false;
                 for (word_index, (&diff_word, &mask_word)) in words.iter().zip(mask.iter()).enumerate() {
@@ -673,7 +697,12 @@ impl TransitionDecision {
                     let mut entry = *template;
                     for &(_, property_id) in &changed[..changed_count] {
                         entry.property_id = property_id;
-                        decide_property(property_id, Some(&entry), None);
+                        let existing_item = if existing.is_empty() {
+                            None
+                        } else {
+                            existing_for(property_id)
+                        };
+                        decide_property(property_id, Some(&entry), existing_item);
                     }
                 }
             }
@@ -776,21 +805,29 @@ impl TransitionDecision {
         {
             return Vec::new();
         }
-        let to_compare = no_overlays
-            .then(|| {
-                before_longhands.shared_with(after_longhands).map(|shared| {
-                    let before_bits = before_longhands.value_groups().inherited_bits();
-                    let after_bits = after_longhands.value_groups().inherited_bits();
-                    if before_bits.writing_mode() == after_bits.writing_mode()
-                        && before_bits.direction() == after_bits.direction()
-                    {
-                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
-                    } else {
-                        shared.longhands_to_compare()
+        let mut to_compare = before_longhands.shared_with(after_longhands).map(|shared| {
+            let before_bits = before_longhands.value_groups().inherited_bits();
+            let after_bits = after_longhands.value_groups().inherited_bits();
+            if before_bits.writing_mode() == after_bits.writing_mode()
+                && before_bits.direction() == after_bits.direction()
+            {
+                shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+            } else {
+                shared.longhands_to_compare()
+            }
+        });
+        if let Some(words) = to_compare.as_mut() {
+            for overlay in [before_overlay, after_overlay].into_iter().flatten() {
+                for entry in overlay.entries() {
+                    if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID) {
+                        let word = usize::from(index) / 64;
+                        if word < words.len() {
+                            words[word] |= 1u64 << (index % 64);
+                        }
                     }
-                })
-            })
-            .flatten();
+                }
+            }
+        }
         let context = std::cell::OnceCell::new();
         let get_context = || context.get_or_init(|| self.animation_context(engine, reference_box, after_overlay));
         let existing_for = |property_id| existing.iter().find(|existing| existing.property_id == property_id);
@@ -832,29 +869,106 @@ impl TransitionDecision {
             }
         };
 
-        let _ = entries.for_each_entry(|entry| {
-            let property_id = entry.property_id;
-            let existing_item = if existing.is_empty() {
-                None
-            } else {
-                existing_for(property_id)
-            };
-            if existing_item.is_none() {
-                if entry.duration.max(0.0) + entry.delay <= 0.0 {
-                    return std::ops::ControlFlow::Continue(());
+        let mut handled_all_via_bitset = false;
+        if let crate::css::style_compute::TransitionEntries::All {
+            template,
+            writing_mode,
+            direction,
+        } = &entries
+            && element.is_none_or(|element| !inherits_animated_values(element))
+        {
+            let positive_duration = template.duration.max(0.0) + template.delay > 0.0;
+            if !positive_duration && existing.is_empty() {
+                handled_all_via_bitset = true;
+            } else if let Some(base_words) = to_compare {
+                let mut words = if positive_duration {
+                    base_words
+                } else {
+                    [0u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]
+                };
+                for existing_item in existing {
+                    if existing_item.custom_name == 0
+                        && let Some(index) = existing_item.property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                    {
+                        let word = usize::from(index) / 64;
+                        if word < words.len() {
+                            words[word] |= 1u64 << (index % 64);
+                        }
+                    }
                 }
-                if let Some(to_compare) = to_compare
-                    && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
-                    && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
-                    && (!after_longhands.is_inherited(property_id)
-                        || element.is_none_or(|element| !inherits_animated_values(element)))
-                {
-                    return std::ops::ControlFlow::Continue(());
+                let (mask, ranks) =
+                    crate::css::computed_values::all_unique_transition_longhands_mask_and_ranks(*writing_mode, *direction);
+                let mut changed = [(0u16, 0u16); 128];
+                let mut changed_count = 0usize;
+                let mut overflowed = false;
+                for (word_index, (&diff_word, &mask_word)) in words.iter().zip(mask.iter()).enumerate() {
+                    let mut bits = diff_word & mask_word;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if changed_count == changed.len() {
+                            overflowed = true;
+                            break;
+                        }
+                        let longhand_index = word_index * 64 + bit;
+                        let property_id = FIRST_LONGHAND_PROPERTY_ID + longhand_index as u16;
+                        changed[changed_count] = (ranks[longhand_index], property_id);
+                        changed_count += 1;
+                    }
+                    if overflowed {
+                        break;
+                    }
+                }
+                if !overflowed {
+                    handled_all_via_bitset = true;
+                    for i in 1..changed_count {
+                        let key = changed[i];
+                        let mut j = i;
+                        while j > 0 && changed[j - 1].0 > key.0 {
+                            changed[j] = changed[j - 1];
+                            j -= 1;
+                        }
+                        changed[j] = key;
+                    }
+                    let mut entry = *template;
+                    for &(_, property_id) in &changed[..changed_count] {
+                        entry.property_id = property_id;
+                        let existing_item = if existing.is_empty() {
+                            None
+                        } else {
+                            existing_for(property_id)
+                        };
+                        decide_property(property_id, Some(&entry), existing_item);
+                    }
                 }
             }
-            decide_property(property_id, Some(entry), existing_item);
-            std::ops::ControlFlow::Continue(())
-        });
+        }
+
+        if !handled_all_via_bitset {
+            let _ = entries.for_each_entry(|entry| {
+                let property_id = entry.property_id;
+                let existing_item = if existing.is_empty() {
+                    None
+                } else {
+                    existing_for(property_id)
+                };
+                if existing_item.is_none() {
+                    if entry.duration.max(0.0) + entry.delay <= 0.0 {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    if let Some(to_compare) = to_compare
+                        && let Some(index) = property_id.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                        && to_compare[usize::from(index) / 64] & (1u64 << (index % 64)) == 0
+                        && (!after_longhands.is_inherited(property_id)
+                            || element.is_none_or(|element| !inherits_animated_values(element)))
+                    {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                }
+                decide_property(property_id, Some(entry), existing_item);
+                std::ops::ControlFlow::Continue(())
+            });
+        }
 
         for existing_item in existing {
             if existing_item.custom_name != 0 || entries.contains_property(existing_item.property_id) {
@@ -1005,21 +1119,29 @@ impl TransitionDecision {
         }
         // Properties in style groups shared between before and after hold identical computed values, so without
         // overlays, existing transitions, or inherited animations they cannot start a transition.
-        let to_compare = no_overlays
-            .then(|| {
-                before_longhands.shared_with(after_longhands).map(|shared| {
-                    let before_bits = before_longhands.value_groups().inherited_bits();
-                    let after_bits = after_longhands.value_groups().inherited_bits();
-                    if before_bits.writing_mode() == after_bits.writing_mode()
-                        && before_bits.direction() == after_bits.direction()
-                    {
-                        shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
-                    } else {
-                        shared.longhands_to_compare()
+        let mut to_compare = before_longhands.shared_with(after_longhands).map(|shared| {
+            let before_bits = before_longhands.value_groups().inherited_bits();
+            let after_bits = after_longhands.value_groups().inherited_bits();
+            if before_bits.writing_mode() == after_bits.writing_mode()
+                && before_bits.direction() == after_bits.direction()
+            {
+                shared.longhands_to_compare_for_flow(before_bits.writing_mode(), before_bits.direction())
+            } else {
+                shared.longhands_to_compare()
+            }
+        });
+        if let Some(words) = to_compare.as_mut() {
+            for overlay in [before_overlay, after_overlay].into_iter().flatten() {
+                for entry in overlay.entries() {
+                    if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID) {
+                        let word = usize::from(index) / 64;
+                        if word < words.len() {
+                            words[word] |= 1u64 << (index % 64);
+                        }
                     }
-                })
-            })
-            .flatten();
+                }
+            }
+        }
         let context = std::cell::OnceCell::new();
         let get_context = || context.get_or_init(|| self.animation_context(engine, reference_box, after_overlay));
         let existing_for = |property_id| existing.iter().find(|existing| existing.property_id == property_id);

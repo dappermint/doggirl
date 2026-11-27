@@ -277,7 +277,10 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         base: Operand,
         cache: u32,
     ) -> Result<bool, CompileFailure> {
-        let Some(entries) = self.cache_entries(cache) else {
+        let Some(entries) = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))
+        else {
             return Ok(false);
         };
         let first = entries[0];
@@ -287,16 +290,12 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         let Some(offset) = accessor.cached_value_offset else {
             return Ok(false);
         };
+        let location @ Some((Some(_), _)) = first.accessor_location(AccessorPart::Getter) else {
+            return Ok(false);
+        };
         let same_cached_getter = entries.iter().all(|entry| {
             entry.holds_accessor
-                && matches!(
-                    entry.action,
-                    Action::Get {
-                        holder: Holder::Prototype { .. },
-                        ..
-                    }
-                )
-                && entry.action == first.action
+                && entry.accessor_location(AccessorPart::Getter) == location
                 && entry.accessor_function.is_some_and(|entry_accessor| {
                     entry_accessor.function == accessor.function
                         && entry_accessor.cached_value_offset == accessor.cached_value_offset
@@ -404,9 +403,12 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
     /// `part` of the same accessor property with functions of the same
     /// executable (see `try_inline_getter()`), with the index of that
     /// executable in the snapshot.
-    fn accessor_call_entries(&self, cache: u32, part: AccessorPart) -> Option<(&'a [CacheEntry], u32)> {
-        let entries = self.cache_entries(cache)?;
+    fn accessor_call_entries(&self, cache: u32, base: Operand, part: AccessorPart) -> Option<(&'a [CacheEntry], u32)> {
+        let entries = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))?;
         let first = entries[0];
+        let location = first.accessor_location(part)?;
         let executable_of = |entry: &CacheEntry| {
             let index = entry.accessor_function?.inline_executable?;
             Some(self.snapshot.executables.get(index as usize)?.cell)
@@ -414,7 +416,9 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         let index = first.accessor_function?.inline_executable?;
         let executable = executable_of(&first)?;
         let same_executable = entries.iter().all(|entry| {
-            entry.calls_accessor(part) && entry.action == first.action && executable_of(entry) == Some(executable)
+            entry.calls_accessor(part)
+                && entry.accessor_location(part) == Some(location)
+                && executable_of(entry) == Some(executable)
         });
         let gates = [ExitKind::NotObject, ExitKind::BadShape, ExitKind::BadCallTarget];
         if !same_executable || !gates.into_iter().all(|kind| self.may_speculate(kind)) {
@@ -431,6 +435,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
     fn native_accessor_entries(
         &self,
         cache: u32,
+        base: Operand,
         part: AccessorPart,
         inputs: &[Operand],
     ) -> Option<(&'a [CacheEntry], NativeCallTarget, u32)> {
@@ -439,7 +444,9 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         } else {
             0
         };
-        let entries = self.cache_entries(cache)?;
+        let entries = self
+            .cache_entries(cache)
+            .or_else(|| self.megamorphic_entries_for_known_shape(cache, base))?;
         let first = entries[0];
         let accessor = first.accessor_function?;
         let mut target = accessor.native?;
@@ -509,7 +516,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         cache: u32,
     ) -> Result<bool, CompileFailure> {
         let Some((entries, target, inlined_frame_bytes)) =
-            self.native_accessor_entries(cache, AccessorPart::Getter, &[base])
+            self.native_accessor_entries(cache, base, AccessorPart::Getter, &[base])
         else {
             return Ok(false);
         };
@@ -531,7 +538,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         cache: u32,
     ) -> Result<bool, CompileFailure> {
         let Some((entries, target, inlined_frame_bytes)) =
-            self.native_accessor_entries(cache, AccessorPart::Setter, &[base, src])
+            self.native_accessor_entries(cache, base, AccessorPart::Setter, &[base, src])
         else {
             return Ok(false);
         };
@@ -639,7 +646,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         base: Operand,
         cache: u32,
     ) -> Result<Option<Flow>, CompileFailure> {
-        let Some((entries, index)) = self.accessor_call_entries(cache, AccessorPart::Getter) else {
+        let Some((entries, index)) = self.accessor_call_entries(cache, base, AccessorPart::Getter) else {
             return Ok(None);
         };
         let (_, getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
@@ -656,7 +663,7 @@ impl<'a, 'z> GraphBuilder<'a, 'z> {
         src: Operand,
         cache: u32,
     ) -> Result<Option<Flow>, CompileFailure> {
-        let Some((entries, index)) = self.accessor_call_entries(cache, AccessorPart::Setter) else {
+        let Some((entries, index)) = self.accessor_call_entries(cache, base, AccessorPart::Setter) else {
             return Ok(None);
         };
         let Some(dst) = self.dead_register(&[base, src]) else {

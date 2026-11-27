@@ -56,6 +56,22 @@ impl Hash for ValueTraitsKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut value = self.0;
         assert!(!value.is_empty());
+        if value.is_int32() {
+            state.write_u64(value.0);
+            return;
+        }
+        if !value.is_cell() {
+            // In the IEEE 754 standard a NaN value is encoded as any value from 0x7ff0000000000001 to 0x7fffffffffffffff,
+            // with the least significant bits (referred to as the 'payload') carrying some kind of diagnostic information
+            // indicating the source of the NaN. Since ECMA262 does not differentiate between different kinds of NaN values,
+            // Sets and Maps must not differentiate between them either.
+            // This is achieved by replacing any NaN value by a canonical qNaN.
+            if value.is_nan() {
+                value = Value::from_f64(f64::NAN);
+            }
+            state.write_u64(value.0);
+            return;
+        }
         if value.is_string() {
             hash_utf16_view(value.as_string().utf16_string_view(), state);
             return;
@@ -66,23 +82,8 @@ impl Hash for ValueTraitsKey {
             return;
         }
 
-        // In the IEEE 754 standard a NaN value is encoded as any value from 0x7ff0000000000001 to 0x7fffffffffffffff,
-        // with the least significant bits (referred to as the 'payload') carrying some kind of diagnostic information
-        // indicating the source of the NaN. Since ECMA262 does not differentiate between different kinds of NaN values,
-        // Sets and Maps must not differentiate between them either.
-        // This is achieved by replacing any NaN value by a canonical qNaN.
-        if value.is_nan() {
-            value = Value::from_f64(f64::NAN);
-        }
-
         // NB: A cell may move, so it is hashed by its identity, not its address.
-        if value.is_cell() {
-            value.as_cell().hash(state);
-            return;
-        }
-
-        // FIXME: Is this the best way to hash doubles & ints?
-        state.write_u64(value.0);
+        value.as_cell().hash(state);
     }
 }
 
