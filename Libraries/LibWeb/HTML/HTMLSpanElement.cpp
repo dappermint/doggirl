@@ -8,7 +8,7 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLSpanElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLSpanElement);
 
 HTMLSpanElement::HTMLSpanElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))

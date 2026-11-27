@@ -115,6 +115,10 @@ public:
     State state() const { return m_state; }
     void set_state(State state) { m_state = state; }
 
+    // Marks this cell's block as holding at least one cell whose destructor must run during sweep.
+    // Only needed for allocators configured with `ConditionalDestructor::Yes`.
+    void mark_needs_destruction() const { gc_cell_mark_needs_destruction(reinterpret_cast<GCCell const*>(this)); }
+
     virtual StringView class_name() const = 0;
 
     class GC_API Visitor {

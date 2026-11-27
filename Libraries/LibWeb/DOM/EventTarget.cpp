@@ -1237,8 +1237,10 @@ void EventTarget::activation_behavior(Event const&)
 
 auto EventTarget::ensure_data() -> Data&
 {
-    if (!m_data)
+    if (!m_data) {
         m_data = make<Data>();
+        mark_needs_destruction();
+    }
     return *m_data;
 }
 

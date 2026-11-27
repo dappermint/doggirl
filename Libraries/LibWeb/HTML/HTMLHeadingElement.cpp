@@ -12,7 +12,7 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLHeadingElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLHeadingElement);
 
 HTMLHeadingElement::HTMLHeadingElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))

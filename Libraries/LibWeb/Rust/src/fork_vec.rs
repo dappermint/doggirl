@@ -55,9 +55,9 @@ pub(crate) struct ForkVec<T> {
     /// How many rows the newest fork was made with, and 0 without a log: a write to a row past them saves nothing, and
     /// so does not ask whether a fork still reads the log.
     rows_at_newest_fork: Cell<usize>,
-    /// Which segments the log of the newest fork saved, a bit each, where the vector saves rows with their segment: a
-    /// write to a row of one of them saves nothing again.
-    segments_saved_since_newest_fork: UnsafeCell<Vec<u64>>,
+    /// Which keys the log of the newest fork saved, a bit each (segment indices when `SAVES_SEGMENTS`, row indices
+    /// otherwise): a write to an already-saved key returns without upgrading the log or probing its map.
+    saved_since_newest_fork: UnsafeCell<Vec<u64>>,
     fork: Option<Box<ForkSide<T>>>,
 }
 
@@ -76,7 +76,7 @@ impl<T> Default for ForkVec<T> {
             storage: Arc::default(),
             log: UnsafeCell::new(None),
             rows_at_newest_fork: Cell::new(0),
-            segments_saved_since_newest_fork: UnsafeCell::default(),
+            saved_since_newest_fork: UnsafeCell::default(),
             fork: None,
         }
     }
@@ -185,11 +185,16 @@ impl<T: Clone + Default> ForkVec<T> {
     #[inline]
     fn save_row(&mut self, index: usize) {
         if index < self.rows_at_newest_fork.get() {
+            let key = Self::saved_key(index);
+            if self.key_saved_since_newest_fork(key) {
+                return;
+            }
             self.save_row_in_log(index);
         }
     }
 
     /// Where a log keeps what it saved of the row at `index`, and where in that the row is.
+    #[inline]
     fn saved_key(index: usize) -> usize {
         if Self::SAVES_SEGMENTS {
             index / ROWS_PER_SEGMENT
@@ -198,6 +203,7 @@ impl<T: Clone + Default> ForkVec<T> {
         }
     }
 
+    #[inline]
     fn saved_offset(index: usize) -> usize {
         if Self::SAVES_SEGMENTS {
             index % ROWS_PER_SEGMENT
@@ -206,20 +212,25 @@ impl<T: Clone + Default> ForkVec<T> {
         }
     }
 
-    fn segment_saved_since_newest_fork(&mut self, segment: usize) -> bool {
-        Self::SAVES_SEGMENTS
-            && self
-                .segments_saved_since_newest_fork
-                .get_mut()
-                .get(segment / 64)
-                .is_some_and(|word| word & (1 << (segment % 64)) != 0)
+    #[inline]
+    fn key_saved_since_newest_fork(&mut self, key: usize) -> bool {
+        self.saved_since_newest_fork
+            .get_mut()
+            .get(key / 64)
+            .is_some_and(|word| word & (1 << (key % 64)) != 0)
+    }
+
+    fn note_key_saved_since_newest_fork(&mut self, key: usize) {
+        let saved = self.saved_since_newest_fork.get_mut();
+        if saved.len() <= key / 64 {
+            saved.resize(key / 64 + 1, 0);
+        }
+        saved[key / 64] |= 1 << (key % 64);
     }
 
     #[cold]
     fn save_row_in_log(&mut self, index: usize) {
-        if self.segment_saved_since_newest_fork(index / ROWS_PER_SEGMENT) {
-            return;
-        }
+        let key = Self::saved_key(index);
         // NB: The last fork reading the log may go on another thread at any moment, so this holds it.
         let Some(log) = self.live_log() else {
             return;
@@ -228,20 +239,15 @@ impl<T: Clone + Default> ForkVec<T> {
             return;
         }
         if Self::SAVES_SEGMENTS {
-            let segment = index / ROWS_PER_SEGMENT;
             // NB: The segment holds every row of it the fork reads: a write to any of them, a pop included, saves it
             //     before it changes.
             // SAFETY: Only the vector writes the log, and `&mut self` rules out any other reference into it.
-            unsafe { &mut *log.saved.get() }.entry(segment).or_insert_with(|| {
+            unsafe { &mut *log.saved.get() }.entry(key).or_insert_with(|| {
                 let rows = self.storage_mut();
-                let start = segment * ROWS_PER_SEGMENT;
+                let start = key * ROWS_PER_SEGMENT;
                 rows[start..rows.len().min(start + ROWS_PER_SEGMENT)].into()
             });
-            let saved = self.segments_saved_since_newest_fork.get_mut();
-            if saved.len() <= segment / 64 {
-                saved.resize(segment / 64 + 1, 0);
-            }
-            saved[segment / 64] |= 1 << (segment % 64);
+            self.note_key_saved_since_newest_fork(key);
             return;
         }
         // SAFETY: Only the vector writes the log, and `&mut self` rules out any other reference into it.
@@ -250,6 +256,7 @@ impl<T: Clone + Default> ForkVec<T> {
         saved
             .entry(index)
             .or_insert_with(|| Box::new([unsafe { (*self.rows.add(index)).clone() }]));
+        self.note_key_saved_since_newest_fork(key);
     }
 
     #[cold]
@@ -400,11 +407,9 @@ impl<T: Clone + Default> Clone for ForkVec<T> {
         let current = unsafe { &mut *self.log.get() };
         let previous = current.replace(Arc::downgrade(&log));
         self.rows_at_newest_fork.set(self.len);
-        if Self::SAVES_SEGMENTS {
-            // SAFETY: As above.
-            // NB: The words take their room as segments are saved, so that a fork allocates nothing for them.
-            unsafe { &mut *self.segments_saved_since_newest_fork.get() }.fill(0);
-        }
+        // SAFETY: As above.
+        // NB: The words take their room as keys are saved, so that a fork allocates nothing for them.
+        unsafe { &mut *self.saved_since_newest_fork.get() }.fill(0);
         if let Some(previous) = previous.as_ref().and_then(Weak::upgrade) {
             // SAFETY: As above.
             unsafe { *previous.next.get() = Some(Arc::clone(&log)) };
@@ -415,7 +420,7 @@ impl<T: Clone + Default> Clone for ForkVec<T> {
             storage: Arc::clone(&self.storage),
             log: UnsafeCell::new(None),
             rows_at_newest_fork: Cell::new(0),
-            segments_saved_since_newest_fork: UnsafeCell::default(),
+            saved_since_newest_fork: UnsafeCell::default(),
             fork: Some(Box::new(ForkSide {
                 log,
                 own: FastMap::default(),

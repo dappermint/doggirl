@@ -150,6 +150,8 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
 
     auto old_data = m_data;
     m_data = full_data.to_string();
+    if (m_data.has_long_storage())
+        mark_needs_destruction();
 
     // 4. Queue a mutation record of "characterData" for node with null, null, node’s data, « », « », null, and null.
     // NOTE: We do this later so that the mutation observer may notify UI clients of this node's new value.

@@ -20,11 +20,12 @@
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(HTMLTableSectionElement);
+GC_DEFINE_ALLOCATOR_WITH_BATCH_DESTRUCTOR(HTMLTableSectionElement);
 
 HTMLTableSectionElement::HTMLTableSectionElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : HTMLElement(document, move(qualified_name))
 {
+    set_tree_mutation_fast_path(DOM::Element::TreeMutationFastPath::PlainHTML);
 }
 
 HTMLTableSectionElement::~HTMLTableSectionElement() = default;

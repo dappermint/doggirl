@@ -564,7 +564,7 @@ impl InlineDeclarations {
 }
 
 /// How many elements a chunk of the column of inline declarations holds.
-const INLINE_DECLARATIONS_PER_CHUNK: usize = 64;
+const INLINE_DECLARATIONS_PER_CHUNK: usize = 16;
 
 /// The inline declarations of a document's elements by slot, which its host writes as it writes their rows, made only as
 /// far as the last element that held any.
