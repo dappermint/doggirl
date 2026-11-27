@@ -286,6 +286,11 @@ bool gc_heap_is_returning_memory_to_system(GCHeap const* heap)
     return as_heap(heap).is_returning_memory_to_system();
 }
 
+void gc_heap_finish_pending_incremental_sweep(GCHeap* heap)
+{
+    as_heap(heap).finish_pending_incremental_sweep();
+}
+
 void gc_heap_defer_gc(GCHeap* heap)
 {
     CAPI::defer_gc(as_heap(heap));

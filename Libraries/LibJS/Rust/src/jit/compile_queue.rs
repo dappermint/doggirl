@@ -193,6 +193,11 @@ impl Drop for Compiled {
         // NB: This keeps all the memory of the result. The compile that takes it gives back what is too much.
         code.clear();
         let mut spare = spare();
+        // When no compile thread is active, drop the code directly instead of stashing it and waking a sleeping
+        // worker just to release it later.
+        if spare.active_thread_count == 0 {
+            return;
+        }
         // NB: With no place left, the memory goes back to the system here.
         let Some(place) = spare.results.iter_mut().find(|place| place.is_none()) else {
             return;

@@ -111,6 +111,7 @@ pub(crate) struct SnapshotScratch {
     shared_call_flags: Vec<u8>,
     shared_call_value: Vec<u16>,
     shared_max_cache_sizes: Vec<u8>,
+    changed_captured_bindings: Vec<EnvironmentCoordinate>,
 }
 
 impl SnapshotScratch {
@@ -124,6 +125,7 @@ impl SnapshotScratch {
         self.shared_call_flags.clear();
         self.shared_call_value.clear();
         self.shared_max_cache_sizes.clear();
+        self.changed_captured_bindings.clear();
     }
 
     #[inline]
@@ -1579,29 +1581,32 @@ impl SnapshotBuilder<'_> {
         //     `ExecutableFeedback`, so `builder::has_run()` still reports unexecuted instructions as not having run.
         let (unprofiled, feedback) = if self.use_shared_learning {
             let local_feedback = executable.feedback();
-            let (has_feedback, arith, value, cache_value, keyed) = {
-                let mut learning = code
-                    .ensure_shared_jit_learning()
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                learning.merge_feedback(local_feedback, caches_slice);
-                self.scratch
-                    .shared_max_cache_sizes
-                    .extend_from_slice(&learning.max_property_cache_sizes);
-                if learning.has_feedback {
-                    self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
-                    self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
-                    let arith = self.snapshot.add(&learning.arith);
-                    let value = self.snapshot.add(&learning.value);
-                    let cache_value = self.snapshot.add(&learning.cache_value);
-                    let keyed = self
-                        .snapshot
-                        .add_exact_iter(learning.keyed_bits.iter().map(|&bits| KeyedFeedbackSnapshot { bits }));
-                    (true, arith, value, cache_value, keyed)
-                } else {
+            let (has_feedback, arith, value, cache_value, keyed) =
+                if local_feedback.is_none() && caches_slice.is_empty() && code.shared_jit_learning().is_none() {
                     (false, List::empty(), List::empty(), List::empty(), List::empty())
-                }
-            };
+                } else {
+                    let mut learning = code
+                        .ensure_shared_jit_learning()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    learning.merge_feedback(local_feedback, caches_slice);
+                    self.scratch
+                        .shared_max_cache_sizes
+                        .extend_from_slice(&learning.max_property_cache_sizes);
+                    if learning.has_feedback {
+                        self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
+                        self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
+                        let arith = self.snapshot.add(&learning.arith);
+                        let value = self.snapshot.add(&learning.value);
+                        let cache_value = self.snapshot.add(&learning.cache_value);
+                        let keyed = self
+                            .snapshot
+                            .add_exact_iter(learning.keyed_bits.iter().map(|&bits| KeyedFeedbackSnapshot { bits }));
+                        (true, arith, value, cache_value, keyed)
+                    } else {
+                        (false, List::empty(), List::empty(), List::empty(), List::empty())
+                    }
+                };
             if has_feedback {
                 let call = self.snapshot.begin();
                 if let Some(local_feedback) = local_feedback {
@@ -1913,18 +1918,18 @@ impl SnapshotBuilder<'_> {
         }
         let exit_sites = executable.jit_exit_sites();
         let has_shared_exits = self.use_shared_learning && executable.code().shared_jit_learning().is_some();
-        let changed: Vec<EnvironmentCoordinate> = if exit_sites.is_empty() && !has_shared_exits {
-            Vec::new()
-        } else {
-            loads
-                .iter()
-                .filter(|&&(_, pc)| {
-                    exit_sites.contains(&(pc, ExitKind::UnexpectedValue))
-                        || (has_shared_exits && executable.code().shared_has_unexpected_value_exit(pc))
-                })
-                .map(|&(coordinate, _)| coordinate)
-                .collect()
-        };
+        self.scratch.changed_captured_bindings.clear();
+        if !exit_sites.is_empty() || has_shared_exits {
+            self.scratch.changed_captured_bindings.extend(
+                loads
+                    .iter()
+                    .filter(|&&(_, pc)| {
+                        exit_sites.contains(&(pc, ExitKind::UnexpectedValue))
+                            || (has_shared_exits && executable.code().shared_has_unexpected_value_exit(pc))
+                    })
+                    .map(|&(coordinate, _)| coordinate),
+            );
+        }
         let bindings = self.snapshot.begin::<(EnvironmentCoordinate, GlobalValueSnapshot)>();
         for &(coordinate, _) in loads {
             let is_captured = self
@@ -1932,7 +1937,7 @@ impl SnapshotBuilder<'_> {
                 .rows_of(&bindings)
                 .iter()
                 .any(|(captured, _)| *captured == coordinate);
-            if changed.contains(&coordinate) || is_captured {
+            if self.scratch.changed_captured_bindings.contains(&coordinate) || is_captured {
                 continue;
             }
             let mut environment = function.environment();

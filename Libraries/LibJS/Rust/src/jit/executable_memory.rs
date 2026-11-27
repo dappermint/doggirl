@@ -392,7 +392,14 @@ pub struct CodeAllocator {
 impl CodeAllocator {
     fn allocate(&mut self, size: usize) -> *mut u8 {
         let size = align_up(size, ALLOCATION_ALIGNMENT);
-        if let Some(index) = self.free_blocks.iter().position(|block| block.size >= size) {
+        // Best-fit keeps large contiguous tail blocks intact for batched installs.
+        if let Some((index, _)) = self
+            .free_blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.size >= size)
+            .min_by_key(|(_, block)| block.size)
+        {
             let block = &mut self.free_blocks[index];
             let address = block.start;
             block.start = block.start.wrapping_add(size);
@@ -418,7 +425,13 @@ impl CodeAllocator {
     /// Returns `None` when existing chunks have ample fragmented free space so we do not map extra chunks.
     fn allocate_contiguous(&mut self, total_size: usize) -> Option<(*mut u8, usize)> {
         let total_size = align_up(total_size, ALLOCATION_ALIGNMENT);
-        if let Some(index) = self.free_blocks.iter().position(|block| block.size >= total_size) {
+        if let Some((index, _)) = self
+            .free_blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.size >= total_size)
+            .min_by_key(|(_, block)| block.size)
+        {
             let block = &mut self.free_blocks[index];
             let address = block.start;
             let chunk = block.chunk;

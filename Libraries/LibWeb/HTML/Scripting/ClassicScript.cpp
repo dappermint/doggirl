@@ -121,7 +121,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename
     return script;
 }
 
-GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::CompiledProgram compiled, MutedErrors muted_errors)
+GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::CompiledProgram compiled, MutedErrors muted_errors, size_t source_line_number, ScriptRegistry::IsInlineSource is_inline_source)
 {
     auto& realm = settings.realm();
 
@@ -149,7 +149,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filena
     }
 
     script->m_script_record = *result.release_value();
-    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
+    register_source(*script, is_inline_source, source_line_number);
 
     return script;
 }

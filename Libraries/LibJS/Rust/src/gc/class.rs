@@ -212,6 +212,8 @@ impl Class {
                 | ClassId::DirectGetterFunction
                 | ClassId::DictionaryPropertyTable
                 | ClassId::BoundFunction
+                | ClassId::RegExpObject
+                | ClassId::ArrayBuffer
         )
     }
 
