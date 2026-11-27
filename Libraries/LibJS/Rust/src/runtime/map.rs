@@ -23,6 +23,23 @@ use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::realm::Realm;
 use crate::runtime::value_traits::ValueTraitsKey;
 
+thread_local! {
+    /// Shared per-thread randomized hasher for Map and Set index tables.
+    static KEYED_COLLECTION_HASHER: foldhash::fast::RandomState = foldhash::fast::RandomState::default();
+}
+
+#[inline(always)]
+fn fold_hash32(hash64: u64) -> u32 {
+    (hash64 ^ (hash64 >> 32)) as u32
+}
+
+/// Deterministically expands a stored 32-bit key hash back to a 64-bit hashbrown table hash so
+/// bucket selection and H2 control tags use all 32 bits without touching `entries` during rehash.
+#[inline(always)]
+fn expand_hash32(hash32: u32) -> u64 {
+    (u64::from(hash32) << 32) | u64::from(hash32.rotate_right(7))
+}
+
 /// What a keyed collection keeps with each of its keys: a Map keeps a value, and a Set keeps nothing.
 pub(crate) trait StoredValue: Copy {
     /// What the entry of a removed key holds.
@@ -72,32 +89,38 @@ impl<V: StoredValue> StoredEntry<V> {
 /// memory than the entries themselves.
 const MAX_ENTRY_COUNT_WITHOUT_INDICES: usize = 8;
 
-/// The positions of the live entries of a collection, found by the hashes of their keys. The keys themselves are only in
-/// the entries, where a collection that moves cells rewrites them.
+/// The positions of the live entries of a collection, paired with a 32-bit key hash so probes reject mismatches
+/// and table rehashes avoid dereferencing `entries` or re-hashing keys. The keys themselves live only in `entries`,
+/// where a moving GC rewrites them.
 #[derive(Default)]
 struct Indices {
-    positions: HashTable<usize>,
-    hasher: foldhash::fast::RandomState,
+    positions: HashTable<(u32, u32)>,
 }
 
 impl Indices {
     #[inline]
-    fn hash(&self, key: Value) -> u64 {
-        self.hasher.hash_one(ValueTraitsKey(key))
+    fn hash_pair(key: Value) -> (u32, u64) {
+        let hash64 = KEYED_COLLECTION_HASHER.with(|hasher| hasher.hash_one(ValueTraitsKey(key)));
+        let hash32 = fold_hash32(hash64);
+        (hash32, expand_hash32(hash32))
     }
 
     #[inline]
     fn find<V: StoredValue>(&self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
+        let (hash32, hash) = Self::hash_pair(key);
         let key_bits = key.0;
         let is_identity_key = !(key.is_string() || key.is_bigint());
         let traits_key = ValueTraitsKey(key);
         self.positions
-            .find(self.hash(key), |&index| {
+            .find(hash, |&(index, entry_hash32)| {
+                if entry_hash32 != hash32 {
+                    return false;
+                }
                 // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
-                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                let entry_key = unsafe { entries.get_unchecked(index as usize) }.key;
                 entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             })
-            .copied()
+            .map(|&(index, _)| index as usize)
     }
 
     #[inline]
@@ -107,49 +130,57 @@ impl Indices {
         key: Value,
         new_index: usize,
     ) -> Option<usize> {
-        let hash = self.hash(key);
+        let (hash32, hash) = Self::hash_pair(key);
         let key_bits = key.0;
         let is_identity_key = !(key.is_string() || key.is_bigint());
         let traits_key = ValueTraitsKey(key);
-        let hasher = &self.hasher;
         match self.positions.entry(
             hash,
-            |&index| {
+            |&(index, entry_hash32)| {
+                if entry_hash32 != hash32 {
+                    return false;
+                }
                 // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
-                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                let entry_key = unsafe { entries.get_unchecked(index as usize) }.key;
                 entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             },
-            |&index| hasher.hash_one(ValueTraitsKey(entries[index].key)),
+            |&(_, entry_hash32)| expand_hash32(entry_hash32),
         ) {
-            hashbrown::hash_table::Entry::Occupied(occupied) => Some(*occupied.get()),
+            hashbrown::hash_table::Entry::Occupied(occupied) => Some(occupied.get().0 as usize),
             hashbrown::hash_table::Entry::Vacant(vacant) => {
-                vacant.insert(new_index);
+                let new_index = u32::try_from(new_index).expect("collection entry count fits in u32");
+                vacant.insert((new_index, hash32));
                 None
             }
         }
     }
 
-    fn insert<V: StoredValue>(&mut self, entries: &[StoredEntry<V>], key: Value, index: usize) {
-        let hash = self.hash(key);
-        let hasher = &self.hasher;
-        self.positions.insert_unique(hash, index, |&index| {
-            hasher.hash_one(ValueTraitsKey(entries[index].key))
-        });
+    fn insert(&mut self, key: Value, index: usize) {
+        let (hash32, hash) = Self::hash_pair(key);
+        let index = u32::try_from(index).expect("collection entry count fits in u32");
+        self.positions
+            .insert_unique(hash, (index, hash32), |&(_, entry_hash32)| {
+                expand_hash32(entry_hash32)
+            });
     }
 
     fn remove<V: StoredValue>(&mut self, entries: &[StoredEntry<V>], key: Value) -> Option<usize> {
+        let (hash32, hash) = Self::hash_pair(key);
         let key_bits = key.0;
         let is_identity_key = !(key.is_string() || key.is_bigint());
         let traits_key = ValueTraitsKey(key);
         let entry = self
             .positions
-            .find_entry(self.hash(key), |&index| {
+            .find_entry(hash, |&(index, entry_hash32)| {
+                if entry_hash32 != hash32 {
+                    return false;
+                }
                 // SAFETY: Every index stored in `positions` points to a live slot in `entries`.
-                let entry_key = unsafe { entries.get_unchecked(index) }.key;
+                let entry_key = unsafe { entries.get_unchecked(index as usize) }.key;
                 entry_key.0 == key_bits || (!is_identity_key && ValueTraitsKey(entry_key) == traits_key)
             })
             .ok()?;
-        Some(entry.remove().0)
+        Some(entry.remove().0.0 as usize)
     }
 }
 
@@ -207,8 +238,26 @@ impl<V: StoredValue> Storage<V> {
     #[inline]
     pub(crate) fn modify<R>(storage: &GcRefCell<Self>, vm: &Vm, modify: impl FnOnce(&mut Self) -> R) -> R {
         let mut storage = storage.borrow_mut(vm);
-        let old_size = storage.external_memory_size();
+        let old_entries_cap = storage.entries.capacity();
+        let old_indices_alloc = storage
+            .indices
+            .as_ref()
+            .map_or(usize::MAX, |indices| indices.positions.allocation_size());
         let result = modify(&mut storage);
+        let new_entries_cap = storage.entries.capacity();
+        let new_indices_alloc = storage
+            .indices
+            .as_ref()
+            .map_or(usize::MAX, |indices| indices.positions.allocation_size());
+        if new_entries_cap == old_entries_cap && new_indices_alloc == old_indices_alloc {
+            return result;
+        }
+        let old_indices_size = if old_indices_alloc == usize::MAX {
+            0
+        } else {
+            size_of::<Indices>().saturating_add(old_indices_alloc)
+        };
+        let old_size = (old_entries_cap * size_of::<StoredEntry<V>>()).saturating_add(old_indices_size);
         let new_size = storage.external_memory_size();
         drop(storage);
         if new_size != old_size {
@@ -308,7 +357,7 @@ impl<V: StoredValue> Storage<V> {
                     self.indices
                         .as_mut()
                         .expect("the indices were just built")
-                        .insert(&self.entries, key, new_index);
+                        .insert(key, new_index);
                 }
             }
         }
@@ -361,7 +410,7 @@ impl<V: StoredValue> Storage<V> {
             .reserve(self.entries.len() + 1, |_| unreachable!("the table is empty"));
         for (index, entry) in self.entries.iter().enumerate() {
             if !entry.is_removed() {
-                indices.insert(&self.entries, entry.key, index);
+                indices.insert(entry.key, index);
             }
         }
         self.indices = Some(indices);
@@ -393,8 +442,8 @@ impl<V: StoredValue> Storage<V> {
                 new_entry_count += 1;
             }
             self.entries.truncate(new_entry_count);
-            for index in &mut indices.positions {
-                *index = new_indices[*index];
+            for (index, _) in &mut indices.positions {
+                *index = new_indices[*index as usize] as u32;
             }
         } else {
             self.entries.retain(|entry| !entry.is_removed());

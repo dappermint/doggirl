@@ -441,18 +441,30 @@ impl CodeAllocator {
     fn free(&mut self, start: *mut u8, size: usize) {
         let size = align_up(size, ALLOCATION_ALIGNMENT);
         let chunk = self.chunk_index_of(start);
+        let end = start.wrapping_add(size);
         let index = self.free_blocks.partition_point(|block| block.start < start);
-        self.free_blocks.insert(index, FreeBlock { start, size, chunk });
-        let adjacent = |blocks: &[FreeBlock], first: usize| {
-            blocks[first].end() == blocks[first + 1].start && blocks[first].chunk == blocks[first + 1].chunk
-        };
-        if index + 1 < self.free_blocks.len() && adjacent(&self.free_blocks, index) {
-            self.free_blocks[index].size += self.free_blocks[index + 1].size;
-            self.free_blocks.remove(index + 1);
-        }
-        if index > 0 && adjacent(&self.free_blocks, index - 1) {
-            self.free_blocks[index - 1].size += self.free_blocks[index].size;
-            self.free_blocks.remove(index);
+        let merge_left = index > 0
+            && self.free_blocks[index - 1].chunk == chunk
+            && self.free_blocks[index - 1].end() == start;
+        let merge_right = index < self.free_blocks.len()
+            && self.free_blocks[index].chunk == chunk
+            && end == self.free_blocks[index].start;
+        match (merge_left, merge_right) {
+            (true, true) => {
+                let right_size = self.free_blocks[index].size;
+                self.free_blocks[index - 1].size += size + right_size;
+                self.free_blocks.remove(index);
+            }
+            (true, false) => {
+                self.free_blocks[index - 1].size += size;
+            }
+            (false, true) => {
+                self.free_blocks[index].start = start;
+                self.free_blocks[index].size += size;
+            }
+            (false, false) => {
+                self.free_blocks.insert(index, FreeBlock { start, size, chunk });
+            }
         }
     }
 

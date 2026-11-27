@@ -404,8 +404,6 @@ static RefPtr<CustomPropertyData const> inheritable_custom_property_data(Layout:
 
 // What one element's animation sample hands the style engine, which lives until the sample is finished.
 struct StyleComputer::AnimationSample {
-    AK_ALLOC_WITH_KMALLOC;
-
     AnimationSample(GC::Ref<StyleComputer const> style_computer, DOM::AbstractElement abstract_element, ComputedStyleWorkingSet& computed_properties)
         : context { style_computer, abstract_element, computed_properties }
     {
@@ -418,7 +416,7 @@ struct StyleComputer::AnimationSample {
     } context;
     AnimationSamplePurpose purpose { AnimationSamplePurpose::Rendering };
     Vector<Animations::RustFFI::FfiSampledEffect, 1> sampled_effects;
-    Vector<u8> document_supported_color_scheme_codes;
+    Vector<u8, 4> document_supported_color_scheme_codes;
     // The custom-property environments whose stores the input names.
     RefPtr<CustomPropertyData const> custom_property_data;
     RefPtr<CustomPropertyData const> base_custom_property_data;
@@ -439,20 +437,24 @@ void StyleComputer::refresh_animations_into_each(Layout::BegunRead const& read, 
     if (requests.is_empty())
         return;
     // The samples are taken in one call of the style engine, each over the record its element holds.
-    Vector<NonnullOwnPtr<AnimationSample>> samples;
-    Vector<ComputedValuesFFI::FfiHostAnimationSample> inputs;
+    // Pre-allocate `samples` before initializing `input` pointers so internal pointers into each sample stay stable.
+    Vector<AnimationSample, 4> samples;
+    Vector<ComputedValuesFFI::FfiHostAnimationSample, 4> inputs;
     samples.ensure_capacity(requests.size());
     inputs.ensure_capacity(requests.size());
-    for (auto const& request : requests) {
-        samples.unchecked_append(begin_animation_sample(read, request.abstract_element, request.effects, request.computed_properties));
-        inputs.unchecked_append(samples.last()->input);
+    for (auto const& request : requests)
+        samples.unchecked_append(AnimationSample { *this, request.abstract_element, request.computed_properties });
+    for (size_t index = 0; index < requests.size(); ++index) {
+        auto const& request = requests[index];
+        initialize_animation_sample(samples[index], read, request.abstract_element, request.effects, request.computed_properties);
+        inputs.unchecked_append(samples[index].input);
     }
-    Vector<ComputedValuesFFI::FfiHostAnimationSampleResult> results;
+    Vector<ComputedValuesFFI::FfiHostAnimationSampleResult, 4> results;
     results.resize(inputs.size());
     ComputedValuesFFI::rust_sample_animation_effects_each(inputs.data(), inputs.size(), &read, results.data());
     for (size_t index = 0; index < requests.size(); ++index) {
         auto const& request = requests[index];
-        finish_animation_sample(*samples[index], results[index]);
+        finish_animation_sample(samples[index], results[index]);
         finish_animation_refresh(read, request.abstract_element, request.computed_properties);
     }
 }
@@ -466,27 +468,28 @@ void StyleComputer::finish_animation_refresh(Layout::BegunRead const& read, DOM:
 
 void StyleComputer::collect_animation_effects_into(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<Animations::EffectRef> effects, ComputedStyleWorkingSet& computed_properties) const
 {
-    auto sample = begin_animation_sample(read, abstract_element, effects, computed_properties);
-    auto result = ComputedValuesFFI::rust_sample_animation_effects(&sample->input, &read);
-    finish_animation_sample(*sample, result);
+    AnimationSample sample { *this, abstract_element, computed_properties };
+    initialize_animation_sample(sample, read, abstract_element, effects, computed_properties);
+    auto result = ComputedValuesFFI::rust_sample_animation_effects(&sample.input, &read);
+    finish_animation_sample(sample, result);
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_for_animation_commit(Layout::BegunRead const& read, DOM::AbstractElement element, ReadonlySpan<Animations::EffectRef> effects) const
 {
     auto style = reconstruct_computed_properties_for_animation(element.installed_style());
-    auto sample = begin_animation_sample(read, element, effects, *style, AnimationSamplePurpose::CommitStyles);
-    auto result = ComputedValuesFFI::rust_sample_animation_effects_for_commit_styles(&sample->input, &read);
-    finish_animation_sample(*sample, result);
+    AnimationSample sample { *this, element, *style };
+    initialize_animation_sample(sample, read, element, effects, *style, AnimationSamplePurpose::CommitStyles);
+    auto result = ComputedValuesFFI::rust_sample_animation_effects_for_commit_styles(&sample.input, &read);
+    finish_animation_sample(sample, result);
     return style;
 }
 
-NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<Animations::EffectRef> effects, ComputedStyleWorkingSet& computed_properties, AnimationSamplePurpose purpose) const
+void StyleComputer::initialize_animation_sample(AnimationSample& sample, Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<Animations::EffectRef> effects, ComputedStyleWorkingSet& computed_properties, AnimationSamplePurpose purpose) const
 {
-    auto sample = make<AnimationSample>(*this, abstract_element, computed_properties);
-    sample->purpose = purpose;
+    sample.purpose = purpose;
     // The style engine samples each effect from the description its record keeps, which the sample publishes to the
     // engine where the engine does not have it yet, with its animation's timing and timeline as they stand.
-    auto& sampled_effects = sample->sampled_effects;
+    auto& sampled_effects = sample.sampled_effects;
     sampled_effects.ensure_capacity(effects.size());
     for (auto const& effect : effects) {
         sampled_effects.unchecked_append({
@@ -498,9 +501,9 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
     // Keyframes substitute against the element's custom properties as they stand; an animated custom property
     // composes over them with the overlay of the sample before peeled off, and a keyframe saying `inherit` takes
     // the environment the element inherits.
-    auto& custom_property_data = sample->custom_property_data;
-    auto& base_custom_property_data = sample->base_custom_property_data;
-    auto& inheritance_custom_property_data = sample->inheritance_custom_property_data;
+    auto& custom_property_data = sample.custom_property_data;
+    auto& base_custom_property_data = sample.base_custom_property_data;
+    auto& inheritance_custom_property_data = sample.inheritance_custom_property_data;
     custom_property_data = abstract_element.custom_property_data();
     base_custom_property_data = custom_property_data;
     if (base_custom_property_data && abstract_element.custom_property_data_is_animation_overlay())
@@ -511,7 +514,7 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
         && !(inheritance_parent.has_value() && inheritable_custom_property_data(read, *inheritance_parent).ptr() == base_custom_property_data.ptr());
 
     // The document's side of the environment keyframes compute in; the engine fills in the element's.
-    auto& document_supported_color_scheme_codes = sample->document_supported_color_scheme_codes;
+    auto& document_supported_color_scheme_codes = sample.document_supported_color_scheme_codes;
     auto document_supported_color_schemes = document().supported_color_schemes();
     if (document_supported_color_schemes.has_value()) {
         document_supported_color_scheme_codes.ensure_capacity(document_supported_color_schemes->size());
@@ -519,7 +522,7 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
             document_supported_color_scheme_codes.unchecked_append(to_underlying(preferred_color_scheme_from_string(scheme)));
     }
     auto document_base_url_bytes = document().serialized_base_url().bytes();
-    sample->environment = {
+    sample.environment = {
         .box_type_input = {},
         .color_scheme_input = {
             .preferred_color_scheme = static_cast<u8>(to_underlying(document().page().preferred_color_scheme())),
@@ -546,7 +549,7 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
     };
 
     using SampleContext = AnimationSample::Context;
-    sample->input = {
+    sample.input = {
         .host = m_style_engine.host(),
         .style_node = abstract_element.element().style_node_id().value(),
         .pseudo_kind = abstract_element.pseudo_element().map([](auto pseudo_element) { return static_cast<u8>(to_underlying(pseudo_element)); }).value_or(NumericLimits<u8>::max()),
@@ -566,9 +569,9 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
         },
         .custom_property_registration_generation = document().custom_property_registration_generation(),
         .inheritance_parent_record = inheritance_parent.has_value() ? inheritance_parent->installed_style().record_pointer() : nullptr,
-        .environment = &sample->environment,
+        .environment = &sample.environment,
         .element_box_slot = Layout::Node::slot_id(abstract_element.element().unsafe_layout_node(read)).index,
-        .callback_context = &sample->context,
+        .callback_context = &sample.context,
         .prepare_overlay_for_mutation = [](void* context) -> void* {
             auto& sample = *static_cast<SampleContext*>(context);
             return sample.computed_properties.prepare_animated_overlay_for_rust_mutation(Badge<StyleComputer> {});
@@ -585,15 +588,15 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
             contexts->line_height = length_context_for(LengthResolutionPhase::LineHeight);
             contexts->remaining = length_context_for(LengthResolutionPhase::Remaining); },
     };
-    return sample;
 }
 
 void StyleComputer::compute_css_keyframe_values(DOM::AbstractElement element, ReadonlySpan<ComputedValuesFFI::FfiReflectedKeyframeProperty> properties, size_t keyframe_count, ComputedValuesFFI::FfiStyleSheetResourceContext const& resource_context, void* context, CSSKeyframeValueCallback emit) const
 {
     Layout::ForcedReadScope read { element.element().document() };
     auto computed_properties = reconstruct_computed_properties_for_animation(element.installed_style());
-    auto sample = begin_animation_sample(read, element, {}, *computed_properties, AnimationSamplePurpose::KeyframeReflection);
-    ComputedValuesFFI::rust_compute_css_keyframe_values(&sample->input, read, properties.data(), properties.size(), keyframe_count, &resource_context, context, emit);
+    AnimationSample sample { *this, element, *computed_properties };
+    initialize_animation_sample(sample, read, element, {}, *computed_properties, AnimationSamplePurpose::KeyframeReflection);
+    ComputedValuesFFI::rust_compute_css_keyframe_values(&sample.input, read, properties.data(), properties.size(), keyframe_count, &resource_context, context, emit);
 }
 
 void StyleComputer::finish_animation_sample(AnimationSample& sample, ComputedValuesFFI::FfiHostAnimationSampleResult const& result) const
