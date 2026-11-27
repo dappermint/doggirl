@@ -18,6 +18,8 @@ WEBVIEW_API extern OrderedHashMap<StringView, StringView> const& user_agents;
 
 WEBVIEW_API Optional<StringView> normalize_user_agent_name(StringView);
 
+WEBVIEW_API Web::NavigatorCompatibilityMode navigator_compatibility_mode_for_user_agent_preset(StringView);
+
 // The names WebContent's navigator-compatibility-mode debug request takes.
 WEBVIEW_API StringView navigator_compatibility_mode_to_string(Web::NavigatorCompatibilityMode);
 

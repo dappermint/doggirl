@@ -14,6 +14,12 @@
 }:
 
 let
+  resolvedVersion =
+    if unwrapped != null && unwrapped ? version then
+      unwrapped.version
+    else
+      "0.2.0";
+
   passthroughDarwinApp =
     stdenv.hostPlatform.isDarwin
     && unwrapped != null
@@ -137,9 +143,9 @@ let
         <key>CFBundlePackageType</key>
         <string>APPL</string>
         <key>CFBundleShortVersionString</key>
-        <string>0.1.0</string>
+        <string>${resolvedVersion}</string>
         <key>CFBundleVersion</key>
-        <string>0.1.0</string>
+        <string>${resolvedVersion}</string>
         <key>NSHighResolutionCapable</key>
         <true/>
         <key>CFBundleDocumentTypes</key>
@@ -183,7 +189,7 @@ let
 
   iconsetDir = "${repoRoot}/UI/Icons/macos/app_icon.iconset";
 in
-runCommand "doggirl-wrapped-0.1.0"
+runCommand "doggirl-wrapped-${resolvedVersion}"
   {
     passAsFile = [
       "launcherScript"

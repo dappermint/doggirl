@@ -49,7 +49,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "doggirl-unwrapped";
-  version = "0.1.0";
+  version = "0.2.0";
 
   inherit src;
 
