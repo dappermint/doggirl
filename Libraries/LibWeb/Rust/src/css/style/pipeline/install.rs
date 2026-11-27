@@ -416,85 +416,81 @@ impl RetainedState {
             });
             // The pseudo-elements follow their element, the ones that no longer generate a box
             // with no record.
-            let main_holds_pseudo = |state: &Self, target: super::PseudoElementTarget| {
-                state
-                    .held_pseudo_style_records
-                    .get(&node)
-                    .and_then(|held| held.iter().find(|&&(held_target, _)| held_target == target))
-                    .map_or(0, |&(_, record)| record)
-            };
-            for kind in super::PSEUDO_ELEMENT_KINDS {
-                let old_pseudo_record = self
-                    .computed_group_sets
-                    .pseudo_style_record(node, kind)
-                    .unwrap_or(computed::FinalStyleRecordID::NONE);
-                let old_pseudo = old_pseudo_record.raw();
-                let new_pseudo_record = match pseudo_element_records
-                    .iter()
-                    .find(|(held, _)| *held == super::PseudoElementTarget::of_kind(kind))
-                {
-                    Some((_, pseudo_record)) => {
-                        // A pseudo-element's containers are its originating element's.
-                        self.note_container_unit_reads(node, pseudo_record, true);
-                        let pseudo_environment = self.pseudo_element_environment(
-                            node,
-                            pseudo_record,
-                            record,
-                            environment,
-                            &mut scratch.minted,
-                        );
-                        let pseudo_record: &Arc<Record> =
-                            &self.record_in_environment(pseudo_record, pseudo_environment);
-                        let new_pseudo_record = self.install_record(pseudo_record, &mut scratch.installed);
-                        // The pseudo-element's move reads the record it moves from, which the assignment lets go
-                        // of, as the element's does.
-                        if old_pseudo != 0 && old_pseudo != new_pseudo_record.raw() {
-                            self.computed_group_sets.pin_style_record(old_pseudo);
-                            installation.pinned_records.push(old_pseudo);
-                        }
-                        self.computed_group_sets
-                            .assign_installed_pseudo_record(node, kind, new_pseudo_record);
-                        new_pseudo_record
+            let has_existing_pseudos = !self.computed_group_sets.has_no_pseudo_rows(node);
+            let has_held_pseudos =
+                !self.held_pseudo_style_records.is_empty() && self.held_pseudo_style_records.contains_key(&node);
+            if !pseudo_element_records.is_empty() || has_existing_pseudos || has_held_pseudos {
+                let main_holds_pseudo = |state: &Self, target: super::PseudoElementTarget| {
+                    if !has_held_pseudos {
+                        return 0;
                     }
-                    // The main thread may hold a record a read demanded for a pseudo-element that generates no
-                    // box, which goes as the element's styles move.
-                    None if old_pseudo == 0
-                        && main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == 0 =>
-                    {
-                        continue;
-                    }
-                    None => computed::FinalStyleRecordID::NONE,
+                    state
+                        .held_pseudo_style_records
+                        .get(&node)
+                        .and_then(|held| held.iter().find(|&&(held_target, _)| held_target == target))
+                        .map_or(0, |&(_, record)| record)
                 };
-                let new_pseudo = new_pseudo_record.raw();
-                let main_holds_new_pseudo =
-                    main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == new_pseudo;
-                if !main_holds_new_pseudo {
-                    installation.swaps.push(StyleSwap::new(
-                        self,
-                        node,
-                        PseudoSlot::pseudo_element(kind),
-                        StyleAtomID::NONE,
-                        new_pseudo_record,
-                    ));
-                }
-                if old_pseudo == new_pseudo {
-                    // A pseudo-element whose record stays plans the animations it names again where
-                    // their `@keyframes` may have moved, as for a first record.
-                    if plan_owed && main_holds_new_pseudo && new_pseudo != 0 {
-                        self.note_pseudo_element_composition(
-                            &mut pseudo_elements,
-                            node,
-                            kind,
-                            computed::FinalStyleRecordID::NONE,
-                            new_pseudo_record,
-                        );
-                    }
-                    // The main thread cleared the style of a pseudo-element whose record stays, as below an element
-                    // that was display:none: it takes the record again, with what it installs beside it, and the
-                    // animations it names start as for a first record.
+                for kind in super::PSEUDO_ELEMENT_KINDS {
+                    let old_pseudo_record = if has_existing_pseudos {
+                        self.computed_group_sets
+                            .pseudo_style_record(node, kind)
+                            .unwrap_or(computed::FinalStyleRecordID::NONE)
+                    } else {
+                        computed::FinalStyleRecordID::NONE
+                    };
+                    let old_pseudo = old_pseudo_record.raw();
+                    let new_pseudo_record = match pseudo_element_records
+                        .iter()
+                        .find(|(held, _)| *held == super::PseudoElementTarget::of_kind(kind))
+                    {
+                        Some((_, pseudo_record)) => {
+                            // A pseudo-element's containers are its originating element's.
+                            self.note_container_unit_reads(node, pseudo_record, true);
+                            let pseudo_environment = self.pseudo_element_environment(
+                                node,
+                                pseudo_record,
+                                record,
+                                environment,
+                                &mut scratch.minted,
+                            );
+                            let pseudo_record: &Arc<Record> =
+                                &self.record_in_environment(pseudo_record, pseudo_environment);
+                            let new_pseudo_record = self.install_record(pseudo_record, &mut scratch.installed);
+                            // The pseudo-element's move reads the record it moves from, which the assignment lets go
+                            // of, as the element's does.
+                            if old_pseudo != 0 && old_pseudo != new_pseudo_record.raw() {
+                                self.computed_group_sets.pin_style_record(old_pseudo);
+                                installation.pinned_records.push(old_pseudo);
+                            }
+                            self.computed_group_sets
+                                .assign_installed_pseudo_record(node, kind, new_pseudo_record);
+                            new_pseudo_record
+                        }
+                        // The main thread may hold a record a read demanded for a pseudo-element that generates no
+                        // box, which goes as the element's styles move.
+                        None if old_pseudo == 0
+                            && main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == 0 =>
+                        {
+                            continue;
+                        }
+                        None => computed::FinalStyleRecordID::NONE,
+                    };
+                    let new_pseudo = new_pseudo_record.raw();
+                    let main_holds_new_pseudo =
+                        main_holds_pseudo(self, super::PseudoElementTarget::of_kind(kind)) == new_pseudo;
                     if !main_holds_new_pseudo {
-                        self.note_pseudo_element_reinstall(&mut pseudo_elements, new_pseudo);
-                        if new_pseudo != 0 {
+                        installation.swaps.push(StyleSwap::new(
+                            self,
+                            node,
+                            PseudoSlot::pseudo_element(kind),
+                            StyleAtomID::NONE,
+                            new_pseudo_record,
+                        ));
+                    }
+                    if old_pseudo == new_pseudo {
+                        // A pseudo-element whose record stays plans the animations it names again where
+                        // their `@keyframes` may have moved, as for a first record.
+                        if plan_owed && main_holds_new_pseudo && new_pseudo != 0 {
                             self.note_pseudo_element_composition(
                                 &mut pseudo_elements,
                                 node,
@@ -503,128 +499,143 @@ impl RetainedState {
                                 new_pseudo_record,
                             );
                         }
+                        // The main thread cleared the style of a pseudo-element whose record stays, as below an element
+                        // that was display:none: it takes the record again, with what it installs beside it, and the
+                        // animations it names start as for a first record.
+                        if !main_holds_new_pseudo {
+                            self.note_pseudo_element_reinstall(&mut pseudo_elements, new_pseudo);
+                            if new_pseudo != 0 {
+                                self.note_pseudo_element_composition(
+                                    &mut pseudo_elements,
+                                    node,
+                                    kind,
+                                    computed::FinalStyleRecordID::NONE,
+                                    new_pseudo_record,
+                                );
+                            }
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let record_damage = self.pseudo_element_record_damage(node, kind, old_pseudo, new_pseudo, new, false)
-                    | bridge::FfiStyleInvalidationField::EngineComputed as u32;
-                // Below an element that was display:none, the main thread holds no record the pseudo-element moves
-                // from.
-                let composition = match new_pseudo {
-                    0 => Default::default(),
-                    _ => self.note_pseudo_element_composition(
+                    let record_damage = self.pseudo_element_record_damage(node, kind, old_pseudo, new_pseudo, new, false)
+                        | bridge::FfiStyleInvalidationField::EngineComputed as u32;
+                    // Below an element that was display:none, the main thread holds no record the pseudo-element moves
+                    // from.
+                    let composition = match new_pseudo {
+                        0 => Default::default(),
+                        _ => self.note_pseudo_element_composition(
+                            &mut pseudo_elements,
+                            node,
+                            kind,
+                            match below_display_none {
+                                true => computed::FinalStyleRecordID::NONE,
+                                false => old_pseudo_record,
+                            },
+                            new_pseudo_record,
+                        ),
+                    };
+                    self.note_pseudo_element_move(
                         &mut pseudo_elements,
                         node,
                         kind,
-                        match below_display_none {
-                            true => computed::FinalStyleRecordID::NONE,
-                            false => old_pseudo_record,
-                        },
-                        new_pseudo_record,
-                    ),
-                };
-                self.note_pseudo_element_move(
-                    &mut pseudo_elements,
-                    node,
-                    kind,
-                    (old_pseudo, new_pseudo, new),
-                    record_damage,
-                    below_display_none,
-                );
-                // A pseudo-element that no longer generates a box goes now; the main thread holds the record it
-                // had until it clears the pseudo-element's style.
-                if new_pseudo_record == computed::FinalStyleRecordID::NONE {
-                    self.remove_computed_pseudo(node, kind);
-                }
-                rows.push(PublishedStyleDeltaRecord {
-                    style_node: node.raw(),
-                    old_style_record: old_pseudo,
-                    new_style_record: new_pseudo,
-                    reaction: input_types::STYLE_REACTION_PUBLISHED_STYLE,
-                    inherited_style_groups: 0,
-                    pseudo_kind: kind,
-                    explicitly_inherited_groups: 0,
-                    record_damage,
-                    owes_an_animation_plan: composition.owes_an_animation_plan,
-                    owes_a_transition_step: composition.owes_a_transition_step,
-                    composed_by_the_host: composition.composed_by_the_host,
-                });
-            }
-            let custom_highlights = self
-                .computed_group_sets
-                .custom_highlight_records(node)
-                .map(|(name, _)| super::PseudoElementTarget::custom_highlight(name))
-                .chain(
-                    pseudo_element_records
-                        .iter()
-                        .map(|&(target, _)| target)
-                        .filter(|target| target.is_custom_highlight()),
-                )
-                .fold(
-                    SmallVec::<[super::PseudoElementTarget; 2]>::new(),
-                    |mut targets, target| {
-                        if !targets.contains(&target) {
-                            targets.push(target);
-                        }
-                        targets
-                    },
-                );
-            for target in custom_highlights {
-                let old_pseudo_record = self
-                    .computed_group_sets
-                    .pseudo_style_record_of(node, target)
-                    .unwrap_or(computed::FinalStyleRecordID::NONE);
-                let old_pseudo = old_pseudo_record.raw();
-                let new_pseudo_record = match pseudo_element_records.iter().find(|(held, _)| *held == target) {
-                    Some((_, pseudo_record)) => {
-                        self.note_container_unit_reads(node, pseudo_record, true);
-                        let pseudo_environment = self.pseudo_element_environment(
-                            node,
-                            pseudo_record,
-                            record,
-                            environment,
-                            &mut scratch.minted,
-                        );
-                        let pseudo_record: &Arc<Record> =
-                            &self.record_in_environment(pseudo_record, pseudo_environment);
-                        let new_pseudo_record = self.install_record(pseudo_record, &mut scratch.installed);
-                        if old_pseudo != 0 && old_pseudo != new_pseudo_record.raw() {
-                            self.computed_group_sets.pin_style_record(old_pseudo);
-                            installation.pinned_records.push(old_pseudo);
-                        }
-                        self.computed_group_sets
-                            .assign_installed_pseudo_record_of(node, target, new_pseudo_record);
-                        new_pseudo_record
+                        (old_pseudo, new_pseudo, new),
+                        record_damage,
+                        below_display_none,
+                    );
+                    // A pseudo-element that no longer generates a box goes now; the main thread holds the record it
+                    // had until it clears the pseudo-element's style.
+                    if new_pseudo_record == computed::FinalStyleRecordID::NONE {
+                        self.remove_computed_pseudo(node, kind);
                     }
-                    None if old_pseudo == 0 && main_holds_pseudo(self, target) == 0 => continue,
-                    None => computed::FinalStyleRecordID::NONE,
-                };
-                let new_pseudo = new_pseudo_record.raw();
-                if main_holds_pseudo(self, target) != new_pseudo {
-                    installation.swaps.push(StyleSwap::new(
-                        self,
+                    rows.push(PublishedStyleDeltaRecord {
+                        style_node: node.raw(),
+                        old_style_record: old_pseudo,
+                        new_style_record: new_pseudo,
+                        reaction: input_types::STYLE_REACTION_PUBLISHED_STYLE,
+                        inherited_style_groups: 0,
+                        pseudo_kind: kind,
+                        explicitly_inherited_groups: 0,
+                        record_damage,
+                        owes_an_animation_plan: composition.owes_an_animation_plan,
+                        owes_a_transition_step: composition.owes_a_transition_step,
+                        composed_by_the_host: composition.composed_by_the_host,
+                    });
+                }
+                let custom_highlights = self
+                    .computed_group_sets
+                    .custom_highlight_records(node)
+                    .map(|(name, _)| super::PseudoElementTarget::custom_highlight(name))
+                    .chain(
+                        pseudo_element_records
+                            .iter()
+                            .map(|&(target, _)| target)
+                            .filter(|target| target.is_custom_highlight()),
+                    )
+                    .fold(
+                        SmallVec::<[super::PseudoElementTarget; 2]>::new(),
+                        |mut targets, target| {
+                            if !targets.contains(&target) {
+                                targets.push(target);
+                            }
+                            targets
+                        },
+                    );
+                for target in custom_highlights {
+                    let old_pseudo_record = self
+                        .computed_group_sets
+                        .pseudo_style_record_of(node, target)
+                        .unwrap_or(computed::FinalStyleRecordID::NONE);
+                    let old_pseudo = old_pseudo_record.raw();
+                    let new_pseudo_record = match pseudo_element_records.iter().find(|(held, _)| *held == target) {
+                        Some((_, pseudo_record)) => {
+                            self.note_container_unit_reads(node, pseudo_record, true);
+                            let pseudo_environment = self.pseudo_element_environment(
+                                node,
+                                pseudo_record,
+                                record,
+                                environment,
+                                &mut scratch.minted,
+                            );
+                            let pseudo_record: &Arc<Record> =
+                                &self.record_in_environment(pseudo_record, pseudo_environment);
+                            let new_pseudo_record = self.install_record(pseudo_record, &mut scratch.installed);
+                            if old_pseudo != 0 && old_pseudo != new_pseudo_record.raw() {
+                                self.computed_group_sets.pin_style_record(old_pseudo);
+                                installation.pinned_records.push(old_pseudo);
+                            }
+                            self.computed_group_sets
+                                .assign_installed_pseudo_record_of(node, target, new_pseudo_record);
+                            new_pseudo_record
+                        }
+                        None if old_pseudo == 0 && main_holds_pseudo(self, target) == 0 => continue,
+                        None => computed::FinalStyleRecordID::NONE,
+                    };
+                    let new_pseudo = new_pseudo_record.raw();
+                    if main_holds_pseudo(self, target) != new_pseudo {
+                        installation.swaps.push(StyleSwap::new(
+                            self,
+                            node,
+                            PseudoSlot::pseudo_element(target.kind),
+                            target.highlight_name,
+                            new_pseudo_record,
+                        ));
+                    }
+                    if old_pseudo == new_pseudo {
+                        continue;
+                    }
+                    let record_damage =
+                        self.pseudo_element_record_damage(node, target.kind, old_pseudo, new_pseudo, new, false)
+                            | bridge::FfiStyleInvalidationField::EngineComputed as u32;
+                    self.note_pseudo_element_move(
+                        &mut pseudo_elements,
                         node,
-                        PseudoSlot::pseudo_element(target.kind),
-                        target.highlight_name,
-                        new_pseudo_record,
-                    ));
-                }
-                if old_pseudo == new_pseudo {
-                    continue;
-                }
-                let record_damage =
-                    self.pseudo_element_record_damage(node, target.kind, old_pseudo, new_pseudo, new, false)
-                        | bridge::FfiStyleInvalidationField::EngineComputed as u32;
-                self.note_pseudo_element_move(
-                    &mut pseudo_elements,
-                    node,
-                    target.kind,
-                    (old_pseudo, new_pseudo, new),
-                    record_damage,
-                    below_display_none,
-                );
-                if new_pseudo_record == computed::FinalStyleRecordID::NONE {
-                    self.remove_computed_pseudo_of(node, target);
+                        target.kind,
+                        (old_pseudo, new_pseudo, new),
+                        record_damage,
+                        below_display_none,
+                    );
+                    if new_pseudo_record == computed::FinalStyleRecordID::NONE {
+                        self.remove_computed_pseudo_of(node, target);
+                    }
                 }
             }
             if old != new

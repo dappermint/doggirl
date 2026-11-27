@@ -260,6 +260,14 @@ impl PartialEq for CommittedSideData {
 }
 
 impl CommittedSideData {
+    #[inline]
+    pub(crate) fn has_heap_payloads(&self) -> bool {
+        self.inline_content.is_some()
+            || self.fragment_ownership.is_some()
+            || self.box_fragments.is_some()
+            || self.hit_test_bounds_of_lines.is_some()
+    }
+
     pub(crate) fn prepared_order_inputs(&self) -> Option<crate::painting::paint_order_plan::PaintOrderInputs> {
         self.order_inputs.is_initialized().then_some(self.order_inputs)
     }

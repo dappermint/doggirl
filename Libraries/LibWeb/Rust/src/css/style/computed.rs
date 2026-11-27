@@ -995,6 +995,9 @@ pub struct ComputedGroupSets {
     live_animation_overlay_assignments: usize,
     next_animation_overlay_generation: u64,
     pseudo_rows_by_node: crate::cow_map::CowMap<StyleNodeID, PseudoComputedRows>,
+    /// Dense presence bitmap for `pseudo_rows_by_node`, indexed by element index (`1 << (idx & 63)` in word `idx >> 6`).
+    /// Keeps the common "element has no pseudo rows" check a single L1 word read instead of a `CowMap` probe.
+    pseudo_rows_bitmap: crate::cow_column::CowColumn<u64, 64>,
     /// How many installed records were freed since what they named was last reclaimed.
     records_freed_since_reclamation: usize,
     next_reclamation_after: usize,
@@ -1019,6 +1022,7 @@ impl Default for ComputedGroupSets {
             live_animation_overlay_assignments: 0,
             next_animation_overlay_generation: 0,
             pseudo_rows_by_node: Default::default(),
+            pseudo_rows_bitmap: Default::default(),
             records_freed_since_reclamation: 0,
             next_reclamation_after: 1024,
         }
@@ -1039,6 +1043,7 @@ impl ComputedGroupSets {
             super::memory_report::MemoryOwner::Installed,
             self.installed_column.len() * size_of::<Option<InstalledStyle>>()
                 + self.installed_pseudo_column.len() * size_of::<Option<std::sync::Arc<InstalledPseudoStyles>>>()
+                + self.pseudo_rows_bitmap.len() * size_of::<u64>()
                 + vec_bytes(&self.pseudo_rows_moved)
                 + self.animation_overlay_column.0.row_bytes()
                 + self.animation_overlay_slots.heap_size()
@@ -1122,12 +1127,53 @@ impl ComputedGroupSets {
             && self.retired_animation_overlay_records() == 0
     }
 
+    #[inline]
+    fn has_pseudo_row_bit(&self, node: StyleNodeID) -> bool {
+        let Some(element_index) = node.element_index() else {
+            return true;
+        };
+        let word_index = (element_index as usize) >> 6;
+        let bit = 1u64 << (element_index & 63);
+        self.pseudo_rows_bitmap
+            .get(word_index)
+            .is_some_and(|&word| word & bit != 0)
+    }
+
+    fn set_pseudo_row_bit(&mut self, node: StyleNodeID, present: bool) {
+        let Some(element_index) = node.element_index() else {
+            return;
+        };
+        let word_index = (element_index as usize) >> 6;
+        let bit = 1u64 << (element_index & 63);
+        if present {
+            if self.pseudo_rows_bitmap.len() <= word_index {
+                self.pseudo_rows_bitmap.grow_to(word_index + 1);
+            }
+            let word = self.pseudo_rows_bitmap.get(word_index).copied().unwrap_or(0);
+            if word & bit == 0 {
+                self.pseudo_rows_bitmap.set(word_index, word | bit);
+            }
+        } else if let Some(&word) = self.pseudo_rows_bitmap.get(word_index)
+            && word & bit != 0
+        {
+            self.pseudo_rows_bitmap.set(word_index, word & !bit);
+        }
+    }
+
     /// Whether the node holds a record for no pseudo-element.
+    #[inline]
     pub(super) fn has_no_pseudo_rows(&self, node: StyleNodeID) -> bool {
+        if !self.has_pseudo_row_bit(node) {
+            return true;
+        }
         self.pseudo_rows(node).is_empty()
     }
 
+    #[inline]
     fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
+        if !self.has_pseudo_row_bit(node) {
+            return &[];
+        }
         self.pseudo_rows_by_node.get(&node).map_or(&[], |rows| rows.as_slice())
     }
 
@@ -1144,6 +1190,9 @@ impl ComputedGroupSets {
         node: StyleNodeID,
         target: super::pipeline::PseudoElementTarget,
     ) -> Option<&mut PseudoComputedRow> {
+        if !self.has_pseudo_row_bit(node) {
+            return None;
+        }
         self.pseudo_rows_moved.push(node);
         self.pseudo_rows_by_node
             .get_mut(&node)
@@ -1156,6 +1205,7 @@ impl ComputedGroupSets {
         target: super::pipeline::PseudoElementTarget,
     ) -> &mut PseudoComputedRow {
         self.pseudo_rows_moved.push(node);
+        self.set_pseudo_row_bit(node, true);
         let rows = self.pseudo_rows_by_node.entry(node).or_default();
         let row_index = rows.iter().position(|row| row.target() == target).unwrap_or_else(|| {
             rows.push(PseudoComputedRow::new(target));
@@ -1165,6 +1215,9 @@ impl ComputedGroupSets {
     }
 
     fn remove_empty_pseudo_row(&mut self, node: StyleNodeID, target: super::pipeline::PseudoElementTarget) {
+        if !self.has_pseudo_row_bit(node) {
+            return;
+        }
         self.pseudo_rows_moved.push(node);
         let Some(rows) = self.pseudo_rows_by_node.get(&node) else {
             return;
@@ -1176,6 +1229,7 @@ impl ComputedGroupSets {
         rows.remove(row_index);
         if rows.is_empty() {
             self.pseudo_rows_by_node.remove(&node);
+            self.set_pseudo_row_bit(node, false);
         }
     }
 
@@ -1859,16 +1913,25 @@ impl ComputedGroupSets {
         if let Some(slot) = self.animation_overlay_column.take(index) {
             self.release_animation_overlay_assignment(slot);
         }
-        self.pseudo_rows_moved.push(node);
-        if let Some(rows) = self.pseudo_rows_by_node.remove(&node) {
-            for row in rows {
-                if let Some(installed) = row.installed {
-                    self.installed.release(installed);
-                }
-                if let Some(slot) = row.installed_overlay_slot {
-                    self.release_animation_overlay_assignment(slot);
+        if self.has_pseudo_row_bit(node) {
+            self.pseudo_rows_moved.push(node);
+            self.set_pseudo_row_bit(node, false);
+            if let Some(rows) = self.pseudo_rows_by_node.remove(&node) {
+                for row in rows {
+                    if let Some(installed) = row.installed {
+                        self.installed.release(installed);
+                    }
+                    if let Some(slot) = row.installed_overlay_slot {
+                        self.release_animation_overlay_assignment(slot);
+                    }
                 }
             }
+        } else if self
+            .installed_pseudo_column
+            .get(index)
+            .is_some_and(Option::is_some)
+        {
+            self.pseudo_rows_moved.push(node);
         }
     }
 
