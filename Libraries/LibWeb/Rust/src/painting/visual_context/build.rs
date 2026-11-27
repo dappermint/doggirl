@@ -280,7 +280,7 @@ impl BoxFacts {
         }
         facts.clip_decided_by_parent = layout_arena
             .with_committed_fragment_link(slot, |link| {
-                link.and_then(|link| link.placement.shown_as.facts.clip_decided_by_parent)
+                link.and_then(|link| link.placement.clip_decided_by_parent())
             })
             .map(|clip_relative_to_border_box| {
                 let border_box =

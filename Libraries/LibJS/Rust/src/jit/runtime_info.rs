@@ -554,10 +554,10 @@ pub(crate) fn build_cached_runtime_info(vm: &Vm) -> RuntimeInfo {
         rope_allocation: cached_alloc.rope,
         function_allocation: cached_alloc.function,
         create_lexical_environment: jit_function_address!(super::allocation::libjs_jit_create_lexical_environment),
-        realm: CellId(0),
-        array_prototype: CellId(0),
-        object_prototype: CellId(0),
-        array_constructor: CellId(0),
+        realm: CellId::from_address(0),
+        array_prototype: CellId::from_address(0),
+        object_prototype: CellId::from_address(0),
+        array_constructor: CellId::from_address(0),
         no_yield_continuation: ExecutionContext::NO_YIELD_CONTINUATION,
         heap_region_base: vm.head.heap_region_base.get() as u64,
         heap_region_offset_mask: HEAP_REGION_OFFSET_MASK,
@@ -602,10 +602,10 @@ pub fn runtime_info(
     info.array_allocation = allocation.array;
     info.rope_allocation = allocation.rope;
     info.function_allocation = allocation.function;
-    info.realm = CellId(realm.as_ptr() as u64);
-    info.array_prototype = CellId(realm.array_prototype().as_ptr() as u64);
-    info.object_prototype = CellId(realm.object_prototype().as_ptr() as u64);
-    info.array_constructor = CellId(realm.intrinsics().array_constructor(vm).as_ptr() as u64);
+    info.realm = CellId::from_address(realm.as_ptr() as u64);
+    info.array_prototype = CellId::from_address(realm.array_prototype().as_ptr() as u64);
+    info.object_prototype = CellId::from_address(realm.object_prototype().as_ptr() as u64);
+    info.array_constructor = CellId::from_address(realm.intrinsics().array_constructor(vm).as_ptr() as u64);
     info
 }
 
