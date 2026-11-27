@@ -114,6 +114,13 @@ pub static EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES: BoxVisualContextNodeHandles = 
 };
 
 impl BoxVisualContextNodeHandles {
+    pub fn is_empty(&self) -> bool {
+        self.spatial.is_empty()
+            && self.chain_clips.is_empty()
+            && self.descendant_clips.is_empty()
+            && self.effects.is_empty()
+    }
+
     pub fn clip_handles(&self) -> impl Iterator<Item = ClipNodeIndex> + '_ {
         self.chain_clips.iter().chain(&self.descendant_clips).copied()
     }

@@ -174,7 +174,7 @@ impl PublishedRows {
 /// What a recording reads of the document's paint state, as it was when the frame was published.
 pub(crate) struct PublishedPaintState {
     pub(crate) visual_context_tree: Option<Arc<VisualContextTree>>,
-    unscrolled_world_transforms: std::sync::OnceLock<WorldTransforms>,
+    unscrolled_world_transforms: std::sync::OnceLock<Arc<WorldTransforms>>,
     /// Each scroll state slot's own scroll offset, shared with the document's scroll state.
     scroll_own_offsets: Arc<Vec<CssPixelPoint>>,
     pub(crate) has_non_viewport_wheel_scroll_target_candidate: bool,
@@ -197,8 +197,13 @@ impl PublishedPaintState {
                 .visual_context_tree
                 .as_deref()
                 .expect("recording runs against a visual context tree");
-            WorldTransforms::new(tree, &[], None)
+            Arc::new(WorldTransforms::new(tree, &[], None))
         })
+    }
+
+    /// Seeds the cached unscrolled world transforms from an already-computed zero-scroll `WorldTransforms`.
+    pub(crate) fn seed_unscrolled_world_transforms(&self, world: &Arc<WorldTransforms>) {
+        let _ = self.unscrolled_world_transforms.set(Arc::clone(world));
     }
 
     pub(crate) fn highlight_pseudo_styles(&self, highlight: HighlightPseudoElement) -> &SelectionPseudoStyles {

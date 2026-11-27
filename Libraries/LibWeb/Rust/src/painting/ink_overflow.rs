@@ -654,52 +654,83 @@ fn mapped_ink(ink: InkOverflow, transform: &crate::painting::visual_context::Tra
     }
 }
 
+fn node_may_have_ink_transform(
+    source: &impl crate::painting::paintable_rows::PaintableRowsRead,
+    node: NodeSlotId,
+    include_will_change: bool,
+) -> bool {
+    use crate::layout::node_facts::NodeShape;
+    use crate::painting::paint_read::PaintRow;
+    let Some(row) = source.node(node) else {
+        return false;
+    };
+    let Some(style) = row.style() else {
+        return false;
+    };
+    let transform = style.transform();
+    transform.resolved_transforms.length != 0
+        || transform.has_offset_path
+        || crate::painting::style_queries::kind_is_svg_element_box(row.kind())
+        || (include_will_change && crate::painting::style_queries::will_change_promotes_transform_node(style))
+}
+
 fn recalculated_ink_overflow(
     source: &impl crate::painting::paintable_rows::PaintableRowsRead,
     state: &PublishedPaintState,
     node: NodeSlotId,
+    scratch_met: &mut crate::fast_hash::FastSet<NodeSlotId>,
 ) -> InkOverflow {
     use crate::css::css_enums::positioning;
     use crate::painting::paintable_data::PaintableFlag;
     let own = own_ink_overflow(source, state, node);
     let mut ink = own;
     let padding = paintable_geometry::first_fragment_padding_box_rect(source, node);
-    if let Some(link) = source.with_committed_fragment_link(node, |link| link.cloned()) {
+    source.with_committed_fragment_link(node, |first_link| {
+        let Some(first_link) = first_link else {
+            return;
+        };
         let later_fragments = source.committed_side_data(node);
         let fragments =
-            std::iter::once(&link).chain(later_fragments.box_fragments().iter().map(|fragment| &fragment.link));
+            std::iter::once(first_link).chain(later_fragments.box_fragments().iter().map(|fragment| &fragment.link));
         for (fragment_index, link) in fragments.enumerate() {
-            for child_link in source.links_in_containing_block_fragment(node, link, fragment_index as u32) {
-                let child = child_link.fragment.node;
-                let child_ink = source.stored_ink_overflow(child);
-                let child_padding = paintable_geometry::first_fragment_padding_box_rect(source, child);
-                let mut contribution_relative_to_padding_box = InkOverflow {
-                    rect: child_ink
-                        .rect
-                        .translated(child_padding.x - padding.x, child_padding.y - padding.y),
-                    ..child_ink
-                };
-                if let Some((mut transform, _)) =
-                    crate::painting::visual_context::node_values::compute_transform(source, child, 1.0)
-                {
-                    // NB: Round out relative to the padding box, as moving the box with its descendants keeps the ink.
-                    transform.origin.x -= padding.x.to_float();
-                    transform.origin.y -= padding.y.to_float();
-                    contribution_relative_to_padding_box = mapped_ink(contribution_relative_to_padding_box, &transform);
-                    contribution_relative_to_padding_box.holds_what_a_transform_moves = true;
-                }
-                include_child(
-                    &mut ink,
-                    InkOverflow {
-                        rect: contribution_relative_to_padding_box
+            source.for_each_child_node_in_containing_block_fragment(
+                node,
+                link,
+                fragment_index as u32,
+                scratch_met,
+                |child| {
+                    let child_ink = source.stored_ink_overflow(child);
+                    let child_padding = paintable_geometry::first_fragment_padding_box_rect(source, child);
+                    let mut contribution_relative_to_padding_box = InkOverflow {
+                        rect: child_ink
                             .rect
-                            .translated(padding.x, padding.y),
-                        ..contribution_relative_to_padding_box
-                    },
-                );
-            }
+                            .translated(child_padding.x - padding.x, child_padding.y - padding.y),
+                        ..child_ink
+                    };
+                    if node_may_have_ink_transform(source, child, true)
+                        && let Some((mut transform, _)) =
+                            crate::painting::visual_context::node_values::compute_transform(source, child, 1.0)
+                    {
+                        // NB: Round out relative to the padding box, as moving the box with its descendants keeps the ink.
+                        transform.origin.x -= padding.x.to_float();
+                        transform.origin.y -= padding.y.to_float();
+                        contribution_relative_to_padding_box =
+                            mapped_ink(contribution_relative_to_padding_box, &transform);
+                        contribution_relative_to_padding_box.holds_what_a_transform_moves = true;
+                    }
+                    include_child(
+                        &mut ink,
+                        InkOverflow {
+                            rect: contribution_relative_to_padding_box
+                                .rect
+                                .translated(padding.x, padding.y),
+                            ..contribution_relative_to_padding_box
+                        },
+                    );
+                },
+            );
         }
-    }
+    });
     if let Some(clip) = overflow_clip_ranges(source, node) {
         clip_content_to_overflow_clip(&mut ink, own, &clip);
     }
@@ -713,8 +744,10 @@ fn recalculated_ink_overflow(
         .paintable_data(node)
         .has_flag(PaintableFlag::HasLaterBoxFragments)
         || !source.default_scroll_shift_anchor(node).is_invalid();
-    ink.contribution_unbounded |= crate::painting::visual_context::node_values::compute_transform(source, node, 1.0)
-        .is_some_and(|(transform, _)| !transform.matrix.is_2d_affine());
+    if !ink.contribution_unbounded && node_may_have_ink_transform(source, node, false) {
+        ink.contribution_unbounded |= crate::painting::visual_context::node_values::compute_transform(source, node, 1.0)
+            .is_some_and(|(transform, _)| !transform.matrix.is_2d_affine());
+    }
     ink.unbounded |= css_rect_is_saturated(ink.rect);
     ink.contribution_unbounded |= ink.unbounded;
     ink.rect = ink.rect.translated(-padding.x, -padding.y);
@@ -833,25 +866,29 @@ impl crate::layout::LayoutNodeArena {
     /// Recalculates the requested rows, descendants before the containing blocks that gather them, and follows
     /// every changed value up to its containing block. Returns how many rows it recalculated.
     fn recalculate_requested_ink_overflow(&mut self, state: &PublishedPaintState) -> usize {
-        let mut requests = std::mem::take(&mut self.paintable_rows.ink_overflow_requests);
-        requests.retain(|node| self.slot_is_live(*node) && self.paintable_row_is_populated(*node));
-        requests.sort_unstable_by_key(|node| self.node_pre_order_label(*node));
+        let requests = std::mem::take(&mut self.paintable_rows.ink_overflow_requests);
+        let mut ordered: Vec<(u64, u32)> = requests
+            .into_iter()
+            .filter(|node| self.slot_is_live(*node) && self.paintable_row_is_populated(*node))
+            .map(|node| (self.node_pre_order_label(node), node.index))
+            .collect();
+        ordered.sort_unstable_by_key(|&(label, _)| label);
         let mut source = self.paintable_rows_mut();
         // Warm ancestors before descendants: a first layout requests every row, and resolving
         // absolute geometry in the reverse order would repeatedly walk their containing blocks.
-        for &node in &requests {
-            paintable_geometry::absolute_rect(&source, node);
+        for &(_, index) in &ordered {
+            paintable_geometry::absolute_rect(&source, NodeSlotId { index });
         }
-        let mut queue: std::collections::BinaryHeap<_> = requests
-            .into_iter()
-            .map(|node| (source.node_pre_order_label(node), node.index))
-            .collect();
+        // Reversing ascending pre-order produces a valid descending max-heap in place.
+        ordered.reverse();
+        let mut queue = std::collections::BinaryHeap::from(ordered);
+        let mut scratch_met = crate::fast_hash::FastSet::default();
         let mut recalculated = 0;
         while let Some((_, index)) = queue.pop() {
             let node = NodeSlotId { index };
             let index = node.slot_index() as usize;
             source.paintable_rows.ink_overflow_dirty[index] = false;
-            let ink = recalculated_ink_overflow(&source, state, node);
+            let ink = recalculated_ink_overflow(&source, state, node, &mut scratch_met);
             recalculated += 1;
             let hit_test_bounds_of_lines = hit_test_bounds_of_lines(&source, node);
             if hit_test_bounds_of_lines.is_some() || source.committed_side_data(node).hit_test_bounds_of_lines.is_some()
@@ -892,6 +929,7 @@ impl crate::layout::LayoutNodeArena {
             unbounded: 0,
             contribution_unbounded: 0,
         };
+        let mut scratch_met = crate::fast_hash::FastSet::default();
         for (index, node) in nodes.iter().copied().enumerate() {
             let stored = source.stored_ink_overflow(node);
             counts.unbounded += usize::from(stored.unbounded);
@@ -899,7 +937,7 @@ impl crate::layout::LayoutNodeArena {
             if nodes.len() > 4096 && !(index as u64 + audit_sequence).is_multiple_of(64) {
                 continue;
             }
-            let recomputed = recalculated_ink_overflow(&source, state, node);
+            let recomputed = recalculated_ink_overflow(&source, state, node, &mut scratch_met);
             assert!(
                 stored == recomputed,
                 "Stored ink overflow is stale: {:?} {node:?}, stored {stored:?}, recomputed {recomputed:?}",

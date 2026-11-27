@@ -9,7 +9,7 @@
 //! host's own thread, without a lock or a write to the engine: one hash lookup on the name's raw identity.
 
 use super::atoms::{AtomLease, ReclaimedStyleAtom};
-use super::engine_calls::{EngineWrite, with_engine};
+use super::engine_calls::EngineWrite;
 use super::index::{AttributeNameForms, StyleAtomID};
 use crate::css::declaration_block::SharedDeclarationBlock;
 use crate::css::ffi_support::{FfiUtf16View, ascii_lowercase};
@@ -353,7 +353,7 @@ fn value_text_is_known_unread(host: &DocumentHost, name: StyleAtomID) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_learn_selector_requirements(host: &DocumentHost, read: &BegunRead) {
     if host.known_selectors_test_local_link().is_none() {
-        host.ask(read, |_| ());
+        host.ask_shallow(read, |_| ());
     }
 }
 
@@ -543,7 +543,7 @@ pub extern "C" fn document_host_refresh_attribute_value_text_requirements(host: 
     // The host knows where the requirements are where it queued no rule since its last job.
     let selector_requirements = match host.known_selector_attribute_value_text_requirements_version() {
         Some(version) => version,
-        None => with_engine(read, host, |engine| {
+        None => super::engine_calls::with_engine_shallow(read, host, |engine| {
             engine.selector_attribute_value_text_requirements_version()
         }),
     };

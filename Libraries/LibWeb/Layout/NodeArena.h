@@ -35,6 +35,7 @@ public:
     ~NodeArena();
 
     void free_subtree(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId);
+    void prepare_and_free_subtree(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId);
     Node* node_if_live(Layout::BegunRead const& read, Compositing::RustFFI::NodeSlotId) const;
     RustFFI::DocumentHost* host() const { return m_render_document->host(); }
     RenderDocument const& render_document() const { return *m_render_document; }

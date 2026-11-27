@@ -2073,11 +2073,9 @@ void Document::tear_down_layout_tree()
         Layout::RustFFI::render_state_pay_flown_round(m_layout_node_arena->host(), read);
     auto* layout_root = layout_root_if_live(read);
     if (layout_root)
-        layout_root->prepare_subtree_for_detach_from_layout_tree();
+        layout_node_arena().prepare_and_free_subtree(read, Layout::Node::slot_id(layout_root));
     m_hit_test_items_on_screen = {};
     m_chrome_widget_registry->clear();
-    if (layout_root)
-        layout_node_arena().free_subtree(read, Layout::Node::slot_id(layout_root));
     m_paint_state = nullptr;
     set_needs_full_layout_tree_update();
 }

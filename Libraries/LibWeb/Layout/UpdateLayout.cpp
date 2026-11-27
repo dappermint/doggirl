@@ -81,9 +81,8 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
             VERIFY(is<Layout::Viewport>(arena.node_if_live(*read, viewport)));
             if (replaced_root.index == viewport.index)
                 return;
-            if (auto* replaced_layout_root = arena.node_if_live(*read, replaced_root)) {
-                replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
-                arena.free_subtree(*read, replaced_root);
+            if (arena.node_if_live(*read, replaced_root)) {
+                arena.prepare_and_free_subtree(*read, replaced_root);
             }
             document.m_paint_state = make<Painting::DocumentPaintState>(arena); },
         .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::RustFFI::FfiNodeIdentity const* rebuilt_roots, size_t count) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build({ rebuilt_roots, count }); },
