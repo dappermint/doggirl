@@ -163,6 +163,10 @@ struct LiveScratch {
     /// The inputs of the document the entries of the matched declarations cache read, as they
     /// were when the last pass started.
     matched_declarations_inputs: Option<MatchedDeclarationsInputs>,
+    /// Substituted values shared across threads and kept between passes.
+    substitutions: super::custom_properties::SharedSubstitutionCache,
+    /// `(in_quirks_mode, custom_property_registration_generation)` that `substitutions` was built under.
+    substitutions_inputs: Option<(bool, u64)>,
     /// The DOM order version of the tree the memos measured where siblings stand in, where the
     /// transaction they measured it for moved no element, so the tree before it was the same.
     memos_dom_order_version: Option<u64>,
@@ -468,6 +472,8 @@ impl Live {
                 .expect("no pass holds a cache while the scratch is trimmed")
                 .trim();
         }
+        self.scratch.substitutions.trim();
+        self.scratch.substitutions_inputs = None;
         self.scratch.invalidate = InvalidateScratch::default();
         self.scratch.install = Default::default();
         self.scratch.replaced = Default::default();
@@ -526,6 +532,7 @@ impl Live {
                 + vec_bytes(&self.scratch.kept),
         );
         self.scratch.matched_declarations.report_memory(report);
+        self.scratch.substitutions.report_memory(report);
         for cache in self.scratch.groups.made() {
             cache
                 .lock()
@@ -563,6 +570,10 @@ impl Live {
             || !transaction.rule_changes.is_empty()
         {
             self.scratch.matched_declarations.forget();
+        }
+        if transaction.restyles_everything || !transaction.environment.is_empty() {
+            self.scratch.substitutions.clear();
+            self.scratch.substitutions_inputs = None;
         }
         let changes = state.projection.changes();
         if transaction.restyles_everything {
@@ -881,6 +892,8 @@ impl Live {
             return;
         }
         self.scratch.matched_declarations.forget();
+        self.scratch.substitutions.trim();
+        self.scratch.substitutions_inputs = None;
         let raw: HashSet<usize> = names.iter().map(ak::Utf16FlyString::raw_identity).collect();
         self.kept_hidden_records.forget();
         let texts: Vec<std::borrow::Cow<'_, [u16]>> = names.iter().map(ak::Utf16FlyString::to_utf16).collect();
@@ -2114,6 +2127,14 @@ impl Live {
             self.scratch.matched_declarations.forget();
             self.scratch.matched_declarations_inputs = Some(matched_declarations_inputs);
         }
+        let substitutions_inputs = (
+            matched_declarations_inputs.in_quirks_mode,
+            matched_declarations_inputs.custom_property_registration_generation,
+        );
+        if self.scratch.substitutions_inputs != Some(substitutions_inputs) {
+            self.scratch.substitutions.clear();
+            self.scratch.substitutions_inputs = Some(substitutions_inputs);
+        }
         self.scratch.matched_declarations.prepare(slot_count);
         if rebuilds_index {
             self.rebuild_index(state);
@@ -2253,6 +2274,7 @@ impl Live {
                 suspends: true,
                 group_caches: Some(&self.scratch.groups),
                 kept_matched_declarations: Some(&self.scratch.matched_declarations),
+                shared_substitutions: Some(&self.scratch.substitutions),
                 waits_once: round + 1 < MAX_SUSPENDING_ROUNDS,
                 cache_audit: self.cache_audit,
                 traces: state.live_counters.is_tracing(),

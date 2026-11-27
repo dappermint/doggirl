@@ -22,11 +22,178 @@ use std::sync::Arc;
 /// A written value, a longhand and the identities of the values the value's references resolve to.
 type ReferencesKey = (usize, u16, smallvec::SmallVec<[usize; 4]>);
 
+/// How many shards [`SharedSubstitutionCache`] splits its entries across to keep concurrent style
+/// threads from contending on one lock.
+const SHARED_SUBSTITUTION_SHARDS: usize = 16;
+
+/// How many entries each shard keeps before resetting, bounding the memory held across passes.
+const SHARED_SUBSTITUTION_MAX_ENTRIES_PER_SHARD: usize = 256;
+
+#[inline]
+fn shared_substitution_shard_index(written: usize, property: u16) -> usize {
+    let mixed = (written >> 3).wrapping_mul(0x9e37_79b9_7f4a_7c15usize) ^ usize::from(property);
+    (mixed ^ (mixed >> 16)) & (SHARED_SUBSTITUTION_SHARDS - 1)
+}
+
 /// What a written value substituted to against two stores, with the stores, which the entry keeps
 /// alive so that no other store takes the address the key names one of them by.
 struct StoresSubstitution {
     substituted: RetainedStyleValueData,
     _stores: [Option<Arc<CustomPropertyStore>>; 2],
+}
+
+/// An entry in [`SharedSubstitutionCache::by_stores`], retaining both the written value and the
+/// stores so no later allocation can reuse an address in the key across passes.
+struct SharedStoresSubstitution {
+    substituted: RetainedStyleValueData,
+    _written: RetainedStyleValueData,
+    _stores: [Option<Arc<CustomPropertyStore>>; 2],
+}
+
+/// An entry in [`SharedSubstitutionCache::by_references`], retaining the written value and the
+/// own store whose resolved values the key names by address.
+struct SharedReferencesSubstitution {
+    substituted: RetainedStyleValueData,
+    _written: RetainedStyleValueData,
+    _store: Option<Arc<CustomPropertyStore>>,
+}
+
+#[derive(Default)]
+struct SharedSubstitutionShard {
+    by_stores: HashMap<(usize, u16, usize, usize), SharedStoresSubstitution>,
+    by_references: HashMap<ReferencesKey, SharedReferencesSubstitution>,
+}
+
+/// Substituted longhand values shared across style threads and kept between passes of a document.
+///
+/// Only values whose substitution depends solely on the custom-property stores, quirks mode and
+/// custom-property registrations are stored here. Shards are lazily allocated on first insert so
+/// documents without `var()` substitutions and forked render states pay no allocation cost.
+#[derive(Default)]
+pub(in crate::css::style) struct SharedSubstitutionCache {
+    shards: std::sync::OnceLock<Box<[std::sync::RwLock<SharedSubstitutionShard>; SHARED_SUBSTITUTION_SHARDS]>>,
+}
+
+impl SharedSubstitutionCache {
+    fn shards(&self) -> &[std::sync::RwLock<SharedSubstitutionShard>; SHARED_SUBSTITUTION_SHARDS] {
+        self.shards.get_or_init(|| {
+            Box::new(std::array::from_fn(|_| {
+                std::sync::RwLock::new(SharedSubstitutionShard::default())
+            }))
+        })
+    }
+
+    /// Drops all cached substitutions while keeping allocated shards for reuse.
+    pub(in crate::css::style) fn clear(&mut self) {
+        let Some(shards) = self.shards.get_mut() else {
+            return;
+        };
+        for shard in shards.iter_mut() {
+            let shard = shard
+                .get_mut()
+                .expect("no pass holds a substitution shard while the cache is cleared");
+            shard.by_stores.clear();
+            shard.by_references.clear();
+        }
+    }
+
+    /// Drops all cached substitutions and releases the shard table.
+    pub(in crate::css::style) fn trim(&mut self) {
+        let _ = self.shards.take();
+    }
+
+    /// Counts the cache's tables toward the worker caches.
+    pub(in crate::css::style) fn report_memory(&self, report: &mut crate::css::style::memory_report::MemoryReport) {
+        use crate::css::style::memory_report::MemoryOwner;
+        use crate::heap_size::map_bytes;
+        let Some(shards) = self.shards.get() else {
+            return;
+        };
+        let mut bytes = std::mem::size_of_val(&**shards);
+        for shard in shards.iter() {
+            let shard = shard
+                .read()
+                .expect("no pass holds a substitution shard while the report runs");
+            bytes += map_bytes(&shard.by_stores) + map_bytes(&shard.by_references);
+        }
+        report.add(MemoryOwner::WorkerCaches, bytes);
+    }
+
+    fn get_by_stores(&self, key: &(usize, u16, usize, usize)) -> Option<RetainedStyleValueData> {
+        let shards = self.shards.get()?;
+        let shard = shards[shared_substitution_shard_index(key.0, key.1)]
+            .read()
+            .expect("no thread panicked while reading substitution cache");
+        shard.by_stores.get(key).map(|entry| entry.substituted.clone())
+    }
+
+    fn get_by_references(&self, key: &ReferencesKey) -> Option<RetainedStyleValueData> {
+        let shards = self.shards.get()?;
+        let shard = shards[shared_substitution_shard_index(key.0, key.1)]
+            .read()
+            .expect("no thread panicked while reading substitution cache");
+        shard.by_references.get(key).map(|entry| entry.substituted.clone())
+    }
+
+    fn insert_by_stores(
+        &self,
+        key: (usize, u16, usize, usize),
+        written: &RetainedStyleValueData,
+        stores: CustomPropertyStores<'_>,
+        substituted: RetainedStyleValueData,
+    ) {
+        let mut shard = self.shards()[shared_substitution_shard_index(key.0, key.1)]
+            .write()
+            .expect("no thread panicked while writing substitution cache");
+        if shard.by_stores.len() >= SHARED_SUBSTITUTION_MAX_ENTRIES_PER_SHARD {
+            shard.by_stores.clear();
+        }
+        shard.by_stores.insert(
+            key,
+            SharedStoresSubstitution {
+                substituted,
+                _written: written.clone(),
+                _stores: [stores.own.cloned(), stores.inherited.cloned()],
+            },
+        );
+    }
+
+    fn insert(
+        &self,
+        key: (usize, u16, usize, usize),
+        references: Option<ReferencesKey>,
+        written: &RetainedStyleValueData,
+        stores: CustomPropertyStores<'_>,
+        substituted: RetainedStyleValueData,
+    ) {
+        let mut shard = self.shards()[shared_substitution_shard_index(key.0, key.1)]
+            .write()
+            .expect("no thread panicked while writing substitution cache");
+        if shard.by_stores.len() >= SHARED_SUBSTITUTION_MAX_ENTRIES_PER_SHARD {
+            shard.by_stores.clear();
+        }
+        shard.by_stores.insert(
+            key,
+            SharedStoresSubstitution {
+                substituted: substituted.clone(),
+                _written: written.clone(),
+                _stores: [stores.own.cloned(), stores.inherited.cloned()],
+            },
+        );
+        if let Some(references) = references {
+            if shard.by_references.len() >= SHARED_SUBSTITUTION_MAX_ENTRIES_PER_SHARD {
+                shard.by_references.clear();
+            }
+            shard.by_references.insert(
+                references,
+                SharedReferencesSubstitution {
+                    substituted,
+                    _written: written.clone(),
+                    _store: stores.own.cloned(),
+                },
+            );
+        }
+    }
 }
 
 /// What a style thread substituted each written value to, keyed by the value, the longhand and
@@ -104,6 +271,7 @@ pub(in crate::css::style) struct CustomPropertyStores<'a> {
     pub(in crate::css::style) own: Option<&'a Arc<CustomPropertyStore>>,
     pub(in crate::css::style) inherited: Option<&'a Arc<CustomPropertyStore>>,
     pub(in crate::css::style) substitutions: &'a std::cell::RefCell<SubstitutionCache>,
+    pub(in crate::css::style) shared_substitutions: Option<&'a SharedSubstitutionCache>,
     pub(in crate::css::style) subject: &'a dyn SubstitutingSubject,
 }
 
@@ -466,6 +634,15 @@ impl RetainedState {
         if let Some(entry) = stores.substitutions.borrow().by_stores.get(&key) {
             return entry.substituted.clone();
         }
+        if let Some(shared) = stores.shared_substitutions
+            && let Some(substituted) = shared.get_by_stores(&key)
+        {
+            stores
+                .substitutions
+                .borrow_mut()
+                .insert_by_stores(key, stores, substituted.clone());
+            return substituted;
+        }
         // What the value references, where every reference is visible and resolves to a value
         // whose identity is all there is to it. An `inherit()` reads the inherited store too.
         let references = (!value_reads_inherited_values(written.data()))
@@ -484,15 +661,30 @@ impl RetainedState {
                     .collect::<Option<smallvec::SmallVec<[usize; 4]>>>()
             })
             .map(|identities| (key.0, property, identities));
-        let found = references
-            .as_ref()
-            .and_then(|references| stores.substitutions.borrow().by_references.get(references).cloned());
-        if let Some(substituted) = found {
-            stores
-                .substitutions
-                .borrow_mut()
-                .insert_by_stores(key, stores, substituted.clone());
-            return substituted;
+        if let Some(references) = references.as_ref() {
+            let local_hit = stores.substitutions.borrow().by_references.get(references).cloned();
+            if let Some(substituted) = local_hit {
+                stores
+                    .substitutions
+                    .borrow_mut()
+                    .insert_by_stores(key, stores, substituted.clone());
+                if let Some(shared) = stores.shared_substitutions {
+                    shared.insert_by_stores(key, written, stores, substituted.clone());
+                }
+                return substituted;
+            }
+            if let Some(shared) = stores.shared_substitutions
+                && let Some(substituted) = shared.get_by_references(references)
+            {
+                let mut substitutions = stores.substitutions.borrow_mut();
+                substitutions.insert_by_stores(key, stores, substituted.clone());
+                substitutions
+                    .by_references
+                    .insert(references.clone(), substituted.clone());
+                drop(substitutions);
+                shared.insert_by_stores(key, written, stores, substituted.clone());
+                return substituted;
+            }
         }
         let token_cache = std::mem::take(&mut stores.substitutions.borrow_mut().token_cache);
         let (substituted, token_cache) = self.substitute_uncached(
@@ -505,8 +697,14 @@ impl RetainedState {
         let mut substitutions = stores.substitutions.borrow_mut();
         substitutions.token_cache = token_cache;
         substitutions.insert_by_stores(key, stores, substituted.clone());
-        if let Some(references) = references {
-            substitutions.by_references.insert(references, substituted.clone());
+        if let Some(references) = references.as_ref() {
+            substitutions
+                .by_references
+                .insert(references.clone(), substituted.clone());
+        }
+        drop(substitutions);
+        if let Some(shared) = stores.shared_substitutions {
+            shared.insert(key, references, written, stores, substituted.clone());
         }
         substituted
     }

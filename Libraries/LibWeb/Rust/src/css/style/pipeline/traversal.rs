@@ -265,6 +265,8 @@ pub(super) struct PassContext<'a> {
     pub(super) group_caches: Option<&'a super::per_thread::PerThread<super::compute::GroupCache>>,
     /// The matched declarations cache a pass keeps for the next, where it keeps its caches.
     pub(super) kept_matched_declarations: Option<&'a MatchedDeclarationsCache>,
+    /// Substituted values shared across threads and kept between passes, where the pass uses caches.
+    pub(super) shared_substitutions: Option<&'a super::custom_properties::SharedSubstitutionCache>,
     /// The cache of a pass that keeps none for the next.
     pub(super) own_matched_declarations: MatchedDeclarationsCache,
     /// Whether an element or pseudo-element whose key another's computation waited with waits for
@@ -321,6 +323,7 @@ impl<'a> PassContext<'a> {
             suspends: false,
             group_caches: None,
             kept_matched_declarations: None,
+            shared_substitutions: None,
             own_matched_declarations: MatchedDeclarationsCache::default(),
             waits_once: false,
             uses_caches: true,
@@ -1582,6 +1585,7 @@ impl<'a> Scratch<'a> {
                     own: sampled.as_ref().or(substituted.as_ref()),
                     inherited: inherited.held.as_ref(),
                     substitutions: &self.substitutions,
+                    shared_substitutions: context.uses_caches.then_some(context.shared_substitutions).flatten(),
                     subject: &subject,
                 },
                 &mut self.groups,
@@ -1620,6 +1624,7 @@ impl<'a> Scratch<'a> {
                         own: substituted.as_ref(),
                         inherited: inherited.held.as_ref(),
                         substitutions: &self.substitutions,
+                        shared_substitutions: context.uses_caches.then_some(context.shared_substitutions).flatten(),
                         subject: &subject,
                     },
                     &mut self.groups,
@@ -2022,6 +2027,7 @@ impl<'a> Scratch<'a> {
                     own: sampled.as_ref().or(substituted.as_ref()),
                     inherited: parent_held.as_deref(),
                     substitutions: &self.substitutions,
+                    shared_substitutions: context.uses_caches.then_some(context.shared_substitutions).flatten(),
                     subject: &subject,
                 },
                 &mut self.groups,
@@ -2063,6 +2069,7 @@ impl<'a> Scratch<'a> {
                         own: substituted.as_ref(),
                         inherited: parent_held.as_deref(),
                         substitutions: &self.substitutions,
+                        shared_substitutions: context.uses_caches.then_some(context.shared_substitutions).flatten(),
                         subject: &subject,
                     },
                     &mut self.groups,
