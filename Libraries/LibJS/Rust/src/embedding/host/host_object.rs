@@ -328,8 +328,8 @@ fn has_property_through_hook(object: &Object, _vm: &Vm, key: &PropertyKey) -> Th
 }
 
 /// Fast path for `[[Get]]` of a non-negative int32 index on a `HostObject` with a `get_indexed_value` hook.
-/// Returns `Some(Ok(value))` when the hook answers, `Some(Err(throw))` on exception, or `None` when the object
-/// does not use a `get_indexed_value` hook or the hook declined (empty value, falling through to `OrdinaryGet`).
+/// Returns `Some(Ok(value))` when the hook answers or when out-of-bounds absence is guaranteed across the object
+/// and its ordinary prototype chain, `Some(Err(throw))` on exception, or `None` when full `OrdinaryGet` is needed.
 #[inline]
 pub(crate) fn try_get_indexed_value_hook_fast(object: &Object, index: u32) -> Option<ThrowCompletionOr<Value>> {
     if object.class().id != ClassId::HostObject {
@@ -339,9 +339,37 @@ pub(crate) fn try_get_indexed_value_hook_fast(object: &Object, index: u32) -> Op
     // SAFETY: The hook takes an object of its class and an index.
     match completion_from_abi(unsafe { hook(lend_object_to_hook(object), index) }) {
         Ok(value) if !value.is_empty() => Some(Ok(value)),
-        Ok(_) => None,
+        Ok(_) => {
+            if indexed_property_guaranteed_absent_on_chain(object) {
+                Some(Ok(Value::UNDEFINED))
+            } else {
+                None
+            }
+        }
         Err(throw) => Some(Err(throw)),
     }
+}
+
+/// Whether an array index not answered by `get_indexed_value` is guaranteed absent on `object` and its entire
+/// prototype chain (WebIDL `LegacyPlatformObjectGetOwnProperty` step 1.3 sets `ignoreNamedProps = true` for array
+/// indices, so only ordinary indexed storage on `object` or a prototype could still supply a value).
+#[inline]
+fn indexed_property_guaranteed_absent_on_chain(object: &Object) -> bool {
+    if object.indexed_storage_kind() != crate::layout::object::IndexedStorageKind::None {
+        return false;
+    }
+    let mut proto = object.shape().prototype();
+    while let Some(current) = proto {
+        if !core::ptr::fn_addr_eq(
+            current.methods().internal_get_own_property,
+            ORDINARY_OBJECT_METHODS.internal_get_own_property,
+        ) || current.indexed_storage_kind() != crate::layout::object::IndexedStorageKind::None
+        {
+            return false;
+        }
+        proto = current.shape().prototype();
+    }
+    true
 }
 
 /// [[Get]] of a class with a get_indexed_value hook: the hook's value for an array index it answers, and otherwise
@@ -362,6 +390,9 @@ fn get_through_indexed_value_hook(
         let value = completion_from_abi(unsafe { hook(lend_object_to_hook(object), key.as_number()) })?;
         if !value.is_empty() {
             return Ok(value);
+        }
+        if indexed_property_guaranteed_absent_on_chain(object) {
+            return Ok(Value::UNDEFINED);
         }
     }
     object.ordinary_get(vm, key, receiver, cacheable_metadata, phase)

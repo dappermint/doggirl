@@ -38,8 +38,11 @@ enum InputValue {
     Register(Gpr),
     Constant(u64),
 }
+pub use call_stub::generate_call_forwarding_stub;
 pub use call_stub::generate_call_stub;
 pub use call_stub::generate_construct_stub;
+pub use call_stub::generate_get_by_id_accessor_stub;
+pub use call_stub::generate_put_by_value_setter_stub;
 pub use entry::generate_entry_trampoline;
 mod array_iterators;
 mod arrays;
@@ -1794,10 +1797,35 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
                 }
             }
             Op::CallForwardingArguments { executable, pc } => {
-                let program_counter = self.frame_field(self.runtime.offsets.execution_context_program_counter);
-                self.masm.store_imm32(&program_counter, *pc);
-                self.emit_frame_runtime_call(self.runtime.call_forwarding_arguments, *pc);
-                let next_pc = self.decoded(*executable, *pc)?.next_pc();
+                let decoded = self.decoded(*executable, *pc)?;
+                let next_pc = decoded.next_pc();
+                if *executable == 0
+                    && self.runtime.dynamic_calls.call_forwarding_stub != 0
+                    && let Instruction::Call {
+                        dst,
+                        this_value,
+                        arguments,
+                        ..
+                    } = decoded.instruction
+                    && arguments.len() == 2
+                {
+                    let registers = M::ARGUMENT_GPRS;
+                    let this_arg = self.slot_address(arguments[0].raw())?;
+                    let callee = self.slot_address(this_value.raw())?;
+                    let passed_count = self.frame_field(self.runtime.offsets.execution_context_passed_argument_count);
+                    self.masm.load64(registers[0], &callee);
+                    self.masm.load64(registers[1], &this_arg);
+                    self.masm.load32(registers[2], &passed_count);
+                    self.masm
+                        .move_imm64(registers[3], u64::from(*pc) | (u64::from(next_pc) << 32));
+                    self.masm.move_imm32(registers[4], dst.raw());
+                    self.masm
+                        .call_absolute(self.runtime.dynamic_calls.call_forwarding_stub);
+                } else {
+                    let program_counter = self.frame_field(self.runtime.offsets.execution_context_program_counter);
+                    self.masm.store_imm32(&program_counter, *pc);
+                    self.emit_frame_runtime_call(self.runtime.call_forwarding_arguments, *pc);
+                }
                 self.emit_continuation_check(next_pc, &[]);
             }
             Op::AllocateObject { shape, reserve, .. } => {
@@ -3123,6 +3151,84 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
         }
         let program_counter = self.frame_field(self.runtime.offsets.execution_context_program_counter);
         self.masm.store_imm32(&program_counter, pc);
+        if opcode == crate::bytecode::OpCode::GetById
+            && self.runtime.dynamic_calls.get_by_id_accessor_stub != 0
+            && let Instruction::GetById {
+                dst, property, cache, ..
+            } = decoded.instruction
+        {
+            let next_pc = decoded.next_pc();
+            let arguments = M::ARGUMENT_GPRS;
+            let name = self.snapshot[self.snapshot.executables[executable as usize].property_key_names]
+                .get(property.0 as usize)
+                .copied()
+                .unwrap_or(0);
+            self.load_input(arguments[0], node, 0, registers);
+            self.property_cache_address(arguments[1], executable, cache)?;
+            self.masm.move_imm64(arguments[2], name);
+            self.masm
+                .move_imm64(arguments[3], u64::from(pc) | (u64::from(next_pc) << 32));
+            self.masm.move_imm32(arguments[4], dst.raw());
+            self.masm
+                .call_absolute(self.runtime.dynamic_calls.get_by_id_accessor_stub);
+            let fallback = self.masm.new_label();
+            let done = self.masm.new_label();
+            self.masm.branch64_imm(
+                Condition::Equal,
+                M::RETURN_GPRS[0],
+                call_stub::ACCESSOR_STUB_DECLINED,
+                fallback,
+            );
+            self.emit_continuation_check(next_pc, &[]);
+            if dst.raw() != crate::bytecode::Operand::INVALID {
+                let dst_slot = self.slot_address(dst.raw())?;
+                match slow_path_layout(opcode).abi {
+                    SlowPathAbi::Scalar => self.masm.load64(M::RETURN_GPRS[1], &dst_slot),
+                    SlowPathAbi::ScalarInputs | SlowPathAbi::Record => {
+                        let record = self.local_address(self.locals.record);
+                        self.masm.load64(self.pinned.scratch, &dst_slot);
+                        self.masm.store64(&record, self.pinned.scratch);
+                    }
+                }
+            }
+            self.masm.jump(done);
+            self.masm.bind(fallback);
+            let output = self.emit_record_call(opcode, executable, pc, next_pc, address, Some((node, registers)))?;
+            self.masm.bind(done);
+            return Ok(output);
+        }
+        if opcode == crate::bytecode::OpCode::PutByValue
+            && self.runtime.dynamic_calls.put_by_value_setter_stub != 0
+            && let Instruction::PutByValue {
+                kind: crate::bytecode::PUT_KIND_NORMAL,
+                ..
+            } = decoded.instruction
+        {
+            let next_pc = decoded.next_pc();
+            let arguments = M::ARGUMENT_GPRS;
+            self.load_input(arguments[0], node, 0, registers);
+            self.load_input(arguments[1], node, 1, registers);
+            self.load_input(arguments[2], node, 2, registers);
+            self.masm
+                .move_imm64(arguments[3], u64::from(pc) | (u64::from(next_pc) << 32));
+            self.masm.move_imm32(arguments[4], crate::bytecode::Operand::INVALID);
+            self.masm
+                .call_absolute(self.runtime.dynamic_calls.put_by_value_setter_stub);
+            let fallback = self.masm.new_label();
+            let done = self.masm.new_label();
+            self.masm.branch64_imm(
+                Condition::Equal,
+                M::RETURN_GPRS[0],
+                call_stub::ACCESSOR_STUB_DECLINED,
+                fallback,
+            );
+            self.emit_continuation_check(next_pc, &[]);
+            self.masm.jump(done);
+            self.masm.bind(fallback);
+            let output = self.emit_record_call(opcode, executable, pc, next_pc, address, Some((node, registers)))?;
+            self.masm.bind(done);
+            return Ok(output);
+        }
         self.emit_record_call(
             opcode,
             executable,

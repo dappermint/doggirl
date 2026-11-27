@@ -33,6 +33,7 @@ use super::Codegen;
 use super::Locals;
 use super::STUB_CODE_LIMIT;
 use super::STUB_ZONE_LIMIT;
+use super::probes::MegamorphicKey;
 use super::target_registers;
 use crate::CompileFailure;
 use crate::asm::Address;
@@ -72,7 +73,25 @@ mod local {
     pub const EXECUTABLE: u32 = 56;
     /// The new target of a construct.
     pub const NEW_TARGET: u32 = 64;
-    pub const SIZE: u32 = 80;
+    /// Boxed packed Array value for the `Function.prototype.apply` fast path, or 0 for caller stack arguments.
+    pub const ARG_SOURCE: u32 = 72;
+    /// Caller's `vm.current_realm` saved across cross-realm ECMAScript calls.
+    pub const CALLER_REALM: u32 = 80;
+    pub const SIZE: u32 = 96;
+}
+
+/// Returned in `M::RETURN_GPRS[0]` by accessor stubs when they decline before
+/// doing anything observable (`SlowPathControl` values are `-1` or `>= 0`).
+pub(super) const ACCESSOR_STUB_DECLINED: i64 = -2;
+
+/// Which stub `generate_stub()` generates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StubKind {
+    Call,
+    Construct,
+    CallForwarding,
+    AccessorGet,
+    PutByValueSetter,
 }
 
 /// Generates the call stub, or nothing if the runtime lacks a helper it
@@ -84,7 +103,59 @@ pub fn generate_call_stub<M: PortableMacroAssembler>(
     if layout.object_flag_is_ecmascript_function == 0 || runtime.jit_call == 0 || runtime.finish_direct_call == 0 {
         return Ok(None);
     }
-    generate_stub::<M>(runtime, false).map(Some)
+    generate_stub::<M>(runtime, StubKind::Call).map(Some)
+}
+
+/// Generates the call forwarding stub for `Op::CallForwardingArguments`
+/// (`f.apply(thisArg, arguments)`), copying passed arguments directly from
+/// the caller frame into the callee frame.
+pub fn generate_call_forwarding_stub<M: PortableMacroAssembler>(
+    runtime: &RuntimeInfo,
+) -> Result<Option<Column<u8>>, CompileFailure> {
+    let layout = runtime.dynamic_calls;
+    if layout.object_flag_is_ecmascript_function == 0
+        || runtime.call_forwarding_arguments == 0
+        || runtime.finish_direct_call == 0
+    {
+        return Ok(None);
+    }
+    generate_stub::<M>(runtime, StubKind::CallForwarding).map(Some)
+}
+
+/// Generates the accessor get stub for `CallSlowPath(GetById)`, probing the
+/// site cache and VM keyed lookup cache for an accessor and calling its
+/// getter directly, returning `ACCESSOR_STUB_DECLINED` on miss or fallback.
+pub fn generate_get_by_id_accessor_stub<M: PortableMacroAssembler>(
+    runtime: &RuntimeInfo,
+) -> Result<Option<Column<u8>>, CompileFailure> {
+    let layout = runtime.dynamic_calls;
+    if layout.object_flag_is_ecmascript_function == 0
+        || runtime.finish_direct_call == 0
+        || runtime.layout.property_lookup_cache_entry_size == 0
+    {
+        return Ok(None);
+    }
+    generate_stub::<M>(runtime, StubKind::AccessorGet).map(Some)
+}
+
+/// Generates the prototype setter stub for `CallSlowPath(PutByValue)`,
+/// probing the VM keyed store cache read-only for a
+/// `ChangePropertyInPrototypeChain` accessor and calling its setter directly,
+/// returning `ACCESSOR_STUB_DECLINED` on miss or fallback.
+pub fn generate_put_by_value_setter_stub<M: PortableMacroAssembler>(
+    runtime: &RuntimeInfo,
+) -> Result<Option<Column<u8>>, CompileFailure> {
+    let layout = runtime.dynamic_calls;
+    if layout.object_flag_is_ecmascript_function == 0
+        || runtime.finish_direct_call == 0
+        || runtime.layout.keyed_store_cache_entries == 0
+        || runtime.layout.keyed_lookup_cache_prototype == 0
+        || runtime.layout.keyed_lookup_cache_prototype_chain_validity == 0
+        || runtime.layout.property_lookup_cache_entry_type_change_property_in_prototype_chain == 0
+    {
+        return Ok(None);
+    }
+    generate_stub::<M>(runtime, StubKind::PutByValueSetter).map(Some)
 }
 
 /// Generates the construct stub (see `Codegen::emit_call_stub()`), or
@@ -104,14 +175,13 @@ pub fn generate_construct_stub<M: PortableMacroAssembler>(
     {
         return Ok(None);
     }
-    generate_stub::<M>(runtime, true).map(Some)
+    generate_stub::<M>(runtime, StubKind::Construct).map(Some)
 }
 
-/// Generates the code of the call stub, or with `construct` of the construct
-/// stub (see `Codegen::emit_call_stub()`).
+/// Generates the code of the call stub, construct stub, or call forwarding stub.
 fn generate_stub<M: PortableMacroAssembler>(
     runtime: &RuntimeInfo,
-    construct: bool,
+    kind: StubKind,
 ) -> Result<Column<u8>, CompileFailure> {
     // NB: A stub has no graph to build: the graph stays empty. The zone holds the lists of the code generator.
     let zone = ak::Zone::new(STUB_ZONE_LIMIT, c"JIT stub");
@@ -179,7 +249,7 @@ fn generate_stub<M: PortableMacroAssembler>(
             requested_temps: &[],
             undeclared_saves_area_uses: core::cell::RefCell::new(ZoneVec::new_in(&zone)),
         };
-        codegen.emit_call_stub(construct)?;
+        codegen.emit_call_stub(kind)?;
         codegen.masm.finish().map_err(super::assembly_failure)?;
     }
     Ok(code)
@@ -347,24 +417,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.frame.local(M::STACK_POINTER, offset)
     }
 
-    /// The address of the `index`th argument the stub's caller stored.
-    fn stub_argument(&self, index: crate::asm::Gpr) -> Address {
-        Address {
-            base: M::STACK_POINTER,
-            index: Some((index, Scale::Eight)),
-            displacement: self.frame.caller_stack_offset as i32,
-        }
-    }
-
-    /// The call stub, or with `construct` the construct stub: called like
-    /// the call stub for a `CallConstruct` or `SuperCall` instruction, with
-    /// the new target in place of the `this` value (or the empty value for
-    /// the running frame's new.target), it makes constructs of ECMAScript
-    /// constructors the runtime allows (see `RuntimeInfo::construct_this`)
-    /// the same way, and lets the runtime push the constructor's frame for
-    /// the stub to enter (see `RuntimeInfo::prepare_construct`) or make the
-    /// construct otherwise.
-    fn emit_call_stub(&mut self, construct: bool) -> Result<(), CompileFailure> {
+    /// The call stub, construct stub, or call forwarding stub.
+    fn emit_call_stub(&mut self, kind: StubKind) -> Result<(), CompileFailure> {
+        let construct = kind == StubKind::Construct;
         let runtime = self.runtime;
         let offsets = runtime.offsets;
         let layout = runtime.dynamic_calls;
@@ -388,15 +443,54 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
 
         let machine_frame = self.frame;
         self.masm.emit_prologue(&machine_frame);
-        for (offset, register) in [
-            (local::CALLEE, callee_value),
-            (local::THIS, this_argument),
-            (local::ARGUMENT_COUNT, argument_count),
-            (local::PCS, pcs),
-            (local::DST, dst),
-        ] {
-            let address = self.stub_local(offset);
-            self.masm.store64(&address, register);
+        match kind {
+            StubKind::Call | StubKind::Construct | StubKind::CallForwarding => {
+                for (offset, register) in [
+                    (local::CALLEE, callee_value),
+                    (local::THIS, this_argument),
+                    (local::ARGUMENT_COUNT, argument_count),
+                    (local::PCS, pcs),
+                    (local::DST, dst),
+                ] {
+                    let address = self.stub_local(offset);
+                    self.masm.store64(&address, register);
+                }
+                if kind == StubKind::Call {
+                    let arg_source = self.stub_local(local::ARG_SOURCE);
+                    self.masm.store_imm64(&arg_source, 0);
+                }
+            }
+            StubKind::AccessorGet => {
+                for (offset, register) in [
+                    (local::THIS, registers[0]),
+                    (local::ARG_SOURCE, registers[2]),
+                    (local::PCS, registers[3]),
+                    (local::DST, registers[4]),
+                ] {
+                    let address = self.stub_local(offset);
+                    self.masm.store64(&address, register);
+                }
+                let arg_count = self.stub_local(local::ARGUMENT_COUNT);
+                self.masm.store_imm64(&arg_count, 0);
+            }
+            StubKind::PutByValueSetter => {
+                for (offset, register) in [
+                    (local::THIS, registers[0]),
+                    (local::ARG_SOURCE, registers[2]),
+                    (local::PCS, registers[3]),
+                    (local::DST, registers[4]),
+                ] {
+                    let address = self.stub_local(offset);
+                    self.masm.store64(&address, register);
+                }
+                let arg_count = self.stub_local(local::ARGUMENT_COUNT);
+                self.masm.store_imm64(&arg_count, 1);
+            }
+        }
+        if !construct {
+            self.masm.load64(scratch, &vm_field(offsets.vm_current_realm));
+            let caller_realm_local = self.stub_local(local::CALLER_REALM);
+            self.masm.store64(&caller_realm_local, scratch);
         }
 
         // Stack traces show the caller at its call.
@@ -405,15 +499,34 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             pcs,
         );
 
-        // The callee must be an object.
-        self.masm.move64(temp, callee_value);
-        self.branch_on_tag(Condition::NotEqual, temp, value::OBJECT_TAG, scratch, slow);
-        self.emit_unbox_cell(function_register, temp);
-        self.masm
-            .load16(temp, &Address::new(function_register, offsets.object_flags as i32));
+        match kind {
+            StubKind::Call | StubKind::Construct | StubKind::CallForwarding => {
+                // The callee must be an object.
+                self.masm.move64(temp, callee_value);
+                self.branch_on_tag(Condition::NotEqual, temp, value::OBJECT_TAG, scratch, slow);
+                self.emit_unbox_cell(function_register, temp);
+                self.masm
+                    .load16(temp, &Address::new(function_register, offsets.object_flags as i32));
+            }
+            StubKind::AccessorGet => {
+                self.emit_accessor_get_probe(slow, leave);
+            }
+            StubKind::PutByValueSetter => {
+                self.emit_put_by_value_setter_probe(slow);
+            }
+        }
 
-        // Raw native functions are called in their lightweight frame.
+        // Raw native functions are called in their lightweight frame, except
+        // `Function.prototype.apply` with nullish or packed Array argArray,
+        // which unwraps straight to its target function with one argument copy.
         let ecmascript_function = self.masm.new_label();
+        let native_function_no_apply = self.masm.new_label();
+        let has_apply_fast_path = kind == StubKind::Call
+            && layout.object_flag_is_raw_native_function != 0
+            && runtime.raw_native_exception != 0
+            && layout.apply_function_address != 0
+            && runtime.layout.object_indexed_elements != 0;
+        let apply_unwrap = has_apply_fast_path.then(|| self.masm.new_label());
         self.masm.branch_test32(
             Condition::NonZero,
             temp,
@@ -427,19 +540,142 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                 u32::from(layout.object_flag_is_raw_native_function),
                 slow,
             );
-            self.emit_stub_native_call(slow, leave)?;
+            if let Some(apply_unwrap) = apply_unwrap {
+                self.masm.load32(
+                    temp,
+                    &Address::new(function_register, layout.raw_native_function_index as i32),
+                );
+                self.masm.and32_imm(temp, temp, layout.native_function_table_index_mask);
+                self.masm.shl64_imm(
+                    temp,
+                    temp,
+                    u8::try_from(layout.native_function_table_entry_size.trailing_zeros()).unwrap_or(0),
+                );
+                self.masm.load64(scratch, &vm_field(layout.vm_native_function_table));
+                self.masm.load64(
+                    scratch,
+                    &Address {
+                        base: scratch,
+                        index: Some((temp, Scale::One)),
+                        displacement: layout.native_function_table_entry_function as i32,
+                    },
+                );
+                self.masm.move_imm64(temp, layout.apply_function_address);
+                self.masm.branch64(Condition::Equal, scratch, temp, apply_unwrap);
+            }
+            self.masm.bind(native_function_no_apply);
+            self.emit_stub_native_call(kind, slow, leave)?;
+            if let Some(apply_unwrap) = apply_unwrap {
+                self.masm.bind(apply_unwrap);
+                let this_local = self.stub_local(local::THIS);
+                let argument_count_local = self.stub_local(local::ARGUMENT_COUNT);
+                let callee_local = self.stub_local(local::CALLEE);
+                let arg_source_local = self.stub_local(local::ARG_SOURCE);
+                let rt_layout = runtime.layout;
+
+                // 1. target_fn = this_value (must be an object).
+                self.masm.load64(function_register, &this_local);
+                self.branch_on_tag(Condition::NotEqual, function_register, value::OBJECT_TAG, scratch, slow);
+
+                // 2. target_this = arg0 (or undefined), arg_array = arg1 (or undefined).
+                let apply_empty_args = self.masm.new_label();
+                let apply_ready = self.masm.new_label();
+                self.masm.move_imm64(other, value::UNDEFINED);
+                self.masm.load64(temp, &argument_count_local);
+                self.masm.branch32_imm(Condition::Equal, temp, 0, apply_empty_args);
+                self.masm.load64(
+                    other,
+                    &Address::new(M::STACK_POINTER, self.frame.caller_stack_offset as i32),
+                );
+                self.masm.branch32_imm(Condition::Below, temp, 2, apply_empty_args);
+                self.masm.load64(
+                    receiver,
+                    &Address::new(M::STACK_POINTER, self.frame.caller_stack_offset as i32 + 8),
+                );
+                // Nullish argArray -> 0 arguments.
+                self.masm.shr64_imm(scratch, receiver, 48);
+                self.masm.or32_imm(scratch, scratch, 1);
+                self.masm
+                    .branch32_imm(Condition::Equal, scratch, i32::from(value::NULL_TAG), apply_empty_args);
+                // Otherwise require a non-interfering packed Array with length <= 64 and length <= capacity.
+                self.branch_on_tag(Condition::NotEqual, receiver, value::OBJECT_TAG, scratch, slow);
+                self.emit_unbox_cell(temp, receiver);
+                let required = u32::from(rt_layout.object_flag_has_magical_length);
+                let forbidden = u32::from(rt_layout.object_flag_may_interfere);
+                self.masm
+                    .load16(scratch, &Address::new(temp, offsets.object_flags as i32));
+                self.masm.and32_imm(scratch, scratch, required | forbidden);
+                self.masm
+                    .branch32_imm(Condition::NotEqual, scratch, required as i32, slow);
+                self.masm.load32(
+                    callee_frame,
+                    &Address::new(temp, rt_layout.object_indexed_array_like_size as i32),
+                );
+                self.masm
+                    .branch32_imm(Condition::Equal, callee_frame, 0, apply_empty_args);
+                self.masm.branch32_imm(Condition::Above, callee_frame, 64, slow);
+                self.masm.load8(
+                    scratch,
+                    &Address::new(temp, rt_layout.object_indexed_storage_kind as i32),
+                );
+                self.masm.branch32_imm(
+                    Condition::NotEqual,
+                    scratch,
+                    i32::from(rt_layout.indexed_storage_kind_packed),
+                    slow,
+                );
+                self.masm.load64(
+                    temp,
+                    &Address::new(temp, rt_layout.object_indexed_elements as i32),
+                );
+                self.masm.branch_test64(Condition::Zero, temp, u64::MAX, slow);
+                self.masm
+                    .load32(scratch, &Address::new(temp, rt_layout.indexed_elements_capacity));
+                self.masm
+                    .branch32(Condition::Above, callee_frame, scratch, slow);
+                self.masm.store64(&argument_count_local, callee_frame);
+                self.masm.store64(&arg_source_local, receiver);
+                self.masm.jump(apply_ready);
+
+                self.masm.bind(apply_empty_args);
+                self.masm.store_imm64(&argument_count_local, 0);
+                self.masm.store_imm64(&arg_source_local, 0);
+
+                self.masm.bind(apply_ready);
+                self.masm.store64(&callee_local, function_register);
+                self.masm.store64(&this_local, other);
+                self.emit_unbox_cell(function_register, function_register);
+                self.masm
+                    .load16(temp, &Address::new(function_register, offsets.object_flags as i32));
+                self.masm.branch_test32(
+                    Condition::NonZero,
+                    temp,
+                    u32::from(layout.object_flag_is_ecmascript_function),
+                    ecmascript_function,
+                );
+                self.masm.branch_test32(
+                    Condition::NonZero,
+                    temp,
+                    u32::from(layout.object_flag_is_raw_native_function),
+                    native_function_no_apply,
+                );
+                self.masm.jump(slow);
+            }
         } else {
             self.masm.jump(slow);
         }
 
         // An ECMAScript function the interpreter's call fast path calls in an
-        // inline frame. One of another realm is called by the runtime, which
-        // changes the current realm.
+        // inline frame. For calls (not constructs), cross-realm callees switch
+        // `vm.current_realm` to the callee's realm and restore it on return,
+        // slow-path fallback, or interpreter finish.
         self.masm.bind(ecmascript_function);
-        self.emit_load_compressed_cell(temp, &Address::new(function_register, offsets.object_shape as i32));
-        self.emit_load_compressed_cell(temp, &Address::new(temp, layout.shape_realm as i32));
-        self.masm
-            .branch64_memory(Condition::NotEqual, &vm_field(offsets.vm_current_realm), temp, slow);
+        if construct {
+            self.emit_load_compressed_cell(temp, &Address::new(function_register, offsets.object_shape as i32));
+            self.emit_load_compressed_cell(temp, &Address::new(temp, layout.shape_realm as i32));
+            self.masm
+                .branch64_memory(Condition::NotEqual, &vm_field(offsets.vm_current_realm), temp, slow);
+        }
         // NB: The executable is decoded once it is known not to be null,
         //     which it stays: the runtime compiles the function again if a
         //     collection in it flushed the executable.
@@ -465,6 +701,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm
             .branch_test32(Condition::Zero, executable_register, u32::MAX, slow);
         self.emit_decompress_cell(executable_register);
+        if !construct {
+            self.emit_load_compressed_cell(temp, &Address::new(function_register, offsets.object_shape as i32));
+            self.emit_load_compressed_cell(temp, &Address::new(temp, layout.shape_realm as i32));
+            self.masm.store64(&vm_field(offsets.vm_current_realm), temp);
+        }
         let environment_local = self.stub_local(local::ENVIRONMENT);
 
         // A construct gets its this value and new target from the runtime.
@@ -697,7 +938,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         let executable_local = self.stub_local(local::EXECUTABLE);
         self.masm.store64(&executable_local, executable_register);
         self.masm.load64(temp, &argument_count_local);
-        self.emit_stub_copy_arguments(scratch, temp, executable_register, receiver);
+        self.emit_stub_copy_arguments(kind, scratch, temp, executable_register, receiver, function_register);
         // The formal parameters not passed, up to formal_count.
         self.masm.sub32(formal_count, formal_count, temp);
         let fill = self.masm.new_label();
@@ -740,7 +981,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm
             .branch64_imm(Condition::NotEqual, status, JitStatus::Returned as i64, not_returned);
         // NB: JIT code never returns the empty value.
-        self.emit_stub_store_result(value_register, temp);
+        self.emit_stub_store_result(kind, value_register, temp);
+        let caller_realm_local = self.stub_local(local::CALLER_REALM);
+        self.masm.load64(temp, &caller_realm_local);
+        self.masm.store64(&vm_field(offsets.vm_current_realm), temp);
         self.masm.load64(temp, &executable_local);
         self.masm.store64(&vm_field(offsets.vm_interpreter_stack_top), temp);
         self.masm
@@ -762,10 +1006,25 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
 
         // Everything else takes the generic path.
         self.masm.bind(slow);
-        self.masm.move64(registers[0], vm);
-        self.masm.move64(registers[1], frame);
-        self.masm.load32(registers[2], &pcs_local);
-        self.masm.call_absolute(runtime.jit_call);
+        self.masm.load64(temp, &caller_realm_local);
+        self.masm.store64(&vm_field(offsets.vm_current_realm), temp);
+        match kind {
+            StubKind::AccessorGet | StubKind::PutByValueSetter => {
+                self.masm.move_imm64(M::RETURN_GPRS[0], ACCESSOR_STUB_DECLINED as u64);
+            }
+            StubKind::CallForwarding => {
+                self.masm.move64(registers[0], vm);
+                self.masm.move64(registers[1], frame);
+                self.masm.load32(registers[2], &pcs_local);
+                self.masm.call_absolute(runtime.call_forwarding_arguments);
+            }
+            StubKind::Call | StubKind::Construct => {
+                self.masm.move64(registers[0], vm);
+                self.masm.move64(registers[1], frame);
+                self.masm.load32(registers[2], &pcs_local);
+                self.masm.call_absolute(runtime.jit_call);
+            }
+        }
 
         self.masm.bind(leave);
         self.masm.emit_epilogue(&machine_frame);
@@ -867,7 +1126,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.branch_on_tag(Condition::NotEqual, temp, value::OBJECT_TAG, scratch, error);
         self.masm.move64(result, temp);
         self.masm.bind(have_result);
-        self.emit_stub_store_result(result, temp);
+        self.emit_stub_store_result(StubKind::Construct, result, temp);
         self.emit_stub_continuation();
         self.masm.jump(leave);
 
@@ -957,23 +1216,87 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.new_frame_constants(ecmascript)
     }
 
-    /// Copies the `count` arguments the stub's caller stored to
-    /// `destination` (an address of the new frame). Clobbers `index` and
-    /// `value_register`.
+    /// Copies the `count` arguments of the stub into `destination` (an address
+    /// in the new frame). Clobbers `index`, `value_register`, and `source_base`.
     fn emit_stub_copy_arguments(
         &mut self,
+        kind: StubKind,
         destination: crate::asm::Gpr,
         count: crate::asm::Gpr,
         index: crate::asm::Gpr,
         value_register: crate::asm::Gpr,
+        source_base: crate::asm::Gpr,
     ) {
+        if kind == StubKind::AccessorGet {
+            return;
+        }
+        if kind == StubKind::PutByValueSetter {
+            let source_local = self.stub_local(local::ARG_SOURCE);
+            self.masm.load64(value_register, &source_local);
+            self.masm.store64(&Address::new(destination, 0), value_register);
+            return;
+        }
+        let copied = self.masm.new_label();
+        self.masm.branch32_imm(Condition::Equal, count, 0, copied);
+        match kind {
+            StubKind::Call => {
+                let arg_source = self.stub_local(local::ARG_SOURCE);
+                let from_stack = self.masm.new_label();
+                let have_source = self.masm.new_label();
+                self.masm.load64(source_base, &arg_source);
+                self.masm.branch64_imm(Condition::Equal, source_base, 0, from_stack);
+                self.emit_unbox_cell(source_base, source_base);
+                self.masm.load64(
+                    source_base,
+                    &Address::new(source_base, self.runtime.layout.object_indexed_elements as i32),
+                );
+                self.masm.jump(have_source);
+                self.masm.bind(from_stack);
+                self.masm.load_effective_address(
+                    source_base,
+                    &Address::new(M::STACK_POINTER, self.frame.caller_stack_offset as i32),
+                );
+                self.masm.bind(have_source);
+            }
+            StubKind::Construct => {
+                self.masm.load_effective_address(
+                    source_base,
+                    &Address::new(M::STACK_POINTER, self.frame.caller_stack_offset as i32),
+                );
+            }
+            StubKind::CallForwarding => {
+                let offsets = self.runtime.offsets;
+                self.masm.load32(
+                    source_base,
+                    &Address::new(self.pinned.frame, offsets.execution_context_slot_count as i32),
+                );
+                self.masm.load32(
+                    index,
+                    &Address::new(self.pinned.frame, offsets.execution_context_argument_count as i32),
+                );
+                self.masm.sub32(source_base, source_base, index);
+                self.masm.load_effective_address(
+                    source_base,
+                    &Address {
+                        base: self.pinned.frame,
+                        index: Some((source_base, Scale::Eight)),
+                        displacement: offsets.execution_context_slots as i32,
+                    },
+                );
+            }
+            StubKind::AccessorGet | StubKind::PutByValueSetter => unreachable!(),
+        }
         self.masm.move_imm32(index, 0);
         let copy = self.masm.new_label();
-        let copied = self.masm.new_label();
-        self.masm.branch32(Condition::Equal, index, count, copied);
         self.masm.bind(copy);
-        let source = self.stub_argument(index);
-        self.masm.load64(value_register, &source);
+        self.masm.load64(
+            value_register,
+            &Address {
+                base: source_base,
+                index: Some((index, Scale::Eight)),
+                displacement: 0,
+            },
+        );
         self.masm.store64(
             &Address {
                 base: destination,
@@ -987,19 +1310,319 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.bind(copied);
     }
 
-    /// Stores the call's result into the calling frame's destination slot.
-    /// Clobbers `temp`.
-    fn emit_stub_store_result(&mut self, result: crate::asm::Gpr, temp: crate::asm::Gpr) {
-        let dst_local = self.stub_local(local::DST);
-        self.masm.load32(temp, &dst_local);
-        self.masm.store64(
-            &Address {
-                base: self.pinned.frame,
-                index: Some((temp, Scale::Eight)),
-                displacement: self.runtime.offsets.execution_context_slots as i32,
-            },
-            result,
+    /// Probes the site cache (`registers[1]`) and VM keyed lookup cache
+    /// (`local::ARG_SOURCE` name) for an accessor on `registers[0]` (`base`).
+    /// On hit with a non-null getter, stores boxed getter in `local::CALLEE`,
+    /// puts unboxed getter in `registers[4]` and its `object_flags` in
+    /// `registers[2]`. On null getter, stores `undefined`, sets continuation,
+    /// and jumps to `leave`. Otherwise jumps to `slow`.
+    fn emit_accessor_get_probe(&mut self, slow: Label, leave: Label) {
+        let offsets = self.runtime.offsets;
+        let layout = self.runtime.layout;
+        let registers = M::ARGUMENT_GPRS;
+        let object = registers[0];
+        let shape = registers[1];
+        let entry = registers[2];
+        let raw = registers[3];
+        let function_register = registers[4];
+        let scratch = self.pinned.scratch;
+
+        let found_site_entry = self.masm.new_label();
+        let try_vm_cache = self.masm.new_label();
+        let have_accessor = self.masm.new_label();
+        let null_getter = self.masm.new_label();
+
+        self.branch_on_tag(Condition::NotEqual, object, value::OBJECT_TAG, scratch, slow);
+        self.emit_unbox_cell(object, object);
+        self.masm.load64(entry, &Address::new(shape, 0));
+        self.emit_load_compressed_cell(shape, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch_test64(Condition::Zero, entry, u64::MAX, slow);
+        self.masm.move64(raw, entry);
+        self.masm
+            .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
+        self.branch_if_entry_shape(entry, shape, found_site_entry);
+
+        self.masm
+            .and64_imm(raw, raw, !layout.property_lookup_cache_data_pointer_mask);
+        let not_polymorphic = self.masm.new_label();
+        self.masm.branch64_imm(
+            Condition::NotEqual,
+            raw,
+            layout.property_lookup_cache_polymorphic_tag as i64,
+            not_polymorphic,
         );
+        for _ in 1..layout.property_lookup_cache_polymorphic_entry_count {
+            self.masm
+                .add64_imm(entry, entry, i64::from(layout.property_lookup_cache_entry_size));
+            self.branch_if_entry_shape(entry, shape, found_site_entry);
+        }
+        self.masm.jump(slow);
+
+        self.masm.bind(not_polymorphic);
+        self.masm.branch64_imm(
+            Condition::NotEqual,
+            raw,
+            layout.property_lookup_cache_megamorphic_tag as i64,
+            slow,
+        );
+        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found_site_entry, try_vm_cache);
+
+        // Matched an entry in the site cache.
+        self.masm.bind(found_site_entry);
+        let expected_dict = Address::new(entry, layout.property_lookup_cache_entry_dictionary_generation as i32);
+        self.branch_unless_dictionary_generation_is(shape, expected_dict, [shape, scratch], slow);
+        let site_type_ok = self.masm.new_label();
+        self.masm.load32(
+            scratch,
+            &Address::new(entry, layout.property_lookup_cache_entry_type as i32),
+        );
+        self.masm.branch32_imm(
+            Condition::Equal,
+            scratch,
+            layout.property_lookup_cache_entry_type_get_own_property as i32,
+            site_type_ok,
+        );
+        self.masm.branch32_imm(
+            Condition::NotEqual,
+            scratch,
+            layout.property_lookup_cache_entry_type_get_property_in_prototype_chain as i32,
+            slow,
+        );
+        self.masm.bind(site_type_ok);
+        let site_own = self.masm.new_label();
+        self.masm.load64(
+            raw,
+            &Address::new(entry, layout.property_lookup_cache_entry_prototype as i32),
+        );
+        self.masm.branch_test64(Condition::Zero, raw, u64::MAX, site_own);
+        self.masm.load64(
+            shape,
+            &Address::new(
+                entry,
+                layout.property_lookup_cache_entry_prototype_chain_validity as i32,
+            ),
+        );
+        self.masm.branch_test64(Condition::Zero, shape, u64::MAX, slow);
+        self.branch_unless_prototype_chain_valid(shape, slow);
+        self.masm.move64(object, raw);
+        self.masm.bind(site_own);
+        self.masm.load32(
+            scratch,
+            &Address::new(entry, layout.property_lookup_cache_entry_property_offset as i32),
+        );
+        self.masm
+            .load64(shape, &Address::new(object, offsets.object_named_properties as i32));
+        self.masm
+            .load64(entry, &Address::indexed(shape, scratch, Scale::Eight, 0));
+        self.branch_on_tag(Condition::NotEqual, entry, value::ACCESSOR_TAG, scratch, slow);
+        self.masm.jump(have_accessor);
+
+        // Megamorphic site miss: probe the VM keyed property lookup cache.
+        self.masm.bind(try_vm_cache);
+        if layout.keyed_lookup_cache_entries == 0
+            || layout.keyed_lookup_cache_prototype == 0
+            || layout.keyed_lookup_cache_prototype_chain_validity == 0
+        {
+            self.masm.jump(slow);
+        } else {
+            let name_local = self.stub_local(local::ARG_SOURCE);
+            self.masm.load64(raw, &name_local);
+            self.masm.branch_test64(Condition::Zero, raw, u64::MAX, slow);
+            let entry_size_log2 = layout.keyed_lookup_cache_entry_size.trailing_zeros();
+            let bits = layout.keyed_lookup_cache_index_bits;
+            self.masm.xor32(scratch, shape, raw);
+            self.masm.mul32_imm(
+                scratch,
+                scratch,
+                layout.property_lookup_cache_megamorphic_hash_multiplier,
+            );
+            self.masm
+                .shr32_imm(scratch, scratch, (32 - bits - entry_size_log2) as u8);
+            self.masm
+                .and32_imm(scratch, scratch, ((1u32 << bits) - 1) << entry_size_log2);
+            self.masm.move_imm64(entry, layout.keyed_lookup_cache_entries);
+            self.masm.add64(entry, entry, scratch);
+            self.masm.branch64_memory(
+                Condition::NotEqual,
+                &Address::new(entry, layout.keyed_lookup_cache_name as i32),
+                raw,
+                slow,
+            );
+            self.masm.branch64_memory(
+                Condition::NotEqual,
+                &Address::new(entry, layout.keyed_lookup_cache_shape as i32),
+                shape,
+                slow,
+            );
+            let expected = Address::new(entry, layout.keyed_lookup_cache_dictionary_generation as i32);
+            self.branch_unless_dictionary_generation_is(shape, expected, [shape, scratch], slow);
+            let vm_own = self.masm.new_label();
+            self.masm.load32(
+                scratch,
+                &Address::new(entry, layout.keyed_lookup_cache_entry_type as i32),
+            );
+            self.masm.branch32_imm(
+                Condition::Equal,
+                scratch,
+                layout.property_lookup_cache_entry_type_get_own_property as i32,
+                vm_own,
+            );
+            self.masm.branch32_imm(
+                Condition::NotEqual,
+                scratch,
+                layout.property_lookup_cache_entry_type_get_property_in_prototype_chain as i32,
+                slow,
+            );
+            self.masm.load64(
+                shape,
+                &Address::new(entry, layout.keyed_lookup_cache_prototype_chain_validity as i32),
+            );
+            self.masm.branch_test64(Condition::Zero, shape, u64::MAX, slow);
+            self.branch_unless_prototype_chain_valid(shape, slow);
+            self.masm
+                .load64(object, &Address::new(entry, layout.keyed_lookup_cache_prototype as i32));
+            self.masm.bind(vm_own);
+            self.masm.load32(
+                scratch,
+                &Address::new(entry, layout.keyed_lookup_cache_property_offset as i32),
+            );
+            self.masm
+                .load64(shape, &Address::new(object, offsets.object_named_properties as i32));
+            self.masm
+                .load64(entry, &Address::indexed(shape, scratch, Scale::Eight, 0));
+            self.branch_on_tag(Condition::NotEqual, entry, value::ACCESSOR_TAG, scratch, slow);
+        }
+
+        self.masm.bind(have_accessor);
+        self.emit_unbox_cell(entry, entry);
+        self.emit_load_compressed_cell_or_branch(
+            function_register,
+            &Address::new(entry, offsets.accessor_getter as i32),
+            null_getter,
+        );
+        self.box_cell_with_tag(entry, function_register, value::OBJECT_TAG);
+        let callee_local = self.stub_local(local::CALLEE);
+        self.masm.store64(&callee_local, entry);
+        self.masm
+            .load16(entry, &Address::new(function_register, offsets.object_flags as i32));
+        let dispatch = self.masm.new_label();
+        self.masm.jump(dispatch);
+
+        self.masm.bind(null_getter);
+        self.masm.move_imm64(entry, value::UNDEFINED);
+        self.emit_stub_store_result(StubKind::AccessorGet, entry, raw);
+        self.emit_stub_continuation();
+        self.masm.jump(leave);
+
+        self.masm.bind(dispatch);
+    }
+
+    /// Probes the VM keyed store cache read-only for a
+    /// `ChangePropertyInPrototypeChain` accessor on (`base` in `registers[0]`,
+    /// `key` in `registers[1]`). On hit with a non-null setter, stores boxed
+    /// setter in `local::CALLEE`, puts unboxed setter in `registers[4]` and its
+    /// `object_flags` in `registers[2]`. Otherwise jumps to `slow`.
+    fn emit_put_by_value_setter_probe(&mut self, slow: Label) {
+        let offsets = self.runtime.offsets;
+        let layout = self.runtime.layout;
+        let registers = M::ARGUMENT_GPRS;
+        let object = registers[0];
+        let shape = registers[1];
+        let entry = registers[2];
+        let name = registers[3];
+        let function_register = registers[4];
+        let scratch = self.pinned.scratch;
+
+        self.branch_on_tag(Condition::NotEqual, object, value::OBJECT_TAG, scratch, slow);
+        self.branch_on_tag(Condition::NotEqual, shape, value::STRING_TAG, scratch, slow);
+        self.emit_unbox_cell(name, shape);
+        self.masm
+            .load64(name, &Address::new(name, layout.primitive_string_storage as i32));
+        self.masm.branch_test64(Condition::Zero, name, u64::MAX, slow);
+
+        self.emit_unbox_cell(object, object);
+        self.emit_load_compressed_cell(shape, &Address::new(object, offsets.object_shape as i32));
+
+        let entry_size_log2 = layout.keyed_lookup_cache_entry_size.trailing_zeros();
+        let bits = layout.keyed_lookup_cache_index_bits;
+        self.masm.xor32(scratch, shape, name);
+        self.masm.mul32_imm(
+            scratch,
+            scratch,
+            layout.property_lookup_cache_megamorphic_hash_multiplier,
+        );
+        self.masm
+            .shr32_imm(scratch, scratch, (32 - bits - entry_size_log2) as u8);
+        self.masm
+            .and32_imm(scratch, scratch, ((1u32 << bits) - 1) << entry_size_log2);
+        self.masm.move_imm64(entry, layout.keyed_store_cache_entries);
+        self.masm.add64(entry, entry, scratch);
+        self.masm.branch64_memory(
+            Condition::NotEqual,
+            &Address::new(entry, layout.keyed_lookup_cache_name as i32),
+            name,
+            slow,
+        );
+        self.masm.branch64_memory(
+            Condition::NotEqual,
+            &Address::new(entry, layout.keyed_lookup_cache_shape as i32),
+            shape,
+            slow,
+        );
+        let expected = Address::new(entry, layout.keyed_lookup_cache_dictionary_generation as i32);
+        self.branch_unless_dictionary_generation_is(shape, expected, [shape, scratch], slow);
+        self.masm.branch32_memory_imm(
+            Condition::NotEqual,
+            &Address::new(entry, layout.keyed_lookup_cache_entry_type as i32),
+            layout.property_lookup_cache_entry_type_change_property_in_prototype_chain as i32,
+            slow,
+        );
+        self.masm
+            .load64(object, &Address::new(entry, layout.keyed_lookup_cache_prototype as i32));
+        self.masm.branch_test64(Condition::Zero, object, u64::MAX, slow);
+        self.masm.load64(
+            shape,
+            &Address::new(entry, layout.keyed_lookup_cache_prototype_chain_validity as i32),
+        );
+        self.masm.branch_test64(Condition::Zero, shape, u64::MAX, slow);
+        self.branch_unless_prototype_chain_valid(shape, slow);
+        self.masm.load32(
+            scratch,
+            &Address::new(entry, layout.keyed_lookup_cache_property_offset as i32),
+        );
+        self.masm
+            .load64(shape, &Address::new(object, offsets.object_named_properties as i32));
+        self.masm
+            .load64(entry, &Address::indexed(shape, scratch, Scale::Eight, 0));
+        self.branch_on_tag(Condition::NotEqual, entry, value::ACCESSOR_TAG, scratch, slow);
+        self.emit_unbox_cell(entry, entry);
+        self.emit_load_compressed_cell_or_branch(
+            function_register,
+            &Address::new(entry, offsets.accessor_setter as i32),
+            slow,
+        );
+        self.box_cell_with_tag(entry, function_register, value::OBJECT_TAG);
+        let callee_local = self.stub_local(local::CALLEE);
+        self.masm.store64(&callee_local, entry);
+        self.masm
+            .load16(entry, &Address::new(function_register, offsets.object_flags as i32));
+    }
+
+    /// Stores the call's result into the calling frame's destination slot
+    /// (unless `kind == StubKind::PutByValueSetter`). Clobbers `temp`.
+    fn emit_stub_store_result(&mut self, kind: StubKind, result: crate::asm::Gpr, temp: crate::asm::Gpr) {
+        if kind != StubKind::PutByValueSetter {
+            let dst_local = self.stub_local(local::DST);
+            self.masm.load32(temp, &dst_local);
+            self.masm.store64(
+                &Address {
+                    base: self.pinned.frame,
+                    index: Some((temp, Scale::Eight)),
+                    displacement: self.runtime.offsets.execution_context_slots as i32,
+                },
+                result,
+            );
+        }
         // Stack traces show the caller at its next instruction from now on.
         let next_pc = Address::new(M::STACK_POINTER, self.stub_local(local::PCS).displacement + 4);
         self.masm.load32(temp, &next_pc);
@@ -1026,7 +1649,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// stub's dynamic argument count. Jumps to `slow` before anything
     /// observable happened if the stacks are too full, and to `leave` with a
     /// control word in the first return register otherwise.
-    fn emit_stub_native_call(&mut self, slow: Label, leave: Label) -> Result<(), CompileFailure> {
+    fn emit_stub_native_call(&mut self, kind: StubKind, slow: Label, leave: Label) -> Result<(), CompileFailure> {
         let runtime = self.runtime;
         let offsets = runtime.offsets;
         let layout = runtime.dynamic_calls;
@@ -1090,7 +1713,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             other,
             &Address::new(native_frame, offsets.execution_context_slots as i32),
         );
-        self.emit_stub_copy_arguments(other, count, registers[0], temp);
+        self.emit_stub_copy_arguments(kind, other, count, registers[0], temp, scratch);
         self.masm
             .store64(&vm_field(offsets.vm_running_execution_context), native_frame);
         // The function runs in its own realm, which may be another one. The
@@ -1141,7 +1764,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.store64(&vm_field(offsets.vm_interpreter_stack_top), temp);
         self.masm
             .store64(&vm_field(offsets.vm_running_execution_context), frame);
-        self.emit_stub_store_result(value_register, temp);
+        self.emit_stub_store_result(kind, value_register, temp);
         self.emit_stub_continuation();
         self.masm.jump(leave);
 

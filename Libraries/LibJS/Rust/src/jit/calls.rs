@@ -95,6 +95,7 @@ fn throw_call_stack_size_exceeded(vm: &Vm, pc: u32) -> SlowPathControl {
 fn finish_call_from_jit(vm: &Vm, frame: NonNull<ExecutionContext>, pc: u32, return_pc: u32) -> SlowPathControl {
     let running = vm.running_execution_context().expect("a frame is running");
     if running == frame {
+        vm.head.current_realm.set(frame_of(frame).realm());
         return SlowPathControl::continue_at(return_pc);
     }
     let running_ref = frame_of(running);
@@ -102,6 +103,7 @@ fn finish_call_from_jit(vm: &Vm, frame: NonNull<ExecutionContext>, pc: u32, retu
     assert_eq!(running_ref.caller_frame.get(), frame.as_ptr());
     let exception = running_ref.register(register::EXCEPTION).get();
     assert!(exception != Value::EMPTY);
+    vm.head.current_realm.set(frame_of(frame).realm());
     vm.unwind_inline_frame_for_exception();
     handle_asm_exception(vm, pc, exception)
 }
@@ -145,6 +147,11 @@ fn call_ecmascript_function_from_jit(
     if vm.did_reach_stack_space_limit() {
         return throw_call_stack_size_exceeded(vm, site.pc);
     }
+    let previous_realm = vm.head.current_realm.get();
+    let callee_realm = Some(function.shape().realm());
+    if previous_realm != callee_realm {
+        vm.head.current_realm.set(callee_realm);
+    }
     let executable = function.inline_call_executable();
     let argument_count = u32::try_from(arguments.len()).expect("the argument count fits in u32");
     let Some(callee_frame) = vm.push_inline_frame_without_this(
@@ -157,6 +164,9 @@ fn call_ecmascript_function_from_jit(
         None,
         false,
     ) else {
+        if previous_realm != callee_realm {
+            vm.head.current_realm.set(previous_realm);
+        }
         return throw_call_stack_size_exceeded(vm, site.pc);
     };
     vm.bind_this_in_inline_frame(function, frame_of(callee_frame), this_value);
@@ -424,7 +434,7 @@ fn call_from_jit(
         return None;
     }
     if let Some(function) = value_as_ecmascript_function_object(callee) {
-        if function.can_inline_call() && ecmascript_function_is_in_current_realm(vm, function) {
+        if function.can_inline_call() {
             return Some(call_ecmascript_function_from_jit(
                 vm, site, function, this_value, arguments,
             ));
@@ -787,11 +797,32 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
         _ if opcode == OpCode::CallWithArgumentArray as u8 => {
             let call = instruction!(CallWithArgumentArray);
             let site = site(call.dst, op::CallWithArgumentArray::LENGTH);
+            let callee = load(call.callee);
+            let this_value = load(call.this_value);
+            let arguments_value = load(call.arguments);
+            if callee.is_function() && arguments_value.is_object() {
+                let array = arguments_value.as_object();
+                if !array.may_interfere_with_indexed_property_access() && array.has_magical_length_property() {
+                    let length = array.indexed_array_like_size();
+                    if length == 0 {
+                        return call_from_jit_or_generic(vm, &site, callee, this_value, &[], 0).0;
+                    }
+                    if array.indexed_storage_kind() == IndexedStorageKind::Packed
+                        && array.indexed_packed_elements_span_size() >= length
+                    {
+                        let mut storage = ArgumentStorage::empty();
+                        storage.fill(vm, length as usize, |slots| {
+                            array.copy_indexed_packed_elements(slots);
+                        });
+                        return call_from_jit_or_generic(vm, &site, callee, this_value, &storage.values(), 0).0;
+                    }
+                }
+            }
             let mut values = op::CallWithArgumentArrayValues {
                 dst: Value::EMPTY,
-                callee: load(call.callee),
-                this_value: load(call.this_value),
-                arguments: load(call.arguments),
+                callee,
+                this_value,
+                arguments: arguments_value,
             };
             let control = Runtime::call_with_argument_array(vm, pc, call, &mut values);
             finish_generic_call(vm, &site, control, values.dst)
@@ -995,12 +1026,23 @@ pub unsafe extern "C" fn libjs_jit_finish_direct_call(
     let frame = NonNull::new(frame).expect("JIT code passes its frame");
     let frame_ref = frame_of(frame);
     let executable = Executable::from_head(frame_ref.executable.get().expect("the frame runs an executable"));
-    let call = instruction_at::<op::Call>(&executable, pc);
+    let opcode = executable.bytecode()[pc as usize];
+    let (length, dst) = if opcode == OpCode::Call as u8 {
+        let call = instruction_at::<op::Call>(&executable, pc);
+        (call.length(), call.dst.0.into())
+    } else if opcode == OpCode::GetById as u8 {
+        let get = instruction_at::<op::GetById>(&executable, pc);
+        (op::GetById::LENGTH, get.dst.0.into())
+    } else if opcode == OpCode::PutByValue as u8 {
+        (op::PutByValue::LENGTH, crate::bytecode::operand::Operand::INVALID)
+    } else {
+        unreachable!("libjs_jit_finish_direct_call runs Call, GetById or PutByValue instructions only");
+    };
     let site = JitCallSite {
         frame,
         pc,
-        return_pc: pc + call.length(),
-        dst: call.dst.0.into(),
+        return_pc: pc + length,
+        dst,
     };
     finish_direct_call_frames(vm, frame, &site, status).0
 }
@@ -1097,64 +1139,170 @@ pub unsafe extern "C" fn libjs_jit_prepare_construct(
                 || !function.shared_data().function_environment_has_this_binding())
     };
 
-    let mut storage = ArgumentStorage::empty();
-    let construct = if opcode == OpCode::CallConstruct as u8 {
-        let call = instruction_at::<op::CallConstruct>(&executable, pc);
-        match value_as_ecmascript_function_object(load(call.callee)) {
-            Some(function) if takes_frame(function) => {
-                storage.fill_from(vm_ref, call.arguments().iter().map(|operand| load(*operand)));
-                Some((function, function.as_function_object_gc()))
-            }
-            _ => None,
-        }
-    } else {
-        // NB: The arguments of a SuperCallWithForwardedArguments are the passed arguments of the frame.
-        let (super_constructor, call_feedback, argument_operands) = if opcode == OpCode::SuperCall as u8 {
-            let call = instruction_at::<op::SuperCall>(&executable, pc);
-            (load(call.super_constructor), call.call_feedback, Some(call.arguments()))
-        } else {
-            let call = instruction_at::<op::SuperCallWithForwardedArguments>(&executable, pc);
-            (load(call.super_constructor), call.call_feedback, None)
-        };
-        match value_as_ecmascript_function_object(super_constructor) {
-            Some(function) if takes_frame(function) => {
-                match argument_operands {
-                    Some(operands) => storage.fill_from(vm_ref, operands.iter().map(|operand| load(*operand))),
-                    None => storage.fill_from_passed_arguments(vm_ref, frame_ref),
-                }
-                let new_target = vm_ref.get_new_target();
-                assert!(new_target.is_object());
-                slow_paths::feedback::record_call(
-                    vm_ref,
-                    call_feedback,
-                    super_constructor,
-                    crate::bytecode::feedback::call_feedback_flags::SAW_CONSTRUCT,
-                );
-                Some((function, new_target.as_function()))
-            }
-            _ => None,
-        }
-    };
     let done = |control: SlowPathControl| PreparedConstruct {
         callee_frame: 0,
         value: control.0 as u64,
     };
-    let Some((function, new_target)) = construct else {
-        // SAFETY: The caller's pointers are live.
-        return done(SlowPathControl(unsafe { libjs_jit_call(vm, frame, pc) }));
+    let push_for_stub = |function: Gc<EcmascriptFunctionObject>,
+                         new_target: Gc<FunctionObject>,
+                         arguments: &[Value]|
+     -> PreparedConstruct {
+        match push_construct_frame(vm_ref, &site, function, new_target, arguments) {
+            Ok(pushed) => {
+                let callee_frame = frame_of(pushed.callee_frame);
+                callee_frame.returns_to_native_caller.set(true);
+                callee_frame.runs_jit_code.set(true);
+                PreparedConstruct {
+                    callee_frame: pushed.callee_frame.as_ptr() as u64,
+                    value: pushed.this_argument.map_or(Value::EMPTY, Value::from_object).0,
+                }
+            }
+            Err(control) => done(control),
+        }
     };
-    match push_construct_frame(vm_ref, &site, function, new_target, &storage.values()) {
-        Ok(pushed) => {
-            let callee_frame = frame_of(pushed.callee_frame);
-            callee_frame.returns_to_native_caller.set(true);
-            callee_frame.runs_jit_code.set(true);
-            PreparedConstruct {
-                callee_frame: pushed.callee_frame.as_ptr() as u64,
-                value: pushed.this_argument.map_or(Value::EMPTY, Value::from_object).0,
+
+    let mut storage = ArgumentStorage::empty();
+    if opcode == OpCode::CallConstruct as u8 {
+        let call = instruction_at::<op::CallConstruct>(&executable, pc);
+        let callee = load(call.callee);
+        let operands = call.arguments();
+        if let Some(function) = value_as_ecmascript_function_object(callee) {
+            storage.fill_from(vm_ref, operands.iter().map(|operand| load(*operand)));
+            let arguments = storage.values();
+            if takes_frame(function) {
+                return push_for_stub(function, function.as_function_object_gc(), &arguments);
+            }
+            if constructs_in_inline_frame(vm_ref, function) {
+                return done(construct_ecmascript_function_from_jit(
+                    vm_ref,
+                    &site,
+                    function,
+                    function.as_function_object_gc(),
+                    &arguments,
+                ));
+            }
+            let mut values = op::CallConstructValues {
+                dst: Value::EMPTY,
+                callee,
+                arguments: [],
+            };
+            let control = slow_paths::call_construct_slow_path(vm_ref, pc, call, &mut values, &arguments);
+            return done(finish_generic_call(vm_ref, &site, control, values.dst));
+        }
+        // Unwrap constructible `BoundFunction` chains per ECMA-262 10.4.1.2.
+        if callee.is_object()
+            && callee.is_constructor()
+            && let Some(first_bound) = callee.as_object().downcast::<BoundFunction>()
+        {
+            let mut chain: [Option<Gc<BoundFunction>>; MAX_JIT_CALL_UNWRAP_DEPTH as usize] =
+                [None; MAX_JIT_CALL_UNWRAP_DEPTH as usize];
+            let mut chain_len = 0usize;
+            let mut total_bound_args = 0usize;
+            let mut current = first_bound;
+            let mut target = None;
+            while chain_len < chain.len() {
+                chain[chain_len] = Some(current);
+                chain_len += 1;
+                total_bound_args += current.bound_arguments_count();
+                let next = current.bound_target_function();
+                if let Some(next_bound) = next.downcast::<BoundFunction>() {
+                    current = next_bound;
+                } else {
+                    target = Some(next);
+                    break;
+                }
+            }
+            if let Some(target_fn) = target
+                && let Some(function) = value_as_ecmascript_function_object(Value::from_object(target_fn))
+                && takes_frame(function)
+            {
+                storage.fill(vm_ref, total_bound_args + operands.len(), |slots| {
+                    let mut cursor = 0;
+                    for bound in chain[..chain_len].iter().rev().flatten() {
+                        let count = bound.bound_arguments_count();
+                        for index in 0..count {
+                            slots[cursor] = bound.bound_argument(index);
+                            cursor += 1;
+                        }
+                    }
+                    for operand in operands {
+                        slots[cursor] = load(*operand);
+                        cursor += 1;
+                    }
+                });
+                return push_for_stub(function, function.as_function_object_gc(), &storage.values());
             }
         }
-        Err(control) => done(control),
+        storage.fill_from(vm_ref, operands.iter().map(|operand| load(*operand)));
+        let arguments = storage.values();
+        let mut values = op::CallConstructValues {
+            dst: Value::EMPTY,
+            callee,
+            arguments: [],
+        };
+        let control = slow_paths::call_construct_slow_path(vm_ref, pc, call, &mut values, &arguments);
+        return done(finish_generic_call(vm_ref, &site, control, values.dst));
     }
+
+    if opcode == OpCode::SuperCall as u8 {
+        let call = instruction_at::<op::SuperCall>(&executable, pc);
+        let super_constructor = load(call.super_constructor);
+        storage.fill_from(vm_ref, call.arguments().iter().map(|operand| load(*operand)));
+        let arguments = storage.values();
+        if let Some(function) = value_as_ecmascript_function_object(super_constructor) {
+            if takes_frame(function) {
+                let new_target = vm_ref.get_new_target();
+                assert!(new_target.is_object());
+                slow_paths::feedback::record_call(
+                    vm_ref,
+                    call.call_feedback,
+                    super_constructor,
+                    crate::bytecode::feedback::call_feedback_flags::SAW_CONSTRUCT,
+                );
+                return push_for_stub(function, new_target.as_function(), &arguments);
+            }
+            if let Some(control) =
+                super_call_from_jit(vm_ref, &site, call.call_feedback, super_constructor, &arguments)
+            {
+                return done(control);
+            }
+        }
+        let mut values = op::SuperCallValues {
+            dst: Value::EMPTY,
+            super_constructor,
+            arguments: [],
+        };
+        let control = slow_paths::super_call_slow_path(vm_ref, pc, call, &mut values, &arguments);
+        return done(finish_generic_call(vm_ref, &site, control, values.dst));
+    }
+
+    // NB: The arguments of a SuperCallWithForwardedArguments are the passed arguments of the frame.
+    let call = instruction_at::<op::SuperCallWithForwardedArguments>(&executable, pc);
+    let super_constructor = load(call.super_constructor);
+    storage.fill_from_passed_arguments(vm_ref, frame_ref);
+    let arguments = storage.values();
+    if let Some(function) = value_as_ecmascript_function_object(super_constructor) {
+        if takes_frame(function) {
+            let new_target = vm_ref.get_new_target();
+            assert!(new_target.is_object());
+            slow_paths::feedback::record_call(
+                vm_ref,
+                call.call_feedback,
+                super_constructor,
+                crate::bytecode::feedback::call_feedback_flags::SAW_CONSTRUCT,
+            );
+            return push_for_stub(function, new_target.as_function(), &arguments);
+        }
+        if let Some(control) = super_call_from_jit(vm_ref, &site, call.call_feedback, super_constructor, &arguments) {
+            return done(control);
+        }
+    }
+    let mut values = op::SuperCallWithForwardedArgumentsValues {
+        dst: Value::EMPTY,
+        super_constructor,
+    };
+    let control = Runtime::super_call_with_forwarded_arguments(vm_ref, pc, call, &mut values);
+    done(finish_generic_call(vm_ref, &site, control, values.dst))
 }
 
 /// What `libjs_jit_construct_this()` returns, in two registers.

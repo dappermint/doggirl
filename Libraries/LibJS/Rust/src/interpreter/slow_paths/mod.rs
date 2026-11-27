@@ -560,6 +560,7 @@ impl RuntimeFunctions for Runtime {
                         Err(throw) => handle_asm_exception(vm, pc, throw.value()),
                     };
                 }
+                return property_access::get_by_value_skip_host_indexed(vm, pc, instruction, values, KeyedSiteCache::Use);
             } else if object.is_proxy_object() {
                 if let Some(control) = crate::jit::calls::get_by_value_proxy_from_jit(vm, pc, instruction, values) {
                     return control;

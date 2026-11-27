@@ -12,6 +12,7 @@ mod keyed;
 mod megamorphic;
 mod property;
 
+pub(super) use megamorphic::MegamorphicKey;
 pub(super) use property::CacheRegisters;
 pub(super) use property::DeferredCacheProbe;
 pub(super) use property::DeferredVmCacheProbe;
