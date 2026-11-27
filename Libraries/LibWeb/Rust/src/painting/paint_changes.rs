@@ -112,6 +112,7 @@ pub(crate) enum PaintChange {
     NoteVisualContextBoxDirty {
         node: NodeSlotId,
         kind: VisualContextBoxDirtyKind,
+        check_table_wrapper: bool,
     },
     /// The visual context tree is built again whole before it is published next.
     RequestFullVisualContextRebuild(super::visual_context::dirty::VisualContextUpdateScope),
@@ -228,9 +229,24 @@ impl PaintChange {
             Self::SetReplacedPaintFacts { target, facts } => arena.set_replaced_paint_facts(target, facts),
             Self::SupersededReplacedPaintFacts => {}
             Self::PublishImageMapAreas { node, areas } => arena.image_map_areas_mut().publish(node, areas),
-            Self::NoteVisualContextBoxDirty { node, kind } => {
+            Self::NoteVisualContextBoxDirty {
+                node,
+                kind,
+                check_table_wrapper,
+            } => {
                 if arena.paintable_row_is_populated(node) {
                     arena.note_visual_context_box_dirty(node, kind);
+                    if check_table_wrapper {
+                        let parent = arena.data(node).parent.get();
+                        if !parent.is_invalid()
+                            && arena.data(parent).kind.get() == crate::layout::node_data::NodeKind::TableWrapper
+                            && arena.paintable_row_is_populated(parent)
+                            && crate::layout::node_facts::node_style_view(arena.data(node))
+                                .is_some_and(|style| style.display().is_table_inside())
+                        {
+                            arena.note_visual_context_box_dirty(parent, kind);
+                        }
+                    }
                 }
             }
             Self::RequestFullVisualContextRebuild(scope) => arena.request_full_visual_context_rebuild(scope),
@@ -602,7 +618,61 @@ pub extern "C" fn render_state_note_visual_context_style_change(
     } else {
         VisualContextBoxDirtyKind::StyleValueChange
     };
-    queue(host, PaintChange::NoteVisualContextBoxDirty { node, kind });
+    queue(
+        host,
+        PaintChange::NoteVisualContextBoxDirty {
+            node,
+            kind,
+            check_table_wrapper: false,
+        },
+    );
+}
+
+/// Notes a style change of the committed box bound to `style_node` (and `generated_for`, or 0 for the element itself)
+/// for its visual contexts, including an enclosing table wrapper if applicable, without making C++ layout shells or
+/// flushing queued style writes. Answers whether a committed box was scheduled for update.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_note_visual_context_style_change_for_style_node(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+    style_node: u32,
+    generated_for: u8,
+    changes_structure: bool,
+) -> bool {
+    let Some(style_node) = StyleNodeID::from_raw(style_node) else {
+        return false;
+    };
+    let identities = host.row_identities(read);
+    let node = if generated_for == 0 {
+        identities.bound_row(style_node)
+    } else {
+        identities.bound_pseudo_element_row(style_node, generated_for)
+    };
+    let Some(node) = node else {
+        return false;
+    };
+    let populated = host.known_paintable_row_is_populated(node).unwrap_or_else(|| {
+        crate::layout::shell_reads::read_arena(host, read, node, |arena, node| {
+            arena.paintable_rows().paintable_row_is_populated(node)
+        })
+    });
+    if !populated {
+        return false;
+    }
+    let kind = if changes_structure {
+        VisualContextBoxDirtyKind::StyleStructuralChange
+    } else {
+        VisualContextBoxDirtyKind::StyleValueChange
+    };
+    queue(
+        host,
+        PaintChange::NoteVisualContextBoxDirty {
+            node,
+            kind,
+            check_table_wrapper: true,
+        },
+    );
+    true
 }
 
 #[unsafe(no_mangle)]

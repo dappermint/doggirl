@@ -103,36 +103,70 @@ impl<'a> ViewLonghands<'a> {
     }
 }
 
-/// The longhands two records hold the very same computed values of, being in groups the records
-/// share.
+/// The longhands two records hold the very same computed values of, being in groups or bits the
+/// records share.
 #[derive(Clone, Copy)]
 pub(crate) struct SharedLonghands {
     /// The groups the records share, one bit per group.
     shared_groups: u32,
+    /// Whether both records hold identical [`StyleBits`] (which also implies identical writing mode and direction).
+    shared_bits: bool,
 }
 
 impl SharedLonghands {
     /// Whether both records hold the very same computed value of `property`.
+    #[inline]
     pub(crate) fn holds(self, property: u16) -> bool {
         let layout = crate::css::computed_values::GroupValueLayout::get();
         let longhand = crate::css::computed_values::LonghandID::new(property);
         let place = layout.place(longhand);
-        // NB: The inherited bits are no group's: the records' values of them compare by value.
-        layout.holds_value(longhand) && place.bit_field().is_none() && self.shared_groups & (1 << place.group()) != 0
+        if place.bit_field().is_some() {
+            return self.shared_bits;
+        }
+        layout.holds_value(longhand) && self.shared_groups & (1 << place.group()) != 0
     }
 
     /// The longhands whose values the records may hold differently, one bit per longhand from the
     /// first: those in a group they do not share, and those that map elsewhere or hold no value of a
     /// group.
     pub(crate) fn longhands_to_compare(self) -> [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] {
+        self.longhands_to_compare_with_table(crate::css::computed_values::GroupValueLayout::group_longhands())
+    }
+
+    /// Like [`Self::longhands_to_compare`], also clearing logical aliases whose physical longhands in
+    /// `(writing_mode, direction)` live in a shared group when both records share that flow.
+    pub(crate) fn longhands_to_compare_for_flow(
+        self,
+        writing_mode: u8,
+        direction: u8,
+    ) -> [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] {
+        let table = if writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB
+            && direction == crate::css::css_enums::direction::LTR
+        {
+            crate::css::computed_values::GroupValueLayout::group_longhands_horizontal_ltr()
+        } else {
+            crate::css::computed_values::GroupValueLayout::group_longhands()
+        };
+        self.longhands_to_compare_with_table(table)
+    }
+
+    fn longhands_to_compare_with_table(
+        self,
+        group_longhands: &[[u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]],
+    ) -> [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT] {
         use crate::css::property_metadata::LONGHAND_WORD_COUNT;
-        let group_longhands = crate::css::computed_values::GroupValueLayout::group_longhands();
         let mut longhands = [u64::MAX; LONGHAND_WORD_COUNT];
         for (group, group_words) in group_longhands.iter().enumerate() {
             if self.shared_groups & (1 << group) != 0 {
                 for (word, group_word) in longhands.iter_mut().zip(group_words) {
                     *word &= !group_word;
                 }
+            }
+        }
+        if self.shared_bits {
+            let bits = crate::css::computed_values::GroupValueLayout::bits_longhands();
+            for (word, bits_word) in longhands.iter_mut().zip(bits) {
+                *word &= !bits_word;
             }
         }
         longhands
@@ -169,10 +203,42 @@ impl<'a> ViewLonghands<'a> {
     }
 
     /// The longhands whose computed values these and `other` hold as one, where both are the engine
-    /// records sharing any group.
+    /// records sharing any group or identical style bits.
     pub(crate) fn shared_with(self, other: Self) -> Option<SharedLonghands> {
-        let shared_groups = self.0.value_groups().shared_group_mask(other.0.value_groups());
-        (shared_groups != 0).then_some(SharedLonghands { shared_groups })
+        let mine = self.0.value_groups();
+        let theirs = other.0.value_groups();
+        let shared_groups = mine.shared_group_mask(theirs);
+        let shared_bits = mine.style_bits() == theirs.style_bits();
+        (shared_groups != 0 || shared_bits).then_some(SharedLonghands {
+            shared_groups,
+            shared_bits,
+        })
+    }
+
+    /// The value groups holding this record's computed longhands.
+    #[inline]
+    pub(crate) fn value_groups(self) -> &'a crate::css::computed_values::StyleGroups {
+        self.0.value_groups()
+    }
+
+    /// Reads an already-physical longhand directly from `groups` and `layout`, skipping logical-alias
+    /// resolution and repeated group-home indirection.
+    #[inline]
+    pub(crate) fn physical_value(
+        groups: &'a crate::css::computed_values::StyleGroups,
+        layout: &crate::css::computed_values::GroupValueLayout,
+        property: u16,
+    ) -> Option<&'a crate::css::style_value::StyleValueData> {
+        let place = layout.place(crate::css::computed_values::LonghandID::new(property));
+        let value = if let Some(field) = place.bit_field() {
+            groups.style_bits().value(field)
+        } else {
+            crate::css::computed_values::value_at(
+                groups.group(crate::css::computed_values::StyleGroupIndex::new(place.group())),
+                place,
+            )
+        };
+        (!value.pointer().is_null()).then(|| value.data())
     }
 
     /// Whether these are the longhands of `record`.

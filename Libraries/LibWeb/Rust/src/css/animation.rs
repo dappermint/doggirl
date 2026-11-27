@@ -500,7 +500,7 @@ fn resolve_animation_property_conflicts(
         };
         *source = animation_specified_value_source(candidate.value.data(), is_inherited);
     }
-    let mut winners = std::collections::HashMap::<(usize, u16, u32), usize>::new();
+    let mut winners = crate::css::style::fast_hash::FastMap::<(usize, u16, u32), usize>::default();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         let key = (
             candidate.keyframe_index,

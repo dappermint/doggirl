@@ -5,6 +5,8 @@
  */
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::url::{BasicParseOptions, HostKind, Url, basic_parse};
 
@@ -88,11 +90,28 @@ enum Site<'a> {
     SchemeAndHost(&'a str, Host),
 }
 
+static OPAQUE_NONCE_PREFIX: OnceLock<[u8; 8]> = OnceLock::new();
+static OPAQUE_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_opaque_nonce() -> Nonce {
+    let prefix = *OPAQUE_NONCE_PREFIX.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).expect("the platform CSPRNG fills buffers");
+        bytes
+    });
+    let counter = OPAQUE_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed).to_ne_bytes();
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&prefix);
+    nonce[8..].copy_from_slice(&counter);
+    nonce
+}
+
 impl Origin {
     pub fn new_opaque(kind: OpaqueOriginKind) -> Self {
-        let mut nonce = Nonce::default();
-        getrandom::fill(&mut nonce).expect("the platform CSPRNG fills buffers");
-        Self::Opaque { nonce, kind }
+        Self::Opaque {
+            nonce: next_opaque_nonce(),
+            kind,
+        }
     }
 
     fn new_tuple(scheme: &str, host: Host, port: Option<u16>) -> Self {
