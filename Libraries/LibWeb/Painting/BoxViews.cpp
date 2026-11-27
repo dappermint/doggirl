@@ -689,6 +689,27 @@ CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::Ffi
     return rect;
 }
 
+Optional<Vector<CSSPixelRect>> try_direct_client_rects(Layout::Node const& node, CSSPixelPoint viewport_scroll_offset, double device_pixels_per_css_pixel)
+{
+    Vector<CSSPixelRect> rects;
+    if (!Layout::RustFFI::layout_script_try_direct_client_rects(
+            node.document_host(), committed_row_slot(node), viewport_scroll_offset, static_cast<float>(device_pixels_per_css_pixel), &rects,
+            [](void* context, CSSPixelRect rect) {
+                static_cast<Vector<CSSPixelRect>*>(context)->append(rect);
+            }))
+        return {};
+    return rects;
+}
+
+Optional<CSSPixelRect> try_direct_bounding_client_rect(Layout::Node const& node, CSSPixelPoint viewport_scroll_offset, double device_pixels_per_css_pixel)
+{
+    CSSPixelRect rect;
+    if (!Layout::RustFFI::layout_script_try_direct_bounding_client_rect(
+            node.document_host(), committed_row_slot(node), viewport_scroll_offset, static_cast<float>(device_pixels_per_css_pixel), &rect))
+        return {};
+    return rect;
+}
+
 CSSPixelPoint offset_to_viewport_ignoring_transforms(Layout::Node const& node)
 {
     CSSPixelPoint offset;

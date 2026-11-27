@@ -2938,7 +2938,7 @@ impl<'pass> SvgFormattingContext<'pass> {
                 self.last_text_subtree_spans.clear();
                 let was_inside_text_box = self.inside_text_box;
                 self.inside_text_box = true;
-                let child_geometry = self.layout_graphics_element(run, child);
+                let (child_geometry, _) = self.layout_graphics_element(run, child);
                 self.inside_text_box = was_inside_text_box;
                 contents
                     .children_bounding_box
@@ -3828,7 +3828,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         let mut children_bounding_box = FloatRect::default();
         for child in self.run.pass.children(self.run.box_) {
             if NodeFacts::new(&self.run.pass, child).is_box()
-                && let Some(geometry) = self.layout_svg_element(run, child)
+                && let Some((geometry, _)) = self.layout_svg_element(run, child)
                 && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
             {
                 children_bounding_box = children_bounding_box.united(
@@ -3856,11 +3856,12 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    /// Lays out and places `child`, and returns its geometry, if it laid it out.
-    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) -> Option<SvgGeometry> {
+    /// Lays out and places `child`, returning its geometry and whether its committed fragment subtree
+    /// can be reused directly when the enclosing SVG viewport does not change.
+    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) -> Option<(SvgGeometry, bool)> {
         let kind = self.node_kind(child);
         if self.svg_attributes(child).is_fit_to_view_box {
-            return Some(self.layout_nested_viewport(run, child));
+            return Some((self.layout_nested_viewport(run, child), false));
         } else if kind == NodeKind::SVGForeignObjectBox {
             // SVG descendants carry no percentage basis, as `cells_of_svg_box` explains.
             let mut child_cells =
@@ -3914,7 +3915,7 @@ impl<'pass> SvgFormattingContext<'pass> {
                 self.layout_mask_or_clip(run, clip, rect);
             }
             // NB: The foreign object's fragment arrives from its own run, so its geometry goes to its parent alone.
-            return Some(self.geometry_of(child, rect, rect));
+            return Some((self.geometry_of(child, rect, rect), false));
         } else if kind_is_svg_graphics_box(kind) {
             return Some(self.layout_graphics_element(run, child));
         }
@@ -3964,10 +3965,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         )
     }
 
-    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> SvgGeometry {
+    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> (SvgGeometry, bool) {
         let graphics_box_cells = self.cells_of_svg_box(graphics_box);
         if let Some(geometry) = self.place_unchanged_committed_shape(graphics_box, &graphics_box_cells) {
-            return geometry;
+            return (geometry, true);
         }
         let kind = self.node_kind(graphics_box);
         let facts = {
@@ -3986,7 +3987,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         // container element
         // An element which can have graphics elements and other container elements as child elements.
         // Specifically: ‘a’, ‘clipPath’, ‘defs’, ‘g’, ‘marker’, ‘mask’, ‘pattern’, ‘svg’, ‘switch’ and ‘symbol’.
-        let (geometry, may_have_resource_children) = if kind_is_svg_container_element(kind) {
+        let (geometry, may_have_resource_children, reusable) = if kind_is_svg_container_element(kind) {
             // https://svgwg.org/svg2-draft/struct.html#Groups
             // 5.2. Grouping: the ‘g’ element
             // The ‘g’ element is a container element for grouping together related graphics elements.
@@ -3995,13 +3996,12 @@ impl<'pass> SvgFormattingContext<'pass> {
             (
                 self.layout_image_element(graphics_box, &graphics_box_cells),
                 !self.first_child(graphics_box).is_invalid(),
+                false,
             )
         } else {
             // Assume this is a path-like element.
-            (
-                self.layout_path_like_element(run, graphics_box, &graphics_box_cells, facts),
-                !self.first_child(graphics_box).is_invalid(),
-            )
+            let (geometry, reusable) = self.layout_path_like_element(run, graphics_box, &graphics_box_cells, facts);
+            (geometry, !self.first_child(graphics_box).is_invalid(), reusable)
         };
 
         if may_have_resource_children {
@@ -4026,73 +4026,116 @@ impl<'pass> SvgFormattingContext<'pass> {
                 self.layout_mask_or_clip(run, pattern, geometry.object_bounding_box);
             }
         }
-        geometry
+        (geometry, reusable)
     }
 
-    /// Places a shape or standalone `<text>` element with the fragment it last committed, where laying it out again
-    /// would produce that fragment: nothing marked it for layout since that commit, it has no child boxes below it,
-    /// and it resolves only against the viewport it was committed in and its own style/attributes. Then neither this
-    /// pass nor the commit redoes a shape or text label that a change to a sibling did not touch. Returns the geometry
-    /// of the element, if it placed it, which is laid out in `cells`.
+    /// Whether `root`, a standalone `<text>` element, and all of its nested `<tspan>` descendants
+    /// consist solely of text nodes and `SVGTextBox` elements whose length/position attributes
+    /// resolve purely against the enclosing SVG viewport and their own styles.
+    fn svg_text_subtree_is_local_to_viewport_and_element(&self, root: Node) -> bool {
+        let attributes = self.svg_attributes(root);
+        if !attributes.is_text_element {
+            return false;
+        }
+        let mut stack: smallvec::SmallVec<[Node; 8]> = smallvec::SmallVec::new();
+        stack.push(root);
+        while let Some(node) = stack.pop() {
+            let attrs = self.svg_attributes(node);
+            if !svg_length_is_local_to_viewport_and_element(attrs.text_length) {
+                return false;
+            }
+            if let Some(positions) = self.run.pass.arena().svg_text_positions(node)
+                && positions.iter().any(|pos| {
+                    !svg_length_is_local_to_viewport_and_element(pos.x)
+                        || !svg_length_is_local_to_viewport_and_element(pos.y)
+                        || !svg_length_is_local_to_viewport_and_element(pos.dx)
+                        || !svg_length_is_local_to_viewport_and_element(pos.dy)
+                })
+            {
+                return false;
+            }
+            for child in self.run.pass.children(node) {
+                let child_kind = self.node_kind(child);
+                if node_facts::kind_is_text(child_kind) {
+                    continue;
+                }
+                if child_kind == NodeKind::SVGTextBox {
+                    stack.push(child);
+                    continue;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Collects the committed fragment links of all descendant boxes below `root` in post-order
+    /// (the exact order `layout_container_element` and `layout_svg_text_box_contents` place them
+    /// into the enclosing SVG run's flat child list). Returns `false` if any descendant box lacks
+    /// a current committed fragment link.
+    fn collect_committed_svg_descendants_post_order(
+        &self,
+        root: Node,
+        out: &mut smallvec::SmallVec<[(Node, fragment_tree::FragmentLink); 16]>,
+    ) -> bool {
+        for child in self.run.pass.children(root) {
+            if !NodeFacts::new(&self.run.pass, child).is_box() {
+                continue;
+            }
+            if !self.collect_committed_svg_descendants_post_order(child, out) {
+                return false;
+            }
+            let Some(link) = self
+                .run
+                .pass
+                .arena()
+                .with_current_committed_fragment_link(child, |link| link.clone())
+            else {
+                return false;
+            };
+            out.push((child, link));
+        }
+        true
+    }
+
+    /// Places a shape, standalone `<text>` subtree, or `<g>` container subtree with the fragment
+    /// it last committed, where laying it out again would produce that exact fragment subtree:
+    /// nothing in the subtree was marked for layout since that commit, it marked itself reusable in
+    /// the same viewport, and it resolves only against the viewport it was committed in and its own
+    /// style/attributes.
     fn place_unchanged_committed_shape(
         &self,
         shape: Node,
         cells: &Cell<used_values::RootInputCells>,
     ) -> Option<SvgGeometry> {
-        if !self.viewport_is_committed_viewport {
+        if !self.viewport_is_committed_viewport || self.inside_text_box {
             return None;
         }
         let kind = self.node_kind(shape);
-        match kind {
-            NodeKind::SVGGeometryBox => {
-                if !self.first_child(shape).is_invalid() {
-                    return None;
-                }
-            }
-            NodeKind::SVGTextBox => {
-                if self.inside_text_box {
-                    return None;
-                }
-                let attributes = self.svg_attributes(shape);
-                if !attributes.is_text_element || !svg_length_is_local_to_viewport_and_element(attributes.text_length) {
-                    return None;
-                }
-                if !self
-                    .run
-                    .pass
-                    .children(shape)
-                    .all(|child| node_facts::kind_is_text(self.node_kind(child)))
-                {
-                    return None;
-                }
-                if let Some(positions) = self.run.pass.arena().svg_text_positions(shape)
-                    && positions.iter().any(|pos| {
-                        !svg_length_is_local_to_viewport_and_element(pos.x)
-                            || !svg_length_is_local_to_viewport_and_element(pos.y)
-                            || !svg_length_is_local_to_viewport_and_element(pos.dx)
-                            || !svg_length_is_local_to_viewport_and_element(pos.dy)
-                    })
-                {
-                    return None;
-                }
-            }
-            _ => return None,
+        if !matches!(
+            kind,
+            NodeKind::SVGGeometryBox | NodeKind::SVGTextBox | NodeKind::SVGGraphicsBox
+        ) {
+            return None;
         }
         self.run.fragments.as_ref()?;
-        // A committed fragment stops being current when something marks its box for layout or edits a text child.
+        // A committed fragment stops being current when anything in its subtree marks a box for layout or edits a text child.
         let link = self
             .run
             .pass
             .arena()
             .with_current_committed_fragment_link(shape, |link| link.clone())?;
         let fragment = link.fragment.clone();
-        fragment.svg()?.path.as_ref()?;
+        let committed_svg = fragment.svg()?;
+        if !committed_svg.subtree_is_reusable_in_same_viewport {
+            return None;
+        }
         let committed_offset = link.offset_in_frame(
             self.run.pass.frame,
             fragment_tree::committed_content_size_of(&self.run.pass, link.placement.containing_block),
         );
         // The transform and the viewport are what the element's geometry takes from outside its own boxes.
-        let committed_geometry = fragment.svg()?.geometry;
+        let committed_geometry = committed_svg.geometry;
         let geometry = self.geometry_of(
             shape,
             committed_geometry.object_bounding_box,
@@ -4100,6 +4143,35 @@ impl<'pass> SvgFormattingContext<'pass> {
         );
         if geometry != committed_geometry {
             return None;
+        }
+        // SVG boxes in this viewport are placed directly into the enclosing SVG run's flat fragment
+        // list (children before their parent). Re-emit committed descendant fragments in post-order
+        // so `Commit::clear_lost_links` keeps them and `Commit::is_unchanged` skips them in O(1).
+        let mut descendants: smallvec::SmallVec<[(Node, fragment_tree::FragmentLink); 16]> = smallvec::SmallVec::new();
+        if kind != NodeKind::SVGGeometryBox
+            && !self.collect_committed_svg_descendants_post_order(shape, &mut descendants)
+        {
+            return None;
+        }
+        for (descendant, descendant_link) in descendants {
+            let descendant_offset = descendant_link.offset_in_frame(
+                self.run.pass.frame,
+                fragment_tree::committed_content_size_of(&self.run.pass, descendant_link.placement.containing_block),
+            );
+            let descendant_cells = self.cells_of_svg_box(descendant);
+            descendant_cells.update_cells(|cells| {
+                cells.take_box_metrics_of_committed_link(&descendant_link, self.run.pass.frame);
+                cells.has_definite_block_size = true;
+            });
+            self.place_laid_out_child(
+                descendant,
+                formatting_context::PlacedChild::laid_out_here(descendant_cells.get(), None, &self.run),
+                descendant_offset.x,
+                descendant_offset.y,
+                Some(fragment_tree::RunRootFragment::propagating_nothing(
+                    descendant_link.fragment,
+                )),
+            );
         }
         cells.update_cells(|cells| {
             cells.take_box_metrics_of_committed_link(&link, self.run.pass.frame);
@@ -4121,7 +4193,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         graphics_box: Node,
         cells: &Cell<used_values::RootInputCells>,
         facts: SvgElementFacts,
-    ) -> SvgGeometry {
+    ) -> (SvgGeometry, bool) {
         // A shape's geometry is its own attributes and computed style against the viewport, and
         // text is its own character data shaped with its own font cascade, so the pass draws both.
         let kind = self.node_kind(graphics_box);
@@ -4182,18 +4254,29 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         let character_cells = character_cells.map(std::sync::Arc::new);
         self.last_text_subtree_cells = character_cells.clone();
+        let subtree_is_reusable_in_same_viewport = match kind {
+            NodeKind::SVGGeometryBox => self.first_child(graphics_box).is_invalid(),
+            NodeKind::SVGTextBox => {
+                !self.inside_text_box && self.svg_text_subtree_is_local_to_viewport_and_element(graphics_box)
+            }
+            _ => false,
+        };
         self.update_svg_payload_of(graphics_box, |svg| {
             svg.path = Some(std::sync::Arc::new(fragment_tree::CommittedSvgPath::new(path)));
             svg.text_segments = text_segments.map(std::sync::Arc::new);
             svg.text_character_cells = character_cells;
             svg.text_own_character_cells = own_character_cells;
+            svg.subtree_is_reusable_in_same_viewport = subtree_is_reusable_in_same_viewport;
         });
         let object_bounding_box = if is_text_content_box {
             bounding_box.to_float_rect()
         } else {
             path_bounding_box
         };
-        self.set_content_rect(graphics_box, cells, bounding_box, object_bounding_box)
+        (
+            self.set_content_rect(graphics_box, cells, bounding_box, object_bounding_box),
+            subtree_is_reusable_in_same_viewport,
+        )
     }
 
     /// Lays out the text content elements inside a <textPath>, or inside one of those, each with the glyphs its own text
@@ -4217,7 +4300,7 @@ impl<'pass> SvgFormattingContext<'pass> {
                 .or_insert_with(|| (libgfx_rust::path::Path::new(), Vec::new()));
             let was_inside_text_box = self.inside_text_box;
             self.inside_text_box = true;
-            let geometry = self.layout_graphics_element(run, child);
+            let (geometry, _) = self.layout_graphics_element(run, child);
             self.inside_text_box = was_inside_text_box;
             bounding_box.unite(float_rect_to_css_pixels(geometry.stroke_bounding_box));
         }
@@ -4347,10 +4430,11 @@ impl<'pass> SvgFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         container: Node,
         cells: &Cell<used_values::RootInputCells>,
-    ) -> (SvgGeometry, bool) {
+    ) -> (SvgGeometry, bool, bool) {
         let mut object_bounding_box = None;
         let mut stroke_bounding_box = None;
         let mut has_resource_child = false;
+        let mut all_children_reusable = true;
         for child in self.run.pass.children(container) {
             // Masks/clips/patterns do not change the bounding box of their parents.
             if node_facts::kind_is_svg_resource_box(self.node_kind(child)) {
@@ -4358,9 +4442,10 @@ impl<'pass> SvgFormattingContext<'pass> {
                 continue;
             }
             if NodeFacts::new(&self.run.pass, child).is_box() {
-                let child_geometry = self
+                let (child_geometry, child_reusable) = self
                     .layout_svg_element(run, child)
                     .expect("a box below an SVG container element is laid out");
+                all_children_reusable &= child_reusable;
                 // The container's bounding boxes include descendants' transforms; children lay out
                 // untransformed, so each child's boxes map through the child's own transform here.
                 let local_transform = libgfx_rust::AffineTransform::from(child_geometry.local_transform);
@@ -4375,6 +4460,13 @@ impl<'pass> SvgFormattingContext<'pass> {
                 ));
             }
         }
+        let container_reusable =
+            self.node_kind(container) == NodeKind::SVGGraphicsBox && !has_resource_child && all_children_reusable;
+        if container_reusable {
+            self.update_svg_payload_of(container, |svg| {
+                svg.subtree_is_reusable_in_same_viewport = true;
+            });
+        }
         (
             self.set_content_rect(
                 container,
@@ -4383,6 +4475,7 @@ impl<'pass> SvgFormattingContext<'pass> {
                 object_bounding_box.unwrap_or_default(),
             ),
             has_resource_child,
+            container_reusable,
         )
     }
 }
