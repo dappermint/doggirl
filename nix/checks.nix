@@ -116,6 +116,8 @@ let
     ];
     translationPrefersHigherQuality = true;
     appearance = {
+      showAllTabsButton = false;
+      showSidebarButton = false;
       showMenuBar = true;
       alwaysShowScrollbars = true;
       showBookmarksBar = "onHover";
@@ -541,6 +543,8 @@ in
         }
         assert settings["languages"] == ["en-GB", "en"]
         assert settings["appearance"] == {
+            "showAllTabsButton": False,
+            "showSidebarButton": False,
             "showMenuBar": True,
             "alwaysShowScrollbars": True,
             "showBookmarksBar": "onHover",

@@ -148,6 +148,8 @@ let
 
         appearance = {
           inherit (profile.appearance)
+            showAllTabsButton
+            showSidebarButton
             showMenuBar
             alwaysShowScrollbars
             showBookmarksBar

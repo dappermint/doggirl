@@ -237,6 +237,12 @@
       type = "bool";
       description = "Offer to temporarily trust self-signed TLS certificates for the current session.";
     };
+    offerToTrustInvalidCertificates = {
+      key = "security.certificates.offer_to_trust_invalid";
+      default = false;
+      type = "bool";
+      description = "Offer to temporarily trust other TLS certificates that fail verification for the current session.";
+    };
     updateCheckIntervalMinutes = {
       key = "updates.check_interval_minutes";
       default = 240;
