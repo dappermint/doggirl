@@ -6920,32 +6920,64 @@ pub(crate) fn compute_animation_keyframe_longhands(
             font_metrics_depend_on_viewport_metrics: false,
         };
     }
-    let parent_snapshot = inheritance_parent_record.map(keyframe_parent_snapshot_of_record);
+    let mut parent_snapshot = None;
     let mut longhands_by_keyframe = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    let mut values = std::iter::repeat_with(|| None)
+        .take(properties.len())
+        .collect::<Vec<_>>();
     for (index, property) in properties.iter().enumerate() {
         if property.custom_name_id != 0 {
+            let value = custom_property_values[index]
+                .clone()
+                .expect("a custom property's keyframe has a computed value");
+            values[index] = Some(value);
             continue;
         }
         assert!((FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property.physical_property_id));
+        if property.is_transition {
+            use crate::css::animation::FfiAnimationSpecifiedValueSource;
+            let value = match property.value_source {
+                FfiAnimationSpecifiedValueSource::Value => property.value.clone(),
+                FfiAnimationSpecifiedValueSource::Initial => initial_value_handle(property.source_longhand_id).clone(),
+                FfiAnimationSpecifiedValueSource::Underlying => underlying_longhands
+                    .handle(property.source_longhand_id)
+                    .expect("an animated longhand must have an underlying value")
+                    .clone_retained(),
+                FfiAnimationSpecifiedValueSource::Inherited => {
+                    if parent_snapshot.is_none() {
+                        parent_snapshot = inheritance_parent_record.map(keyframe_parent_snapshot_of_record);
+                    }
+                    parent_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.value_handle(property.source_longhand_id))
+                        .unwrap_or_else(|| initial_value_handle(property.source_longhand_id))
+                        .clone()
+                }
+            };
+            values[index] = Some(value);
+            continue;
+        }
         longhands_by_keyframe
             .entry(property.keyframe_index)
             .or_default()
             .push(index);
     }
 
-    const LONGHAND_WORD_COUNT: usize = NUMBER_OF_LONGHAND_PROPERTIES.div_ceil(64);
-    let mut values = std::iter::repeat_with(|| None)
-        .take(properties.len())
-        .collect::<Vec<_>>();
-    for (index, property) in properties.iter().enumerate() {
-        if property.custom_name_id == 0 {
-            continue;
-        }
-        let value = custom_property_values[index]
-            .clone()
-            .expect("a custom property's keyframe has a computed value");
-        values[index] = Some(value);
+    if longhands_by_keyframe.is_empty() {
+        return AnimationKeyframeLonghands {
+            values: values
+                .into_iter()
+                .map(|value| value.expect("every transition or custom keyframe produced a value"))
+                .collect(),
+            depends_on_viewport_metrics: false,
+            font_metrics_depend_on_viewport_metrics: false,
+        };
     }
+
+    if parent_snapshot.is_none() {
+        parent_snapshot = inheritance_parent_record.map(keyframe_parent_snapshot_of_record);
+    }
+    const LONGHAND_WORD_COUNT: usize = NUMBER_OF_LONGHAND_PROPERTIES.div_ceil(64);
     let mut depends_on_viewport_metrics = false;
     let mut font_metrics_depend_on_viewport_metrics = false;
     for indices in longhands_by_keyframe.values() {

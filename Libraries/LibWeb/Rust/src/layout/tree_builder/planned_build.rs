@@ -115,8 +115,16 @@ pub(super) fn finish_table_fixup(host: &mut TreeBuilderHost<'_>, plan: &SubtreeP
 /// boxes now, the list's own box among them, and the boxes the list kept.
 pub(super) struct UnitCommit<'a> {
     pub(super) taken_over: &'a HashMap<NodeSlotId, NodeSlotId>,
-    pub(super) old_parents: &'a HashSet<NodeSlotId>,
+    pub(super) root: NodeSlotId,
+    pub(super) taken_old_parents: &'a HashSet<NodeSlotId>,
     pub(super) kept: &'a dyn Fn(NodeSlotId) -> bool,
+}
+
+impl UnitCommit<'_> {
+    #[inline]
+    pub(super) fn is_old_parent(&self, slot: NodeSlotId) -> bool {
+        slot == self.root || (!self.taken_old_parents.is_empty() && self.taken_old_parents.contains(&slot))
+    }
 }
 
 /// Gives the rows of the planned boxes below `root`, which the plan made and linked, what the builder's own steps give
@@ -220,7 +228,7 @@ pub(super) fn commit_plan(
     // styles, and the boxes absolutely positioned rows escape, once the boxes above them know whether they contain
     // them.
     let parent_is_planned = |parent: NodeSlotId| match unit {
-        Some(unit) => !unit.old_parents.contains(&parent),
+        Some(unit) => !unit.is_old_parent(parent),
         None => parent != root,
     };
     for subtree_root in rows_derived_on_commit {
@@ -502,7 +510,7 @@ fn commit_row_one_by_one(
         return;
     }
     let parent_is_planned = match unit {
-        Some(unit) => !unit.old_parents.contains(&parent_slot),
+        Some(unit) => !unit.is_old_parent(parent_slot),
         None => parent_slot != root,
     };
     if host.arena_mut().note_planned_child_attached_with_derived_facts(
