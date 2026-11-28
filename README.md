@@ -4,7 +4,7 @@
 
 doggirl is [dappermint](https://github.com/dappermint)'s hard fork of [ladybird](https://github.com/LadybirdBrowser/ladybird), an independent web browser built around its own standards-based engine. the fork focuses on browser performance and interaction latency. it keeps ladybird's [multi-process architecture](Documentation/ProcessArchitecture.md) and works on hot paths in the javascript engine, layout, style and rendering
 
-v0.4.0 includes faster aarch64 jit code generation, reuse of layout and paint work, and lower overhead for style and dom updates. [release history](https://github.com/dappermint/doggirl/releases)
+v0.4.1 fixes crashes and regressions in layout, rendering and javascript. it also updates the engine to ladybird [`690336455f`](https://github.com/LadybirdBrowser/ladybird/commit/690336455f478a3ee00403e2ef40b494550b8bc3) and adds three terrier barks to the about page. [release history](https://github.com/dappermint/doggirl/releases)
 
 > [!IMPORTANT]
 > doggirl is pre-alpha. expect compatibility gaps and crashes
@@ -14,13 +14,13 @@ v0.4.0 includes faster aarch64 jit code generation, reuse of layout and paint wo
 the nix flake installs a prebuilt macOS bundle on `aarch64-darwin` using a SHA-256 pin. try the release without installing it
 
 ```sh
-nix run github:dappermint/doggirl/v0.4.0#doggirl
+nix run github:dappermint/doggirl/v0.4.1#doggirl
 ```
 
 install the same release in your user profile
 
 ```sh
-nix profile install github:dappermint/doggirl/v0.4.0#doggirl
+nix profile install github:dappermint/doggirl/v0.4.1#doggirl
 doggirl
 ```
 
@@ -29,7 +29,7 @@ doggirl
 pin the release in your `flake.nix` inputs
 
 ```nix
-inputs.doggirl.url = "github:dappermint/doggirl/v0.4.0";
+inputs.doggirl.url = "github:dappermint/doggirl/v0.4.1";
 ```
 
 add `doggirl` to your `outputs` arguments. add the module and option below to your existing `nix-darwin` configuration's `modules` list
@@ -46,20 +46,20 @@ apply your configuration with `sudo darwin-rebuild switch --flake .#my-mac`, usi
 
 for a package list, use `doggirl.packages.aarch64-darwin.doggirl` in `environment.systemPackages` or `home.packages`
 
-## v0.4.0 test results
+## v0.4.1 test results
 
 | check | result |
 | --- | --- |
-| libweb | 20,591 passed, 57 failed, 2 crashed, 118 skipped |
-| libjs runtime | 9,292 passed, 1 failed, 3 expected failures. the runtime results matched with moving gc forced |
+| libweb | 20,662 passed, 0 failed, 0 crashed, 118 skipped |
+| libjs runtime | 9,293 passed and 3 expected failures. the results matched with moving gc forced |
 | libjs ast and bytecode | all 101 ast and 171 bytecode test files passed with moving gc forced |
-| nix on apple silicon | all 7 flake checks passed. the packaged browser loaded an http page and passed javascript, flex layout and canvas checks |
+| nix on apple silicon | all 7 flake checks passed. the packaged browser passed http, javascript, flex layout, canvas and about-page audio checks |
 
-all 59 libweb failures and crashes reproduced on the previous fork master build (`6e8c319390`). the [raw test summary](https://github.com/dappermint/doggirl/releases/download/v0.4.0/test-results.json) lists the affected tests
+all 59 libweb cases that failed or crashed in v0.4.0 passed in v0.4.1. [test results](https://github.com/dappermint/doggirl/releases/download/v0.4.1/test-results.json)
 
 ## speedometer 3.1
 
-tested on 28 november 2026 on an apple m5 pro running macOS 27.3. each browser ran headless with a fresh profile and a 1280 × 900 css-pixel viewport at scale 1. we ran eight blocks with one launch per browser in each block, counterbalanced the order, and scored ten full iterations per launch. the table shows the median and range of the eight launch scores. [benchmark](https://browserbench.org/Speedometer3.1/)
+the v0.4.0 comparison ran on 28 november 2026 on an apple m5 pro running macOS 27.3. each browser ran headless with a fresh profile and a 1280 × 900 css-pixel viewport at scale 1. we ran eight blocks with one launch per browser in each block, counterbalanced the order, and scored ten full iterations per launch. the table shows the median and range of the eight launch scores. [benchmark](https://browserbench.org/Speedometer3.1/)
 
 | browser | median score | launch range |
 | --- | ---: | ---: |
