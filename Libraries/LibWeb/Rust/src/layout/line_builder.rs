@@ -51,7 +51,7 @@ struct LineRelativeAlignedSubtree {
 /// Extends the aligned subtree whose root and alignment `subtree` names to hold `start..end`, or the line box
 /// `earliest..latest` where the box is in no aligned subtree.
 fn extend_aligned_subtree_or_line_box(
-    aligned_subtrees: &mut Vec<LineRelativeAlignedSubtree>,
+    aligned_subtrees: &mut smallvec::SmallVec<[LineRelativeAlignedSubtree; 2]>,
     (earliest, latest): (&mut CssPixels, &mut CssPixels),
     subtree: Option<(Node, u8)>,
     (start, end): (CssPixels, CssPixels),
@@ -81,7 +81,7 @@ struct LineAlignment {
     latest: CssPixels,
     line_box_baseline: CssPixels,
     has_line_relative_aligned_subtree: bool,
-    aligned_subtrees: Vec<LineRelativeAlignedSubtree>,
+    aligned_subtrees: smallvec::SmallVec<[LineRelativeAlignedSubtree; 2]>,
     first_unshifted_text_baseline: Option<CssPixels>,
 }
 
@@ -1243,9 +1243,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
 
     /// The inline boxes of this formatting context around `style_source`, innermost first, up to the first one aligned
     /// to the line box, each with the shift of its baseline by its own vertical-align.
-    fn vertical_shifts_of_enclosing_inline_boxes(&self, style_source: Node) -> Vec<(Node, CssPixels)> {
+    fn vertical_shifts_of_enclosing_inline_boxes(
+        &self,
+        style_source: Node,
+    ) -> smallvec::SmallVec<[(Node, CssPixels); 4]> {
         let containing_block = self.context().containing_block;
-        let mut shifts = Vec::new();
+        let mut shifts = smallvec::SmallVec::new();
         if style_source == containing_block {
             return shifts;
         }
@@ -1407,6 +1410,15 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         let in_line_height_quirks_mode = self
             .facts(self.context().containing_block)
             .document_in_line_height_quirks_mode();
+        if !in_line_height_quirks_mode {
+            return LineTextFacts {
+                in_line_height_quirks_mode: false,
+                strut_fragment_start,
+                kept_fragments: 0..0,
+                boxes_holding_text: std::collections::HashSet::new(),
+                holds_only_block_ellipsis: false,
+            };
+        }
         let line = self.line(line_index);
         let fragments = &line.fragments[..strut_fragment_start];
         let is_content = |fragment: &line_box_fragment::LineBoxFragmentData| {
@@ -1922,10 +1934,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
 
     /// The struts of the line at `line_index` that count: those of inline boxes that no fragment on the line belongs
     /// to, on a line that isn't empty apart from them.
-    fn inline_box_struts_without_fragments(&self, line_index: usize) -> Vec<line_box::InlineBoxStrut> {
+    fn inline_box_struts_without_fragments(
+        &self,
+        line_index: usize,
+    ) -> smallvec::SmallVec<[line_box::InlineBoxStrut; 4]> {
         let line = self.line(line_index);
         if line.inline_box_struts.is_empty() || !line.takes_inline_box_struts() {
-            return Vec::new();
+            return smallvec::SmallVec::new();
         }
         let containing_block = self.context().containing_block;
         let holds_fragment = |box_: Node| {
@@ -2016,10 +2031,10 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             earliest = earliest.min(self.current_block_offset + line_box_baseline - marker_line.ascent);
             latest = latest.max(self.current_block_offset + line_box_baseline + marker_line.descent);
         }
-        let mut aligned_subtrees: Vec<LineRelativeAlignedSubtree> = Vec::new();
+        let mut aligned_subtrees: smallvec::SmallVec<[LineRelativeAlignedSubtree; 2]> = smallvec::SmallVec::new();
         let mut first_unshifted_text_baseline: Option<CssPixels> = None;
         let current_block_offset = self.current_block_offset;
-        let mut inline_box_alignments: Vec<InlineBoxAlignment> = Vec::new();
+        let mut inline_box_alignments: smallvec::SmallVec<[InlineBoxAlignment; 4]> = smallvec::SmallVec::new();
 
         for fragment_index in 0..fragment_count {
             if !self.line(line_index).fragments[fragment_index].takes_part_in_line_alignment() {
@@ -2261,22 +2276,22 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             }
         }
 
-        // Top- and bottom-aligned subtrees do not participate in choosing the line box baseline. Once all other boxes
-        // have been positioned, grow the line box to the minimum size that can contain every aligned subtree.
-        let maximum_block_size = |alignment| {
-            aligned_subtrees
-                .iter()
-                .filter(|subtree| subtree.alignment == alignment)
-                .map(|subtree| subtree.block_end - subtree.block_start)
-                .max()
-                .unwrap_or_default()
-        };
         if earliest > latest {
             earliest = self.current_block_offset;
             latest = self.current_block_offset;
         }
-        latest = latest.max(earliest + maximum_block_size(vertical_align::TOP));
-        earliest = earliest.min(latest - maximum_block_size(vertical_align::BOTTOM));
+        if !aligned_subtrees.is_empty() {
+            let maximum_block_size = |alignment| {
+                aligned_subtrees
+                    .iter()
+                    .filter(|subtree| subtree.alignment == alignment)
+                    .map(|subtree| subtree.block_end - subtree.block_start)
+                    .max()
+                    .unwrap_or_default()
+            };
+            latest = latest.max(earliest + maximum_block_size(vertical_align::TOP));
+            earliest = earliest.min(latest - maximum_block_size(vertical_align::BOTTOM));
+        }
         LineAlignment {
             earliest,
             latest,

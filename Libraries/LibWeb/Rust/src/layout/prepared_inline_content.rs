@@ -70,6 +70,8 @@ impl PreparedItem {
     pub(super) const UPRIGHT: u16 = 1 << 11;
     pub(super) const TAB_STOP: u16 = 1 << 12;
     pub(super) const SOFT_WRAPS: u16 = 1 << 13;
+    pub(super) const ASCII_WHITESPACE: u16 = 1 << 14;
+    pub(super) const ENDS_IN_ASCII_SPACE: u16 = 1 << 15;
 
     pub(super) fn new(type_: ItemType, node: Node, flags: u16) -> Self {
         Self {
