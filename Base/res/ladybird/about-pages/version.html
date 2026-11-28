@@ -347,30 +347,33 @@
             const copyButton = document.querySelector("#copy");
             const pawButton = document.querySelector("#about-paw");
             const woofBubble = document.querySelector("#woof-bubble");
-            const BARK_SOUND_URL = "resource://ladybird/about-pages/bark.wav";
+            const BARK_SOUNDS = [1, 2, 3].map(index => `resource://ladybird/about-pages/bark-${index}.wav`);
             const BARK_UNLOCK_CLICKS = 5;
             let detailsText = "";
             let pawClicks = 0;
             let audioContext = null;
-            let barkBufferPromise = null;
+            const barkBuffers = new Map();
             let woofTimer = null;
 
             async function playBarkSound() {
+                const barkSound = BARK_SOUNDS[Math.floor(Math.random() * BARK_SOUNDS.length)];
                 const pitch = 0.88 + Math.random() * 0.24;
                 try {
                     const AudioCtx = window.AudioContext || window.webkitAudioContext;
                     if (AudioCtx) {
                         if (!audioContext) audioContext = new AudioCtx();
                         if (audioContext.state === "suspended") await audioContext.resume();
-                        if (!barkBufferPromise) {
-                            barkBufferPromise = fetch(BARK_SOUND_URL)
+                        let barkBuffer = barkBuffers.get(barkSound);
+                        if (!barkBuffer) {
+                            barkBuffer = fetch(barkSound)
                                 .then(response => {
                                     if (!response.ok) throw new Error(`HTTP ${response.status}`);
                                     return response.arrayBuffer();
                                 })
                                 .then(data => audioContext.decodeAudioData(data));
+                            barkBuffers.set(barkSound, barkBuffer);
                         }
-                        const buffer = await barkBufferPromise;
+                        const buffer = await barkBuffer;
                         const source = audioContext.createBufferSource();
                         source.buffer = buffer;
                         source.playbackRate.value = pitch;
@@ -379,11 +382,11 @@
                         return;
                     }
                 } catch {
-                    barkBufferPromise = null;
+                    barkBuffers.delete(barkSound);
                 }
 
                 try {
-                    const audio = new Audio(BARK_SOUND_URL);
+                    const audio = new Audio(barkSound);
                     audio.preservesPitch = false;
                     audio.playbackRate = pitch;
                     await audio.play();

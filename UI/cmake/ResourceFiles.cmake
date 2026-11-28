@@ -27,7 +27,9 @@ list(TRANSFORM INTERNAL_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladyb
 
 set(ABOUT_PAGES
     about.html
-    bark.wav
+    bark-1.wav
+    bark-2.wav
+    bark-3.wav
     bookmarks.html
     certificate.html
     crashes.html
