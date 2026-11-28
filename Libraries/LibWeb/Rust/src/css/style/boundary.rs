@@ -393,6 +393,8 @@ style_boundary! {
         } => engine.record_font_input_changes(&family_name_lengths, &family_name_units, &font_lists);
         fill_loaded_font_faces => FillLoadedFontFaces { fills: LoadedFontFaceFills };
         consume_element_style_input => ConsumeElementStyleInput { node: StyleNodeID };
+        consume_element_style_inputs => ConsumeElementStyleInputs { nodes: Box<[StyleNodeID]> } =>
+            engine.consume_element_style_inputs(&nodes);
         set_element_replaced_content_input => SetElementReplacedContentInput {
             node: StyleNodeID, kind: u8, present: u8, values: [u32; 4]
         } => engine.set_element_replaced_content_input(node, ReplacedContentInput::from_raw(kind, present, values));

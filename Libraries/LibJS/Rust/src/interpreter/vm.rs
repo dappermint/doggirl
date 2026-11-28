@@ -1826,7 +1826,8 @@ impl Vm {
             }
             let idle_collection_count = &executable.head.idle_collection_count;
             let ran_since_last_gc = idle_collection_count.get() == 0;
-            executable.remove_dead_cells(sweep, ran_since_last_gc);
+            let fold_value_feedback = executable.needs_value_feedback_fold_at_gc(self, ran_since_last_gc);
+            executable.remove_dead_cells(sweep, ran_since_last_gc, fold_value_feedback);
             executable.drop_jit_code_that_lost_embedded_cells(self, sweep);
             idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true

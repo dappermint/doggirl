@@ -76,6 +76,7 @@ void style_engine_record_derived_element_style_input(DocumentHost const*, StyleN
 void style_engine_record_font_input_changes(DocumentHost const*, ReadonlySpan<u32> family_name_lengths, ReadonlySpan<u16> family_name_units, ReadonlySpan<u64> font_lists);
 void style_engine_fill_loaded_font_faces(DocumentHost const*, ReadonlySpan<u64> fills);
 void style_engine_consume_element_style_input(DocumentHost const*, StyleNodeID node);
+void style_engine_consume_element_style_inputs(DocumentHost const*, ReadonlySpan<StyleNodeID> nodes);
 void style_engine_set_element_adjustment_facts(DocumentHost const*, StyleNodeID node, u32 facts);
 void style_engine_set_element_construction_facts(DocumentHost const*, StyleNodeID node, u32 facts);
 void style_engine_set_element_box_kind(DocumentHost const*, StyleNodeID node, u8 box_kind);

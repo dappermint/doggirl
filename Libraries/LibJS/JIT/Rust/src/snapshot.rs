@@ -794,6 +794,7 @@ pub struct DirectGetterFields {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct KeyedFeedbackSnapshot {
     /// `KeyedFeedback::Bits`.
     pub bits: u32,

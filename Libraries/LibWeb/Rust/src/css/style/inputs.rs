@@ -2130,6 +2130,18 @@ impl StyleEngine {
         }
     }
 
+    /// Drop any deferred style inputs owed by a batch of departing elements.
+    pub fn consume_element_style_inputs(&mut self, nodes: &[StyleNodeID]) {
+        if self.host.deferred_element_style_inputs.is_empty() {
+            return;
+        }
+        for &node in nodes {
+            if self.host.deferred_element_style_inputs.remove(&node).is_some() {
+                self.host.deferred_element_style_inputs_moved = true;
+            }
+        }
+    }
+
     /// Whether one element still owes a deferred style input, asked per node the way the recorded
     /// batch is.
     #[must_use]
