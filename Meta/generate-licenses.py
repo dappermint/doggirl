@@ -751,7 +751,7 @@ def generate(args: argparse.Namespace) -> str:
             "",
         ]
         for library, archive_name in lgpl:
-            introduction += [f"  {library}", f"    {THIRD_PARTY_SOURCES_URL}/{archive_name()}"]
+            introduction += [f"  {library}", f"    {args.third_party_sources_url}/{archive_name()}"]
         introduction += [
             "",
             "The source code of Ladybird at https://github.com/LadybirdBrowser/ladybird contains everything needed to",
@@ -799,6 +799,7 @@ def main() -> int:
     parser.add_argument(
         "--release", action="store_true", help="name where release-tools publishes the source of each LGPL port"
     )
+    parser.add_argument("--third-party-sources-url", default=THIRD_PARTY_SOURCES_URL)
     parser.add_argument(
         "--third-party-sources",
         type=pathlib.Path,
