@@ -40,10 +40,10 @@ if (DEFINED ENV{FLATPAK_ID} AND DEFINED ENV{FLATPAK_DEST})
     list(APPEND licenses_dependencies "${flatpak_manifest}")
 endif()
 
-# Build Release publishes the source archives of the LGPL libraries of a distribution build and of the Flatpak, so
-# LICENSES.txt points to them.
+# GitHub releases include the source archives of LGPL libraries alongside the browser.
 if ((LADYBIRD_VCPKG_TYPE STREQUAL "distribution" OR building_flatpak) AND NOT LADYBIRD_VERSION STREQUAL "")
-    list(APPEND licenses_arguments --release)
+    list(APPEND licenses_arguments --release
+        --third-party-sources-url "${PROJECT_HOMEPAGE_URL}/releases/download/v${LADYBIRD_VERSION}")
 endif()
 
 add_custom_command(
