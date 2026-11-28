@@ -217,7 +217,12 @@ void web_bindings_push_element_queue()
 
 void web_bindings_pop_element_queue_and_invoke_reactions()
 {
-    auto queue = main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.take_last();
+    auto& stack = main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack;
+    if (stack.last().is_empty()) {
+        stack.shrink(stack.size() - 1, true);
+        return;
+    }
+    auto queue = stack.take_last();
     HTML::invoke_custom_element_reactions(queue);
 }
 

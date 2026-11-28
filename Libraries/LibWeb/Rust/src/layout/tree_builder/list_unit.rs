@@ -904,7 +904,8 @@ fn reconcile(
     // like it.
     let mut taken_over: HashMap<NodeSlotId, NodeSlotId> = HashMap::default();
     let mut taken: HashSet<NodeSlotId> = HashSet::default();
-    {
+    let has_planned_wrappers = planned.iter().any(|row| row.role == PlannedRole::Wrapper);
+    if has_planned_wrappers && old_rows.iter().any(|row| row.is_wrapper) {
         let arena = host.arena();
         let old_wrappers: HashSet<NodeSlotId> = old_rows
             .iter()
@@ -917,7 +918,11 @@ fn reconcile(
             if wrapper.role != PlannedRole::Wrapper {
                 continue;
             }
-            let parent = taken_over.get(&wrapper.parent).copied().unwrap_or(wrapper.parent);
+            let parent = if taken_over.is_empty() {
+                wrapper.parent
+            } else {
+                taken_over.get(&wrapper.parent).copied().unwrap_or(wrapper.parent)
+            };
             if parent != root && !taken.contains(&parent) {
                 continue;
             }
@@ -961,10 +966,16 @@ fn reconcile(
             }
         }
     }
-    let map = |slot: NodeSlotId| taken_over.get(&slot).copied().unwrap_or(slot);
+    let map = |slot: NodeSlotId| {
+        if taken_over.is_empty() {
+            slot
+        } else {
+            taken_over.get(&slot).copied().unwrap_or(slot)
+        }
+    };
     let dropped: Vec<OldRow> = old_rows
         .iter()
-        .filter(|row| !taken.contains(&row.slot) && !plan.tree.stands_in_for(row.slot))
+        .filter(|row| (taken.is_empty() || !taken.contains(&row.slot)) && !plan.tree.stands_in_for(row.slot))
         .copied()
         .collect();
 
@@ -987,25 +998,30 @@ fn reconcile(
     //               inline-level in flow has among block-level siblings.
     let drops_contained_abspos_boxes_only = !dropped.is_empty() && {
         let arena = host.arena();
-        let dropped_slots: HashSet<NodeSlotId> = dropped.iter().map(|row| row.slot).collect();
-        let is_contained_abspos_box = |row: &OldRow| {
-            !row.is_wrapper
-                && (row.parent == root || dropped_slots.contains(&row.parent))
-                && node_kind_is_node_with_style(arena.data(row.slot).kind.get())
-                && node_facts::node_style_view(arena.data(row.slot))
-                    .is_some_and(|style| style.position() == crate::css::css_enums::positioning::ABSOLUTE)
-                && arena.containing_block_by_walking_ancestors(row.slot) == root
-        };
-        dropped.iter().all(|row| {
-            if !row.is_wrapper {
-                return is_contained_abspos_box(row);
-            }
-            row.parent == root
-                && old_rows
-                    .iter()
-                    .filter(|child| child.parent == row.slot)
-                    .all(|child| dropped_slots.contains(&child.slot) && is_contained_abspos_box(child))
-        })
+        let all_non_wrappers_are_abspos = dropped.iter().all(|row| {
+            row.is_wrapper
+                || (node_kind_is_node_with_style(arena.data(row.slot).kind.get())
+                    && node_facts::node_style_view(arena.data(row.slot))
+                        .is_some_and(|style| style.position() == crate::css::css_enums::positioning::ABSOLUTE))
+        });
+        all_non_wrappers_are_abspos && {
+            let dropped_slots: HashSet<NodeSlotId> = dropped.iter().map(|row| row.slot).collect();
+            let is_contained_abspos_box = |row: &OldRow| {
+                !row.is_wrapper
+                    && (row.parent == root || dropped_slots.contains(&row.parent))
+                    && arena.containing_block_by_walking_ancestors(row.slot) == root
+            };
+            dropped.iter().all(|row| {
+                if !row.is_wrapper {
+                    return is_contained_abspos_box(row);
+                }
+                row.parent == root
+                    && old_rows
+                        .iter()
+                        .filter(|child| child.parent == row.slot)
+                        .all(|child| dropped_slots.contains(&child.slot) && is_contained_abspos_box(child))
+            })
+        }
     };
     if drops_contained_abspos_boxes_only {
         for row in dropped.iter().filter(|row| !row.is_wrapper) {
@@ -1056,11 +1072,11 @@ fn reconcile(
         host.arena_mut().derive_flex_or_grid_item_flags(wrapper);
     }
 
-    let mut old_parents_of_list: HashSet<NodeSlotId> = taken.clone();
-    old_parents_of_list.insert(root);
+    let is_old_parent = |slot: NodeSlotId| slot == root || (!taken.is_empty() && taken.contains(&slot));
     let unit = UnitCommit {
         taken_over: &taken_over,
-        old_parents: &old_parents_of_list,
+        root,
+        taken_old_parents: &taken,
         kept: &|slot| plan.tree.stands_in_for(slot),
     };
     commit_plan(host, state, root, &plan, descendant_count, false, Some(&unit));
@@ -1103,8 +1119,8 @@ fn reconcile(
         .iter()
         .filter(|row| {
             row.role != PlannedRole::Kept
-                && !taken_over.contains_key(&row.slot)
-                && old_parents_of_list.contains(&map(row.parent))
+                && (taken_over.is_empty() || !taken_over.contains_key(&row.slot))
+                && is_old_parent(map(row.parent))
         })
         .map(|row| row.slot)
         .collect();
@@ -1136,44 +1152,55 @@ fn reconcile(
     }
     // NB: A new anonymous box that holds a kept box, at any depth, is not new as a whole: the kept box noted its move
     //     above.
-    let parents_in_plan: HashMap<NodeSlotId, NodeSlotId> = planned.iter().map(|row| (row.slot, row.parent)).collect();
-    let mut ancestors_of_kept_rows: HashSet<NodeSlotId> = HashSet::default();
-    for row in planned.iter().filter(|row| row.role == PlannedRole::Kept) {
-        let mut ancestor = row.parent;
-        while ancestor != root && ancestors_of_kept_rows.insert(ancestor) {
-            ancestor = parents_in_plan[&ancestor];
-        }
-    }
-    for &row in &new_top_rows {
-        if !ancestors_of_kept_rows.contains(&row) {
-            host.arena_mut().note_new_layout_subtree_attached(row);
+    if !new_top_rows.is_empty() {
+        if planned.iter().any(|row| row.role == PlannedRole::Kept && row.parent != root) {
+            let parents_in_plan: HashMap<NodeSlotId, NodeSlotId> =
+                planned.iter().map(|row| (row.slot, row.parent)).collect();
+            let mut ancestors_of_kept_rows: HashSet<NodeSlotId> = HashSet::default();
+            for row in planned.iter().filter(|row| row.role == PlannedRole::Kept && row.parent != root) {
+                let mut ancestor = row.parent;
+                while ancestor != root && ancestors_of_kept_rows.insert(ancestor) {
+                    ancestor = parents_in_plan[&ancestor];
+                }
+            }
+            for &row in &new_top_rows {
+                if !ancestors_of_kept_rows.contains(&row) {
+                    host.arena_mut().note_new_layout_subtree_attached(row);
+                }
+            }
+        } else {
+            for &row in &new_top_rows {
+                host.arena_mut().note_new_layout_subtree_attached(row);
+            }
         }
     }
     // An anonymous box that took another over and whose children changed lays out again, as its list's box does.
-    let mut changed_wrappers: HashSet<NodeSlotId> = HashSet::default();
-    for row in &planned {
-        let parent = map(row.parent);
-        // NB: An anonymous box takes another over only under the same parent.
-        let changed = match row.role {
-            PlannedRole::Kept => row.old_parent != parent,
-            PlannedRole::Wrapper => !taken_over.contains_key(&row.slot),
-            PlannedRole::New => true,
-        };
-        if changed && taken.contains(&parent) {
-            changed_wrappers.insert(parent);
+    if !taken.is_empty() {
+        let mut changed_wrappers: HashSet<NodeSlotId> = HashSet::default();
+        for row in &planned {
+            let parent = map(row.parent);
+            // NB: An anonymous box takes another over only under the same parent.
+            let changed = match row.role {
+                PlannedRole::Kept => row.old_parent != parent,
+                PlannedRole::Wrapper => !taken_over.contains_key(&row.slot),
+                PlannedRole::New => true,
+            };
+            if changed && taken.contains(&parent) {
+                changed_wrappers.insert(parent);
+            }
+            // NB: An anonymous box a kept box moved out of lost a child.
+            if row.role == PlannedRole::Kept && row.old_parent != parent && taken.contains(&row.old_parent) {
+                changed_wrappers.insert(row.old_parent);
+            }
         }
-        // NB: An anonymous box a kept box moved out of lost a child.
-        if row.role == PlannedRole::Kept && row.old_parent != parent && taken.contains(&row.old_parent) {
-            changed_wrappers.insert(row.old_parent);
+        for row in &dropped {
+            if taken.contains(&row.parent) {
+                changed_wrappers.insert(row.parent);
+            }
         }
-    }
-    for row in &dropped {
-        if taken.contains(&row.parent) {
-            changed_wrappers.insert(row.parent);
+        for wrapper in changed_wrappers {
+            host.arena_mut().note_child_list_restructured(wrapper);
         }
-    }
-    for wrapper in changed_wrappers {
-        host.arena_mut().note_child_list_restructured(wrapper);
     }
     invalidate_layout_for_list_change(host, state, root, change, &new_top_rows);
     if !new_top_rows.is_empty() {

@@ -1082,7 +1082,8 @@ struct StyleNodeTables {
     /// The maps are borrowed for writing only by the publication entry points, which can run while a
     /// tree build is under way: an element styled on the build's behalf replaces its style record,
     /// which republishes the resources its style names. No reader holds a borrow across a host call.
-    svg_attribute_facts: CowMap<StyleNodeID, super::svg_formatting_context::FfiSvgAttributeFacts>,
+    svg_attribute_facts: CowColumn<Option<Arc<super::svg_formatting_context::FfiSvgAttributeFacts>>, 64>,
+    svg_attribute_facts_count: usize,
     /// The parsed MathML attributes each MathML element published, keyed by its style node.
     math_attribute_facts: CowMap<StyleNodeID, super::math_formatting_context::FfiMathAttributeFacts>,
     /// The `points` list each <polyline> and <polygon> published beside its facts.
@@ -2658,6 +2659,7 @@ impl LayoutNodeArena {
             counters_sets,
             generated_content,
             svg_attribute_facts,
+            svg_attribute_facts_count,
             math_attribute_facts,
             svg_points,
             svg_text_positions,
@@ -2680,11 +2682,17 @@ impl LayoutNodeArena {
         }
         let mut removed_svg_attribute_facts = None;
         let mut removed_implicit_anchor = false;
-        if style_node.text_index().is_none() {
+        if let Some(element_index) = style_node.element_index() {
             counters_sets.forget(style_node);
             generated_content.forget(style_node);
-            if !svg_attribute_facts.is_empty() {
-                removed_svg_attribute_facts = svg_attribute_facts.remove(&style_node);
+            if *svg_attribute_facts_count != 0 {
+                let slot = element_index as usize;
+                if svg_attribute_facts.get(slot).is_some_and(Option::is_some) {
+                    removed_svg_attribute_facts = svg_attribute_facts.replace(slot, None).flatten();
+                    if removed_svg_attribute_facts.is_some() {
+                        *svg_attribute_facts_count -= 1;
+                    }
+                }
             }
             if !svg_points.is_empty() {
                 svg_points.remove(&style_node);
@@ -3728,7 +3736,7 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn svg_attribute_facts(&self, id: NodeSlotId) -> &super::svg_formatting_context::FfiSvgAttributeFacts {
-        if self.style_node_tables.svg_attribute_facts.is_empty() {
+        if self.style_node_tables.svg_attribute_facts_count == 0 {
             return &super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT;
         }
         match self.node_style_node(id) {
@@ -3744,12 +3752,13 @@ impl LayoutNodeArena {
         &self,
         style_node: StyleNodeID,
     ) -> &super::svg_formatting_context::FfiSvgAttributeFacts {
-        if self.style_node_tables.svg_attribute_facts.is_empty() {
+        if self.style_node_tables.svg_attribute_facts_count == 0 {
             return &super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT;
         }
         self.style_node_tables
             .svg_attribute_facts
-            .get(&style_node)
+            .get(style_node.element_slot())
+            .and_then(Option::as_deref)
             .unwrap_or(&super::svg_formatting_context::FfiSvgAttributeFacts::DEFAULT)
     }
 
@@ -3847,24 +3856,53 @@ impl LayoutNodeArena {
         points: &[super::svg_formatting_context::FfiFloatPoint],
         text_positions: &[super::svg_formatting_context::FfiSvgTextPosition],
     ) {
+        let Some(element_index) = style_node.element_index() else {
+            return;
+        };
+        let slot = element_index as usize;
         let retained = Self::published_reference_atoms(&facts);
-        let replaced = self
-            .style_node_tables
-            .svg_attribute_facts
-            .insert(style_node, facts)
-            .map_or([0; PUBLISHED_REFERENCE_ATOM_COUNT], |published| {
-                Self::published_reference_atoms(&published)
-            });
-        self.retain_published_reference_atoms(retained, replaced);
+        let tables = &mut self.style_node_tables;
+        if tables.svg_attribute_facts.len() <= slot {
+            tables.svg_attribute_facts.grow_to(slot + 1);
+        }
+        let replaced = if let Some(existing) = tables.svg_attribute_facts.get(slot).and_then(Option::as_ref) {
+            if **existing == facts {
+                retained
+            } else {
+                let old_atoms = Self::published_reference_atoms(existing);
+                let mut row = tables
+                    .svg_attribute_facts
+                    .row_mut(slot)
+                    .expect("svg_attribute_facts grown to hold slot");
+                if let Some(arc) = row.as_mut() {
+                    *Arc::make_mut(arc) = facts;
+                } else {
+                    *row = Some(Arc::new(facts));
+                    tables.svg_attribute_facts_count += 1;
+                }
+                old_atoms
+            }
+        } else {
+            tables.svg_attribute_facts.set(slot, Some(Arc::new(facts)));
+            tables.svg_attribute_facts_count += 1;
+            [0; PUBLISHED_REFERENCE_ATOM_COUNT]
+        };
+        if retained != replaced {
+            self.retain_published_reference_atoms(retained, replaced);
+        }
         let published_points = &mut self.style_node_tables.svg_points;
         if points.is_empty() {
-            published_points.remove(&style_node);
+            if !published_points.is_empty() {
+                published_points.remove(&style_node);
+            }
         } else {
             published_points.insert(style_node, points.into());
         }
         let published_positions = &mut self.style_node_tables.svg_text_positions;
         if text_positions.is_empty() {
-            published_positions.remove(&style_node);
+            if !published_positions.is_empty() {
+                published_positions.remove(&style_node);
+            }
         } else {
             published_positions.insert(style_node, text_positions.into());
         }
@@ -3874,19 +3912,49 @@ impl LayoutNodeArena {
     /// published its attributes yet has no place to put them, and will carry them itself when it
     /// does: the publication is made when the style tree names the element.
     pub(crate) fn set_style_node_svg_style_references(&mut self, style_node: StyleNodeID, references: [u32; 4]) {
-        let published = &mut self.style_node_tables.svg_attribute_facts;
-        let Some(facts) = published.get_mut(&style_node) else {
+        if self.style_node_tables.svg_attribute_facts_count == 0 {
+            return;
+        }
+        let Some(element_index) = style_node.element_index() else {
             return;
         };
-        let replaced = Self::published_reference_atoms(facts);
-        [
-            facts.mask_reference_atom,
-            facts.clip_path_reference_atom,
-            facts.fill_reference_atom,
-            facts.stroke_reference_atom,
-        ] = references;
-        let retained = Self::published_reference_atoms(facts);
-        self.retain_published_reference_atoms(retained, replaced);
+        let slot = element_index as usize;
+        let Some(existing) = self
+            .style_node_tables
+            .svg_attribute_facts
+            .get(slot)
+            .and_then(Option::as_ref)
+        else {
+            return;
+        };
+        if [
+            existing.mask_reference_atom,
+            existing.clip_path_reference_atom,
+            existing.fill_reference_atom,
+            existing.stroke_reference_atom,
+        ] == references
+        {
+            return;
+        }
+        let replaced = Self::published_reference_atoms(existing);
+        let retained = {
+            let mut row = self
+                .style_node_tables
+                .svg_attribute_facts
+                .row_mut(slot)
+                .expect("slot exists");
+            let facts = Arc::make_mut(row.as_mut().expect("entry exists"));
+            [
+                facts.mask_reference_atom,
+                facts.clip_path_reference_atom,
+                facts.fill_reference_atom,
+                facts.stroke_reference_atom,
+            ] = references;
+            Self::published_reference_atoms(facts)
+        };
+        if retained != replaced {
+            self.retain_published_reference_atoms(retained, replaced);
+        }
     }
 
     /// The element the document's id index holds for the atom `name`, which is what
