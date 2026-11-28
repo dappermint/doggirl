@@ -1232,11 +1232,13 @@ impl<'pass> FlexFormattingContext<'pass> {
                         &inputs,
                         self.main_axis_is_horizontal(),
                     ));
-                    self.items_to_fork.take();
                     self.flex_item_details.push(FlexItemDetails::new(inputs, cells));
                     self.populate_specified_margins(self.flex_items.len() - 1);
                 }
             }
+        }
+        if self.flex_items.len() != first_new_item {
+            self.items_to_fork.take();
         }
 
         // https://drafts.csswg.org/css-display-3/#order-modified-document-order
@@ -1244,13 +1246,14 @@ impl<'pass> FlexFormattingContext<'pass> {
         // NB: The items stay in order-modified document order for a reversed flex direction too: Placing them along
         //     the main axis is what reverses them.
         if items_have_different_orders {
-            let mut order_modified_document_order: Vec<usize> = (first_new_item..self.flex_items.len()).collect();
+            let mut order_modified_document_order: smallvec::SmallVec<[usize; 8]> =
+                (first_new_item..self.flex_items.len()).collect();
             order_modified_document_order.sort_by(|&left, &right| {
                 self.order_of_item(self.flex_item_details[left].inputs.style)
                     .cmp(&self.order_of_item(self.flex_item_details[right].inputs.style))
             });
             fn reorder<T: Copy>(items: &mut Vec<T>, first_new_item: usize, order: &[usize]) {
-                let reordered: Vec<T> = order.iter().map(|&index| items[index]).collect();
+                let reordered: smallvec::SmallVec<[T; 8]> = order.iter().map(|&index| items[index]).collect();
                 items.truncate(first_new_item);
                 items.extend(reordered);
             }
@@ -4107,6 +4110,14 @@ impl<'pass> FlexFormattingContext<'pass> {
             };
             let first = calculate_largest(self, false);
             self.set_container_cross_size(first);
+            let any_percentage_cross_size = (0..self.flex_items.len()).any(|index| {
+                self.computed_cross_size(index).contains_percentage()
+                    || self.computed_cross_min_size(index).contains_percentage()
+                    || self.computed_cross_max_size(index).contains_percentage()
+            });
+            if !any_percentage_cross_size {
+                return first;
+            }
             return calculate_largest(self, true);
         }
         // row multi-line flex container cross-size
@@ -4127,6 +4138,14 @@ impl<'pass> FlexFormattingContext<'pass> {
             };
             let first = calculate_largest(self, false);
             self.set_container_cross_size(first);
+            let any_percentage_cross_size = (0..self.flex_items.len()).any(|index| {
+                self.computed_cross_size(index).contains_percentage()
+                    || self.computed_cross_min_size(index).contains_percentage()
+                    || self.computed_cross_max_size(index).contains_percentage()
+            });
+            if !any_percentage_cross_size {
+                return first;
+            }
             return calculate_largest(self, true);
         }
         // The max-content cross size is the sum of the flex line cross sizes resulting from
@@ -4197,8 +4216,6 @@ impl<'pass> FlexFormattingContext<'pass> {
         self.take_layout_input(layout_input.clone());
         if self.main_axis_is_horizontal() {
             self.determine_flex_base_sizes_and_hypothetical_main_sizes();
-            self.collect_flex_items_into_flex_lines();
-            self.resolve_flexible_lengths();
             return self.calculate_intrinsic_main_size_of_flex_container();
         }
         if !self.is_single_line() && layout_input.available_space.inline_size == AvailableSize::MaxContent {
@@ -4343,9 +4360,15 @@ impl<'pass> FlexFormattingContext<'pass> {
             // NB: A calc-size() minimum can resolve to more than the automatic minimum size.
             let min_is_calc_size = self.flex_items[index].main_min_size_is_calc_size;
             let flex_base_size = self.flex_items[index].flex_base_size;
+            let content_basis_cannot_raise_base_size = !min_is_calc_size
+                && !self.flex_item_details[index].inputs.is_replaced_box
+                && self.flex_item_details[index].inputs.preferred_aspect_ratio.is_none()
+                && matches!(self.used_flex_basis_for_item(index), UsedFlexBasis::Content);
             let clamp_min = if self.has_main_min_size(index) {
                 self.specified_main_min_size(index)
-            } else if !min_is_calc_size && should_skip_automatic_minimum_size_clamp {
+            } else if !min_is_calc_size
+                && (should_skip_automatic_minimum_size_clamp || content_basis_cannot_raise_base_size)
+            {
                 CssPixels::default()
             } else {
                 self.automatic_minimum_size_for_clamping(index, flex_base_size.min(clamp_max))

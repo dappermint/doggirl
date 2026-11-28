@@ -1271,6 +1271,8 @@ pub(crate) struct BlockFormattingContext<'pass> {
     /// box for it.
     outside_marker_line_box_block_size_of_root: Cell<Option<CssPixels>>,
     floats: RefCell<Vec<FloatingBox>>,
+    float_count: Cell<usize>,
+    float_bands_dirty: Cell<bool>,
     deferred_float_sides: Cell<u8>,
     bands: RefCell<SmallVec<[FloatBand; 4]>>,
     lowest_left_margin_edge: Cell<Option<CssPixels>>,
@@ -1487,6 +1489,8 @@ impl<'pass> BlockFormattingContext<'pass> {
             outside_marker_line: Cell::new(None),
             outside_marker_line_box_block_size_of_root: Cell::new(None),
             floats: RefCell::new(Vec::new()),
+            float_count: Cell::new(0),
+            float_bands_dirty: Cell::new(false),
             deferred_float_sides: Cell::new(0),
             bands: RefCell::new(smallvec![FloatBand::above_every_float()]),
             lowest_left_margin_edge: Cell::new(None),
@@ -2004,8 +2008,17 @@ impl<'pass> BlockFormattingContext<'pass> {
         {
             return None;
         }
-        let style = self.style(node);
         let available_inline_size = available_space.inline_size.to_px_or_zero();
+        if self.float_count.get() == 0 {
+            let block_start = if measure_over_border_box {
+                content_position_in_root.y - self.metrics_of(sized_child).border_box_top(false)
+            } else {
+                content_position_in_root.y
+            };
+            self.note_float_read_from(block_start);
+            return Some(available_inline_size);
+        }
+        let style = self.style(node);
         let metrics = self.metrics_of(sized_child);
         let (border_box_block_size, block_size_is_unresolved) = self.block_extent_of_box_avoiding_floats(sized_child);
         let box_in_root_rect = if measure_over_border_box {
@@ -2804,6 +2817,29 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn rebuild_float_bands(&self) {
+        let float_count = self.float_count.get();
+        if float_count == 0 {
+            if !self.float_bands_dirty.get() {
+                return;
+            }
+            {
+                let mut bands = self.bands.borrow_mut();
+                bands.clear();
+                bands.push(FloatBand::above_every_float());
+            }
+            self.lowest_left_margin_edge.set(None);
+            self.lowest_right_margin_edge.set(None);
+            self.float_bands_dirty.set(false);
+            return;
+        }
+        let has_open_top_margin_group = self
+            .margin_states
+            .borrow()
+            .iter()
+            .any(|state| state.has_open_top_margin_group());
+        if !self.float_bands_dirty.get() && !has_open_top_margin_group {
+            return;
+        }
         {
             let mut bands = self.bands.borrow_mut();
             bands.clear();
@@ -2815,6 +2851,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         for &floating_box in floats.iter() {
             self.add_float_to_bands(floating_box);
         }
+        self.float_bands_dirty.set(has_open_top_margin_group);
     }
 
     fn update_lowest_floating_descendant_bottom_margin_edge(&self) {
@@ -2843,6 +2880,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             return;
         }
         self.update_lowest_floating_descendant_bottom_margin_edge();
+        self.float_bands_dirty.set(true);
         self.rebuild_float_bands();
     }
 
@@ -3097,7 +3135,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         probe: &mut FloatAvoidanceProbe,
     ) -> CssPixels {
         let node = sized_child.node;
-        if !matches!(available_space.inline_size, AvailableSize::Definite(_))
+        if self.float_count.get() == 0
+            || !matches!(available_space.inline_size, AvailableSize::Definite(_))
             || !self.box_should_avoid_floats_because_it_establishes_fc(node)
         {
             return content_block_offset;
@@ -3266,11 +3305,11 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     pub(crate) fn has_floating_boxes(&self) -> bool {
-        !self.floats.borrow().is_empty()
+        self.float_count.get() != 0
     }
 
     pub(crate) fn floating_box_count(&self) -> usize {
-        self.floats.borrow().len()
+        self.float_count.get()
     }
 
     pub(crate) fn take_floating_boxes_from(&self, index: usize) -> Vec<FloatingBox> {
@@ -3278,7 +3317,9 @@ impl<'pass> BlockFormattingContext<'pass> {
             return Vec::new();
         }
         let floating_boxes = self.floats.borrow_mut().split_off(index);
+        self.float_count.set(index);
         self.update_lowest_floating_descendant_bottom_margin_edge();
+        self.float_bands_dirty.set(true);
         self.rebuild_float_bands();
         floating_boxes
     }
@@ -3287,8 +3328,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         if floating_boxes.is_empty() {
             return;
         }
+        let added = floating_boxes.len();
         self.floats.borrow_mut().extend(floating_boxes);
+        self.float_count.set(self.float_count.get() + added);
         self.update_lowest_floating_descendant_bottom_margin_edge();
+        self.float_bands_dirty.set(true);
         self.rebuild_float_bands();
     }
 
@@ -3317,6 +3361,9 @@ impl<'pass> BlockFormattingContext<'pass> {
                 + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node)
                 + lowest_flow_position,
         );
+        if self.float_count.get() == 0 {
+            return None;
+        }
         let (clearance, margins_after_clearance) = self.flow_position_past_floats_cleared_by(
             node,
             flow_position,
@@ -3776,34 +3823,39 @@ impl<'pass> BlockFormattingContext<'pass> {
         let alignment = self.prefixed_block_alignment(node);
         let available_inline_size = available_space.inline_size.to_px_or_zero();
         let space = if self.box_should_avoid_floats_because_it_establishes_fc(node) {
-            let uses_whole_line = alignment.is_some()
-                || self.box_avoiding_floats_is_placed_from_right(node)
-                || matches!(
-                    self.style(self.containing_block(node)).text_align(),
-                    text_align::_WEBKIT_CENTER | text_align::_WEBKIT_RIGHT
+            if self.float_count.get() == 0 {
+                self.note_float_read_from(content_position_in_root.y - metrics.border_box_top(false));
+                Some(inline_formatting_context::SpaceUsedByFloats::default())
+            } else {
+                let uses_whole_line = alignment.is_some()
+                    || self.box_avoiding_floats_is_placed_from_right(node)
+                    || matches!(
+                        self.style(self.containing_block(node)).text_align(),
+                        text_align::_WEBKIT_CENTER | text_align::_WEBKIT_RIGHT
+                    );
+                let (border_box_block_size, block_size_is_unresolved) =
+                    self.block_extent_of_box_avoiding_floats(sized_child);
+                let border_box_rect = CssPixelRect {
+                    x: content_position_in_root.x,
+                    y: content_position_in_root.y - metrics.border_box_top(false),
+                    width: if uses_whole_line {
+                        available_inline_size
+                    } else {
+                        content_inline_size
+                    },
+                    height: border_box_block_size,
+                };
+                let space = self.intrusions_for_band_into_rect(
+                    self.band_beside_border_box(
+                        border_box_rect.y,
+                        border_box_rect.bottom(),
+                        content_position_in_root.y,
+                        block_size_is_unresolved,
+                    ),
+                    border_box_rect,
                 );
-            let (border_box_block_size, block_size_is_unresolved) =
-                self.block_extent_of_box_avoiding_floats(sized_child);
-            let border_box_rect = CssPixelRect {
-                x: content_position_in_root.x,
-                y: content_position_in_root.y - metrics.border_box_top(false),
-                width: if uses_whole_line {
-                    available_inline_size
-                } else {
-                    content_inline_size
-                },
-                height: border_box_block_size,
-            };
-            let space = self.intrusions_for_band_into_rect(
-                self.band_beside_border_box(
-                    border_box_rect.y,
-                    border_box_rect.bottom(),
-                    content_position_in_root.y,
-                    block_size_is_unresolved,
-                ),
-                border_box_rect,
-            );
-            Some(space)
+                Some(space)
+            }
         } else {
             None
         };
@@ -5351,7 +5403,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         block_container: Node,
         containing_line_box_fragment: Option<used_values::LineBoxFragmentCoordinate>,
     ) -> bool {
-        (self.floats.borrow().is_empty() || !self.margin_state().has_open_top_margin_group())
+        (self.float_count.get() == 0 || !self.margin_state().has_open_top_margin_group())
+            && !self.run.pass.first_child(node).is_invalid()
             && self.in_flow_child_depends_only_on_its_key_and_floats(
                 node,
                 block_container,
@@ -5995,7 +6048,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     /// Whether a float placed so far reaches below `block_offset` in `block_container`.
-    fn float_reaches_below(
+    pub(crate) fn float_reaches_below(
         &self,
         block_container: Node,
         block_offset: CssPixels,
@@ -8246,6 +8299,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.deferred_float_sides
             .set(self.deferred_float_sides.get() | if floating_box.side == FloatSide::Left { 1 } else { 2 });
         self.floats.borrow_mut().pop();
+        self.float_count.set(self.float_count.get() - 1);
+        self.float_bands_dirty.set(true);
         self.rebuild_float_bands();
         true
     }
@@ -8308,6 +8363,8 @@ impl<'pass> BlockFormattingContext<'pass> {
             return;
         }
         self.floats.borrow_mut().truncate(state.float_count);
+        self.float_count.set(state.float_count);
+        self.float_bands_dirty.set(false);
         *self.bands.borrow_mut() = state.bands;
         self.lowest_left_margin_edge.set(state.lowest_left_margin_edge);
         self.lowest_right_margin_edge.set(state.lowest_right_margin_edge);
@@ -8402,6 +8459,15 @@ impl<'pass> BlockFormattingContext<'pass> {
         margin_box_rect.x = floating_box.margin_box_left_in_root_coordinate_space();
         floating_box.margin_box_rect_in_root_coordinate_space = margin_box_rect;
         self.floats.borrow_mut().push(floating_box);
+        self.float_count.set(self.float_count.get() + 1);
+        if self
+            .margin_states
+            .borrow()
+            .iter()
+            .any(|state| state.has_open_top_margin_group())
+        {
+            self.float_bands_dirty.set(true);
+        }
         self.add_float_to_bands(floating_box);
         (floating_box, content_block_offset)
     }
