@@ -59,6 +59,36 @@ all 59 libweb cases that failed or crashed in v0.4.0 passed in v0.4.1. [test res
 
 ## speedometer 3.1
 
+### v0.4.1 against v0.4.0 and upstream
+
+v0.4.1 scored within run-to-run variation of v0.4.0 and led upstream ladybird in all six blocks
+
+| browser | median score | launch range |
+| --- | ---: | ---: |
+| doggirl v0.4.1 | 32.45 | 31.68 to 33.07 |
+| doggirl v0.4.0 | 32.18 | 31.47 to 33.41 |
+| upstream ladybird [`690336455f`](https://github.com/LadybirdBrowser/ladybird/commit/690336455f478a3ee00403e2ef40b494550b8bc3) | 22.05 | 21.30 to 22.55 |
+
+the paired score change was +0.2% (95% confidence interval -2.2% to +2.7%) against v0.4.0 and +47.2% (95% confidence interval +44.0% to +50.4%) against upstream
+
+the published doggirl bundles and upstream ladybird ran on the same apple m5 pro with macOS 27.3 on 28 november 2026. each build ran three warm-up iterations in a separate launch. the six blocks covered all six launch orders. each scored launch ran headless with a fresh profile and a 1280 × 900 css-pixel viewport at device scale 1. all 20 workloads completed in every iteration. a launch score is the mean of its ten scored iterations. [benchmark](https://browserbench.org/Speedometer3.1/)
+
+<details>
+<summary>scores by block</summary>
+
+| block | doggirl v0.4.1 | doggirl v0.4.0 | upstream ladybird |
+| ---: | ---: | ---: | ---: |
+| 1 | 31.68 | 31.50 | 22.08 |
+| 2 | 32.86 | 32.35 | 22.55 |
+| 3 | 32.60 | 33.41 | 22.27 |
+| 4 | 31.78 | 31.47 | 21.78 |
+| 5 | 32.29 | 33.14 | 21.30 |
+| 6 | 33.07 | 32.02 | 22.01 |
+
+</details>
+
+### v0.4.0 against upstream, chromium and firefox
+
 the v0.4.0 comparison ran on 28 november 2026 on an apple m5 pro running macOS 27.3. each browser ran headless with a fresh profile and a 1280 × 900 css-pixel viewport at scale 1. we ran eight blocks with one launch per browser in each block, counterbalanced the order, and scored ten full iterations per launch. the table shows the median and range of the eight launch scores. [benchmark](https://browserbench.org/Speedometer3.1/)
 
 | browser | median score | launch range |
