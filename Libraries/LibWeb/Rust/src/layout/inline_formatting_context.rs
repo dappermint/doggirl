@@ -2175,8 +2175,18 @@ impl<'context> InlineFormattingContext<'context> {
             ContentSizingLines::new(LinesWithoutLineBoxes::indented_by(false, text_indentation));
         let mut min_content_lines = ContentSizingLines::new(LinesWithoutLineBoxes::indented_by(true, text_indentation));
         for index in 0..items.len() {
-            max_content_lines.append(self, items, prepared, index);
-            min_content_lines.append(self, items, prepared, index);
+            let item = &items[index];
+            let text_info = if item.type_ == inline_level_iterator::ItemType::Text {
+                Some((
+                    self.style(self.parent_node(item.node)),
+                    item.is_collapsible_whitespace || item.is_ascii_whitespace_prepared(self, prepared),
+                    item.ends_in_ascii_space_prepared(self, prepared),
+                ))
+            } else {
+                None
+            };
+            max_content_lines.append(self, items, prepared, index, text_info);
+            min_content_lines.append(self, items, prepared, index, text_info);
         }
         max_content_lines.append_pending_start_edges();
         min_content_lines.append_pending_start_edges();
@@ -2742,8 +2752,21 @@ impl<'context> InlineFormattingContext<'context> {
             .iter()
             .take_while(|item| item.type_ != inline_level_iterator::ItemType::BlockLevelBox)
             .any(|item| item.type_ == inline_level_iterator::ItemType::FloatingElement);
-        if self.parent.floating_box_count() == 0 && !segment_has_float {
-            return;
+        if !segment_has_float {
+            let first_changed_line = self.line_data().line_boxes.len().saturating_sub(2);
+            let min_block_offset = self
+                .line_data()
+                .line_boxes
+                .get(first_changed_line)
+                .map_or(line_builder.current_block_offset(), |line| line.block_start)
+                .min(line_builder.current_block_offset());
+            if !self.parent.float_reaches_below(
+                self.containing_block,
+                min_block_offset,
+                self.containing_block_position_in_bfc_root,
+            ) {
+                return;
+            }
         }
         let first_changed_line = self.line_data().line_boxes.len().saturating_sub(2);
         let saved_lines = self.line_data().line_boxes[first_changed_line..].to_vec();
@@ -2871,7 +2894,8 @@ impl<'context> InlineFormattingContext<'context> {
                         .add_strut_of_empty_inline_box(empty_box.node, pending_leading_edges + empty_box.leading_edges);
                 }
                 if item.is_collapsible_whitespace
-                    || (item.type_ == inline_level_iterator::ItemType::Text && item.is_ascii_whitespace(self))
+                    || (item.type_ == inline_level_iterator::ItemType::Text
+                        && item.is_ascii_whitespace_prepared(self, iterator.prepared_content()))
                 {
                     // NB: Preserved white space stays on the line, hanging off its end if it has to, so a box after
                     //     it comes after it on the line too.
@@ -3128,7 +3152,8 @@ impl<'context> InlineFormattingContext<'context> {
                     });
                     let style = self.style(self.parent_node(item.node));
                     if style.text_wrap_mode() == text_wrap_mode::WRAP {
-                        let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(self);
+                        let is_whitespace = item.is_collapsible_whitespace
+                            || item.is_ascii_whitespace_prepared(self, iterator.prepared_content());
                         let line_ends_in_whitespace = self
                             .line_data()
                             .line_boxes
@@ -4533,6 +4558,7 @@ impl ContentSizingLines {
         items: &[inline_level_iterator::Item],
         prepared: &prepared_inline_content::PreparedInlineContent,
         index: usize,
+        text_info: Option<(StyleValues<'_>, bool, bool)>,
     ) {
         let item = &items[index];
         if item.type_ == inline_level_iterator::ItemType::FloatingElement {
@@ -4546,21 +4572,16 @@ impl ContentSizingLines {
         if item.is_collapsible_whitespace && line_is_empty_or_ends_in_whitespace {
             self.lines
                 .append_edges_of_collapsed_whitespace(item.margin_end, item.border_end, item.padding_end);
-            if self.lines.breaks_before_next_fragment()
-                && matches!(
-                    context.text_item_wrap_opportunity(
-                        prepared,
-                        item,
-                        context.style(context.parent_node(item.node)),
-                        true,
-                        remaining_items,
-                        line_is_empty_or_ends_in_whitespace,
-                        false,
-                    ),
-                    TextItemWrapOpportunity::BeforeWhitespaceSequence(_)
-                )
-            {
-                self.lines.finish();
+            if self.lines.breaks_before_next_fragment() {
+                let style = text_info
+                    .map(|(style, _, _)| style)
+                    .unwrap_or_else(|| context.style(context.parent_node(item.node)));
+                if style.text_wrap_mode() == text_wrap_mode::WRAP
+                    && style.white_space_collapse() != white_space_collapse::BREAK_SPACES
+                    && inline_level_iterator::has_whitespace_wrap_opportunity(context, prepared, item, remaining_items)
+                {
+                    self.lines.finish();
+                }
             }
             self.pending_start_margin += item.margin_start;
             self.pending_start_border += item.border_start;
@@ -4616,7 +4637,8 @@ impl ContentSizingLines {
                 )
             }
             inline_level_iterator::ItemType::Text => {
-                let style = context.style(context.parent_node(item.node));
+                let (style, is_whitespace, ends_in_ascii_space) = text_info.expect("text item has text_info");
+                let measures_min_content = self.measures_min_content();
                 // https://drafts.csswg.org/css-text-3/#hanging
                 // Glyphs that conditionally hang are not taken into account when computing min-content sizes
                 // and any sizes derived thereof, but they are taken into account for max-content sizes and any sizes
@@ -4624,7 +4646,7 @@ impl ContentSizingLines {
                 let trailing_whitespace_inline_size = if matches!(
                     style.white_space_collapse(),
                     white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
-                ) || (self.measures_min_content()
+                ) || (measures_min_content
                     && style.white_space_collapse() == white_space_collapse::PRESERVE
                     && style.text_wrap_mode() == text_wrap_mode::WRAP)
                 {
@@ -4633,55 +4655,33 @@ impl ContentSizingLines {
                 } else {
                     CssPixels::default()
                 };
-                // NB: Min-content breaks at every soft wrap opportunity, so content that ends in a soft hyphen ends
-                //     its line in a hyphen wherever the content after it can start a line. And min-content breaks
-                //     before every atomic inline that a line can break before, as append_atomic_inline() does.
-                let next_content = remaining_items.iter().find(|next| {
-                    !matches!(
-                        next.type_,
-                        inline_level_iterator::ItemType::InlineEdge
-                            | inline_level_iterator::ItemType::AbsolutelyPositionedElement
-                            | inline_level_iterator::ItemType::FloatingElement
-                    )
-                });
-                let breaks_after_item = next_content.is_some_and(|next| match next.type_ {
-                    inline_level_iterator::ItemType::Text | inline_level_iterator::ItemType::Element => {
-                        next.can_break_before
-                    }
-                    _ => false,
-                });
                 if style.text_wrap_mode() == text_wrap_mode::WRAP {
-                    let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(context);
                     let breaks_between_graphemes = !is_whitespace && breaks_between_graphemes(style);
-                    let opportunity = if self.lines.breaks_before_next_fragment() {
-                        let can_break_after_previous_grapheme_broken_item =
-                            previous_text_item_breaks_between_graphemes && !breaks_between_graphemes;
-                        context.text_item_wrap_opportunity(
-                            prepared,
-                            item,
-                            style,
-                            is_whitespace,
-                            remaining_items,
-                            self.lines.is_empty_or_ends_in_whitespace_that_wraps()
-                                || can_break_after_previous_grapheme_broken_item,
-                            false,
-                        )
-                    } else {
-                        TextItemWrapOpportunity::None
-                    };
                     if is_whitespace {
-                        if matches!(opportunity, TextItemWrapOpportunity::BeforeWhitespaceSequence(_)) {
-                            self.lines.finish();
-                            return;
-                        }
-                        if opportunity == TextItemWrapOpportunity::BeforeText {
-                            self.lines.finish();
+                        if self.lines.breaks_before_next_fragment() {
+                            if style.white_space_collapse() == white_space_collapse::BREAK_SPACES {
+                                let can_break_after_previous_grapheme_broken_item =
+                                    previous_text_item_breaks_between_graphemes;
+                                if self.lines.is_empty_or_ends_in_whitespace_that_wraps()
+                                    || can_break_after_previous_grapheme_broken_item
+                                {
+                                    self.lines.finish();
+                                }
+                            } else if inline_level_iterator::has_whitespace_wrap_opportunity(
+                                context,
+                                prepared,
+                                item,
+                                remaining_items,
+                            ) {
+                                self.lines.finish();
+                                return;
+                            }
                         }
                         self.lines
                             .append(border_box_inline_size, true, trailing_whitespace_inline_size);
                         return;
                     }
-                    if breaks_between_graphemes && self.measures_min_content() {
+                    if breaks_between_graphemes && measures_min_content {
                         self.previous_text_item_breaks_between_graphemes = true;
                         self.append_text_broken_between_graphemes(
                             context,
@@ -4694,10 +4694,31 @@ impl ContentSizingLines {
                         );
                         return;
                     }
-                    if opportunity == TextItemWrapOpportunity::BeforeText {
-                        self.lines.finish();
+                    if self.lines.breaks_before_next_fragment() {
+                        let can_break_after_previous_grapheme_broken_item =
+                            previous_text_item_breaks_between_graphemes && !breaks_between_graphemes;
+                        if item.can_break_before
+                            || self.lines.is_empty_or_ends_in_whitespace_that_wraps()
+                            || can_break_after_previous_grapheme_broken_item
+                        {
+                            self.lines.finish();
+                        }
                     }
-                    if self.measures_min_content() && item.has_soft_wraps(prepared) {
+                    if measures_min_content && item.has_soft_wraps(prepared) {
+                        let next_content = remaining_items.iter().find(|next| {
+                            !matches!(
+                                next.type_,
+                                inline_level_iterator::ItemType::InlineEdge
+                                    | inline_level_iterator::ItemType::AbsolutelyPositionedElement
+                                    | inline_level_iterator::ItemType::FloatingElement
+                            )
+                        });
+                        let breaks_after_item = next_content.is_some_and(|next| match next.type_ {
+                            inline_level_iterator::ItemType::Text | inline_level_iterator::ItemType::Element => {
+                                next.can_break_before
+                            }
+                            _ => false,
+                        });
                         let text = context.pass.text_content(item.node);
                         let sizes = item.soft_wrap_segment_inline_sizes(
                             prepared,
@@ -4732,14 +4753,32 @@ impl ContentSizingLines {
                 {
                     self.lines.finish();
                 }
-                let hyphen = if self.measures_min_content() && breaks_after_item {
-                    inline_level_iterator::hyphen_inline_size_after(context, prepared, item)
+                let hyphen = if measures_min_content {
+                    let next_content = remaining_items.iter().find(|next| {
+                        !matches!(
+                            next.type_,
+                            inline_level_iterator::ItemType::InlineEdge
+                                | inline_level_iterator::ItemType::AbsolutelyPositionedElement
+                                | inline_level_iterator::ItemType::FloatingElement
+                        )
+                    });
+                    let breaks_after_item = next_content.is_some_and(|next| match next.type_ {
+                        inline_level_iterator::ItemType::Text | inline_level_iterator::ItemType::Element => {
+                            next.can_break_before
+                        }
+                        _ => false,
+                    });
+                    if breaks_after_item {
+                        inline_level_iterator::hyphen_inline_size_after(context, prepared, item)
+                    } else {
+                        CssPixels::default()
+                    }
                 } else {
                     CssPixels::default()
                 };
                 self.lines.append(
                     border_box_inline_size + hyphen,
-                    item.ends_in_ascii_space(context),
+                    ends_in_ascii_space,
                     trailing_whitespace_inline_size,
                 );
                 if style.text_wrap_mode() != text_wrap_mode::WRAP {
