@@ -74,7 +74,7 @@ const NOT_LISTED: Run = Run::NOT_WRITTEN;
 pub(super) struct ValueLiveness<'w> {
     /// The values live into each block and out of each block, sorted.
     pub live_in: Lists<'w, NodeId>,
-    live_out: Lists<'w, NodeId>,
+    pub live_out: Lists<'w, NodeId>,
     /// For each node, the values whose last use (on this path) it is, as a part of `dying`.
     deaths: ZoneVec<'w, Run>,
     dying: ZoneVec<'w, NodeId>,
