@@ -84,6 +84,30 @@ pub struct CellImage {
     pub slots: List<CellSlot>,
 }
 
+fn copy_cell_words<T>(cell: Gc<T>, size: usize, out: &mut [u64]) {
+    debug_assert_eq!(out.len(), size.div_ceil(8));
+    for (index, start) in (0..size).step_by(8).enumerate() {
+        let mut bytes = [0u8; 8];
+        let len = (size - start).min(8);
+        // SAFETY: The cell is live and has `size` bytes, of which these `len` are some, and `bytes` has room for 8.
+        unsafe { core::ptr::copy_nonoverlapping(cell.as_ptr().cast::<u8>().add(start), bytes.as_mut_ptr(), len) };
+        // NB: A copy is a new cell, which has not been hashed, whatever the identity hash state of the sample is.
+        if (start..start + len).contains(&IDENTITY_HASH_STATE_OFFSET) {
+            bytes[IDENTITY_HASH_STATE_OFFSET - start] = 0;
+        }
+        out[index] = u64::from_ne_bytes(bytes);
+    }
+}
+
+fn convert_slot_kind(kind: SlotKind) -> CellSlotHolds {
+    match kind {
+        SlotKind::Value => CellSlotHolds::Value,
+        SlotKind::Cell => CellSlotHolds::Cell,
+        SlotKind::CompressedCell => CellSlotHolds::CompressedCell,
+        SlotKind::SelfPointer => CellSlotHolds::SelfPointer,
+    }
+}
+
 /// The image of the first `size` bytes of `cell`, if tracing the cell tells where all the cells in them are (see
 /// record_cell_slots()). Only then may JIT code copy the bytes, since it must know which of them are cells.
 fn cell_image<T>(snapshot: &mut SnapshotWriter, cell: Gc<T>, size: usize) -> Option<CellImage> {
@@ -91,24 +115,52 @@ fn cell_image<T>(snapshot: &mut SnapshotWriter, cell: Gc<T>, size: usize) -> Opt
     if !recorded.complete {
         return None;
     }
-    let words = snapshot.begin();
-    for_each_cell_word(cell, size, |word| snapshot.push(word));
-    let words = snapshot.end(words);
-    let slots = snapshot.begin();
-    for (offset, kind) in recorded.slots {
-        snapshot.push(CellSlot {
-            offset,
-            holds: match kind {
-                SlotKind::Value => CellSlotHolds::Value,
-                SlotKind::Cell => CellSlotHolds::Cell,
-                SlotKind::CompressedCell => CellSlotHolds::CompressedCell,
-                SlotKind::SelfPointer => CellSlotHolds::SelfPointer,
-            },
-        });
-    }
+    let word_count = size.div_ceil(8);
+    let words = if word_count <= 16 {
+        let mut stack_words = [0u64; 16];
+        copy_cell_words(cell, size, &mut stack_words[..word_count]);
+        snapshot.add(&stack_words[..word_count])
+    } else {
+        let words = snapshot.begin();
+        for_each_cell_word(cell, size, |word| snapshot.push(word));
+        snapshot.end(words)
+    };
+    let slots = snapshot.add_exact_iter(recorded.slots.into_iter().map(|(offset, kind)| CellSlot {
+        offset,
+        holds: convert_slot_kind(kind),
+    }));
+    Some(CellImage { words, slots })
+}
+
+/// The image of a template cell whose slot layout is process-constant (computed once via `record_cell_slots()`).
+fn cell_image_with_cached_slots<T, const WORDS: usize>(
+    snapshot: &mut SnapshotWriter,
+    cell: Gc<T>,
+    cached_slots: &std::sync::OnceLock<Option<Box<[CellSlot]>>>,
+) -> Option<CellImage> {
+    let slots = cached_slots
+        .get_or_init(|| {
+            let recorded = record_cell_slots(cell, size_of::<T>());
+            if !recorded.complete {
+                return None;
+            }
+            Some(
+                recorded
+                    .slots
+                    .into_iter()
+                    .map(|(offset, kind)| CellSlot {
+                        offset,
+                        holds: convert_slot_kind(kind),
+                    })
+                    .collect(),
+            )
+        })
+        .as_deref()?;
+    let mut words = [0u64; WORDS];
+    copy_cell_words(cell, size_of::<T>(), &mut words);
     Some(CellImage {
-        words,
-        slots: snapshot.end(slots),
+        words: snapshot.add(&words),
+        slots: snapshot.add(slots),
     })
 }
 
@@ -263,7 +315,15 @@ pub fn allocation_infos<'d>(
         }
     };
     // NB: Without an image, the template is empty, and code allocates objects through the runtime.
-    let object_image = cell_image(snapshot, object_template, size_of::<Object>()).unwrap_or_default();
+    const OBJECT_TEMPLATE_WORDS: usize = size_of::<Object>().div_ceil(8);
+    static OBJECT_TEMPLATE_SLOTS: std::sync::OnceLock<Option<Box<[CellSlot]>>> = std::sync::OnceLock::new();
+    debug_assert!(core::ptr::eq(class_of(object_template), Object::CLASS));
+    let object_image = cell_image_with_cached_slots::<Object, OBJECT_TEMPLATE_WORDS>(
+        snapshot,
+        object_template,
+        &OBJECT_TEMPLATE_SLOTS,
+    )
+    .unwrap_or_default();
     let mut object = cached.object;
     object.template = object_image.words;
     object.template_slots = object_image.slots;
@@ -278,7 +338,12 @@ pub fn allocation_infos<'d>(
         }
     };
     let array_shape = array_template.shape();
-    let array_image = cell_image(snapshot, array_template, size_of::<Array>()).unwrap_or_default();
+    const ARRAY_TEMPLATE_WORDS: usize = size_of::<Array>().div_ceil(8);
+    static ARRAY_TEMPLATE_SLOTS: std::sync::OnceLock<Option<Box<[CellSlot]>>> = std::sync::OnceLock::new();
+    debug_assert!(core::ptr::eq(class_of(array_template), Array::CLASS));
+    let array_image =
+        cell_image_with_cached_slots::<Array, ARRAY_TEMPLATE_WORDS>(snapshot, array_template, &ARRAY_TEMPLATE_SLOTS)
+            .unwrap_or_default();
     let mut array = cached.array;
     array.template = array_image.words;
     array.template_slots = array_image.slots;

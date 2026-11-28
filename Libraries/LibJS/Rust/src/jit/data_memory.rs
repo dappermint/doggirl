@@ -142,8 +142,16 @@ impl DataMemory {
             len,
             allocator: Rc::clone(allocator),
         };
-        for (destination, word) in memory.words().iter().zip(words) {
-            destination.set(*word);
+        if !words.is_empty() {
+            // SAFETY: `Cell<u32>` has the same layout as `u32`, `memory.words()` has length `words.len()`, and the
+            //         newly allocated block does not overlap `words`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    words.as_ptr(),
+                    memory.words().as_ptr().cast::<u32>().cast_mut(),
+                    words.len(),
+                );
+            }
         }
         memory
     }

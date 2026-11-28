@@ -125,18 +125,6 @@ impl PropertyLookupCacheEntryData {
             PropertyLookupCacheEntryType::Empty => unreachable!("empty entries have no cache key"),
         }
     }
-
-    fn has_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
-        (self.key != 0 && sweep.is_dead_or_moving(Value::from_bits(self.key).as_cell()))
-            || self.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
-            || self.shape.is_some_and(|key| sweep.is_dead_or_moving(key.shape))
-            || self
-                .prototype
-                .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
-            || self
-                .prototype_chain_validity
-                .is_some_and(|validity| sweep.is_dead_or_moving(validity))
-    }
 }
 
 // SAFETY: Entries live in the inline caches of executables and of the VM, which the VM sweeps after each collection (see
@@ -212,21 +200,37 @@ impl PropertyLookupCacheEntry {
 
     /// Forgets the whole entry if one of its cells died in this collection, as clear_cache_entry_if_dead does.
     fn clear_if_it_has_a_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
-        if self.entry_type.get() == PropertyLookupCacheEntryType::Empty
-            && self.shape.get().is_none()
-            && self.getter.get().is_none()
-        {
+        let entry_type = self.entry_type.get();
+        let shape = self.shape.get();
+        let getter = self.getter.get();
+        if entry_type == PropertyLookupCacheEntryType::Empty && shape.is_none() && getter.is_none() {
             return false;
         }
-        if self.get().has_dead_cell(sweep) {
+        let has_dead = shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
+            || self.new_shape.get().is_some_and(|shape| sweep.is_dead_or_moving(shape))
+            || self
+                .prototype
+                .get()
+                .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
+            || self
+                .prototype_chain_validity
+                .get()
+                .is_some_and(|validity| sweep.is_dead_or_moving(validity))
+            || {
+                let key = self.key.get();
+                key != 0 && sweep.is_dead_or_moving(Value::from_bits(key).as_cell())
+            };
+        if has_dead {
             self.set(PropertyLookupCacheEntryData::default());
+            return false;
         }
-        if self.getter.get().is_some_and(|getter| sweep.is_dead_or_moving(getter)) {
+        if let Some(getter_fn) = getter
+            && sweep.is_dead_or_moving(getter_fn)
+        {
             self.getter.set(None);
+            return entry_type != PropertyLookupCacheEntryType::Empty || shape.is_some();
         }
-        self.entry_type.get() != PropertyLookupCacheEntryType::Empty
-            || self.shape.get().is_some()
-            || self.getter.get().is_some()
+        true
     }
 }
 
@@ -1469,8 +1473,14 @@ impl CallCache {
 const DIRTY_PROPERTY_LOOKUP_CACHES: u8 = 1 << 0;
 const DIRTY_GLOBAL_VARIABLE_CACHES: u8 = 1 << 1;
 const DIRTY_OBJECT_SHAPE_CACHES: u8 = 1 << 2;
+const DIRTY_CALL_CACHES: u8 = 1 << 3;
 
 impl Executable {
+    #[inline]
+    pub fn has_dirty_property_lookup_caches(&self) -> bool {
+        self.head.dirty_caches.get() & DIRTY_PROPERTY_LOOKUP_CACHES != 0
+    }
+
     #[inline]
     fn mark_caches_dirty(&self, bit: u8) {
         let current = self.head.dirty_caches.get();
@@ -1537,7 +1547,7 @@ impl Executable {
     }
 
     /// Forgets the cells the inline caches remember that died in this collection.
-    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>, ran_since_last_gc: bool) {
+    pub fn remove_dead_cells(&self, sweep: &Sweep<'_>, ran_since_last_gc: bool, fold_value_feedback: bool) {
         let dirty = self.head.dirty_caches.get();
         let mut next_dirty = 0u8;
         if dirty & DIRTY_PROPERTY_LOOKUP_CACHES != 0 {
@@ -1567,9 +1577,20 @@ impl Executable {
                 next_dirty |= DIRTY_GLOBAL_VARIABLE_CACHES;
             }
         }
-        for cache in self.call_caches() {
-            if cache.has_dead_cell(sweep) {
-                cache.clear();
+        if ran_since_last_gc || (dirty & DIRTY_CALL_CACHES != 0) {
+            let mut any_live = false;
+            for cache in self.call_caches() {
+                if cache.callee.get() == CALL_CACHE_EMPTY_CALLEE {
+                    continue;
+                }
+                if cache.has_dead_cell(sweep) {
+                    cache.clear();
+                } else {
+                    any_live = true;
+                }
+            }
+            if any_live {
+                next_dirty |= DIRTY_CALL_CACHES;
             }
         }
         if dirty & DIRTY_OBJECT_SHAPE_CACHES != 0 {
@@ -1591,7 +1612,7 @@ impl Executable {
             self.head.dirty_caches.set(next_dirty);
         }
         if let Some(feedback) = self.feedback() {
-            feedback.remove_dead_cells(sweep, ran_since_last_gc);
+            feedback.remove_dead_cells(sweep, fold_value_feedback);
         }
     }
 
@@ -2195,6 +2216,9 @@ impl Executable {
         }
         let feedback = self.feedback.get().expect("the feedback was just made");
         self.head.call_caches.set(feedback.call_caches().as_ptr());
+        if !feedback.call_caches().is_empty() {
+            self.mark_caches_dirty(DIRTY_CALL_CACHES);
+        }
         self.point_interpreter_at_feedback(feedback);
         feedback
     }

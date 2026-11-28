@@ -425,18 +425,19 @@ fn array_iterator_next(vm: &Vm, realm: Gc<Realm>) -> Option<Gc<FunctionObject>> 
 /// property for as long as the object keeps the shape (see `Object::storage_set()`). Loads of the properties of
 /// prototypes always check, as they are guarded by no check of the object they load from.
 fn property_holds_data(entry: &PropertyLookupCacheEntryData) -> bool {
-    if !matches!(
-        entry.entry_type,
-        PropertyLookupCacheEntryType::GetOwnProperty | PropertyLookupCacheEntryType::ChangeOwnProperty
-    ) {
-        return false;
+    match entry.entry_type {
+        PropertyLookupCacheEntryType::ChangeOwnProperty if entry.writes_data_property => true,
+        PropertyLookupCacheEntryType::GetOwnProperty if entry.getter.is_some() => false,
+        PropertyLookupCacheEntryType::GetOwnProperty | PropertyLookupCacheEntryType::ChangeOwnProperty => {
+            let Some(ShapeKey { shape, .. }) = entry.shape else {
+                return false;
+            };
+            shape
+                .property_metadata_at_offset(entry.property_offset)
+                .is_some_and(|metadata| metadata.attributes.is_writable())
+        }
+        _ => false,
     }
-    let Some(ShapeKey { shape, .. }) = entry.shape else {
-        return false;
-    };
-    shape
-        .property_metadata_at_offset(entry.property_offset)
-        .is_some_and(|metadata| metadata.attributes.is_writable())
 }
 
 /// The value the prototype of a GetPropertyInPrototypeChain or ChangePropertyInPrototypeChain entry holds in the
@@ -810,10 +811,11 @@ impl SnapshotBuilder<'_> {
         let environment = realm.global_declarative_environment();
         let environment_serial = environment.environment_serial_number();
         let shape = object.shape();
+        let global_caches = executable.global_variable_caches();
         let caches = self.snapshot.begin();
-        for cache in executable.global_variable_caches() {
-            let row = self.global_cache(cache, object, environment, environment_serial, shape, caller);
-            self.snapshot.push(row);
+        for cache in global_caches {
+            let entry = self.global_cache(cache, object, environment, environment_serial, shape, caller);
+            self.snapshot.push(entry);
         }
         let caches = self.snapshot.end(caches);
         GlobalsSnapshot {
@@ -1589,45 +1591,61 @@ impl SnapshotBuilder<'_> {
                         .ensure_shared_jit_learning()
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    learning.merge_feedback(local_feedback, caches_slice);
-                    self.scratch
-                        .shared_max_cache_sizes
-                        .extend_from_slice(&learning.max_property_cache_sizes);
+                    let (had_prior_feedback, had_prior_property_caches) =
+                        learning.merge_feedback(local_feedback, caches_slice);
+                    if had_prior_property_caches {
+                        self.scratch
+                            .shared_max_cache_sizes
+                            .extend_from_slice(&learning.max_property_cache_sizes);
+                    }
                     if learning.has_feedback {
-                        self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
-                        self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
+                        if had_prior_feedback || local_feedback.is_none() {
+                            self.scratch.shared_call_flags.extend_from_slice(&learning.call_flags);
+                            self.scratch.shared_call_value.extend_from_slice(&learning.call_value);
+                        }
                         let arith = self.snapshot.add(&learning.arith);
                         let value = self.snapshot.add(&learning.value);
                         let cache_value = self.snapshot.add(&learning.cache_value);
-                        let keyed = self
-                            .snapshot
-                            .add_exact_iter(learning.keyed_bits.iter().map(|&bits| KeyedFeedbackSnapshot { bits }));
+                        const _: () = assert!(
+                            size_of::<KeyedFeedbackSnapshot>() == size_of::<u32>()
+                                && align_of::<KeyedFeedbackSnapshot>() == align_of::<u32>()
+                        );
+                        // SAFETY: `KeyedFeedbackSnapshot` is `#[repr(transparent)]` over `u32`.
+                        let keyed_slice = unsafe {
+                            ak::slice_from_raw_parts(
+                                learning.keyed_bits.as_ptr().cast::<KeyedFeedbackSnapshot>(),
+                                learning.keyed_bits.len(),
+                            )
+                        };
+                        let keyed = self.snapshot.add(keyed_slice);
                         (true, arith, value, cache_value, keyed)
                     } else {
                         (false, List::empty(), List::empty(), List::empty(), List::empty())
                     }
                 };
             if has_feedback {
-                let call = self.snapshot.begin();
-                if let Some(local_feedback) = local_feedback {
+                let call = if let Some(local_feedback) = local_feedback {
+                    let call = self.snapshot.begin();
                     for (slot, call) in local_feedback.call().iter().enumerate() {
                         let shared_flags = self.scratch.shared_call_flags.get(slot).copied().unwrap_or(0);
                         let shared_value = self.scratch.shared_call_value.get(slot).copied().unwrap_or(0);
                         let row = self.call_feedback(call, entry, shared_flags, shared_value);
                         self.snapshot.push(row);
                     }
+                    self.snapshot.end(call)
                 } else {
-                    for index in 0..self.scratch.shared_call_flags.len() {
-                        let flags = self.scratch.shared_call_flags[index] & SHARED_CALL_FLAGS_MASK;
-                        let value = self.scratch.shared_call_value[index];
-                        self.snapshot.push(CallFeedbackSnapshot {
+                    let shared_flags = &self.scratch.shared_call_flags;
+                    let shared_value = &self.scratch.shared_call_value;
+                    self.snapshot.add_exact_iter((0..shared_flags.len()).map(|index| {
+                        let flags = shared_flags[index] & SHARED_CALL_FLAGS_MASK;
+                        let value = shared_value[index];
+                        CallFeedbackSnapshot {
                             flags,
                             value,
                             ..CallFeedbackSnapshot::default()
-                        });
-                    }
-                }
-                let call = self.snapshot.end(call);
+                        }
+                    }))
+                };
                 let snapshot = FeedbackSnapshot {
                     arith,
                     value,
@@ -1912,10 +1930,15 @@ impl SnapshotBuilder<'_> {
         if loads.is_empty() {
             return List::empty();
         }
-        let exit_sites = executable.jit_exit_sites();
+        let has_local_exits = executable.jit_exit_site_count() != 0;
         let has_shared_exits = self.use_shared_learning && executable.code().shared_jit_learning().is_some();
         self.scratch.changed_captured_bindings.clear();
-        if !exit_sites.is_empty() || has_shared_exits {
+        if has_local_exits || has_shared_exits {
+            let exit_sites = if has_local_exits {
+                executable.jit_exit_sites()
+            } else {
+                Vec::new()
+            };
             self.scratch.changed_captured_bindings.extend(
                 loads
                     .iter()
