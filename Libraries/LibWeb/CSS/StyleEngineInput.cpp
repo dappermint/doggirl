@@ -664,7 +664,8 @@ void record_subtree_connecting_under_parent(DOM::Node& parent, DOM::Node& root, 
     style_engine->note_pending_arrivals(1);
     style_engine->list_arrival(root);
     root.set_style_arrival_pending(true);
-    if (!parent_ancestors_marked) {
+    // A stylesheet can take in arrivals before insertion finishes, clearing the marks for the next sibling.
+    if (!parent_ancestors_marked || !parent.descendant_style_arrival_pending()) {
         parent_ancestors_marked = true;
         for (auto* ancestor = &parent; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
             if (ancestor->style_arrival_pending())

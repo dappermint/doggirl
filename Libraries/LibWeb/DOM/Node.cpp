@@ -3316,7 +3316,6 @@ void Node::remove_all_children(bool suppress_observers)
     bool const has_node_iterators = document().has_node_iterators();
     bool const parent_root_is_shadow_root = parent_root.is_shadow_root();
     bool const this_is_shadow_host = is<Element>(*this) && static_cast<Element const&>(*this).is_shadow_host();
-    bool marked_parent_needs_layout_tree_update = false;
 
     bool has_subtree_mutation_observer = false;
     for (auto* inclusive_ancestor = this; inclusive_ancestor && !has_subtree_mutation_observer; inclusive_ancestor = inclusive_ancestor->parent()) {
@@ -3331,6 +3330,16 @@ void Node::remove_all_children(bool suppress_observers)
     }
 
     bool const batch_disconnect_in_style_engine = was_tracked_by_style_engine && !this_is_shadow_host && !parent_root_is_shadow_root;
+    // Check which children contributed to layout before their boxes and style identities are detached.
+    if (was_tracked_by_style_engine) {
+        for (auto* child = first_child(); child; child = child->next_sibling()) {
+            if (!node_contributes_to_layout_tree(*child))
+                continue;
+            child->update_layout_tree_for_removal(*this);
+            if (!this_is_shadow_host)
+                break;
+        }
+    }
     if (batch_disconnect_in_style_engine) {
         CSS::record_all_children_disconnecting(*this, document().layout_node_arena_if_created());
     } else if (was_tracked_by_style_engine) {
@@ -3381,16 +3390,8 @@ void Node::remove_all_children(bool suppress_observers)
         auto old_flat_tree_parent = a_child_holds_a_propagating_state_source ? old_flat_tree_parent_for_focus_within(*child, *this) : GC::Ptr<Node> {};
         bool const child_holds_a_propagating_state_source = a_child_holds_a_propagating_state_source && CSS::Invalidation::holds_a_propagating_state_source(*child);
 
-        if (was_tracked_by_style_engine) {
-            if (!marked_parent_needs_layout_tree_update || this_is_shadow_host) {
-                if (node_contributes_to_layout_tree(*child)) {
-                    child->update_layout_tree_for_removal(*this);
-                    marked_parent_needs_layout_tree_update = true;
-                }
-            }
-            if (!batch_disconnect_in_style_engine)
-                child->report_removal_to_style_engine(*this);
-        }
+        if (was_tracked_by_style_engine && !batch_disconnect_in_style_engine)
+            child->report_removal_to_style_engine(*this);
 
         // 7. Remove node from its parent’s children.
         bool const defer_subtree_root = was_connected
