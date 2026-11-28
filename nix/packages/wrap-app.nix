@@ -14,7 +14,7 @@
 }:
 
 let
-  resolvedVersion = if unwrapped != null && unwrapped ? version then unwrapped.version else "0.4.0";
+  resolvedVersion = if unwrapped != null && unwrapped ? version then unwrapped.version else "0.4.1";
 
   passthroughDarwinApp =
     stdenv.hostPlatform.isDarwin
