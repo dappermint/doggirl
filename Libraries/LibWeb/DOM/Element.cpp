@@ -188,7 +188,7 @@ void web_dom_element_attribute(Element*, ReadonlyBytes name, void* value, void (
 }
 
 #if ARCH(X86_64) && !defined(AK_OS_WINDOWS)
-static_assert(sizeof(Element) == 304);
+static_assert(sizeof(Element) == 320);
 #endif
 
 Element::RareData::~RareData() = default;

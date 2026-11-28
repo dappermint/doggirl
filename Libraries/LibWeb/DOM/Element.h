@@ -293,6 +293,8 @@ public:
     WebIDL::ExceptionOr<bool> toggle_attribute(Utf16FlyString const& name, Optional<bool> force);
     size_t attribute_list_size() const;
 
+    static constexpr size_t inline_attribute_capacity = 3;
+
     struct Attribute {
         QualifiedName name;
         Utf16String value;
@@ -1100,8 +1102,7 @@ private:
     };
     static_assert(sizeof(AttributeList) % alignof(Attribute) == 0);
 
-    static constexpr size_t inline_attribute_capacity = 2;
-    static constexpr u8 attribute_mode_heap = 3;
+    static constexpr u8 attribute_mode_heap = inline_attribute_capacity + 1;
 
     bool has_heap_attributes() const { return m_attribute_mode == attribute_mode_heap; }
     bool has_raw_attributes() const { return has_heap_attributes() ? !m_attribute_storage.heap->is_empty() : m_attribute_mode != 0; }
@@ -1186,8 +1187,8 @@ private:
     Optional<Utf16FlyString> m_id;
     Vector<Utf16FlyString, 1> m_classes;
 
-    // Stores up to two attributes inline to avoid heap allocations for common HTML elements; spills to a heap
-    // AttributeList once a third attribute is appended or capacity > 2 is requested.
+    // Stores up to three attributes inline to avoid heap allocations for common HTML elements; spills to a heap
+    // AttributeList once a fourth attribute is appended or capacity > 3 is requested.
     union AttributeStorage {
         AttributeList* heap;
         alignas(Attribute) u8 inline_bytes[inline_attribute_capacity * sizeof(Attribute)];
@@ -1237,11 +1238,6 @@ private:
     // Policy blocks it is decided when the element is inserted.
     bool m_style_attribute_awaits_content_security_policy_check : 1 { false };
     mutable bool m_has_lang_value : 1 { false };
-    // 0..=2: inline attributes in m_attribute_storage.inline_bytes; 3 (attribute_mode_heap): heap AttributeList*.
-    u8 m_attribute_mode : 2 { 0 };
-
-    // https://dom.spec.whatwg.org/#concept-element-custom-element-state
-    CustomElementState m_custom_element_state : 3 { CustomElementState::Undefined };
 
     // Built-in HTML elements that share the default HTMLElement insertion/removal steps (and have no post-connection
     // steps) opt into a fast path during bulk DOM insertion and removal. Packed into the existing bitfield padding.
@@ -1266,6 +1262,12 @@ public:
 
 private:
     TreeMutationFastPath m_tree_mutation_fast_path : 2 { TreeMutationFastPath::None };
+
+    // 0..=3: inline attributes in m_attribute_storage.inline_bytes; 4 (attribute_mode_heap): heap AttributeList*.
+    u8 m_attribute_mode : 3 { 0 };
+
+    // https://dom.spec.whatwg.org/#concept-element-custom-element-state
+    CustomElementState m_custom_element_state : 3 { CustomElementState::Undefined };
 
     // The child indices the element remembers, or zero for those not counted yet, and the generation of its parent's
     // child list they were counted in; zero for none.
