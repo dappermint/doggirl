@@ -1,5 +1,7 @@
 # doggirl
 
+<img src="UI/Icons/macos/app_icon.iconset/icon_128x128.png" alt="doggirl paw logo" width="128" height="128">
+
 doggirl is [dappermint](https://github.com/dappermint)'s hard fork of [ladybird](https://github.com/LadybirdBrowser/ladybird), an independent web browser built around its own standards-based engine. the fork focuses on browser performance and interaction latency. it keeps ladybird's [multi-process architecture](Documentation/ProcessArchitecture.md) and works on hot paths in the javascript engine, layout, style and rendering
 
 v0.4.0 includes faster aarch64 jit code generation, reuse of layout and paint work, and lower overhead for style and dom updates. [release history](https://github.com/dappermint/doggirl/releases)
@@ -22,7 +24,27 @@ nix profile install github:dappermint/doggirl/v0.4.0#doggirl
 doggirl
 ```
 
-for a declarative install, pin the same release as a flake input and import the [nix-darwin or home manager module](Documentation/Nix.md)
+### add doggirl to your flake
+
+pin the release in your `flake.nix` inputs
+
+```nix
+inputs.doggirl.url = "github:dappermint/doggirl/v0.4.0";
+```
+
+add `doggirl` to your `outputs` arguments. add the module and option below to your existing `nix-darwin` configuration's `modules` list
+
+```nix
+modules = [
+  doggirl.darwinModules.default
+  { programs.doggirl.enable = true; }
+  # your other modules
+];
+```
+
+apply your configuration with `sudo darwin-rebuild switch --flake .#my-mac`, using your configuration name in place of `my-mac`. the module installs the prebuilt bundle and exposes settings for profiles and launch flags. [nix module options](Documentation/Nix.md)
+
+for a package list, use `doggirl.packages.aarch64-darwin.doggirl` in `environment.systemPackages` or `home.packages`
 
 ## v0.4.0 test results
 
@@ -50,7 +72,7 @@ doggirl scored +46.2% versus upstream ladybird across matched blocks (95% interv
 
 ## build and contribute
 
-[build instructions](Documentation/BuildInstructionsLadybird.md) cover the source build. see the [fork's repository conventions](AGENTS.md) for its build and test workflow and [ladybird's documentation](Documentation/) for the engine. report fork-specific bugs in [doggirl issues](https://github.com/dappermint/doggirl/issues)
+[build instructions](Documentation/BuildInstructionsLadybird.md) cover the source build. see the [fork's development guide](Documentation/DoggirlDevelopment.md) for its build and test workflow and [ladybird's documentation](Documentation/) for the engine. report fork-specific bugs in [doggirl issues](https://github.com/dappermint/doggirl/issues)
 
 ## licence
 
