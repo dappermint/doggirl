@@ -5,7 +5,9 @@
  */
 
 #include <AK/HashTable.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/QuickSort.h>
+#include <AK/ScopeGuard.h>
 #include <AK/SetUnion.h>
 #include <LibGC/DeferGC.h>
 #include <LibGC/RootHashTable.h>
@@ -2913,13 +2915,40 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
     }
 
     GC::DeferGC defer_gc(parent.heap());
-    Vector<u32, 64> layout_style_nodes;
-    Vector<StyleNodeID, 64> unlinked_top_level;
-    Vector<u32, 64> departing_element_ids;
-    Vector<DOM::Element*, 64> departing_elements;
-    Vector<StyleNodeID, 64> departing_text_ids;
-    Vector<DOM::Text*, 64> departing_texts;
-    Vector<DOM::ShadowRoot*, 4> shadow_roots;
+    struct DisconnectScratch {
+        Vector<u32> layout_style_nodes;
+        Vector<StyleNodeID> unlinked_top_level;
+        Vector<StyleNodeID> departing_element_ids;
+        Vector<DOM::Element*> departing_elements;
+        Vector<StyleNodeID> departing_text_ids;
+        Vector<DOM::Text*> departing_texts;
+        Vector<DOM::ShadowRoot*> shadow_roots;
+
+        void clear_keeping_capacity()
+        {
+            layout_style_nodes.clear_with_capacity();
+            unlinked_top_level.clear_with_capacity();
+            departing_element_ids.clear_with_capacity();
+            departing_elements.clear_with_capacity();
+            departing_text_ids.clear_with_capacity();
+            departing_texts.clear_with_capacity();
+            shadow_roots.clear_with_capacity();
+        }
+    };
+    static thread_local NeverDestroyed<Optional<DisconnectScratch>> s_scratch;
+    DisconnectScratch scratch = s_scratch->has_value() ? s_scratch->release_value() : DisconnectScratch {};
+    ScopeGuard return_scratch = [&] {
+        scratch.clear_keeping_capacity();
+        if (!s_scratch->has_value())
+            *s_scratch = move(scratch);
+    };
+    auto& layout_style_nodes = scratch.layout_style_nodes;
+    auto& unlinked_top_level = scratch.unlinked_top_level;
+    auto& departing_element_ids = scratch.departing_element_ids;
+    auto& departing_elements = scratch.departing_elements;
+    auto& departing_text_ids = scratch.departing_text_ids;
+    auto& departing_texts = scratch.departing_texts;
+    auto& shadow_roots = scratch.shadow_roots;
     bool had_non_empty_direct_text_child = false;
 
     for (auto* child = parent.first_child(); child; child = child->next_sibling()) {
@@ -2958,7 +2987,7 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
                         element->set_initial_style_features_pending(false);
                         style_engine->cancel_deferred_element_initial_features_for_style_node(id);
                     }
-                    departing_element_ids.append(id.value());
+                    departing_element_ids.append(id);
                     departing_elements.append(element);
                 }
             } else if (auto* text = as_if<DOM::Text>(node)) {
@@ -2986,18 +3015,18 @@ void record_all_children_disconnecting(DOM::Node& parent, Layout::NodeArena* lay
         StyleEngineFFI::style_engine_unlink_style_nodes_from_dom_order(style_engine->host(), unlinked_top_level.span(), dom_order_parent_of(&parent));
 
     if (!departing_element_ids.is_empty()) {
-        style_engine->record_all_children_departures(dom_order_parent_of(&parent), departing_element_ids.span());
-        for (size_t i = 0; i < departing_elements.size(); ++i) {
-            style_computer.unregister_style_node(StyleNodeID { departing_element_ids[i] });
-            departing_elements[i]->set_style_node_id(no_style_node);
-        }
+        static_assert(sizeof(StyleNodeID) == sizeof(u32) && alignof(StyleNodeID) == alignof(u32));
+        ReadonlySpan<u32> departing_raw_ids { reinterpret_cast<u32 const*>(departing_element_ids.data()), departing_element_ids.size() };
+        style_engine->record_all_children_departures(dom_order_parent_of(&parent), departing_raw_ids);
+        style_computer.unregister_element_style_nodes(departing_element_ids.span());
+        for (auto* element : departing_elements)
+            element->set_style_node_id(no_style_node);
     }
 
     if (!departing_text_ids.is_empty()) {
-        for (size_t i = 0; i < departing_texts.size(); ++i) {
-            style_computer.unregister_style_node(departing_text_ids[i]);
-            departing_texts[i]->set_style_node_id(no_style_node);
-        }
+        style_computer.unregister_text_style_nodes(departing_text_ids.span());
+        for (auto* text : departing_texts)
+            text->set_style_node_id(no_style_node);
         StyleEngineFFI::style_engine_retire_text_style_nodes(style_engine->host(), departing_text_ids.span());
     }
 

@@ -158,7 +158,7 @@ struct CachedAsciiAttributeValueEntry {
     bool checked_for_single_class { false };
 };
 
-static constexpr size_t ascii_value_cache_size = 512;
+static constexpr size_t ascii_value_cache_size = 1024;
 static constexpr size_t ascii_value_cache_mask = ascii_value_cache_size - 1;
 static constexpr size_t ascii_value_cache_max_length = 64;
 static constexpr size_t text_value_cache_max_length = 128;
@@ -1889,7 +1889,7 @@ private:
             case RustFfiHtmlFragmentOperationKind::OpenElement:
             case RustFfiHtmlFragmentOperationKind::AppendVoidElement: {
                 auto element = DOM::create_builtin_html_element_for_fragment(document, heap, to_underlying(operation.tag_kind), uses_document_global_registry, registry);
-                if (operation.length > 2)
+                if (operation.length > DOM::Element::inline_attribute_capacity)
                     element->ensure_attribute_capacity(operation.length);
                 bool const is_input = operation.tag_kind == RustFfiHtmlFragmentTag::Input;
                 bool input_needs_reset = false;
