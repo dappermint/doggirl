@@ -121,10 +121,12 @@ static bool system_language_evaluates_to_true(Utf16View value)
 
 bool SVGGraphicsElement::conditional_processing_attributes_evaluate_to_true() const
 {
+    if (has_no_raw_attributes())
+        return true;
     // If the attribute is not present, then it implicitly evaluates to "true".
-    if (auto required_extensions = attribute(AttributeNames::requiredExtensions); required_extensions.has_value() && !required_extensions_evaluate_to_true(*required_extensions))
+    if (auto required_extensions = get_attribute_ns({}, AttributeNames::requiredExtensions); required_extensions.has_value() && !required_extensions_evaluate_to_true(*required_extensions))
         return false;
-    if (auto system_language = attribute(AttributeNames::systemLanguage); system_language.has_value() && !system_language_evaluates_to_true(*system_language))
+    if (auto system_language = get_attribute_ns({}, AttributeNames::systemLanguage); system_language.has_value() && !system_language_evaluates_to_true(*system_language))
         return false;
     return true;
 }

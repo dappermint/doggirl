@@ -59,12 +59,18 @@ SVGTextPositioningElement::ParsedTextPositioning SVGTextPositioningElement::pars
 {
     // https://svgwg.org/svg2-draft/text.html#TSpanAttributes
     // FIXME: Implement support for the rotate attribute.
-    return {
-        .x = SVGLengthList::parse(get_attribute_value(AttributeNames::x)),
-        .y = SVGLengthList::parse(get_attribute_value(AttributeNames::y)),
-        .dx = SVGLengthList::parse(get_attribute_value(AttributeNames::dx)),
-        .dy = SVGLengthList::parse(get_attribute_value(AttributeNames::dy)),
-    };
+    ParsedTextPositioning result;
+    if (has_no_raw_attributes())
+        return result;
+    if (auto x = get_attribute_ns({}, AttributeNames::x); x.has_value() && !x->is_empty())
+        result.x = SVGLengthList::parse(*x);
+    if (auto y = get_attribute_ns({}, AttributeNames::y); y.has_value() && !y->is_empty())
+        result.y = SVGLengthList::parse(*y);
+    if (auto dx = get_attribute_ns({}, AttributeNames::dx); dx.has_value() && !dx->is_empty())
+        result.dx = SVGLengthList::parse(*dx);
+    if (auto dy = get_attribute_ns({}, AttributeNames::dy); dy.has_value() && !dy->is_empty())
+        result.dy = SVGLengthList::parse(*dy);
+    return result;
 }
 
 GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::ensure_length_list(GC::Ptr<SVGAnimatedLengthList>& list,

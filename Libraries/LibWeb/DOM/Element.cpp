@@ -6687,6 +6687,9 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
     auto value_or_empty = value.has_value() ? value->utf16_view() : u""sv;
 
     if (local_name == HTML::AttributeNames::class_) {
+        if (old_value == value)
+            return;
+
         // Elements without a StyleEngine identity have no feature state to update. Avoid moving
         // their class list out just for record_element_class_list_changed() to reject the update.
         Optional<Vector<Utf16FlyString, 1>> old_style_engine_classes;
@@ -6719,6 +6722,9 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
     }
 
     if (local_name == HTML::AttributeNames::id) {
+        if (old_value == value)
+            return;
+
         // StyleEngine keys local features by interned atom, so capture the old side before the
         // element's own copy is replaced.
         auto old_id = m_id;
@@ -7078,34 +7084,44 @@ Utf16String Element::advisory_information() const
 Optional<Utf16String> Element::lang() const
 {
     auto determine_lang_attribute = [&]() -> Utf16String {
-        // 1. If the node is an element that has a lang attribute in the XML namespace set
-        //      Use the value of that attribute.
-        auto maybe_xml_lang = get_attribute_ns(Namespace::XML, HTML::AttributeNames::lang);
-        if (maybe_xml_lang.has_value())
-            return maybe_xml_lang.release_value();
-
-        // 2. If the node is an HTML element or an element in the SVG namespace, and it has a lang in no namespace attribute set
-        //      Use the value of that attribute.
-        if (is_html_element() || namespace_uri() == Namespace::SVG) {
-            auto maybe_lang = get_attribute(HTML::AttributeNames::lang);
-            if (maybe_lang.has_value())
-                return maybe_lang.release_value();
+        if (has_raw_attributes()) {
+            auto lang_bits = attribute_filter_bits(HTML::AttributeNames::lang);
+            if ((m_subtree_attribute_filter & lang_bits) == lang_bits) {
+                // 1. If the node is an element that has a lang attribute in the XML namespace set
+                //      Use the value of that attribute.
+                // 2. If the node is an HTML element or an element in the SVG namespace, and it has a lang in no namespace attribute set
+                //      Use the value of that attribute.
+                bool const check_no_ns_lang = is_html_element() || namespace_uri() == Namespace::SVG;
+                Utf16String const* no_ns_lang = nullptr;
+                for (auto const& [name, value] : raw_attribute_span()) {
+                    if (name.local_name() != HTML::AttributeNames::lang)
+                        continue;
+                    auto const& ns = name.namespace_();
+                    if (ns == Namespace::XML)
+                        return value;
+                    if (check_no_ns_lang && !ns.has_value() && !no_ns_lang)
+                        no_ns_lang = &value;
+                }
+                if (no_ns_lang)
+                    return *no_ns_lang;
+            }
         }
 
         // 3. If the node's parent is a shadow root
         //      Use the language of that shadow root's host.
         if (auto* parent = this->parent(); parent && parent->is_shadow_root()) {
-            if (auto language = static_cast<ShadowRoot const&>(*parent).host()->lang(); language.has_value())
-                return language.release_value();
-            return {};
+            auto const& host = *static_cast<ShadowRoot const&>(*parent).host();
+            if (!host.m_has_lang_value)
+                (void)host.lang();
+            return host.m_lang_value;
         }
 
         // 4. If the node's parent element is not null
         //      Use the language of that parent element.
         if (auto parent = parent_element()) {
-            if (auto language = parent->lang(); language.has_value())
-                return language.release_value();
-            return {};
+            if (!parent->m_has_lang_value)
+                (void)parent->lang();
+            return parent->m_lang_value;
         }
 
         // 5. Otherwise
