@@ -276,13 +276,13 @@ static Optional<SkRect> bitmap_rect_of_draw(SkMatrix const& matrix, SkPaint cons
 
 // A shadow without blur of one path in one color is the same path in the color of the shadow, moved by the offset of
 // the shadow.
-static bool shadow_is_moved_path(Canvas2DCompositing const& compositing, SkPaint const& paint, DrawnShape const& shape)
+static bool shadow_is_moved_path(Canvas2DCompositing const& compositing, SkMatrix const& matrix, SkPaint const& paint, DrawnShape const& shape)
 {
     auto const& shadow = compositing.shadow;
-    // NB: With an offset of whole pixels, the path drawn at the offset has the same edges as a layer moved by the
-    //     offset. With an operator other than source-over, a pixel that the path covers partly can blend differently
-    //     from the same pixel of a layer.
+    // Re-rasterising at the offset can change edge coverage under a rotation or scale. Translate a rasterised
+    // layer for those transforms and for fractional offsets.
     return shape.is_one_path
+        && matrix.isTranslate()
         && shadow.blur == 0
         && shadow.offset_x == AK::round(shadow.offset_x)
         && shadow.offset_y == AK::round(shadow.offset_y)
@@ -323,7 +323,7 @@ static void draw_with_compositing(SkCanvas& canvas, SkPaint& paint, Canvas2DComp
     // 5. When shadows are drawn, render the shadow from image B, using the current shadow styles, creating image C.
     // 6. When shadows are drawn, composite C within the clipping region over the current output bitmap using the
     //    current compositing and blending operator.
-    if (compositing.has_shadow && shadow_is_moved_path(compositing, paint, shape)) {
+    if (compositing.has_shadow && shadow_is_moved_path(compositing, canvas.getTotalMatrix(), paint, shape)) {
         // NB: The current transformation matrix does not affect the offset of a shadow, so the offset is applied
         //     after the matrix. The shadow takes the alpha of image B, which is the alpha of the paint.
         auto const& shadow = compositing.shadow;
