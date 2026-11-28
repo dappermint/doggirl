@@ -1234,19 +1234,13 @@ impl<'a> Planner<'a> {
             self.answered_marks.push(element);
         }
         let stamped_by_builder = facts & box_fact::STAMPED_BY_BUILDER != 0;
-        let needs_owed_image_resources = stamped_by_builder
-            || self.engine.style_record_holds_image_values(record)
-            || node_facts::kind_takes_paint_facts_from_element(planned.row().kind.get())
-            || node_facts::construction_facts_name_replaced_element(self.engine.element_construction_facts(element));
-        if needs_owed_image_resources {
-            self.owed_images.push((
-                slot,
-                OwedImageResources::StyleResources {
-                    owns_content_replacement_image: stamped_by_builder
-                        && facts & box_fact::OWNS_CONTENT_REPLACEMENT_IMAGE != 0,
-                },
-            ));
-        }
+        self.owed_images.push((
+            slot,
+            OwedImageResources::StyleResources {
+                owns_content_replacement_image: stamped_by_builder
+                    && facts & box_fact::OWNS_CONTENT_REPLACEMENT_IMAGE != 0,
+            },
+        ));
         let mut one_by_one = self.placed_row_is_committed_one_by_one(node)
             || stamped_by_builder
             || facts & box_fact::HOLDS_HIGHLIGHT_STYLE != 0
@@ -2679,15 +2673,13 @@ impl<'a> Planner<'a> {
             }
         }
 
-        if engine.element_adjustment_facts(element) & element_adjustment_fact::IS_SVG_ELEMENT != 0 {
-            let svg_attributes = self.arena.style_node_svg_attribute_facts(element);
-            if svg_attributes.is_graphics_element {
-                let svg_attributes = *svg_attributes;
-                // NB: The box of an SVG resource a graphics element references is built again with the element's list.
-                let in_unit_list = std::mem::take(&mut self.in_unit_list);
-                self.plan_svg_resources(element, node, svg_attributes);
-                self.in_unit_list = in_unit_list;
-            }
+        let svg_attributes = self.arena.style_node_svg_attribute_facts(element);
+        if svg_attributes.is_graphics_element {
+            let svg_attributes = *svg_attributes;
+            // NB: The box of an SVG resource a graphics element references is built again with the element's list.
+            let in_unit_list = std::mem::take(&mut self.in_unit_list);
+            self.plan_svg_resources(element, node, svg_attributes);
+            self.in_unit_list = in_unit_list;
         }
         if can_have_children && !children_are_discarded && !self.has_svg_root && !plans_window {
             // Add ::marker and ::after once normal children are complete.

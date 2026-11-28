@@ -366,12 +366,13 @@ fn inline_establishes_absolute_position_containing_block(style: ComputedValuesVi
 /// Whether a box with `style` may establish a containing block for absolutely or fixed positioned boxes, which
 /// [`establishes_positioning_containing_blocks`] answers for the box. A box this answers no for establishes neither,
 /// unless it is the viewport or a `<foreignObject>`'s box, which establish them whatever their style.
-pub(crate) fn style_may_establish_fixed_positioning_containing_block(style: ComputedValuesView<'_>) -> bool {
+pub(crate) fn style_may_establish_positioning_containing_blocks(style: ComputedValuesView<'_>) -> bool {
     use crate::css::css_enums::{backface_visibility, content_visibility};
     let transform = style.transform();
     let effects = style.effects();
     let box_values = style.box_values();
-    has_any_will_change(style)
+    style.position() != positioning::STATIC
+        || has_any_will_change(style)
         || !transform.transformations.pointer.is_null()
         || !transform.translate.pointer.is_null()
         || !transform.rotate.pointer.is_null()
@@ -385,10 +386,6 @@ pub(crate) fn style_may_establish_fixed_positioning_containing_block(style: Comp
         || style.content_visibility() == content_visibility::AUTO
         || transform.transform_style == transform_style::PRESERVE_3D
         || transform.backface_visibility == backface_visibility::HIDDEN
-}
-
-pub(crate) fn style_may_establish_positioning_containing_blocks(style: ComputedValuesView<'_>) -> bool {
-    style.position() != positioning::STATIC || style_may_establish_fixed_positioning_containing_block(style)
 }
 
 pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, node: NodeSlotId) -> (bool, bool) {

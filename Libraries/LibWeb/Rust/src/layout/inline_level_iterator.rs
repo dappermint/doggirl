@@ -505,36 +505,6 @@ impl Item {
             || self.exited_right_to_left_end_margin != none
     }
 
-    pub(crate) fn is_ascii_whitespace_prepared(
-        &self,
-        context: &inline_formatting_context::InlineFormattingContext<'_>,
-        prepared: &PreparedInlineContent,
-    ) -> bool {
-        assert_eq!(self.type_, ItemType::Text);
-        let prepared_item = self.prepared_item(prepared);
-        if self.offset_in_node == prepared_item.offset_in_node()
-            && self.length_in_node == prepared_item.length_in_node()
-        {
-            return prepared_item.has(PreparedItem::ASCII_WHITESPACE);
-        }
-        self.is_ascii_whitespace(context)
-    }
-
-    pub(crate) fn ends_in_ascii_space_prepared(
-        &self,
-        context: &inline_formatting_context::InlineFormattingContext<'_>,
-        prepared: &PreparedInlineContent,
-    ) -> bool {
-        assert_eq!(self.type_, ItemType::Text);
-        let prepared_item = self.prepared_item(prepared);
-        if self.offset_in_node == prepared_item.offset_in_node()
-            && self.length_in_node == prepared_item.length_in_node()
-        {
-            return prepared_item.has(PreparedItem::ENDS_IN_ASCII_SPACE);
-        }
-        self.ends_in_ascii_space(context)
-    }
-
     pub(crate) fn is_ascii_whitespace(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
         assert_eq!(self.type_, ItemType::Text);
         let text = &context.pass.text_content(self.node).text;
@@ -1426,12 +1396,6 @@ impl<'pass> InlineContentPreparer<'pass> {
         }
 
         let mut node = self.pass.first_child(containing_block);
-        if node.is_invalid() {
-            return true;
-        }
-        if self.pass.next_sibling(node).is_invalid() && self.facts(node).is_text_node() {
-            return !self.pass.text_content(node).may_require_bidi_processing;
-        }
         while !node.is_invalid() {
             let facts = self.facts(node);
             if !facts.is_text_node() {
@@ -2003,19 +1967,6 @@ impl<'pass> InlineContentPreparer<'pass> {
         }
         if can_break_before {
             flags |= PreparedItem::CAN_BREAK_BEFORE;
-        }
-        let chunk_text = &full_text[chunk.start()..chunk.start() + chunk.length()];
-        if chunk_text
-            .iter()
-            .all(|unit| *unit <= 0x7f && (*unit as u8).is_ascii_whitespace())
-        {
-            flags |= PreparedItem::ASCII_WHITESPACE;
-        }
-        if chunk_text
-            .last()
-            .is_some_and(|unit| line_box_fragment::is_ascii_space(*unit))
-        {
-            flags |= PreparedItem::ENDS_IN_ASCII_SPACE;
         }
         if is_first_chunk {
             flags |= PreparedItem::TAKES_LEADING_EDGES;
@@ -3097,36 +3048,6 @@ impl InlineLevelIterator {
             .filter(|node| context.facts(*node).is_fragmented_inline())
             .collect()
     }
-}
-
-pub(crate) fn has_whitespace_wrap_opportunity(
-    context: &inline_formatting_context::InlineFormattingContext<'_>,
-    prepared: &PreparedInlineContent,
-    whitespace: &Item,
-    items: &[Item],
-) -> bool {
-    if items
-        .iter()
-        .find(|item| !sits_between_line_content(item))
-        .is_some_and(|item| item.type_ == ItemType::Element && item.can_break_before)
-    {
-        return false;
-    }
-    let (length, end) = sequence_length(context, prepared, items, false, false);
-    let prefix =
-        (end == SequenceEnd::SoftWrapInText).then(|| first_breakable_segment(context, prepared, &items[length], end));
-    if length == 0 && prefix.is_none() {
-        return false;
-    }
-    let whitespace_after = (end == SequenceEnd::Whitespace && length > 0).then(|| &items[length]);
-    let size = sequence_inline_extent(
-        context,
-        std::iter::once(whitespace)
-            .chain(&items[..length])
-            .chain(prefix.as_ref()),
-        whitespace_after,
-    );
-    size > inline_extent([whitespace])
 }
 
 pub(crate) fn whitespace_and_sequence_inline_size(

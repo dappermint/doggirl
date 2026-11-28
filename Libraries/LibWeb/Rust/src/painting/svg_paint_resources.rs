@@ -228,11 +228,6 @@ impl SvgPaintResources {
         }
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn has_slot(&self, slot: NodeSlotId) -> bool {
-        self.rows.contains_key(&slot)
-    }
-
     /// Raises `flag`, which the document's host reads, while any row enrolled a resource, rather than a flag of its
     /// own. No row has enrolled one yet.
     pub(crate) fn share_enrolled_flag(&mut self, flag: Arc<AtomicBool>) {

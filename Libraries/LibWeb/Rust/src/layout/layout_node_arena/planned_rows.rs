@@ -23,9 +23,6 @@ mod planned_style_fact {
     pub(crate) const IS_ABSOLUTELY_POSITIONED: u32 = 1 << 8;
     /// The box has size containment or is a size container, which a box's replaced content facts follow.
     pub(crate) const HAS_SIZE_CONTAINMENT_OR_IS_SIZE_CONTAINER: u32 = 1 << 9;
-    /// The box has non-static `position` and no properties that could establish a fixed containing block, so its
-    /// absolute containing block flag can be stamped directly during planning without per-row commit derivation.
-    pub(crate) const ESTABLISHES_ABSOLUTE_CB_ONLY: u32 = 1 << 10;
     /// Where the SVG paint resource kinds the row enrolls start, in the bits above the others.
     pub(crate) const SVG_PAINT_RESOURCE_KINDS_SHIFT: u32 = 16;
 }
@@ -55,10 +52,8 @@ pub(crate) fn planned_record_style_facts(style: ComputedValuesView<'_>) -> u32 {
     if super::super::node_facts::style_makes_scroll_container(style) {
         facts |= MAKES_SCROLL_CONTAINER;
     }
-    if crate::painting::style_queries::style_may_establish_fixed_positioning_containing_block(style) {
+    if crate::painting::style_queries::style_may_establish_positioning_containing_blocks(style) {
         facts |= MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS;
-    } else if style.position() != crate::css::css_enums::positioning::STATIC {
-        facts |= ESTABLISHES_ABSOLUTE_CB_ONLY;
     }
     if style.is_absolutely_positioned() {
         facts |= IS_ABSOLUTELY_POSITIONED;
@@ -99,12 +94,6 @@ pub(crate) fn planned_style_facts_for_kind(record_facts: u32, kind: NodeKind) ->
     if !crate::painting::node_painting::is_svg_path(kind) {
         let path_kinds = SvgPaintResourceKind::Fill.bit() | SvgPaintResourceKind::Stroke.bit();
         facts &= !(u32::from(path_kinds) << SVG_PAINT_RESOURCE_KINDS_SHIFT);
-    }
-    if facts & ESTABLISHES_ABSOLUTE_CB_ONLY != 0 && !super::super::node_facts::kind_is_box(kind) {
-        facts &= !ESTABLISHES_ABSOLUTE_CB_ONLY;
-        if kind == NodeKind::InlineNode {
-            facts |= MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS;
-        }
     }
     facts
 }
@@ -147,9 +136,6 @@ pub(crate) fn planned_style_flags(style_facts: u32) -> u32 {
     if style_facts & HAS_PRESERVE_3D_TRANSFORM_STYLE != 0 {
         flags |= NodeFlag::HasPreserve3dTransformStyle as u32;
     }
-    if style_facts & ESTABLISHES_ABSOLUTE_CB_ONLY != 0 {
-        flags |= NodeFlag::EstablishesAbsolutePositionContainingBlock as u32;
-    }
     flags
 }
 
@@ -178,19 +164,17 @@ fn planned_row_enrolls_for_replaced_content_facts(row: &NodeData, style_facts: u
 /// element's. Any other row of a planned parent takes nothing from either.
 pub(crate) fn planned_element_row_notes_its_style(row: &NodeData, style_facts: u32) -> bool {
     use planned_style_fact::*;
-    let needs_cb_derivation = style_facts & MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS != 0
-        || (style_facts & ESTABLISHES_ABSOLUTE_CB_ONLY == 0
-            && row.flags.get()
-                & (NodeFlag::EstablishesAbsolutePositionContainingBlock as u32
-                    | NodeFlag::EstablishesFixedPositionContainingBlock as u32)
-                != 0);
-    needs_cb_derivation
-        || style_facts
-            & (IS_ABSOLUTELY_POSITIONED
-                | MAKES_SCROLL_CONTAINER
-                | (u32::from(u8::MAX) << SVG_PAINT_RESOURCE_KINDS_SHIFT))
+    style_facts
+        & (MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS
+            | IS_ABSOLUTELY_POSITIONED
+            | MAKES_SCROLL_CONTAINER
+            | (u32::from(u8::MAX) << SVG_PAINT_RESOURCE_KINDS_SHIFT))
+        != 0
+        || row.flags.get()
+            & (NodeFlag::IsDocumentElement as u32
+                | NodeFlag::EstablishesAbsolutePositionContainingBlock as u32
+                | NodeFlag::EstablishesFixedPositionContainingBlock as u32)
             != 0
-        || row.flags.get() & NodeFlag::IsDocumentElement as u32 != 0
         || matches!(row.kind.get(), NodeKind::Viewport | NodeKind::SVGForeignObjectBox)
         || planned_row_enrolls_for_replaced_content_facts(row, style_facts)
 }
@@ -221,7 +205,6 @@ impl LayoutNodeArena {
         }
         let svg_paint_resource_kinds = (style_facts >> SVG_PAINT_RESOURCE_KINDS_SHIFT) as u8;
         if svg_paint_resource_kinds != 0 {
-            self.metadata_mut(slot.slot_index()).state |= slot_state::HAS_SVG_PAINT_RESOURCES;
             self.svg_paint_resources
                 .set_enrolled_kinds(slot, svg_paint_resource_kinds);
         }
@@ -300,9 +283,6 @@ impl LayoutNodeArena {
         owed: &std::sync::Arc<OwedImageResourcesEntries>,
         range: std::ops::Range<usize>,
     ) {
-        if range.is_empty() {
-            return;
-        }
         self.image_resources_owed_to_host
             .stretches
             .push(OwedImageResourcesStretch::Planned(owed.clone(), range));
@@ -333,7 +313,7 @@ impl LayoutNodeArena {
         let (may_establish_positioning_containing_blocks, may_be_absolutely_positioned) =
             style_facts.map_or((true, true), |facts| {
                 (
-                    facts & (MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS | ESTABLISHES_ABSOLUTE_CB_ONLY) != 0,
+                    facts & MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS != 0,
                     facts & IS_ABSOLUTELY_POSITIONED != 0,
                 )
             });
@@ -631,7 +611,7 @@ impl LayoutNodeArena {
         let (may_establish_positioning_containing_blocks, may_be_absolutely_positioned) =
             style_facts.map_or((true, true), |facts| {
                 (
-                    facts & (MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS | ESTABLISHES_ABSOLUTE_CB_ONLY) != 0,
+                    facts & MAY_ESTABLISH_POSITIONING_CONTAINING_BLOCKS != 0,
                     facts & IS_ABSOLUTELY_POSITIONED != 0,
                 )
             });

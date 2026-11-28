@@ -33,11 +33,6 @@ impl PartialRelayoutBoundaryRoots {
             self.freed += 1;
         }
     }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn contains(&self, node: NodeSlotId) -> bool {
-        self.registered.contains(&node)
-    }
 }
 
 pub(crate) struct LayoutTreeUpdateClassification {
@@ -201,7 +196,6 @@ impl LayoutNodeArena {
         }
         if roots.registered.insert(node) {
             roots.roots.push(node);
-            self.note_slot_state(node.slot_index(), super::layout_node_arena::slot_state::HAS_PARTIAL_BOUNDARY);
         }
         self.partial_relayout_boundary_roots = roots;
     }

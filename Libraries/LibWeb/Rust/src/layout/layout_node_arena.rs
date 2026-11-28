@@ -441,9 +441,7 @@ impl TextSlots {
 
     /// Empties the slot at `index`, if there is one.
     fn reset(&mut self, index: usize) {
-        if let Some(slot) = self.slots.get(index)
-            && (slot.state != TextNodeSlot::NO_STATE || slot.generation != 0)
-        {
+        if index < self.slots.len() {
             self.release_state(index);
             self.slots[index] = TextNodeSlot::default();
             self.republish(index);
@@ -589,23 +587,11 @@ struct SlotMetadata {
 }
 
 /// What [`SlotMetadata::state`] says of a slot.
-pub(super) mod slot_state {
+mod slot_state {
     /// The slot holds a live row.
     pub(super) const OCCUPIED: u8 = 1 << 0;
     /// The row is in [`super::LayoutNodeArena::nodes_enrolled_for_replaced_content_facts_sync`].
     pub(super) const ENROLLED_FOR_REPLACED_CONTENT_FACTS_SYNC: u8 = 1 << 1;
-    /// The row may have an entry in [`super::LayoutNodeArena::out_of_flow_positioning_contained`].
-    pub(super) const HAS_OUT_OF_FLOW_CONTAINED: u8 = 1 << 2;
-    /// The row may have an entry in [`super::LayoutNodeArena::replaced_paint_facts`].
-    pub(super) const HAS_REPLACED_PAINT_FACTS: u8 = 1 << 3;
-    /// The row may have an entry in [`super::LayoutNodeArena::layer_image_paint_facts`].
-    pub(super) const HAS_LAYER_IMAGE_PAINT_FACTS: u8 = 1 << 4;
-    /// The row may have an entry in [`super::LayoutNodeArena::svg_paint_resources`].
-    pub(super) const HAS_SVG_PAINT_RESOURCES: u8 = 1 << 5;
-    /// The row may be registered in [`super::LayoutNodeArena::partial_relayout_boundary_roots`].
-    pub(crate) const HAS_PARTIAL_BOUNDARY: u8 = 1 << 6;
-    /// The row may be enrolled in [`super::LayoutNodeArena::text_nodes_enrolled_for_content_sync`].
-    pub(super) const HAS_TEXT_CONTENT_SYNC: u8 = 1 << 7;
 }
 
 impl SlotMetadata {
@@ -854,17 +840,11 @@ impl FreedSubtree {
     pub(crate) fn destroy_shells_and_invoke_callbacks(self, main_thread: &crate::stage::MainThread) {
         if let Some(host_tables) = main_thread.host_tables() {
             if !host_tables.shells.borrow().is_empty() {
-                let mut shells_to_destroy: smallvec::SmallVec<[*mut c_void; 8]> = smallvec::SmallVec::new();
-                {
-                    let mut shells = host_tables.shells.borrow_mut();
-                    for &slot in &self.rows {
-                        if let Some(shell) = shells.remove(&slot) {
-                            shells_to_destroy.push(shell.as_ptr());
-                        }
+                for &slot in &self.rows {
+                    let shell = host_tables.shells.borrow_mut().remove(&slot);
+                    if let Some(shell) = shell {
+                        crate::layout::tree_mutation::destroy_shell(main_thread, shell.as_ptr());
                     }
-                }
-                for shell in shells_to_destroy {
-                    crate::layout::tree_mutation::destroy_shell(main_thread, shell);
                 }
             }
             if !host_tables.rows_with_layer_image_paint_facts.borrow().is_empty() {
@@ -874,31 +854,19 @@ impl FreedSubtree {
                 }
             }
             if !host_tables.owned_image_providers.borrow().is_empty() {
-                let mut providers_to_destroy: smallvec::SmallVec<[*mut c_void; 4]> = smallvec::SmallVec::new();
-                {
-                    let mut providers = host_tables.owned_image_providers.borrow_mut();
-                    for &slot in &self.rows {
-                        if let Some(provider) = providers.remove(&slot) {
-                            providers_to_destroy.push(provider);
-                        }
+                for &slot in &self.rows {
+                    let provider = host_tables.owned_image_providers.borrow_mut().remove(&slot);
+                    if let Some(provider) = provider {
+                        crate::layout::tree_mutation::destroy_owned_image_provider(main_thread, provider);
                     }
-                }
-                for provider in providers_to_destroy {
-                    crate::layout::tree_mutation::destroy_owned_image_provider(main_thread, provider);
                 }
             }
             if !host_tables.image_observer_sets.borrow().is_empty() {
-                let mut observers_to_destroy: smallvec::SmallVec<[*mut c_void; 4]> = smallvec::SmallVec::new();
-                {
-                    let mut sets = host_tables.image_observer_sets.borrow_mut();
-                    for &slot in &self.rows {
-                        if let Some(observers) = sets.remove(&slot) {
-                            observers_to_destroy.push(observers);
-                        }
+                for &slot in &self.rows {
+                    let observers = host_tables.replace_image_observers(slot, std::ptr::null_mut());
+                    if !observers.is_null() {
+                        crate::layout::tree_mutation::destroy_image_observers(main_thread, observers);
                     }
-                }
-                for observers in observers_to_destroy {
-                    crate::layout::tree_mutation::destroy_image_observers(main_thread, observers);
                 }
             }
         }
@@ -985,7 +953,7 @@ impl BoundRows {
     }
 
     fn has_pseudo_element_rows(&self, generator: StyleNodeID) -> bool {
-        !self.pseudo_elements.is_empty() && self.pseudo_elements.contains_key(&generator)
+        self.pseudo_elements.contains_key(&generator)
     }
 
     /// Binds the pseudo-element to `row`, or unbinds it for an invalid one, and answers the row it was bound to.
@@ -1979,16 +1947,15 @@ impl LayoutNodeArena {
         *self.searchable_text = None;
         let index = id.slot_index();
         let id_generation = id.generation();
-        let (should_reuse, slot_state_bits) = {
+        let should_reuse = {
             let metadata = self.metadata_mut(index);
             assert!(metadata.occupied(), "layout node arena freed an unused slot");
             assert_eq!(
                 metadata.generation, id_generation,
                 "layout node arena freed a stale slot generation"
             );
-            (metadata.generation != u8::MAX, metadata.state)
+            metadata.generation != u8::MAX
         };
-        let flags = self.data(id).flags.get();
 
         let paintable_row_reset = self.prepare_paintable_row_freed_reset(index);
         if let Some(reset) = paintable_row_reset {
@@ -1997,21 +1964,14 @@ impl LayoutNodeArena {
         if !self.inline_boxes_lifted_out_of.is_empty() {
             self.inline_boxes_lifted_out_of.remove(&id);
         }
-        if slot_state_bits & slot_state::HAS_OUT_OF_FLOW_CONTAINED != 0 {
+        if !self.out_of_flow_positioning_contained.is_empty() {
             self.out_of_flow_positioning_contained.remove(&id);
-        } else {
-            debug_assert!(!self.out_of_flow_positioning_contained.contains_key(&id));
         }
         if !self.rows_positioned_against_implicit_anchor.is_empty() {
             self.rows_positioned_against_implicit_anchor.remove(&id);
         }
         self.pre_order_labels[index as usize] = 0;
-        if slot_state_bits & slot_state::HAS_PARTIAL_BOUNDARY != 0 {
-            self.partial_relayout_boundary_roots.note_freed(id);
-        } else {
-            #[cfg(debug_assertions)]
-            debug_assert!(!self.partial_relayout_boundary_roots.contains(id));
-        }
+        self.partial_relayout_boundary_roots.note_freed(id);
         self.metadata_mut(index).set_occupied(false);
         self.forget_row_sharing_dom_node(id);
         self.unbind_row(id);
@@ -2027,12 +1987,8 @@ impl LayoutNodeArena {
         self.links_held_apart_from_their_containing_blocks.remove(id);
         self.paintable_rows.reset_committed_fragment_link_slot(index);
         self.text_slots.reset(index as usize);
-        if slot_state_bits & slot_state::HAS_TEXT_CONTENT_SYNC != 0 {
-            if !self.text_nodes_enrolled_for_content_sync.is_empty() {
-                self.text_nodes_enrolled_for_content_sync.remove(&id);
-            }
-        } else {
-            debug_assert!(!self.text_nodes_enrolled_for_content_sync.contains(&id));
+        if !self.text_nodes_enrolled_for_content_sync.is_empty() {
+            self.text_nodes_enrolled_for_content_sync.remove(&id);
         }
         if self
             .replaced_content_facts
@@ -2051,36 +2007,19 @@ impl LayoutNodeArena {
             self.display_contents_text_wrappers.remove(&id);
         }
         self.memo_invalidations.note_slot_freed(index);
-        if flags & (NodeFlag::NeedsLayoutUpdate as u32 | NodeFlag::NeedsOwnGeometryUpdate as u32) != 0 {
-            self.remove_layout_update_flag_node(id);
-        } else {
-            debug_assert!(!self.layout_update_flag_node_indices.contains_key(&id));
-        }
+        self.remove_layout_update_flag_node(id);
         if !self.math_layout_kinds.is_empty() {
             self.math_layout_kinds.remove(&id);
         }
-        if slot_state_bits & slot_state::HAS_REPLACED_PAINT_FACTS != 0 {
-            if !self.replaced_paint_facts.is_empty() && self.replaced_paint_facts.contains_key(&id) {
-                Arc::make_mut(&mut self.replaced_paint_facts).remove(&id);
-                self.paint_fact_writes += 1;
-            }
-        } else {
-            debug_assert!(!self.replaced_paint_facts.contains_key(&id));
+        if !self.replaced_paint_facts.is_empty() && self.replaced_paint_facts.contains_key(&id) {
+            Arc::make_mut(&mut self.replaced_paint_facts).remove(&id);
+            self.paint_fact_writes += 1;
         }
-        if slot_state_bits & slot_state::HAS_LAYER_IMAGE_PAINT_FACTS != 0 {
-            if !self.layer_image_paint_facts.is_empty() && self.layer_image_paint_facts.contains_key(&id) {
-                Arc::make_mut(&mut self.layer_image_paint_facts).remove(&id);
-                self.paint_fact_writes += 1;
-            }
-        } else {
-            debug_assert!(!self.layer_image_paint_facts.contains_key(&id));
+        if !self.layer_image_paint_facts.is_empty() && self.layer_image_paint_facts.contains_key(&id) {
+            Arc::make_mut(&mut self.layer_image_paint_facts).remove(&id);
+            self.paint_fact_writes += 1;
         }
-        if slot_state_bits & slot_state::HAS_SVG_PAINT_RESOURCES != 0 {
-            self.svg_paint_resources.forget_slot(id);
-        } else {
-            #[cfg(debug_assertions)]
-            debug_assert!(!self.svg_paint_resources.has_slot(id));
-        }
+        self.svg_paint_resources.forget_slot(id);
         if has_any_highlight_pseudo_styles {
             for highlight in crate::painting::selection::HighlightPseudoElement::ALL {
                 let styles = self.paint_state.highlight_pseudo_styles_mut(highlight);
@@ -3402,9 +3341,6 @@ impl LayoutNodeArena {
                 kinds |= SvgPaintResourceKind::Stroke.bit();
             }
         }
-        if kinds != 0 {
-            self.metadata_mut(id.slot_index()).state |= slot_state::HAS_SVG_PAINT_RESOURCES;
-        }
         self.svg_paint_resources.set_enrolled_kinds(id, kinds);
     }
 
@@ -4685,11 +4621,6 @@ impl LayoutNodeArena {
                     NodeFlag::EstablishesAbsolutePositionContainingBlock as u32;
             }
         }
-        self.metadata_mut(inputs.containing_block.slot_index()).state |= slot_state::HAS_OUT_OF_FLOW_CONTAINED;
-        if !inputs.inline_containing_block.is_invalid() {
-            self.metadata_mut(inputs.inline_containing_block.slot_index()).state |=
-                slot_state::HAS_OUT_OF_FLOW_CONTAINED;
-        }
         self.mark_nodes_escaped_by_out_of_flow_box(node, inputs.containing_block);
     }
 
@@ -4775,7 +4706,6 @@ impl LayoutNodeArena {
 
     pub(crate) fn enroll_text_node_for_content_sync(&mut self, node: NodeSlotId) {
         self.text_nodes_enrolled_for_content_sync.insert(node);
-        self.metadata_mut(node.slot_index()).state |= slot_state::HAS_TEXT_CONTENT_SYNC;
     }
 
     /// Stamps a row the build allocated for a DOM node, with the facts the style mirror publishes
@@ -5091,7 +5021,6 @@ impl LayoutNodeArena {
             false
         } else {
             Arc::make_mut(table).insert(id, entries);
-            self.metadata_mut(id.slot_index()).state |= slot_state::HAS_LAYER_IMAGE_PAINT_FACTS;
             true
         };
         if changed {
@@ -5143,7 +5072,6 @@ impl LayoutNodeArena {
                 continue;
             }
             Arc::make_mut(&mut self.replaced_paint_facts).insert(row, facts.clone());
-            self.metadata_mut(row.slot_index()).state |= slot_state::HAS_REPLACED_PAINT_FACTS;
             self.paint_fact_writes += 1;
             self.note_paint_change_for_repaint(row, paint_change);
         }
@@ -6161,7 +6089,6 @@ impl LayoutNodeArena {
         self.built_text_rows_awaiting_sync = ForkVec::default();
         for row in waiting {
             self.text_nodes_enrolled_for_content_sync.insert(row);
-            self.metadata_mut(row.slot_index()).state |= slot_state::HAS_TEXT_CONTENT_SYNC;
         }
     }
 
@@ -7000,10 +6927,6 @@ impl LayoutNodeArena {
             .get_mut(index / SLOTS_PER_CHUNK)
             .expect("invalid layout node arena slot ID");
         chunk.slot_mut(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes)
-    }
-
-    pub(super) fn note_slot_state(&mut self, index: u32, bit: u8) {
-        self.metadata_mut(index).state |= bit;
     }
 
     fn metadata_mut(&mut self, index: u32) -> &mut SlotMetadata {
