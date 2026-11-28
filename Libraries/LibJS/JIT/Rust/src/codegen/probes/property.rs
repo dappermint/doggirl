@@ -227,6 +227,46 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         Ok(())
     }
 
+    /// Continues probing a non-null cache whose first entry did not match `registers.shape`,
+    /// where `registers.entry` already holds the masked cache data pointer and `self.pinned.scratch`
+    /// holds the raw tagged cache pointer.
+    fn probe_cache_entry_after_first(
+        &mut self,
+        registers: &CacheRegisters,
+        miss: Label,
+        megamorphic_miss: Label,
+    ) {
+        let layout = self.runtime.layout;
+        let scratch = self.pinned.scratch;
+        let CacheRegisters { shape, entry, .. } = *registers;
+        let found = self.masm.new_label();
+        self.masm
+            .and64_imm(scratch, scratch, !layout.property_lookup_cache_data_pointer_mask);
+        let not_polymorphic = self.masm.new_label();
+        self.masm.branch64_imm(
+            Condition::NotEqual,
+            scratch,
+            layout.property_lookup_cache_polymorphic_tag as i64,
+            not_polymorphic,
+        );
+        for _ in 1..layout.property_lookup_cache_polymorphic_entry_count {
+            self.masm
+                .add64_imm(entry, entry, i64::from(layout.property_lookup_cache_entry_size));
+            self.branch_if_entry_shape(entry, shape, found);
+        }
+        self.masm.jump(miss);
+        self.masm.bind(not_polymorphic);
+        self.masm.branch64_imm(
+            Condition::NotEqual,
+            scratch,
+            layout.property_lookup_cache_megamorphic_tag as i64,
+            miss,
+        );
+        self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Named, found, megamorphic_miss);
+        self.masm.bind(found);
+        self.branch_unless_dictionary_generation_matches(shape, entry, miss);
+    }
+
     /// Branches to `miss` unless the dictionary generation of the shape in
     /// `shape` is the cache entry's. Clobbers `shape`.
     fn branch_unless_dictionary_generation_matches(&mut self, shape: Gpr, entry: Gpr, miss: Label) {
@@ -634,6 +674,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
         self.masm.branch_test64(Condition::Zero, entry, u64::MAX, probe);
+        self.masm.move64(scratch, entry);
         self.masm
             .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
         self.masm.branch64_memory(
@@ -675,7 +716,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.bind(others);
         let vm_cache_name = self.megamorphic_cache_name(executable, name_index);
         let vm_cache = vm_cache_name.map(|_| self.masm.new_label());
-        self.probe_cache_entry(&registers, executable, cache_index, probe, vm_cache.unwrap_or(probe))?;
+        self.probe_cache_entry_after_first(&registers, probe, vm_cache.unwrap_or(probe));
         self.masm.branch32_memory_imm(
             Condition::NotEqual,
             &Address::new(entry, layout.property_lookup_cache_entry_type as i32),

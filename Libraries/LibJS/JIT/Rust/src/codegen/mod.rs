@@ -2089,10 +2089,10 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
                 let cell = self.cell_address_of(node_id, output, 1);
                 let storage = Address::new(cell, self.runtime.offsets.object_named_properties as i32);
                 self.masm.load64(output, &storage);
-                if let Some(exit) = exit {
-                    self.emit_exit_if_accessor(&slot, exit);
-                }
                 self.masm.load64(output, &slot);
+                if let Some(exit) = exit {
+                    self.branch_on_tag(Condition::Equal, output, value::ACCESSOR_TAG, self.pinned.scratch, exit);
+                }
             }
             Op::StoreNamed { offset, holds_data } => {
                 let exit = (!holds_data).then(|| self.exit_site(node_id));

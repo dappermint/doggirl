@@ -817,6 +817,15 @@ mod macro_assembler {
             "negs w3, w4; b.vs 0x0" => |m| backward!(m, |m: &mut MacroAssembler, l| m.branch_neg32_overflow(X3, X4, l));
             "fcmp d0, d1; b.eq 0x0; b.vs 0x0" => |m| backward!(m, |m: &mut MacroAssembler, l| m.branch_double(DoubleCondition::EqualOrUnordered, D0, D1, l));
             "fcmp d0, d1; b.mi 0x0" => |m| backward!(m, |m: &mut MacroAssembler, l| m.branch_double(DoubleCondition::LessThan, D0, D1, l));
+        });
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        assert_encodings!(MacroAssembler, disassembler::aarch64, {
+            "fjcvtzs w0, d1; b.ne 0x0" => |m| {
+                backward!(m, |m: &mut MacroAssembler, l| m.branch_convert_double_to_int32(X0, D1, l, NegativeZero::Fail));
+            };
+        });
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        assert_encodings!(MacroAssembler, disassembler::aarch64, {
             "fcvtzs w0, d1; scvtf d31, w0; fcmp d31, d1; b.ne 0x0; cbnz w0, 0x1c; fmov x17, d1; tbnz x17, #0x3f, 0x0" => |m| {
                 backward!(m, |m: &mut MacroAssembler, l| m.branch_convert_double_to_int32(X0, D1, l, NegativeZero::Fail));
             };

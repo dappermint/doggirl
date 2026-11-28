@@ -165,6 +165,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// a zero low half.
     pub(in crate::codegen) fn emit_float64_to_int32(&mut self, node: NodeId) {
         let (input, output) = (self.float_input(node, 0), self.output(node));
+        if self.masm.js_truncate_double_to_int32(output, input) {
+            return;
+        }
         let (large, done) = (self.masm.new_label(), self.masm.new_label());
         // NB: Truncations out of range result in the smallest or (on some
         //     targets) the largest int64.

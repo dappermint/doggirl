@@ -141,21 +141,37 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.local_address(self.locals.saves + 8 * index as u32)
     }
 
-    /// Stores `registers` into the saves area, in order.
+    /// Stores `registers` into the saves area, in order, pairing adjacent saves where supported.
     pub(super) fn emit_save_registers(&mut self, registers: &[Gpr]) {
-        for (index, register) in registers.iter().enumerate() {
+        let mut index = 0;
+        while index + 1 < registers.len() {
             let address = self.save_address(index);
-            self.masm.store64(&address, *register);
+            self.masm.store_pair64(&address, registers[index], registers[index + 1]);
+            index += 2;
+        }
+        if index < registers.len() {
+            let address = self.save_address(index);
+            self.masm.store64(&address, registers[index]);
         }
     }
 
     /// Loads `registers` back from the saves area, but `except`, which holds
-    /// a result.
+    /// a result, pairing adjacent loads where supported.
     pub(super) fn emit_restore_registers(&mut self, registers: &[Gpr], except: Option<Gpr>) {
-        for (index, register) in registers.iter().enumerate() {
-            if Some(*register) != except {
+        let mut index = 0;
+        while index < registers.len() {
+            if Some(registers[index]) == except {
+                index += 1;
+                continue;
+            }
+            if index + 1 < registers.len() && Some(registers[index + 1]) != except {
                 let address = self.save_address(index);
-                self.masm.load64(*register, &address);
+                self.masm.load_pair64(registers[index], registers[index + 1], &address);
+                index += 2;
+            } else {
+                let address = self.save_address(index);
+                self.masm.load64(registers[index], &address);
+                index += 1;
             }
         }
     }
