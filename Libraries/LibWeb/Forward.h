@@ -578,7 +578,7 @@ class WholeBodyTransport;
 namespace Web::Fetch::Engine::Event {
 
 struct EndOfBody;
-struct NetworkActivity;
+struct TransportActivity;
 
 }
 
