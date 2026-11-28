@@ -306,6 +306,18 @@ let
     appearance = mkOption {
       type = types.submodule {
         options = {
+          showAllTabsButton = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Show the all tabs button in the toolbar.";
+          };
+
+          showSidebarButton = mkOption {
+            type = types.bool;
+            default = true;
+            description = "Show the sidebar button in the toolbar.";
+          };
+
           showMenuBar = mkOption {
             type = types.bool;
             default = false;
