@@ -615,8 +615,6 @@ pub struct ClockTicks {
     animation_changes: AtomicU64,
     /// Where the render clock heard the pointer went, until a tick hovers what is there.
     pointer: Mutex<hover::PointerState>,
-    /// Whether the render clock has heard the pointer enter this document without forgetting it.
-    has_pointer: AtomicBool,
     /// The border boxes of the elements the lane sampled or its hover restyled in the last frame a tick presented, and
     /// the colors the boxes its hover's transitions restyled showed. For a test.
     presented_boxes: Mutex<PresentedBoxes>,
@@ -673,7 +671,6 @@ impl ClockTicks {
             plan_animates: AtomicBool::new(false),
             animation_changes: AtomicU64::new(0),
             pointer: Mutex::new(hover::PointerState::default()),
-            has_pointer: AtomicBool::new(false),
             presented_boxes: Mutex::default(),
         })
     }
@@ -760,16 +757,8 @@ impl ClockTicks {
 
     /// Hands the lane where the pointer went, which the next tick hovers, and answers what the lane wants next.
     pub(super) fn pointer_moved(&self, pointer: PendingPointer) -> hover::PointerAnswer {
-        if pointer.position.is_some() {
-            self.has_pointer.store(true, Ordering::Relaxed);
-        }
         let follows = self.published().follows_pointer;
         self.pointer_state().moved(pointer, follows)
-    }
-
-    /// Whether a pointer has entered this document and not been forgotten.
-    pub(super) fn has_pointer(&self) -> bool {
-        self.has_pointer.load(Ordering::Relaxed)
     }
 
     /// Hands the lane that the pointer rests where an animation moves what is under it, which the next tick hovers
@@ -791,7 +780,6 @@ impl ClockTicks {
         let older = pointer.last().is_some_and(|last| last.input_event_id < input_event_id);
         if older {
             pointer.forget();
-            self.has_pointer.store(false, Ordering::Relaxed);
         }
         older
     }

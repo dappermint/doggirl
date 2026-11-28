@@ -1306,14 +1306,14 @@ impl Lane {
     /// Hit tests the preserved frame without copying mutable style and layout state.
     pub(super) fn hover_read_only(&mut self, pointer: PendingPointer, frame_time_nanoseconds: i64) -> super::LaneMove {
         use crate::painting::paint_read::{GeometryRead, PaintSource};
-        if pointer.buttons != 0 {
+        // An update that sealed no plan can leave this lane in place until the next frame.
+        let Some(plan) = self.plan.hover.take_if(|_| pointer.buttons == 0) else {
             return super::LaneMove {
                 input_event_id: pointer.input_event_id,
                 target: None,
                 handed: false,
             };
-        }
-        let plan = self.plan.hover.take().expect("a read-only hover plan");
+        };
         let mut nested = None;
         let target = (|| {
             let Some(position) = pointer.position else {
