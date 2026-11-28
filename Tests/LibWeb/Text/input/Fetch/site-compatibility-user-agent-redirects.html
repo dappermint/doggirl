@@ -33,13 +33,13 @@
             popup.close();
 
             const userAgentOf = async url => (await (await fetch(server.recordedRequestHeadersURL(url))).json())["User-Agent"][0];
-            const shown = userAgent => (userAgent.includes("Ladybird/") ? "shown" : "hidden");
+            const shown = userAgent => (userAgent.includes("Doggirl/") ? "shown" : "hidden");
             return `${shown(await userAgentOf(initialURL.href))}, then ${shown(await userAgentOf(finalURL.href))}`;
         }
 
         try {
-            println(`non-matching to matching: Ladybird/ ${await navigationUserAgents("matching-target", false, true)}`);
-            println(`matching to non-matching: Ladybird/ ${await navigationUserAgents("non-matching-target", true, false)}`);
+            println(`non-matching to matching: Doggirl/ ${await navigationUserAgents("matching-target", false, true)}`);
+            println(`matching to non-matching: Doggirl/ ${await navigationUserAgents("non-matching-target", true, false)}`);
 
             const explicitURL = await server.createEcho("GET", "/site-compatibility-user-agent-explicit", {
                 status: 200,

@@ -9,6 +9,7 @@
 #include <AK/StringBuilder.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/Loader/SiteCompatibility.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 
 namespace Web {
 
@@ -161,6 +162,7 @@ String SiteCompatibilityRule::apply_user_agent_transformations(StringView user_a
         switch (transformation) {
         case UserAgentTransformation::HideLadybird:
             transformed_user_agent = remove_product(transformed_user_agent, "Ladybird"sv);
+            transformed_user_agent = remove_product(transformed_user_agent, BROWSER_NAME ""sv);
             break;
         case UserAgentTransformation::HideChromium:
             transformed_user_agent = remove_product(transformed_user_agent, "Chrome"sv);

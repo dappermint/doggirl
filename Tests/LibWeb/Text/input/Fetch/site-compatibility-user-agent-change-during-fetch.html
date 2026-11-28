@@ -20,7 +20,7 @@
             }]));
 
             const userAgent = (await (await responsePromise).json())["User-Agent"][0];
-            println(`User-Agent as at the fetch's start: ${userAgent.includes("Ladybird/") ? "PASS" : "FAIL"}`);
+            println(`User-Agent as at the fetch's start: ${userAgent.includes("Doggirl/") ? "PASS" : "FAIL"}`);
         } catch (error) {
             println(`FAIL: ${error}`);
         } finally {
