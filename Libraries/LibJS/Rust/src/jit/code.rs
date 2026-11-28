@@ -284,30 +284,8 @@ impl JitCode {
         defer_gc: &DeferGc<'_>,
     ) -> Self {
         let entry = entry_at(&memory, entry_offset);
-        let addresses: Vec<u64> = embedded_cells.iter().map(|cell| cell.as_ptr() as u64).collect();
-        let (embedded_cells, function_cells) = split_function_cells(embedded_cells, defer_gc);
-        let index = |index: usize| u32::try_from(index).expect("code embeds fewer than 4 G cells");
-        let mut slots = HashMap::with_capacity(embedded_cells.len() + function_cells.len());
-        for (position, cell) in embedded_cells.iter().enumerate() {
-            slots
-                .entry(cell.as_ptr() as u64)
-                .or_insert(CellSlot::Embedded(index(position)));
-        }
-        for (position, &(_, cell)) in function_cells.iter().enumerate() {
-            slots
-                .entry(cell.as_ptr() as u64)
-                .or_insert(CellSlot::Function(index(position)));
-        }
-        let relocated_cells = addresses
-            .into_iter()
-            .map(|address| {
-                let slot = *slots.get(&address).expect("the code keeps every cell it embeds");
-                RelocatedCell {
-                    held: Cell::new(address),
-                    slot,
-                }
-            })
-            .collect();
+        let (embedded_cells, function_cells, relocated_cells) =
+            split_function_cells_with_relocations(embedded_cells, defer_gc);
         Self {
             exit_count: Cell::new(0),
             interpreted_frames: RefCell::new(HashMap::default()),
@@ -623,6 +601,12 @@ impl JitCode {
             .set((frames.len() * 2).max(MIN_INTERPRETED_FRAME_COUNT_TO_FORGET_AT));
     }
 
+    /// Whether any execution of this code has exited to the interpreter or still has interpreter frames tracked.
+    #[inline]
+    pub fn has_exited_or_interpreted_frames(&self) -> bool {
+        self.exit_count.get() != 0 || !self.interpreted_frames.borrow().is_empty()
+    }
+
     /// Counts a tier-up check of `frame` at a back edge from where it reaches no on-stack replacement entry, and
     /// returns whether the frame made all it may. Other frames that run in the interpreter finish there like before.
     pub fn count_fruitless_loop_check(&self, frame: &ExecutionContext) -> bool {
@@ -646,11 +630,12 @@ fn cell_addr_bloom_mask(addr: usize) -> u64 {
 }
 
 /// Splits the cells that belong to an ECMAScript function among `embedded_cells` off them (see
-/// `JitCode::function_cells`), returning the other embedded cells and those cells, with their functions.
-fn split_function_cells(
+/// `JitCode::function_cells`), returning the other embedded cells, those cells with their functions, and the
+/// relocation slot for each input cell in its original `Artifact::embedded_cells()` order.
+fn split_function_cells_with_relocations(
     mut embedded_cells: Vec<Gc<CellHeader>>,
     _defer_gc: &DeferGc<'_>,
-) -> (Vec<Gc<CellHeader>>, FunctionCells) {
+) -> (Vec<Gc<CellHeader>>, FunctionCells, Vec<RelocatedCell>) {
     let mut function_cells = Vec::new();
     let mut candidate_owned: Vec<(Gc<CellHeader>, Gc<CellHeader>)> = Vec::new();
     let mut bloom = 0u64;
@@ -674,65 +659,135 @@ fn split_function_cells(
             candidate_owned.push((function_cell, exec_cell));
         }
     }
+    let to_u32 = |index: usize| u32::try_from(index).expect("code embeds fewer than 4 G cells");
     if function_cells.is_empty() && candidate_owned.is_empty() {
-        return (embedded_cells, function_cells);
+        let relocated_cells = embedded_cells
+            .iter()
+            .enumerate()
+            .map(|(position, cell)| RelocatedCell {
+                held: Cell::new(cell.as_ptr() as u64),
+                slot: CellSlot::Embedded(to_u32(position)),
+            })
+            .collect();
+        return (embedded_cells, function_cells, relocated_cells);
     }
+    let mut relocated_cells = Vec::with_capacity(embedded_cells.len());
     if candidate_owned.len() <= 16 && function_cells.len() <= 16 {
-        // Common case: bloom-filtered single pass over `embedded_cells` without sorting or extra allocations.
-        let mut matched_candidates = 0u16;
+        // Common case: bloom-filtered single pass over `embedded_cells` without sorting, hashing, or extra allocations.
+        let mut matched_slots = [u32::MAX; 16];
         let initial_env_count = function_cells.len();
-        embedded_cells.retain(|cell| {
+        let mut write = 0usize;
+        for read in 0..embedded_cells.len() {
+            let cell = embedded_cells[read];
             let addr = cell.as_ptr().addr();
             let mask = cell_addr_bloom_mask(addr);
             if (bloom & mask) != mask {
-                return true;
+                embedded_cells[write] = cell;
+                relocated_cells.push(RelocatedCell {
+                    held: Cell::new(addr as u64),
+                    slot: CellSlot::Embedded(to_u32(write)),
+                });
+                write += 1;
+                continue;
             }
             let ptr = cell.as_ptr();
-            let mut owned = function_cells[..initial_env_count]
+            let mut fn_slot = function_cells[..initial_env_count]
                 .iter()
-                .any(|&(_, env)| env.as_ptr() == ptr);
+                .position(|&(_, env)| env.as_ptr() == ptr)
+                .map(to_u32);
             for (index, &(function_cell, candidate)) in candidate_owned.iter().enumerate() {
                 if candidate.as_ptr() == ptr {
-                    owned = true;
-                    let bit = 1u16 << index;
-                    if matched_candidates & bit == 0 {
-                        matched_candidates |= bit;
+                    let slot = if matched_slots[index] == u32::MAX {
+                        let pos = to_u32(function_cells.len());
                         function_cells.push((function_cell, candidate));
+                        matched_slots[index] = pos;
+                        pos
+                    } else {
+                        matched_slots[index]
+                    };
+                    if fn_slot.is_none() {
+                        fn_slot = Some(slot);
                     }
                 }
             }
-            !owned
-        });
-        return (embedded_cells, function_cells);
+            if let Some(slot) = fn_slot {
+                relocated_cells.push(RelocatedCell {
+                    held: Cell::new(addr as u64),
+                    slot: CellSlot::Function(slot),
+                });
+            } else {
+                embedded_cells[write] = cell;
+                relocated_cells.push(RelocatedCell {
+                    held: Cell::new(addr as u64),
+                    slot: CellSlot::Embedded(to_u32(write)),
+                });
+                write += 1;
+            }
+        }
+        embedded_cells.truncate(write);
+        return (embedded_cells, function_cells, relocated_cells);
     }
     // Larger case: sort only the small candidate and environment lists (not all `embedded_cells`) and guard lookups
     // with the 64-bit bloom filter.
     candidate_owned.sort_unstable_by_key(|&(_, candidate)| candidate.as_ptr().addr());
-    let mut env_addrs: Vec<usize> = function_cells.iter().map(|&(_, env)| env.as_ptr().addr()).collect();
-    env_addrs.sort_unstable();
-    env_addrs.dedup();
-    let mut matched = vec![false; candidate_owned.len()];
-    embedded_cells.retain(|cell| {
+    let mut env_entries: Vec<(usize, u32)> = function_cells
+        .iter()
+        .enumerate()
+        .map(|(pos, &(_, env))| (env.as_ptr().addr(), to_u32(pos)))
+        .collect();
+    env_entries.sort_unstable_by_key(|&(addr, _)| addr);
+    let mut matched_slots = vec![u32::MAX; candidate_owned.len()];
+    let mut write = 0usize;
+    for read in 0..embedded_cells.len() {
+        let cell = embedded_cells[read];
         let addr = cell.as_ptr().addr();
         let mask = cell_addr_bloom_mask(addr);
         if (bloom & mask) != mask {
-            return true;
+            embedded_cells[write] = cell;
+            relocated_cells.push(RelocatedCell {
+                held: Cell::new(addr as u64),
+                slot: CellSlot::Embedded(to_u32(write)),
+            });
+            write += 1;
+            continue;
         }
-        let mut owned = env_addrs.binary_search(&addr).is_ok();
+        let mut fn_slot = env_entries
+            .binary_search_by_key(&addr, |&(env_addr, _)| env_addr)
+            .ok()
+            .map(|idx| env_entries[idx].1);
         let start = candidate_owned.partition_point(|&(_, candidate)| candidate.as_ptr().addr() < addr);
         let mut index = start;
         while index < candidate_owned.len() && candidate_owned[index].1.as_ptr().addr() == addr {
-            owned = true;
-            if !matched[index] {
-                matched[index] = true;
+            let slot = if matched_slots[index] == u32::MAX {
+                let pos = to_u32(function_cells.len());
                 let (function_cell, candidate) = candidate_owned[index];
                 function_cells.push((function_cell, candidate));
+                matched_slots[index] = pos;
+                pos
+            } else {
+                matched_slots[index]
+            };
+            if fn_slot.is_none() {
+                fn_slot = Some(slot);
             }
             index += 1;
         }
-        !owned
-    });
-    (embedded_cells, function_cells)
+        if let Some(slot) = fn_slot {
+            relocated_cells.push(RelocatedCell {
+                held: Cell::new(addr as u64),
+                slot: CellSlot::Function(slot),
+            });
+        } else {
+            embedded_cells[write] = cell;
+            relocated_cells.push(RelocatedCell {
+                held: Cell::new(addr as u64),
+                slot: CellSlot::Embedded(to_u32(write)),
+            });
+            write += 1;
+        }
+    }
+    embedded_cells.truncate(write);
+    (embedded_cells, function_cells, relocated_cells)
 }
 
 /// The realm of a realm, a shape or an object, which code that embeds the cell keeps alive only while the realm is
@@ -974,9 +1029,16 @@ impl Executable {
 
     /// Frees the slot of the executable, which died, and drops its JIT code.
     pub fn free_jit_entry_slot(&self, vm: &Vm, sweep: &Sweep<'_>) {
-        if Arc::strong_count(self.code()) > 1 && super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
-            self.code()
-                .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
+        let has_dirty_property_caches = self.has_dirty_property_lookup_caches();
+        if (self.feedback().is_some() || has_dirty_property_caches)
+            && Arc::strong_count(self.code()) > 1
+            && super::tier_up::uses_shared_jit_learning(&vm.jit.options, false)
+        {
+            self.code().merge_shared_jit_feedback(
+                self.feedback(),
+                self.property_lookup_caches(),
+                has_dirty_property_caches,
+            );
         }
         let Some(table) = vm.jit.entry_table.as_ref() else {
             return;
@@ -993,6 +1055,18 @@ impl Executable {
         } else {
             drop(code);
         }
+    }
+
+    /// Whether this executable may have written interpreter value buckets since the last GC that need folding.
+    pub fn needs_value_feedback_fold_at_gc(&self, vm: &Vm, ran_since_last_gc: bool) -> bool {
+        if !ran_since_last_gc || self.interpreter_tier() == crate::jit::InterpreterTier::Unprofiled {
+            return false;
+        }
+        if self.jit_compile_state() != CompileState::Installed {
+            return true;
+        }
+        self.jit_code(vm)
+            .is_none_or(JitCode::has_exited_or_interpreted_frames)
     }
 
     /// The executable's attached JIT code, if any. `vm` is the VM whose heap the executable lives in.
@@ -1020,7 +1094,8 @@ impl Executable {
     }
 
     pub fn jit_exit_sites(&self) -> Vec<(u32, ExitKind)> {
-        self.jit_state().exit_sites.borrow().clone()
+        self.jit_state_if_created()
+            .map_or_else(Vec::new, |state| state.exit_sites.borrow().clone())
     }
 
     /// The sites where JIT code exited that recompiles do not speculate at again (see `jit_exit_sites()`). A bad shape
@@ -1031,8 +1106,11 @@ impl Executable {
     /// When `use_shared` is true, also includes exit sites learned by earlier realms linking the same `ExecutableData`
     /// without mutating this executable's local `exit_sites`.
     pub fn jit_exit_sites_for_recompile_with_shared(&self, use_shared: bool) -> Vec<(u32, ExitKind)> {
-        let local_sites = self.jit_state().exit_sites.borrow();
-        let local_sizes = self.jit_state().shape_exit_cache_sizes.borrow();
+        let local_state = self.jit_state_if_created();
+        let local_sites_guard = local_state.map(|state| state.exit_sites.borrow());
+        let local_sizes_guard = local_state.map(|state| state.shape_exit_cache_sizes.borrow());
+        let local_sites: &[(u32, ExitKind)] = local_sites_guard.as_deref().map_or(&[], Vec::as_slice);
+        let local_sizes: &[(u32, u8)] = local_sizes_guard.as_deref().map_or(&[], Vec::as_slice);
 
         let shared_guard = use_shared
             .then(|| self.code().shared_jit_learning())
@@ -1117,7 +1195,8 @@ impl Executable {
     }
 
     pub fn jit_exit_site_count(&self) -> usize {
-        self.jit_state().exit_sites.borrow().len()
+        self.jit_state_if_created()
+            .map_or(0, |state| state.exit_sites.borrow().len())
     }
 
     /// Records a site where JIT code exited, and returns its index among the sites.
@@ -1133,7 +1212,10 @@ impl Executable {
     /// The sites where JIT code exited in inlined builtins (see `add_jit_builtin_exit_site()`), each mapped by `map`,
     /// which must not run code or allocate.
     pub fn map_jit_builtin_exit_sites<T>(&self, mut map: impl FnMut(Gc<Executable>, u32, ExitKind) -> T) -> Vec<T> {
-        let sites = self.jit_state().builtin_exit_sites.borrow();
+        let Some(state) = self.jit_state_if_created() else {
+            return Vec::new();
+        };
+        let sites = state.builtin_exit_sites.borrow();
         sites
             .iter()
             .map(|&(builtin, pc, kind)| map(builtin, pc, kind))
@@ -1141,7 +1223,8 @@ impl Executable {
     }
 
     pub fn jit_builtin_exit_site_count(&self) -> usize {
-        self.jit_state().builtin_exit_sites.borrow().len()
+        self.jit_state_if_created()
+            .map_or(0, |state| state.builtin_exit_sites.borrow().len())
     }
 
     /// Records a site where JIT code exited in an inlined builtin, and returns its index among those sites.
@@ -1155,7 +1238,7 @@ impl Executable {
     }
 
     pub fn jit_discard_count(&self) -> u32 {
-        self.jit_state().discard_count.get()
+        self.jit_state_if_created().map_or(0, |state| state.discard_count.get())
     }
 
     /// Notes that an exit of the executable's installed code was at a site the code did not know of, which a
@@ -1280,8 +1363,11 @@ impl Executable {
     /// Drops the executable's discarded code, which no frame runs anymore.
     fn detach_jit_code(&self, vm: &Vm) {
         if super::tier_up::uses_shared_jit_learning(&vm.jit.options, false) {
-            self.code()
-                .merge_shared_jit_feedback(self.feedback(), self.property_lookup_caches());
+            self.code().merge_shared_jit_feedback(
+                self.feedback(),
+                self.property_lookup_caches(),
+                self.has_dirty_property_lookup_caches(),
+            );
         }
         let state = self.jit_state();
         let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
