@@ -2,8 +2,8 @@ Harness status: OK
 
 Found 33 tests
 
-31 Pass
-2 Fail
+32 Pass
+1 Fail
 Pass	querySelectorAll
 Pass	createElement
 Pass	createElementNS
@@ -21,7 +21,7 @@ Pass	Request
 Pass	Response
 Pass	getElementsByTagName
 Fail	getElementsByTagNameNS
-Fail	getElementsByClassName
+Pass	getElementsByClassName
 Pass	createDocumentType
 Pass	createDocument
 Pass	createHTMLDocument

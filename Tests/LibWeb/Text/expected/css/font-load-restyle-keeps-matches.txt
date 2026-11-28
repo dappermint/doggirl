@@ -1,5 +1,5 @@
 style passes: PARTIAL
-spans computed: span, span@2
-spans sharing a style: 48
+at least 40 spans reuse a style: true
+alternating matches kept: true
 spans whose style changed: 50
 face loaded: loaded

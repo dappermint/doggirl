@@ -1,2 +1,2 @@
-1.Success: {"size":312,"type":"image/png"}
-2.Success: {"size":823,"type":"image/jpeg"}
+1.Success: {"width":100,"height":100,"type":"image/png"}
+2.Success: {"width":100,"height":100,"type":"image/jpeg"}

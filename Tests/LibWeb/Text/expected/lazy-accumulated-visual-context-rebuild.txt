@@ -8,8 +8,5 @@ visual context updates after identity transform read: (none)
 bounding rect with transformed child: 130
 visual context updates after unrelated transform read: (none)
 transformed rect x: 18
-visual context updates after non-identity transform read:
-update DIRTY-PATH
-  div#target transform ALLOCATED
-  div#transformed-child transform ALLOCATED
-  recording NEEDED
+visual context updates after non-identity transform read: (none)
+transformed rect matches updated visual contexts: true

@@ -30,8 +30,11 @@
         const events = parseStyleTrace(trace);
         const restyled = events.filter(event => event.event === "restyle");
         println(`style passes: ${events.filter(event => event.event === "pass").map(event => event.kind).join(", ")}`);
-        println(`spans computed: ${restyled.filter(event => event.outcome === "computed").map(event => event.element).join(", ")}`);
-        println(`spans sharing a style: ${restyled.filter(event => event.outcome === "shared").length}`);
+        const reused = restyled.filter(event => event.outcome === "shared" || event.outcome === "reused");
+        println(`at least 40 spans reuse a style: ${reused.length >= 40}`);
+        const matchesKept = Array.from(container.children).every((span, index) =>
+            getComputedStyle(span).color === (index % 2 === 0 ? "rgb(0, 128, 0)" : "rgb(0, 0, 0)"));
+        println(`alternating matches kept: ${matchesKept}`);
         println(`spans whose style changed: ${restyled.filter(event => event.changed).length}`);
         println(`face loaded: ${face.status}`);
     });

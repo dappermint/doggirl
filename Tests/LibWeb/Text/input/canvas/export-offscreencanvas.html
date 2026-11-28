@@ -17,14 +17,16 @@
         await testPart(async () => {
             const offscreenCanvas = new OffscreenCanvas(100, 100);
             const result = await offscreenCanvas.convertToBlob({ type: "image/png" });
-            return { size: result.size, type: result.type };
+            const bitmap = await createImageBitmap(result);
+            return { width: bitmap.width, height: bitmap.height, type: result.type };
         });
 
         // 2. Export a OffscreenCanvas to a JPEG blob
         await testPart(async () => {
             const offscreenCanvas = new OffscreenCanvas(100, 100);
             const result = await offscreenCanvas.convertToBlob({ type: "image/jpeg" });
-            return { size: result.size, type: result.type };
+            const bitmap = await createImageBitmap(result);
+            return { width: bitmap.width, height: bitmap.height, type: result.type };
         });
     });
 </script>

@@ -36,8 +36,11 @@
         lines.push(`visual context updates after unrelated transform read:${visualContextUpdates()}`);
 
         target.style.transform = 'translateX(10px)';
-        lines.push(`transformed rect x: ${target.getBoundingClientRect().x}`);
+        const directX = target.getBoundingClientRect().x;
+        lines.push(`transformed rect x: ${directX}`);
         lines.push(`visual context updates after non-identity transform read:${visualContextUpdates()}`);
+        internals.updateVisualContextsForTesting();
+        lines.push(`transformed rect matches updated visual contexts: ${target.getBoundingClientRect().x === directX}`);
         internals.takeVisualContextTrace();
 
         for (const line of lines)

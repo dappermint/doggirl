@@ -45,7 +45,8 @@
             slot.style.color = "green";
             internals.updateStyle();
             println(`${mode}: assigned colors: ${children.every(child => getComputedStyle(child).color === "rgb(0, 128, 0)")}`);
-            println(`${mode}: layout records follow installed records:\n${layoutRecords(host)}`);
+            const recordsMatch = children.every(child => /^div record (\d+), box record \1$/.test(layoutRecords(child)));
+            println(`${mode}: assigned box records match installed records: ${recordsMatch}`);
             println(`${mode}: assigned box widths: ${children.every(child => child.getBoundingClientRect().width === 10)}`);
             host.remove();
         }
