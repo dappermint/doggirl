@@ -115,6 +115,10 @@ pub mod code {
 
         pub fn drop_jit_code_that_lost_embedded_cells(&self, _vm: &Vm, _sweep: &Sweep<'_>) {}
 
+        pub fn needs_value_feedback_fold_at_gc(&self, _vm: &Vm, _ran_since_last_gc: bool) -> bool {
+            false
+        }
+
         pub fn jit_compile_state(&self) -> CompileState {
             CompileState::None
         }

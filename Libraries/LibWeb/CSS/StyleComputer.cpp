@@ -263,6 +263,39 @@ void StyleComputer::unregister_style_node(StyleNodeID style_node_id)
     }
 }
 
+void StyleComputer::unregister_element_style_nodes(ReadonlySpan<StyleNodeID> style_node_ids)
+{
+    if (style_node_ids.is_empty())
+        return;
+    auto const table_size = m_element_style_nodes.size();
+    m_style_nodes_retired_beside_lanes.ensure_capacity(m_style_nodes_retired_beside_lanes.size() + style_node_ids.size());
+    bool any_registered = false;
+    for (auto style_node_id : style_node_ids) {
+        if (style_node_id == 0)
+            continue;
+        auto index = style_node_index(style_node_id);
+        if (index < table_size) {
+            m_element_style_nodes[index] = nullptr;
+            m_style_nodes_retired_beside_lanes.set(style_node_id);
+            any_registered = true;
+        }
+    }
+    if (any_registered)
+        StyleEngineFFI::style_engine_consume_element_style_inputs(m_style_engine.host(), style_node_ids);
+}
+
+void StyleComputer::unregister_text_style_nodes(ReadonlySpan<StyleNodeID> style_node_ids)
+{
+    auto const table_size = m_text_style_nodes.size();
+    for (auto style_node_id : style_node_ids) {
+        if (style_node_id == 0)
+            continue;
+        auto index = style_node_index(style_node_id);
+        if (index < table_size)
+            m_text_style_nodes[index] = nullptr;
+    }
+}
+
 GC::Ptr<DOM::Node> StyleComputer::node_for_lane_style_node(StyleNodeID style_node_id) const
 {
     if (m_style_nodes_retired_beside_lanes.contains(style_node_id))

@@ -264,6 +264,8 @@ public:
     void register_style_node(StyleNodeID style_node_id, DOM::Node&);
     void ensure_style_node_slot(StyleNodeID);
     void unregister_style_node(StyleNodeID style_node_id);
+    void unregister_element_style_nodes(ReadonlySpan<StyleNodeID> style_node_ids);
+    void unregister_text_style_nodes(ReadonlySpan<StyleNodeID> style_node_ids);
     [[nodiscard]] GC::Ptr<DOM::Element> element_for_style_node(StyleNodeID style_node_id) const;
     // Every element holding a style node, in the order of the nodes.
     template<typename Callback>

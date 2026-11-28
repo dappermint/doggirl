@@ -229,71 +229,104 @@ pub(crate) struct SharedJitLearning {
 
 #[cfg(all(not(test), feature = "jit"))]
 impl SharedJitLearning {
+    /// Merges local feedback and property-cache sizes into shared learning.
+    /// Returns `(had_prior_feedback, had_prior_property_caches)` describing whether shared learning already held data
+    /// from earlier realms before this merge.
     pub(crate) fn merge_feedback(
         &mut self,
         feedback: Option<&crate::bytecode::feedback::ExecutableFeedback>,
         property_caches: &[crate::bytecode::executable::PropertyLookupCache],
-    ) {
+    ) -> (bool, bool) {
+        let had_prior_feedback = self.has_feedback;
+        let had_prior_property_caches = !self.max_property_cache_sizes.is_empty();
         if let Some(feedback) = feedback {
             feedback.update_value_feedback();
             self.has_feedback = true;
 
             let arith = feedback.arith();
             if !arith.is_empty() {
-                if self.arith.len() < arith.len() {
-                    self.arith.resize(arith.len(), 0);
-                }
                 // SAFETY: `Cell<u8>` is `#[repr(transparent)]` over `u8` and no concurrent mutation occurs on this VM thread.
                 let arith_vals = unsafe { ak::slice_from_raw_parts(arith.as_ptr().cast::<u8>(), arith.len()) };
-                for (dst, &src) in self.arith.iter_mut().zip(arith_vals) {
-                    *dst |= src;
+                if self.arith.is_empty() {
+                    self.arith.extend_from_slice(arith_vals);
+                } else {
+                    if self.arith.len() < arith_vals.len() {
+                        self.arith.resize(arith_vals.len(), 0);
+                    }
+                    for (dst, &src) in self.arith.iter_mut().zip(arith_vals) {
+                        *dst |= src;
+                    }
                 }
             }
 
             let value = feedback.value();
             if !value.is_empty() {
-                if self.value.len() < value.len() {
-                    self.value.resize(value.len(), 0);
-                }
                 // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
                 let value_vals = unsafe { ak::slice_from_raw_parts(value.as_ptr().cast::<u16>(), value.len()) };
-                for (dst, &src) in self.value.iter_mut().zip(value_vals) {
-                    *dst |= src;
+                if self.value.is_empty() {
+                    self.value.extend_from_slice(value_vals);
+                } else {
+                    if self.value.len() < value_vals.len() {
+                        self.value.resize(value_vals.len(), 0);
+                    }
+                    for (dst, &src) in self.value.iter_mut().zip(value_vals) {
+                        *dst |= src;
+                    }
                 }
             }
 
             let cache_value = feedback.cache_value();
             if !cache_value.is_empty() {
-                if self.cache_value.len() < cache_value.len() {
-                    self.cache_value.resize(cache_value.len(), 0);
-                }
                 // SAFETY: `Cell<u16>` is `#[repr(transparent)]` over `u16` and no concurrent mutation occurs on this VM thread.
                 let cache_value_vals =
                     unsafe { ak::slice_from_raw_parts(cache_value.as_ptr().cast::<u16>(), cache_value.len()) };
-                for (dst, &src) in self.cache_value.iter_mut().zip(cache_value_vals) {
-                    *dst |= src;
+                if self.cache_value.is_empty() {
+                    self.cache_value.extend_from_slice(cache_value_vals);
+                } else {
+                    if self.cache_value.len() < cache_value_vals.len() {
+                        self.cache_value.resize(cache_value_vals.len(), 0);
+                    }
+                    for (dst, &src) in self.cache_value.iter_mut().zip(cache_value_vals) {
+                        *dst |= src;
+                    }
                 }
             }
 
             let keyed = feedback.keyed();
             if !keyed.is_empty() {
-                if self.keyed_bits.len() < keyed.len() {
-                    self.keyed_bits.resize(keyed.len(), 0);
-                }
-                for (dst, src) in self.keyed_bits.iter_mut().zip(keyed) {
-                    *dst |= src.bits.get();
+                if self.keyed_bits.is_empty() {
+                    self.keyed_bits.reserve(keyed.len());
+                    for src in keyed {
+                        self.keyed_bits.push(src.bits.get());
+                    }
+                } else {
+                    if self.keyed_bits.len() < keyed.len() {
+                        self.keyed_bits.resize(keyed.len(), 0);
+                    }
+                    for (dst, src) in self.keyed_bits.iter_mut().zip(keyed) {
+                        *dst |= src.bits.get();
+                    }
                 }
             }
 
             let calls = feedback.call();
             if !calls.is_empty() {
-                if self.call_flags.len() < calls.len() {
-                    self.call_flags.resize(calls.len(), 0);
-                    self.call_value.resize(calls.len(), 0);
-                }
-                for ((dst_flags, dst_value), src) in self.call_flags.iter_mut().zip(&mut self.call_value).zip(calls) {
-                    *dst_flags |= src.flags.get() & SHARED_CALL_FLAGS_MASK;
-                    *dst_value |= src.value.get();
+                if self.call_flags.is_empty() {
+                    self.call_flags.reserve(calls.len());
+                    self.call_value.reserve(calls.len());
+                    for src in calls {
+                        self.call_flags.push(src.flags.get() & SHARED_CALL_FLAGS_MASK);
+                        self.call_value.push(src.value.get());
+                    }
+                } else {
+                    if self.call_flags.len() < calls.len() {
+                        self.call_flags.resize(calls.len(), 0);
+                        self.call_value.resize(calls.len(), 0);
+                    }
+                    for ((dst_flags, dst_value), src) in self.call_flags.iter_mut().zip(&mut self.call_value).zip(calls) {
+                        *dst_flags |= src.flags.get() & SHARED_CALL_FLAGS_MASK;
+                        *dst_value |= src.value.get();
+                    }
                 }
             }
         }
@@ -310,6 +343,7 @@ impl SharedJitLearning {
                 }
             }
         }
+        (had_prior_feedback, had_prior_property_caches)
     }
 
     pub(crate) fn record_exit_site(&mut self, pc: u32, kind: libjs_jit::code::ExitKind, bad_shape_size: Option<u8>) {
@@ -672,8 +706,14 @@ impl ExecutableData {
         &self,
         feedback: Option<&crate::bytecode::feedback::ExecutableFeedback>,
         property_caches: &[crate::bytecode::executable::PropertyLookupCache],
+        has_dirty_property_caches: bool,
     ) {
-        let has_non_empty_cache = property_caches
+        let caches_to_merge = if has_dirty_property_caches {
+            property_caches
+        } else {
+            &[]
+        };
+        let has_non_empty_cache = caches_to_merge
             .iter()
             .any(|cache| crate::jit::code::speculated_cache_size(cache) > 0);
         if !has_non_empty_cache
@@ -685,7 +725,7 @@ impl ExecutableData {
             .ensure_shared_jit_learning()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        learning.merge_feedback(feedback, property_caches);
+        learning.merge_feedback(feedback, caches_to_merge);
     }
 
     #[cfg(all(not(test), feature = "jit"))]

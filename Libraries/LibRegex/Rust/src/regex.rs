@@ -40,6 +40,19 @@ struct AltEntry {
     first: u16,
 }
 
+/// Multi-offset ASCII NEON prefilter for literal alternations with `min_len >= 2`.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct MultiOffsetAsciiPrefilter {
+    /// When every alternative starts with the exact same ASCII byte, use `vceqq` instead of a table lookup at offset 0.
+    first_byte: Option<u8>,
+    lut0: vm::AsciiNibbleLut,
+    lut1: vm::AsciiNibbleLut,
+    /// Optional third offset (`min_len - 1` when `min_len >= 3`), or 0 when `min_len == 2`.
+    offset2: usize,
+    lut2: vm::AsciiNibbleLut,
+}
+
 struct LiteralAltMatcher {
     /// Contiguous UTF-16 storage for all alternatives.
     alt_units: Vec<u16>,
@@ -53,6 +66,8 @@ struct LiteralAltMatcher {
     min_len: usize,
     all_single_unit: bool,
     first_scan: FirstUnitScan,
+    #[cfg(target_arch = "aarch64")]
+    multi_offset_prefilter: Option<MultiOffsetAsciiPrefilter>,
 }
 
 impl LiteralAltMatcher {
@@ -185,6 +200,63 @@ impl LiteralAltMatcher {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        let multi_offset_prefilter = if min_len >= 2 && !alts.is_empty() {
+            let build_lut = |pos: usize| -> Option<(vm::AsciiNibbleLut, Option<u8>)> {
+                let mut table = [false; 256];
+                let mut single: Option<u8> = None;
+                let mut distinct_count = 0usize;
+                for alt in &alts {
+                    let cu = alt[pos];
+                    if cu >= 0x80 {
+                        return None;
+                    }
+                    let add = |b: u8, table: &mut [bool; 256], single: &mut Option<u8>, distinct_count: &mut usize| {
+                        if !table[b as usize] {
+                            table[b as usize] = true;
+                            *single = Some(b);
+                            *distinct_count += 1;
+                        }
+                    };
+                    if ignore_case {
+                        let folded = fold_ascii_for_compare(cu) as u8;
+                        add(folded, &mut table, &mut single, &mut distinct_count);
+                        if is_ascii_alpha(u16::from(folded)) {
+                            add(folded - 32, &mut table, &mut single, &mut distinct_count);
+                        }
+                    } else {
+                        add(cu as u8, &mut table, &mut single, &mut distinct_count);
+                    }
+                }
+                let lut = vm::AsciiNibbleLut::from_byte_table(&table)?;
+                Some((lut, (distinct_count == 1).then(|| single.unwrap())))
+            };
+            let offset2 = if min_len >= 3 { min_len - 1 } else { 0 };
+            if let (Some((lut0, first_byte)), Some((lut1, _))) = (build_lut(0), build_lut(1)) {
+                if offset2 != 0 {
+                    build_lut(offset2).map(|(lut2, _)| MultiOffsetAsciiPrefilter {
+                        first_byte,
+                        lut0,
+                        lut1,
+                        offset2,
+                        lut2,
+                    })
+                } else {
+                    Some(MultiOffsetAsciiPrefilter {
+                        first_byte,
+                        lut0,
+                        lut1,
+                        offset2: 0,
+                        lut2: lut1,
+                    })
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             alt_units,
             alt_latin1,
@@ -194,6 +266,8 @@ impl LiteralAltMatcher {
             min_len,
             all_single_unit,
             first_scan,
+            #[cfg(target_arch = "aarch64")]
+            multi_offset_prefilter,
         }
     }
 
@@ -598,6 +672,26 @@ impl Regex {
             None
         };
         #[cfg(target_arch = "aarch64")]
+        if let Some(ref prefilter) = matcher.multi_offset_prefilter {
+            if let Some((pos, alt_len)) = input.find_multi_offset_ascii_match(
+                start,
+                end,
+                prefilter.first_byte,
+                &prefilter.lut0,
+                &prefilter.lut1,
+                prefilter.offset2,
+                &prefilter.lut2,
+                check_at,
+            ) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
+            }
+            return false;
+        }
+        #[cfg(target_arch = "aarch64")]
         if let FirstUnitScan::AsciiLut { ref lut, ref bits } = matcher.first_scan {
             if let Some((pos, alt_len)) = input.find_ascii_lut_match(start, end, lut, bits, check_at) {
                 if out.len() >= 2 {
@@ -681,6 +775,26 @@ impl Regex {
             }
             None
         };
+        #[cfg(target_arch = "aarch64")]
+        if let Some(ref prefilter) = matcher.multi_offset_prefilter {
+            if let Some((pos, alt_len)) = input.find_multi_offset_ascii_match(
+                start,
+                end,
+                prefilter.first_byte,
+                &prefilter.lut0,
+                &prefilter.lut1,
+                prefilter.offset2,
+                &prefilter.lut2,
+                check_at,
+            ) {
+                if out.len() >= 2 {
+                    out[0] = pos as i32;
+                    out[1] = (pos + alt_len) as i32;
+                }
+                return true;
+            }
+            return false;
+        }
         #[cfg(target_arch = "aarch64")]
         if let FirstUnitScan::AsciiLut { ref lut, ref bits } = matcher.first_scan {
             if let Some((pos, alt_len)) = input.find_ascii_lut_match(start, end, lut, bits, check_at) {
