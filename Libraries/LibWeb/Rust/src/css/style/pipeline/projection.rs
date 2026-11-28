@@ -80,7 +80,7 @@ pub(in crate::css::style) use writer::ProjectionWriter;
 
 /// How many rows a chunk of the projection holds, and so how many rows the first write after a fork
 /// copies.
-const ROWS_PER_CHUNK: usize = 16;
+const ROWS_PER_CHUNK: usize = 64;
 
 /// Empty a list of what one transaction wrote or changed. Keep small lists warm for the next transaction, but do not
 /// retain what a batch of arriving elements grew one to for the lifetime of every document.

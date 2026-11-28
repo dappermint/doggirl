@@ -680,7 +680,7 @@ public:
     // Whether the environment `custom_property_data()` answers is the overlay of what the element's or the
     // pseudo-element's own animations sample.
     [[nodiscard]] bool custom_property_data_is_animation_overlay(Optional<CSS::PseudoElement>) const;
-    [[nodiscard]] size_t published_presentational_hint_properties_heap_size() const;
+    [[nodiscard]] size_t published_presentational_hint_properties_heap_size() const { return m_published_presentational_hint_properties.capacity() * sizeof(CSS::StyleProperty); }
 
     // Publish the environment the element's custom-property data moved to on its record, so the
     // engine reads the environment the element holds.
@@ -1204,6 +1204,7 @@ private:
     CSS::InstalledStyle m_installed_style;
     u64 m_animation_style_generation { 0 };
     u64 m_animation_subtree_style_generation { 0 };
+    Vector<CSS::StyleProperty> m_published_presentational_hint_properties;
 
     void register_element_reference_pseudo_element(CSS::PseudoElement type, GC::Ref<Element> element);
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
@@ -1282,7 +1283,6 @@ private:
     GC::Member<CSS::CSSStyleProperties> m_inline_style;
     GC::Member<ShadowRoot> m_shadow_root;
 
-    OwnPtr<Vector<CSS::StyleProperty, 4>> m_published_presentational_hint_properties;
     mutable Utf16String m_lang_value;
 };
 

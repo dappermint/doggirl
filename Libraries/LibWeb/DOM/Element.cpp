@@ -623,8 +623,7 @@ size_t Element::external_memory_size() const
         size = JS::saturating_add_external_memory_size(size, CSS::Parser::ValueParserFFI::rust_declaration_block_external_memory_size(m_inline_declarations));
     if (has_heap_attributes())
         size = JS::saturating_add_external_memory_size(size, sizeof(AttributeList) + m_attribute_storage.heap->capacity() * sizeof(Attribute));
-    if (m_published_presentational_hint_properties)
-        size = JS::saturating_add_external_memory_size(size, published_presentational_hint_properties_heap_size());
+    size = JS::saturating_add_external_memory_size(size, published_presentational_hint_properties_heap_size());
     for (auto const& attribute : raw_attribute_span())
         size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(attribute.value));
     return size;
@@ -1692,26 +1691,12 @@ void Element::apply_presentational_hints(Vector<CSS::StyleProperty>& properties)
     }
 }
 
-size_t Element::published_presentational_hint_properties_heap_size() const
-{
-    if (!m_published_presentational_hint_properties)
-        return 0;
-    auto size = sizeof(*m_published_presentational_hint_properties);
-    if (m_published_presentational_hint_properties->capacity() > 4)
-        size += m_published_presentational_hint_properties->capacity() * sizeof(CSS::StyleProperty);
-    return size;
-}
-
 bool Element::presentational_hint_properties_need_publication(ReadonlySpan<CSS::StyleProperty> properties) const
 {
-    if (!m_published_presentational_hint_properties)
-        return !properties.is_empty();
-
-    auto const& published = *m_published_presentational_hint_properties;
-    if (published.size() == properties.size()) {
+    if (m_published_presentational_hint_properties.size() == properties.size()) {
         bool properties_are_unchanged = true;
         for (size_t index = 0; index < properties.size(); ++index)
-            properties_are_unchanged &= published[index] == properties[index];
+            properties_are_unchanged &= m_published_presentational_hint_properties[index] == properties[index];
         if (properties_are_unchanged)
             return false;
     }
@@ -1721,17 +1706,10 @@ bool Element::presentational_hint_properties_need_publication(ReadonlySpan<CSS::
 
 void Element::did_publish_presentational_hint_properties(ReadonlySpan<CSS::StyleProperty> properties)
 {
-    if (properties.is_empty()) {
-        m_published_presentational_hint_properties.clear();
-        return;
-    }
-    if (!m_published_presentational_hint_properties)
-        m_published_presentational_hint_properties = make<Vector<CSS::StyleProperty, 4>>();
-    auto& published = *m_published_presentational_hint_properties;
-    published.clear_with_capacity();
-    published.ensure_capacity(properties.size());
+    m_published_presentational_hint_properties.clear();
+    m_published_presentational_hint_properties.ensure_capacity(properties.size());
     for (auto const& property : properties)
-        published.unchecked_append(property);
+        m_published_presentational_hint_properties.unchecked_append(property);
 }
 
 void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)

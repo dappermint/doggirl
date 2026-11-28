@@ -25,7 +25,7 @@ use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-pub(crate) const PAINTABLE_SLOTS_PER_CHUNK: usize = 16;
+pub(crate) const PAINTABLE_SLOTS_PER_CHUNK: usize = 64;
 
 #[cfg(test)]
 mod tests {
