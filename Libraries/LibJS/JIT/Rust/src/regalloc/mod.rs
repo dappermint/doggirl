@@ -525,6 +525,7 @@ pub fn allocate<'w>(graph: &Graph, registers: &RegisterSet, work: &'w Zone) -> R
     let liveness = ValueLiveness::compute(graph, &size, work)?;
     let coalescing = Coalescing::compute(graph, &liveness, work);
     let loops = Loops::compute(graph, &liveness, work)?;
+    let cold_blocks_are_last = graph.blocks.iter().skip_while(|block| !block.is_cold).all(|block| block.is_cold);
     let allocator = Allocator {
         graph,
         registers,
@@ -535,6 +536,12 @@ pub fn allocate<'w>(graph: &Graph, registers: &RegisterSet, work: &'w Zone) -> R
         value_registers: ZoneVec::from_elem_in(None, size.nodes, work),
         end_entries: ZoneVec::with_capacity_in(size.blocks.saturating_mul(8), work),
         end_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
+        use_cold_spills: cold_blocks_are_last,
+        current_block_is_cold: false,
+        cold_homes: ZoneVec::from_elem_in(None, size.nodes, work),
+        cold_home_touched: ZoneVec::new_in(work),
+        cold_home_end_entries: ZoneVec::new_in(work),
+        cold_home_end_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
         merge_entries: ZoneVec::with_capacity_in(size.blocks.saturating_mul(4), work),
         merge_runs: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
         merge_recorded: ZoneVec::from_elem_in(false, size.blocks, work),
@@ -566,6 +573,19 @@ struct Allocator<'a, 'w> {
     end_entries: ZoneVec<'w, (u8, NodeId)>,
     /// Range in `end_entries` for each finished block.
     end_runs: ZoneVec<'w, Run>,
+    /// Whether all cold blocks come after all hot blocks, allowing cold-only lazy spilling without
+    /// inserting eager definition-site stores on the hot path.
+    use_cold_spills: bool,
+    /// Whether the block currently being allocated is cold.
+    current_block_is_cold: bool,
+    /// Per-cold-block lazily spilled stack homes for values that have no permanent home.
+    cold_homes: ZoneVec<'w, Option<u32>>,
+    /// Values whose `cold_homes` entry was set in the current block (for fast O(touched) clearing).
+    cold_home_touched: ZoneVec<'w, NodeId>,
+    /// Compact `(value, stack_slot)` cold homes live out of finished cold blocks (disjoint from `end_entries`).
+    cold_home_end_entries: ZoneVec<'w, (NodeId, u32)>,
+    /// Range in `cold_home_end_entries` for each finished block.
+    cold_home_end_runs: ZoneVec<'w, Run>,
     /// Frozen non-phi `(register, value)` entries kept in registers on entry to a merge/loop header with a state
     /// predecessor, shared verbatim by `place_merge_phis`, `start_block`, and `add_merge_moves`.
     merge_entries: ZoneVec<'w, (u8, NodeId)>,
@@ -670,6 +690,19 @@ impl<'w> Allocator<'_, 'w> {
                 self.end_entries.push((register, self.contents[register as usize]));
             }
             self.end_runs[block.index()] = Run::new(end_start, self.end_entries.len());
+            if self.current_block_is_cold && !self.cold_home_touched.is_empty() {
+                let cold_start = self.cold_home_end_entries.len();
+                let live_out = self.liveness.live_out.get(block.index());
+                for &value in &self.cold_home_touched {
+                    if self.value_registers[value.index()].is_none()
+                        && let Some(slot) = self.cold_homes[value.index()]
+                        && live_out.binary_search(&value).is_ok()
+                    {
+                        self.cold_home_end_entries.push((value, slot));
+                    }
+                }
+                self.cold_home_end_runs[block.index()] = Run::new(cold_start, self.cold_home_end_entries.len());
+            }
             self.finished[block.index()] = true;
             // NB: How many moves and exit values a node gets is known only when it is allocated.
             check_items(self.allocation.moves.len())?;
@@ -680,8 +713,15 @@ impl<'w> Allocator<'_, 'w> {
 
     /// Whether holding `value` in `register` will be clobbered by a call or float-clobbering slow path it crosses.
     fn clobbered_in(&self, value: NodeId, register: u8) -> bool {
-        (self.liveness.crosses_call(value) && self.registers.caller_saved().contains(register))
-            || (self.liveness.crosses_float_clobber(value) && self.registers.caller_saved_fprs().contains(register))
+        if self.use_cold_spills {
+            (self.liveness.crosses_hot_call(value) && self.registers.caller_saved().contains(register))
+                || (self.liveness.crosses_hot_float_clobber(value)
+                    && self.registers.caller_saved_fprs().contains(register))
+        } else {
+            (self.liveness.crosses_call(value) && self.registers.caller_saved().contains(register))
+                || (self.liveness.crosses_float_clobber(value)
+                    && self.registers.caller_saved_fprs().contains(register))
+        }
     }
 
     /// Whether `value` needs a spill/frame home from its definition when allocated in `register`.
@@ -749,12 +789,39 @@ impl<'w> Allocator<'_, 'w> {
         }
     }
 
+    fn set_cold_home(&mut self, value: NodeId, slot: u32) {
+        if self.cold_homes[value.index()].is_none() {
+            self.cold_home_touched.push(value);
+        }
+        self.cold_homes[value.index()] = Some(slot);
+    }
+
+    /// Spills `value` (currently in `register`) lazily inside a cold block so hot definitions never pay
+    /// eager def-site stores for cold-only calls or evictions.
+    fn ensure_home_from_register(&mut self, value: NodeId, register: u8) {
+        if frame_home(self.graph, value).is_some() || self.allocation.nodes[value.index()].spill_slot.is_some() {
+            return;
+        }
+        if self.use_cold_spills && self.current_block_is_cold {
+            if self.cold_homes[value.index()].is_none() {
+                let slot = self.new_spill_slot();
+                self.set_cold_home(value, slot);
+                self.add_move(Location::Register(register), Location::Stack(slot));
+            }
+            return;
+        }
+        self.ensure_spill_slot(value);
+    }
+
     fn clear_contents(&mut self) {
         for register in self.occupied.iter() {
             let value = self.contents[register as usize];
             self.value_registers[value.index()] = None;
         }
         self.occupied = RegisterMask::default();
+        for value in self.cold_home_touched.drain_all() {
+            self.cold_homes[value.index()] = None;
+        }
     }
 
     /// Whether the loop with the header `block`, if it is one, leaves `value` in its stack slot: a value that has one
@@ -769,6 +836,7 @@ impl<'w> Allocator<'_, 'w> {
     fn start_block(&mut self, block: BlockId) {
         self.clear_contents();
         let block_data = self.graph.block(block);
+        self.current_block_is_cold = block_data.is_cold;
         let live_in = self.liveness.live_in.get(block.index());
         if let Some(predecessor) = state_predecessor(self.graph, block) {
             assert!(
@@ -800,6 +868,16 @@ impl<'w> Allocator<'_, 'w> {
                 self.merge_runs[block.index()] = Run::new(start, self.merge_entries.len());
                 self.merge_recorded[block.index()] = true;
             }
+            if !live_in.is_empty() {
+                let phis = &block_data.phis;
+                let cold_run = self.cold_home_end_runs[predecessor.index()].range();
+                for entry_index in cold_run {
+                    let (value, slot) = self.cold_home_end_entries[entry_index];
+                    if live_in.binary_search(&value).is_ok() && !phis.contains(&value) {
+                        self.set_cold_home(value, slot);
+                    }
+                }
+            }
             for phi in &block_data.phis {
                 if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
                     debug_assert!(!self.occupied.contains(register));
@@ -819,6 +897,13 @@ impl<'w> Allocator<'_, 'w> {
                     let (register, value) = self.end_entries[entry_index];
                     if live_in.binary_search(&value).is_ok() {
                         self.assign_register(register, value);
+                    }
+                }
+                let cold_run = self.cold_home_end_runs[predecessor.index()].range();
+                for entry_index in cold_run {
+                    let (value, slot) = self.cold_home_end_entries[entry_index];
+                    if live_in.binary_search(&value).is_ok() {
+                        self.set_cold_home(value, slot);
                     }
                 }
             }
@@ -858,7 +943,7 @@ impl<'w> Allocator<'_, 'w> {
     fn evict(&mut self, register: u8) {
         if self.occupied.contains(register) {
             let value = self.contents[register as usize];
-            self.ensure_home(value);
+            self.ensure_home_from_register(value, register);
             self.free_register(register);
         }
     }
@@ -928,6 +1013,9 @@ impl<'w> Allocator<'_, 'w> {
         if let Some(slot) = frame_home(self.graph, value) {
             return Location::Frame(slot);
         }
+        if let Some(slot) = self.cold_homes[value.index()] {
+            return Location::Stack(slot);
+        }
         let slot = self.allocation.nodes[value.index()]
             .spill_slot
             .unwrap_or_else(|| panic!("v{} is neither in a register nor spilled", value.0));
@@ -938,6 +1026,14 @@ impl<'w> Allocator<'_, 'w> {
     /// `node`, is still needed after it. Registers only ever hold live values.
     fn is_live_after(&self, value: NodeId, node: NodeId) -> bool {
         !self.liveness.dies_at(node).contains(&value)
+    }
+
+    /// Whether `value` is referenced by `frame_state` (including parent frames and virtual object properties).
+    fn is_in_frame_state(&self, frame_state: crate::ir::FrameStateId, value: NodeId) -> bool {
+        self.graph
+            .frame_state_values(frame_state, self.work)
+            .into_iter()
+            .any(|(_, candidate)| candidate == value)
     }
 
     /// Adds a move before the node that is being allocated.
@@ -994,7 +1090,7 @@ impl<'w> Allocator<'_, 'w> {
                         if !blocked.contains(previous)
                             && !(clobbered.contains(register)
                                 && !clobbered.contains(previous)
-                                && self.is_live_after(input, node_id)) =>
+                                && (self.is_live_after(input, node_id) || node.frame_state.is_some())) =>
                     {
                         self.free_register(previous);
                         self.assign_register(register, input);
@@ -1098,8 +1194,12 @@ impl<'w> Allocator<'_, 'w> {
         {
             for register in RegisterMask(clobbered.0 & self.occupied.0).iter() {
                 let value = self.contents[register as usize];
-                if self.is_live_after(value, node_id) {
-                    self.ensure_home(value);
+                if self.is_live_after(value, node_id)
+                    || node
+                        .frame_state
+                        .is_some_and(|frame_state| self.is_in_frame_state(frame_state, value))
+                {
+                    self.ensure_home_from_register(value, register);
                 }
                 self.free_register(register);
             }
@@ -1243,6 +1343,21 @@ impl<'w> Allocator<'_, 'w> {
                         if from != to {
                             self.parallel_moves.push(Move { from, to });
                         }
+                    }
+                }
+            }
+        }
+        let cold_run = self.cold_home_end_runs[predecessor.index()].range();
+        if !cold_run.is_empty() {
+            let live_in = self.liveness.live_in.get(join.index());
+            let phis = &self.graph.block(join).phis;
+            for entry_index in cold_run {
+                let (value, slot) = self.cold_home_end_entries[entry_index];
+                if live_in.binary_search(&value).is_ok() && !phis.contains(&value) {
+                    let to = Location::Stack(slot);
+                    let from = self.current_location(value);
+                    if from != to {
+                        self.parallel_moves.push(Move { from, to });
                     }
                 }
             }

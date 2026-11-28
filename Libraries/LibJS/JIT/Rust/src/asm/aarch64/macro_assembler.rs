@@ -757,6 +757,51 @@ impl PortableMacroAssembler for MacroAssembler<'_> {
         self.load_store(MemOp::StrD, src.0, address);
     }
 
+    fn store_pair64(&mut self, address: &Address, first: Gpr, second: Gpr) {
+        if address.index.is_none() && address.displacement % 8 == 0 && (-512..512).contains(&address.displacement) {
+            self.assembler
+                .stp(first, second, PairOperand::Offset(address.base, address.displacement));
+        } else {
+            self.store64(address, first);
+            let next = Address {
+                displacement: address.displacement + 8,
+                ..*address
+            };
+            self.store64(&next, second);
+        }
+    }
+
+    fn load_pair64(&mut self, first: Gpr, second: Gpr, address: &Address) {
+        if address.index.is_none()
+            && address.displacement % 8 == 0
+            && (-512..512).contains(&address.displacement)
+            && first != second
+        {
+            self.assembler
+                .ldp(first, second, PairOperand::Offset(address.base, address.displacement));
+        } else {
+            self.load64(first, address);
+            let next = Address {
+                displacement: address.displacement + 8,
+                ..*address
+            };
+            self.load64(second, &next);
+        }
+    }
+
+    fn js_truncate_double_to_int32(&mut self, dst: Gpr, src: Fpr) -> bool {
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            self.assembler.fjcvtzs(dst, src);
+            true
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        {
+            let _ = (dst, src);
+            false
+        }
+    }
+
     fn load_imm128(&mut self, dst: Fpr, imm: u128) {
         self.check_plain_bits(imm as u64);
         self.check_plain_bits((imm >> 64) as u64);
@@ -1199,6 +1244,14 @@ impl PortableMacroAssembler for MacroAssembler<'_> {
     }
 
     fn branch_convert_double_to_int32(&mut self, dst: Gpr, src: Fpr, fail: Label, negative_zero: NegativeZero) {
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        if negative_zero == NegativeZero::Fail {
+            // ARMv8.3 FEAT_JSCVT: fjcvtzs converts to int32 and sets PSTATE.Z = 1 iff the
+            // conversion was exact and the input was not -0.0, NaN, Inf, fractional, or out of range.
+            self.assembler.fjcvtzs(dst, src);
+            self.assembler.b_cond(Cond::Ne, fail);
+            return;
+        }
         // fcvtzs saturates and turns NaN into 0, so converting back and
         // comparing catches every inexact case ("ne" includes unordered).
         self.assembler.fcvtzs(W32, dst, src);

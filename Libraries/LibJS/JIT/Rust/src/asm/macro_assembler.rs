@@ -200,6 +200,28 @@ pub trait PortableMacroAssembler: Sized {
     fn load_effective_address(&mut self, dst: Gpr, address: &Address);
     fn load_double(&mut self, dst: Fpr, address: &Address);
     fn store_double(&mut self, address: &Address, src: Fpr);
+    /// Stores two 64-bit GPRs to `[address]` and `[address + 8]`.
+    fn store_pair64(&mut self, address: &Address, first: Gpr, second: Gpr) {
+        self.store64(address, first);
+        let next = Address {
+            displacement: address.displacement + 8,
+            ..*address
+        };
+        self.store64(&next, second);
+    }
+    /// Loads two 64-bit GPRs from `[address]` and `[address + 8]`.
+    fn load_pair64(&mut self, first: Gpr, second: Gpr, address: &Address) {
+        self.load64(first, address);
+        let next = Address {
+            displacement: address.displacement + 8,
+            ..*address
+        };
+        self.load64(second, &next);
+    }
+    /// Emits a single-instruction JavaScript `ToInt32` (`fjcvtzs`) if supported on this target.
+    fn js_truncate_double_to_int32(&mut self, _dst: Gpr, _src: Fpr) -> bool {
+        false
+    }
     /// Loads a float and widens it to a double.
     fn load_float_as_double(&mut self, dst: Fpr, address: &Address);
     /// Rounds a double to a float and stores it.
