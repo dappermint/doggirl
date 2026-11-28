@@ -529,6 +529,51 @@ pub trait Input: Copy {
         None
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn find_multi_offset_ascii_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        first_byte: Option<u8>,
+        lut0: &AsciiNibbleLut,
+        lut1: &AsciiNibbleLut,
+        offset2: usize,
+        lut2: &AsciiNibbleLut,
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        let lo0 = lut0.lo();
+        let lo1 = lut1.lo();
+        let lo2 = lut2.lo();
+        let mut pos = start;
+        while pos < end {
+            let c0 = self.code_unit(pos);
+            let m0 = match first_byte {
+                Some(b) => c0 == u16::from(b),
+                None => c0 < 0x80 && (lo0[(c0 & 0x0F) as usize] & (1u8 << (c0 >> 4))) != 0,
+            };
+            if m0 {
+                let c1 = self.code_unit(pos + 1);
+                if c1 < 0x80 && (lo1[(c1 & 0x0F) as usize] & (1u8 << (c1 >> 4))) != 0 {
+                    let m2 = if offset2 == 0 {
+                        true
+                    } else {
+                        let c2 = self.code_unit(pos + offset2);
+                        c2 < 0x80 && (lo2[(c2 & 0x0F) as usize] & (1u8 << (c2 >> 4))) != 0
+                    };
+                    if m2 && let Some(match_len) = check(pos) {
+                        return Some((pos, match_len));
+                    }
+                }
+            }
+            pos += 1;
+        }
+        None
+    }
+
     #[inline(always)]
     fn matches_latin1_at(self, pos: usize, needle: &[u8]) -> bool {
         if pos + needle.len() > self.len() {
@@ -732,6 +777,112 @@ impl Input for &[u16] {
         None
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn find_multi_offset_ascii_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        first_byte: Option<u8>,
+        lut0: &AsciiNibbleLut,
+        lut1: &AsciiNibbleLut,
+        offset2: usize,
+        lut2: &AsciiNibbleLut,
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        if start >= end || end > self.len() {
+            return None;
+        }
+        let max_offset = offset2.max(1);
+        debug_assert!(end - 1 + max_offset < self.len());
+        let len = end - start;
+        let ptr = unsafe { self.as_ptr().add(start) };
+        let lo0 = lut0.lo();
+        let lo1 = lut1.lo();
+        let lo2 = lut2.lo();
+        let mut offset = 0usize;
+        if len >= 8 {
+            use core::arch::aarch64::*;
+            const HI_LUT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            // SAFETY: NEON is always available on aarch64. Since `offset + 8 <= len` and `end - 1 + max_offset < self.len()`,
+            //         every 8-element load at `ptr.add(offset + k)` for `k <= max_offset` stays within `self`.
+            unsafe {
+                let lo0_v = vld1q_u8(lo0.as_ptr());
+                let lo1_v = vld1q_u8(lo1.as_ptr());
+                let lo2_v = vld1q_u8(lo2.as_ptr());
+                let hi_v = vld1q_u8(HI_LUT.as_ptr());
+                let mask_0f = vdup_n_u8(0x0F);
+                let max_ascii = vdupq_n_u16(0x7F);
+                let first_v = first_byte.map(|b| vdupq_n_u16(u16::from(b)));
+                while offset + 8 <= len {
+                    let v0 = vld1q_u16(ptr.add(offset));
+                    let mut hit = if let Some(b_v) = first_v {
+                        vmovn_u16(vceqq_u16(v0, b_v))
+                    } else {
+                        let non_ascii = vmovn_u16(vcgtq_u16(v0, max_ascii));
+                        let narrow = vmovn_u16(v0);
+                        let lo_bits = vqtbl1_u8(lo0_v, vand_u8(narrow, mask_0f));
+                        let hi_bits = vqtbl1_u8(hi_v, vshr_n_u8::<4>(narrow));
+                        vbic_u8(vtst_u8(lo_bits, hi_bits), non_ascii)
+                    };
+                    if vmaxv_u8(hit) != 0 {
+                        let v1 = vld1q_u16(ptr.add(offset + 1));
+                        let non_ascii1 = vmovn_u16(vcgtq_u16(v1, max_ascii));
+                        let narrow1 = vmovn_u16(v1);
+                        let lo1_bits = vqtbl1_u8(lo1_v, vand_u8(narrow1, mask_0f));
+                        let hi1_bits = vqtbl1_u8(hi_v, vshr_n_u8::<4>(narrow1));
+                        hit = vand_u8(hit, vbic_u8(vtst_u8(lo1_bits, hi1_bits), non_ascii1));
+                        if offset2 != 0 && vmaxv_u8(hit) != 0 {
+                            let v2 = vld1q_u16(ptr.add(offset + offset2));
+                            let non_ascii2 = vmovn_u16(vcgtq_u16(v2, max_ascii));
+                            let narrow2 = vmovn_u16(v2);
+                            let lo2_bits = vqtbl1_u8(lo2_v, vand_u8(narrow2, mask_0f));
+                            let hi2_bits = vqtbl1_u8(hi_v, vshr_n_u8::<4>(narrow2));
+                            hit = vand_u8(hit, vbic_u8(vtst_u8(lo2_bits, hi2_bits), non_ascii2));
+                        }
+                        let mut mask = vget_lane_u64(vreinterpret_u64_u8(hit), 0);
+                        while mask != 0 {
+                            let lane = (mask.trailing_zeros() >> 3) as usize;
+                            let pos = start + offset + lane;
+                            if let Some(match_len) = check(pos) {
+                                return Some((pos, match_len));
+                            }
+                            mask &= !(0xFFu64 << (lane << 3));
+                        }
+                    }
+                    offset += 8;
+                }
+            }
+        }
+        while offset < len {
+            let pos = start + offset;
+            let c0 = self[pos];
+            let m0 = match first_byte {
+                Some(b) => c0 == u16::from(b),
+                None => c0 < 0x80 && (lo0[(c0 & 0x0F) as usize] & (1u8 << (c0 >> 4))) != 0,
+            };
+            if m0 {
+                let c1 = self[pos + 1];
+                if c1 < 0x80 && (lo1[(c1 & 0x0F) as usize] & (1u8 << (c1 >> 4))) != 0 {
+                    let m2 = if offset2 == 0 {
+                        true
+                    } else {
+                        let c2 = self[pos + offset2];
+                        c2 < 0x80 && (lo2[(c2 & 0x0F) as usize] & (1u8 << (c2 >> 4))) != 0
+                    };
+                    if m2 && let Some(match_len) = check(pos) {
+                        return Some((pos, match_len));
+                    }
+                }
+            }
+            offset += 1;
+        }
+        None
+    }
+
     #[inline(always)]
     fn find_builtin_class_non_unicode(self, start: usize, class: BuiltinCharacterClass) -> Option<usize> {
         let slice = self.get(start..)?;
@@ -925,6 +1076,105 @@ impl Input for &[u8] {
                 let pos = start + offset;
                 if let Some(match_len) = check(pos) {
                     return Some((pos, match_len));
+                }
+            }
+            offset += 1;
+        }
+        None
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn find_multi_offset_ascii_match<F>(
+        self,
+        start: usize,
+        end: usize,
+        first_byte: Option<u8>,
+        lut0: &AsciiNibbleLut,
+        lut1: &AsciiNibbleLut,
+        offset2: usize,
+        lut2: &AsciiNibbleLut,
+        mut check: F,
+    ) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        if start >= end || end > self.len() {
+            return None;
+        }
+        let max_offset = offset2.max(1);
+        debug_assert!(end - 1 + max_offset < self.len());
+        let len = end - start;
+        let ptr = unsafe { self.as_ptr().add(start) };
+        let lo0 = lut0.lo();
+        let lo1 = lut1.lo();
+        let lo2 = lut2.lo();
+        let mut offset = 0usize;
+        if len >= 16 {
+            use core::arch::aarch64::*;
+            const HI_LUT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+            // SAFETY: NEON is always available on aarch64. Since `offset + 16 <= len` and `end - 1 + max_offset < self.len()`,
+            //         every 16-byte load at `ptr.add(offset + k)` for `k <= max_offset` stays within `self`.
+            unsafe {
+                let lo0_v = vld1q_u8(lo0.as_ptr());
+                let lo1_v = vld1q_u8(lo1.as_ptr());
+                let lo2_v = vld1q_u8(lo2.as_ptr());
+                let hi_v = vld1q_u8(HI_LUT.as_ptr());
+                let mask_0f = vdupq_n_u8(0x0F);
+                let first_v = first_byte.map(|b| vdupq_n_u8(b));
+                while offset + 16 <= len {
+                    let v0 = vld1q_u8(ptr.add(offset));
+                    let mut hit = if let Some(b_v) = first_v {
+                        vceqq_u8(v0, b_v)
+                    } else {
+                        let lo_bits = vqtbl1q_u8(lo0_v, vandq_u8(v0, mask_0f));
+                        let hi_bits = vqtbl1q_u8(hi_v, vshrq_n_u8::<4>(v0));
+                        vtstq_u8(lo_bits, hi_bits)
+                    };
+                    if vmaxvq_u8(hit) != 0 {
+                        let v1 = vld1q_u8(ptr.add(offset + 1));
+                        let lo1_bits = vqtbl1q_u8(lo1_v, vandq_u8(v1, mask_0f));
+                        let hi1_bits = vqtbl1q_u8(hi_v, vshrq_n_u8::<4>(v1));
+                        hit = vandq_u8(hit, vtstq_u8(lo1_bits, hi1_bits));
+                        if offset2 != 0 && vmaxvq_u8(hit) != 0 {
+                            let v2 = vld1q_u8(ptr.add(offset + offset2));
+                            let lo2_bits = vqtbl1q_u8(lo2_v, vandq_u8(v2, mask_0f));
+                            let hi2_bits = vqtbl1q_u8(hi_v, vshrq_n_u8::<4>(v2));
+                            hit = vandq_u8(hit, vtstq_u8(lo2_bits, hi2_bits));
+                        }
+                        let mut mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
+                        while mask != 0 {
+                            let lane = (mask.trailing_zeros() >> 2) as usize;
+                            let pos = start + offset + lane;
+                            if let Some(match_len) = check(pos) {
+                                return Some((pos, match_len));
+                            }
+                            mask &= !(0xFu64 << (lane << 2));
+                        }
+                    }
+                    offset += 16;
+                }
+            }
+        }
+        while offset < len {
+            let pos = start + offset;
+            let c0 = self[pos];
+            let m0 = match first_byte {
+                Some(b) => c0 == b,
+                None => c0 < 0x80 && (lo0[(c0 & 0x0F) as usize] & (1u8 << (c0 >> 4))) != 0,
+            };
+            if m0 {
+                let c1 = self[pos + 1];
+                if c1 < 0x80 && (lo1[(c1 & 0x0F) as usize] & (1u8 << (c1 >> 4))) != 0 {
+                    let m2 = if offset2 == 0 {
+                        true
+                    } else {
+                        let c2 = self[pos + offset2];
+                        c2 < 0x80 && (lo2[(c2 & 0x0F) as usize] & (1u8 << (c2 >> 4))) != 0
+                    };
+                    if m2 && let Some(match_len) = check(pos) {
+                        return Some((pos, match_len));
+                    }
                 }
             }
             offset += 1;
